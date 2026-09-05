@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A股四维选股 · 控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">📈 A股四维选股 <span class="sub">技术面 · 股息率 · 行业排名 · 基本面</span></div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="results">结果</button>
+    <button class="tab" data-tab="strategy">策略</button>
+    <button class="tab" data-tab="run">运行</button>
+  </nav>
+  <div id="global-status" class="global-status"></div>
+</header>
+
+<main>
+  <!-- ============ 结果 ============ -->
+  <section id="tab-results" class="tab-panel active">
+    <div class="results-layout">
+      <aside class="run-list-box">
+        <h3>运行记录 <button id="btn-refresh-runs" class="mini-btn" title="刷新">⟳</button></h3>
+        <ul id="run-list" class="run-list"></ul>
+      </aside>
+      <div class="run-detail" id="run-detail">
+        <p class="placeholder">← 从左侧选择一次运行查看详情</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 策略 ============ -->
+  <section id="tab-strategy" class="tab-panel">
+    <div class="strategy-toolbar">
+      <span id="strategy-meta" class="muted"></span>
+      <button id="btn-strategy-edit" class="primary-btn">✏️ 编辑模式</button>
+      <button id="btn-strategy-save" class="primary-btn hidden">💾 保存策略</button>
+      <button id="btn-strategy-cancel" class="ghost-btn hidden">取消</button>
+    </div>
+    <div id="strategy-cards" class="cards"></div>
+    <div id="strategy-msg" class="msg-box"></div>
+  </section>
+
+  <!-- ============ 运行 ============ -->
+  <section id="tab-run" class="tab-panel">
+    <div class="run-form card">
+      <h3>触发新筛选</h3>
+      <label for="run-date">筛选日期（YYYY-MM-DD，默认今天；非交易日自动回退到最近交易日）</label>
+      <div class="run-row">
+        <input type="date" id="run-date">
+        <button id="btn-run-start" class="primary-btn">▶ 开始筛选</button>
+      </div>
+      <p class="muted small">首次运行需拉取全市场数据（可能约 2 小时）；命中本地缓存时秒级完成。同一时间只允许一个运行任务。</p>
+    </div>
+
+    <div id="run-progress" class="card hidden">
+      <h3>任务状态 <span id="task-state-badge" class="badge"></span></h3>
+      <div id="task-meta" class="muted small"></div>
+      <pre id="log-tail" class="log-tail"></pre>
+    </div>
+  </section>
+</main>
+
+<footer class="footnote">
+  数据源：BaoStock（日K / 分红 / 季报 / 行业 / 股票列表）；A股日K为 T+1 更新，筛选运行日 = 请求日期回退到的最近交易日。
+  技术面基于后复权日K(adjustflag=1)；当前价与股息率分母用不复权收盘价(adjustflag=3)。腾讯 qt.gtimg.cn 仅做交叉验证，不进主计算路径。
+  页面数据均读自本机 output/ · config/ · logs/ 文件系统，无数据库。
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

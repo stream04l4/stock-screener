@@ -165,7 +165,48 @@ EOF
 重复运行秒级。`--date` 必须 ≤ 当前日期（程序会拒绝未来日期并报错退出），
 误用未来日期不会污染该交易日的真实运行。
 
-## 8. 目录结构
+## 8. Web 前端（控制台）
+
+在 `web/` 下提供 FastAPI 后端 + 无构建静态单页应用，用于查看运行结果、编辑策略阈值、触发新筛选。复用现有 `.venv`（已加装 fastapi / uvicorn），不引入数据库——所有数据读自 `output/`、`config/`、`logs/` 文件系统。
+
+### 启动（systemd user service）
+
+```bash
+# unit 已写入 ~/.config/systemd/user/stock-screener-web.service
+systemctl --user daemon-reload
+systemctl --user enable --now stock-screener-web.service   # enabled + started
+systemctl --user status stock-screener-web.service
+# 绑定 0.0.0.0:3080（访问控制由云安全组负责，应用层不加认证）
+```
+
+手动前台启动（调试用）：
+
+```bash
+cd /home/ubuntu/stock-screener
+.venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --port 3080
+```
+
+打开 `http://<host>:3080/`，左侧/顶部三个页签：**结果**（运行列表→漏斗条形图→入选表→技术面幸存者全量表，可搜索/排序/分页）、**策略**（分组卡片展示各维度阈值+说明，编辑模式改完提交 PUT）、**运行**（选日期触发筛选，轮询实时日志尾部，完成后自动回结果页）。
+
+### API 一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/runs` | 扫描 `output/` 列出已有运行（日期/入选数/候选数/生成时间），倒序 |
+| GET | `/api/runs/{YYYYMMDD}` | 该次运行详情：漏斗各层数量、最终入选列表、全部技术面幸存者 CSV(JSON)、缺失名单、跳过排名的行业组、报告 markdown 原文 |
+| GET | `/api/strategy` | 当前 `config/strategy.yaml` 解析后的 JSON + 原始文本 |
+| PUT | `/api/strategy` | 更新阈值：逐项校验类型与范围（如 `min_yield_pct∈[0,50]`、`ma_period∈[20,500]` 整数），非法值 400；合法则先备份 `.bak` 再原子写回（纯 YAML，所有 key 齐全） |
+| POST | `/api/runs` | body `{date}`（可选，默认今天）。后台**子进程**执行 `python -m screener --date D --config config/strategy.yaml`，立即返回 task_id；同一时间只允许一个任务（已有则 409） |
+| GET | `/api/runs/{task_id}/status` | running/done/failed + 日志尾部（最后 ~20 行）+ 完成后指向结果 |
+
+### 说明与约束
+
+- **只读复用** `screener/` 主代码：Web 不改动筛选逻辑，仅调用其 CLI 子进程与读取产物文件。
+- 触发运行用**子进程**而非 uvicorn 线程内跑（首跑可能 ~2h，不能阻塞 API）；子进程日志写 `logs/web_run_<task_id>.log`。
+- PUT 写回前备份到 `config/strategy.yaml.bak`（保留最近一份）。注释会被简化为纯 YAML，但所有 key 齐全且经 `screener.config.load_config` 复校验。
+- 前端不硬编码业务阈值：策略字段一律以 `/api/strategy` 返回为准渲染。
+
+## 9. 目录结构
 
 ```
 stock-screener/
@@ -183,13 +224,16 @@ stock-screener/
 │       ├── cache.py            # 本地 CSV 缓存（原子写+哨兵+TTL）
 │       ├── fetchers.py         # 各接口抓取（缓存优先）
 │       └── tencent.py          # 腾讯实时快照（GBK 转码封装，仅交叉验证）
-├── tests/                    # 65 个离线单测 + fixtures（真实样例数据）
+├── tests/                    # 74 个离线单测 + fixtures（真实样例数据）
+├── web/                      # Web 前端（FastAPI 后端 + 静态 SPA，端口 3080）
+│   ├── app.py                # FastAPI 应用（API + 子进程任务管理 + 策略校验）
+│   └── static/               # index.html / style.css / app.js（vanilla JS，无构建）
 ├── cache/                    # 原始数据缓存（自动生成）
 ├── output/                   # result_*.csv / report_*.md（自动生成）
-└── logs/                     # run_*.log / cron.log
+└── logs/                     # run_*.log / web_run_*.log / cron.log
 ```
 
-## 9. 已知限制
+## 10. 已知限制
 
 - BaoStock 单 socket 串行：全市场首拉慢（~1.5-2h），无法安全并发（实测多进程
   并发登录会挂起）；缓存命中后无此问题。
