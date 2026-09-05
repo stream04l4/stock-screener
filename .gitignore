@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 虚拟环境（uv 创建，本地重建：uv venv && uv sync）
+.venv/
+
+# 运行时数据（不入库；首次运行自动拉取，约 84MB）
+cache/
+logs/
+output/

@@ -1,0 +1,45 @@
+# A股选股策略配置 —— 所有筛选阈值都在这里，代码中不硬编码任何阈值。
+# 单位约定：带 _pct 的字段是百分数（3 表示 3%）；代码内部统一转小数比较。
+
+technical:
+  ma_period: 200                    # 收盘价 > MA{n}（后复权日K）
+  return_window_days: 250           # 区间收益率回看窗口（交易日）
+  min_return_pct: 0                 # 近250日区间收益率下限（%），含边界
+  max_return_pct: 100               # 近250日区间收益率上限（%），含边界
+  max_annual_volatility_pct: 45     # 年化波动率上限（%，不含边界）
+
+dividend:
+  window_days: 365                  # 股息率窗口：[运行日-365天, 运行日]
+  min_yield_pct: 3                  # 股息率下限（%），含边界
+
+industry:
+  rank_by: roeAvg                   # 组内排名依据（目前仅支持最近披露报告期 ROE）
+  top_pct: 30                       # 保留行业内前 30%（按 ROE 降序）
+  min_group_size: 5                 # 行业组不足该数量 → 跳过排名约束并在报告注明
+
+fundamental:
+  roe_min_pct: 10                   # ROE 下限（%，报告期累计口径、未年化，含边界）
+  net_profit_yoy_field: YOYPNI      # 净利同比字段：YOYPNI(归母) / YOYNI(净利润)，须 > 0
+  liability_max_pct: 60             # 资产负债率上限（%，含边界）
+  gross_margin_min_pct: 20          # 毛利率下限（%，不含边界）；金融业该字段为空 → 落缺失名单
+  probe_quarters_back: 3            # "最近披露报告期"从当前季度最多回退探测的季数
+
+universe:
+  a_share_prefixes:                 # 沪深A股代码前缀（排除指数/ETF/B股）
+    - sh.60
+    - sh.68
+    - sz.00
+    - sz.30
+  listing_min_trading_days: 250     # 上市满 N 个交易日（窗口内K线行数判断）
+  st_name_keyword: ST               # 名称辅助标记（剔除以日K isST=1 为准）
+
+data:
+  kline_calendar_days_back: 420     # 后复权窗口K线回溯日历天（覆盖250个交易日+节假日余量）
+  retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）
+  cache_dir: cache                  # 本地缓存目录（相对路径基于项目根）
+
+crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
+  enabled: true
+  sample_size: 20                   # 从最终入选股中抽样 N 只验证收盘价
+  price_tolerance_pct: 0.5          # 收盘价偏差容忍度（%）
+  batch_size: 50                    # 腾讯接口单批请求股票数

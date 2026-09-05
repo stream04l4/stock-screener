@@ -1,0 +1,24 @@
+[project]
+name = "stock-screener"
+version = "0.1.0"
+description = "A股选股策略程序：技术面 + 股息率 + 行业内排名 + 基本面四维筛选（主数据源 BaoStock）"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "baostock>=0.8.9",
+    "pandas>=2.0",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["screener"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
