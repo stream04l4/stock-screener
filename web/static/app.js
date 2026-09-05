@@ -108,8 +108,8 @@ async function selectRun(day, liEl) {
   box.innerHTML = '<p class="placeholder">加载中…</p>';
   currentRunDate = day;
   try {
-    // API 需要 YYYYMMDD，列表里是 ISO（YYYY-MM-DD）
-    const d = await api("/api/runs/" + day.replace(/-/g, ""));
+    // 列表与详情端点统一用 ISO（YYYY-MM-DD）
+    const d = await api("/api/runs/" + day);
     renderRunDetail(d, box);
   } catch (e) {
     box.innerHTML = "";

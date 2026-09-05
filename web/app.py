@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date as _date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -519,8 +519,13 @@ class TaskManager:
         }
         if state in ("done", "failed"):
             run_day = _result_day_for(t.get("date") or "", log_path)
-            out["result_date"] = run_day
-            out["api"] = f"/api/runs/{run_day}" if run_day else None
+            # 对外统一 ISO；_result_day_for 内部返回紧凑 YYYYMMDD（用于拼文件路径）
+            out["result_date"] = (
+                f"{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}" if run_day else None
+            )
+            out["api"] = (
+                f"/api/runs/{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}" if run_day else None
+            )
             # 清理锁（仅当是本任务）
             self._clear_lock(task_id)
         return out
@@ -627,10 +632,20 @@ def list_runs() -> Dict[str, Any]:
 
 @app.get("/api/runs/{day}")
 def run_detail(day: str) -> Dict[str, Any]:
-    if not re.fullmatch(r"\d{8}", day):
-        raise HTTPException(status_code=400, detail="date 应为 YYYYMMDD")
-    csv_p = OUTPUT_DIR / f"result_{day}.csv"
-    report_p = OUTPUT_DIR / f"report_{day}.md"
+    # 统一对外日期格式为 ISO（YYYY-MM-DD），与列表端点/CLI 一致；
+    # 兼容旧客户端的紧凑格式 YYYYMMDD。两种格式都做真实日历校验。
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        compact = day.replace("-", "")
+    elif re.fullmatch(r"\d{8}", day):
+        compact = day
+    else:
+        raise HTTPException(status_code=400, detail="date 应为 YYYY-MM-DD（或兼容 YYYYMMDD）")
+    try:
+        _date(int(compact[:4]), int(compact[4:6]), int(compact[6:]))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"非法日期: {day}")
+    csv_p = OUTPUT_DIR / f"result_{compact}.csv"
+    report_p = OUTPUT_DIR / f"report_{compact}.md"
     if not csv_p.exists():
         raise HTTPException(status_code=404, detail=f"无该日运行结果: {day}")
 
@@ -644,7 +659,7 @@ def run_detail(day: str) -> Dict[str, Any]:
         parsed = parse_report(md)
 
     return {
-        "date": day,
+        "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
         "generated_at": _mtime_iso(csv_p),
         "funnel": parsed["funnel"],
         "selected": selected,
