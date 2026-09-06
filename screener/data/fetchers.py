@@ -263,6 +263,187 @@ class DataFetcher:
             run_day_tradestatus=to_int(r[4]),
         )
 
+    # ---------- v2 稳定键增量缓存（报告 R1-c 方案 A） ----------
+    # 旧漂移键 kline_{code}_{start}_{end}_af1* / kline_day_* 保留但不再读写：
+    # af=1 全历史 = kline_af3 × adjfactor 本地重建，历史不可变、尾部追加。
+
+    # v2 稳定键缓存的 K线字段：只保留全链路实际消费的列（date/close/isST/tradestatus
+    # + code）。af1 重建、MA/RSI/MACD/波动率、运行日快照、上市天数全部只需 close；
+    # open/high/low/preclose/volume/amount/turn/pctChg/peTTM/pbMRQ 在 v2 无消费者。
+    # 字段数直接决定全历史拉取时长（逐行字符串传输，实测 15 字段 28-41s vs 5 字段
+    # 5.5-9.3s/股）→ 一次性迁移可行性关键。解析一律按列名（reconstruct/snapshot），
+    # 兼容早期误存的 15 字段文件。
+    KLINE_AF3_FIELDS = ("date", "code", "close", "isST", "tradestatus")
+
+    def _kline_af3_key(self, code: str) -> str:
+        return make_cache_name("kline_af3", code)
+
+    def _adjfactor_key(self, code: str) -> str:
+        return make_cache_name("adjfactor", code)
+
+    def kline_af3_history(self, code: str) -> Optional[Dict[str, Any]]:
+        """读全历史不复权K线缓存（稳定键）。返回 {"columns","rows"} 或 None（缺失/损坏）。"""
+        return self.cache.get(self._kline_af3_key(code))
+
+    def kline_af3_last_date(self, code: str) -> Optional[str]:
+        """缓存中最后一根K线的日期（增量起点 = 该日+1）。无缓存 → None。"""
+        hit = self.kline_af3_history(code)
+        if not hit or not hit["rows"]:
+            return None
+        last = str(hit["rows"][-1][0]).strip()
+        return last or None
+
+    def kline_af3_fetch(self, code: str, start: str, end: str) -> Tuple[List[str], List[List[str]]]:
+        """拉取 [start, end] 的不复权K线（af=3），**不写缓存**（由调用方决定追加）。"""
+        return self.client.call_with_fields(
+            bs.query_history_k_data_plus,
+            label=f"kline_af3_{code}",
+            code=code,
+            fields=",".join(self.KLINE_AF3_FIELDS),
+            start_date=start,
+            end_date=end,
+            frequency="d",
+            adjustflag="3",  # 3=不复权（真实成交价，永不变）
+        )
+
+    def kline_af3_append(self, code: str, new_rows: List[List[str]]) -> None:
+        """把新区间K线行追加到稳定键缓存（原子重写全文件）。"""
+        if not new_rows:
+            return
+        hit = self.kline_af3_history(code)
+        cols = list(hit["columns"]) if hit else list(self.KLINE_AF3_FIELDS)
+        rows = list(hit["rows"]) if hit else []
+        # 防御：丢弃与已有尾部日期重复的行（重跑/断点续传幂等）
+        existing_dates = {str(r[0]).strip() for r in rows}
+        rows.extend(r for r in new_rows if str(r[0]).strip() not in existing_dates)
+        self.cache.put(self._kline_af3_key(code), cols, rows)
+
+    def kline_af3_full(self, code: str, start: str, end: str) -> None:
+        """一次性全量拉取（IPO/2000 起 ~ run_day）并写入稳定键缓存。"""
+        _, rows = self.kline_af3_fetch(code, start, end)
+        if rows:
+            self.cache.put(self._kline_af3_key(code), list(self.KLINE_AF3_FIELDS), rows)
+
+    def adjfactor_history(self, code: str) -> Optional[Dict[str, Any]]:
+        """读全历史复权因子缓存（稳定键）。返回 {"columns","rows"} 或 None。"""
+        return self.cache.get(self._adjfactor_key(code))
+
+    def adjfactor_last_date(self, code: str) -> Optional[str]:
+        """已缓存的最后除权日。无缓存/无事件 → None。"""
+        hit = self.adjfactor_history(code)
+        if not hit or not hit["rows"]:
+            return None
+        last = str(hit["rows"][-1][1]).strip()
+        return last or None
+
+    def adjfactor_fetch(self, code: str, start: str, end: str) -> Tuple[List[str], List[List[str]]]:
+        """拉取 [start, end] 的复权因子（query_adjust_factor），不写缓存。"""
+        return self.client.call_with_fields(
+            bs.query_adjust_factor,
+            label=f"adjfactor_{code}",
+            code=code, start_date=start, end_date=end,
+        )
+
+    def adjfactor_append(self, code: str, new_rows: List[List[str]]) -> None:
+        """把新除权事件行追加到稳定键缓存（按 dividOperateDate 去重、升序）。"""
+        if not new_rows:
+            return
+        hit = self.adjfactor_history(code)
+        cols = list(hit["columns"]) if hit else ["code", "dividOperateDate", "foreAdjustFactor",
+                                                 "backAdjustFactor", "adjustFactor"]
+        rows = list(hit["rows"]) if hit else []
+        seen = {str(r[1]).strip() for r in rows}
+        merged = rows + [r for r in new_rows if str(r[1]).strip() not in seen]
+        # 按除权日升序（稳定键约定）
+        merged.sort(key=lambda r: str(r[1]))
+        self.cache.put(self._adjfactor_key(code), cols, merged)
+
+    def adjfactor_full(self, code: str, start: str, end: str) -> None:
+        """一次性全量拉取复权因子（2000 起）并写入稳定键缓存。"""
+        _, rows = self.adjfactor_fetch(code, start, end)
+        if rows:
+            rows.sort(key=lambda r: str(r[1]))
+            self.cache.put(self._adjfactor_key(code),
+                           ["code", "dividOperateDate", "foreAdjustFactor",
+                            "backAdjustFactor", "adjustFactor"], rows)
+
+    def kline_af3_incremental(self, code: str, run_day: str) -> Optional[KlineData]:
+        """v2 核心：稳定键增量更新 + 运行日快照（替代旧 kline_run_day）。
+
+        - 缓存缺失 → 全量拉取（IPO/2000 起 ~ run_day）+ 写缓存；
+        - 缓存存在且尾日期 == run_day → 0 次查询（纯命中）；
+        - 否则尾部追加 [last_date+1, run_day]（通常仅当日 1 根）。
+
+        返回运行日 KlineData（current_price/is_st/tradestatus），无数据 → None。
+        该查询同时提供当前价(af3 close)与窗口扩展，每股 K线查询 2 次→1 次。
+        """
+        last = self.kline_af3_last_date(code)
+        if last is None:
+            # 首次：全量历史（断点续跑天然支持——写成功后下次走增量）
+            self.kline_af3_full(code, "2000-01-01", run_day)
+        elif last < run_day:
+            start = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
+            _, rows = self.kline_af3_fetch(code, start, run_day)
+            self.kline_af3_append(code, rows)
+
+        hit = self.kline_af3_history(code)
+        if not hit or not hit["rows"]:
+            return None
+        # 运行日快照：取最后一根（BaoStock 对停牌日也返回行，OHLC=昨收）
+        r = hit["rows"][-1]
+        idx = {name: i for i, name in enumerate(hit["columns"])}
+
+        def col(name: str) -> Optional[str]:
+            i = idx.get(name)
+            return str(r[i]).strip() if (i is not None and i < len(r)) else ""
+
+        close_s = col("close")
+        return KlineData(
+            code=code,
+            dates=[col("date")],
+            closes=[to_float(close_s) or 0.0],
+            tradestatus=[to_int(col("tradestatus")) or 0],
+            last_date=col("date"),
+            n_rows=len(hit["rows"]),  # 全历史K线行数（上市时长代理，含停牌行）
+            current_price=to_float(close_s),
+            is_st=to_int(col("isST")),
+            run_day_tradestatus=to_int(col("tradestatus")),
+        )
+
+    def kline_af3_rebuilt(self, code: str) -> Optional[Dict[str, List]]:
+        """从稳定键缓存重建 (dates, af3_close, af1_close)（本地、离线、秒级）。"""
+        kl = self.kline_af3_history(code)
+        if not kl or not kl["rows"]:
+            return None
+        af = self.adjfactor_history(code)
+        factor_rows = list(af["rows"]) if af else []
+        from ..reconstruct import rebuild_kline_series
+        # 按缓存表头定位 close 列（兼容 5 字段 v2 布局与早期 15 字段文件）
+        return rebuild_kline_series(kl["rows"], factor_rows, kl["columns"])
+
+    def maybe_refresh_adjfactor(self, code: str, div_records: List[Dict[str, Any]]) -> bool:
+        """事件驱动复权因子刷新（R1-c）：仅当分红数据出现 > 已缓存最后除权日的
+        新 ex-date 时，拉取 [last_ex_date, run_day] 的因子并 append；否则 0 次查询。
+
+        backAdjustFactor 是 IPO 起累计值 → 新事件行自带完整累计因子，直接去重
+        append 即可（历史行零改动）。
+        :return: True = 实际发生了因子查询（供统计/日志）。
+        """
+        if self.run_day is None or not div_records:
+            return False
+        new_ex = max(
+            (str(r.get("dividOperateDate") or "").strip() for r in div_records),
+            default="",
+        )
+        last = self.adjfactor_last_date(code)
+        if not new_ex or (last is not None and new_ex <= last):
+            return False  # 无新除权事件 → 0 次额外查询（绝大多数股票的稳态）
+        start = last if last else "2000-01-01"
+        _, rows = self.adjfactor_fetch(code, start, self.run_day.isoformat())
+        self.adjfactor_append(code, rows)
+        log.info("复权因子事件驱动刷新: %s 新除权日 %s（start=%s）", code, new_ex, start)
+        return True
+
     # ---------- 分红（逐年循环！） ----------
     DIVIDEND_FIELDS = [
         "code", "dividPreNoticeDate", "dividAgmPumDate", "dividPlanAnnounceDate",
@@ -348,4 +529,25 @@ class DataFetcher:
                       "cashRatio", "YOYLiability", "liabilityToAsset", "assetToEquity"],
                      rows[-1]))
         d["liabilityToAsset"] = to_float(d.get("liabilityToAsset"))
+        return d
+
+    def cashflow_data(self, code: str, year: int, quarter: int) -> Optional[Dict[str, Any]]:
+        """query_cash_flow_data：CFOToNP 等（v2 Piotroski S2/S4 用）。未披露 → None。"""
+        name = make_cache_name("cashflow", code, year, quarter)
+
+        def fetch():
+            return self.client.call_with_fields(
+                bs.query_cash_flow_data, label=f"cashflow_{code}_{year}Q{quarter}",
+                code=code, year=year, quarter=quarter,
+            )
+
+        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter))
+        if not rows:
+            return None
+        d: Dict[str, Any] = dict(zip(["code", "pubDate", "statDate", "CAToAsset", "NCAToAsset",
+                                      "tangibleAssetToAsset", "ebitToInterest", "CFOToOR",
+                                      "CFOToNP", "CFOToGr"], rows[-1]))
+        for k in ("CAToAsset", "NCAToAsset", "tangibleAssetToAsset",
+                  "ebitToInterest", "CFOToOR", "CFOToNP", "CFOToGr"):
+            d[k] = to_float(str(d.get(k) or ""))
         return d

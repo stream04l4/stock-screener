@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import json
 import os
 import re
 import shutil
@@ -26,8 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from ruamel.yaml import YAML
@@ -109,9 +111,53 @@ def _parse_md_table(block: str) -> List[List[str]]:
     return rows
 
 
+def _parse_kpi_table(block: str) -> Dict[str, Any]:
+    """解析 v2 报告「一、KPI 概览」表（| 指标 | 值 |）→ dict。
+
+    键：selected / avg_ttm_yield_pct / avg_roe_pct / industry_concentration(str)。
+    值列可能含 '—'（无数据）→ None。
+    """
+    kpi: Dict[str, Any] = {
+        "selected": None,
+        "avg_ttm_yield_pct": None,
+        "avg_roe_pct": None,
+        "industry_concentration": None,
+    }
+    for cells in _parse_md_table(block):
+        if len(cells) < 2 or cells[0] == "指标":
+            continue
+        label, val = cells[0].strip(), cells[1].strip()
+        if val in ("", "—"):
+            continue
+        if label.startswith("入选数"):
+            m = re.search(r"(-?\d+)", val)
+            kpi["selected"] = int(m.group(1)) if m else None
+        elif "TTM股息率" in label:
+            m = re.search(r"-?\d+(?:\.\d+)?", val)
+            kpi["avg_ttm_yield_pct"] = float(m.group(0)) if m else None
+        elif "平均ROE" in label:
+            m = re.search(r"-?\d+(?:\.\d+)?", val)
+            kpi["avg_roe_pct"] = float(m.group(0)) if m else None
+        elif "行业集中度" in label:
+            kpi["industry_concentration"] = val
+    return kpi
+
+
 def parse_report(md: str) -> Dict[str, Any]:
-    """从 report_*.md 解析：漏斗、缺失名单、跳过行业组。"""
+    """从 report_*.md 解析：漏斗、缺失名单、跳过行业组 + v2 KPI 概览。"""
     sections = _split_sections(md)
+
+    # --- v2 KPI 概览：标题含「KPI」的节 ---
+    kpi: Dict[str, Any] = {
+        "selected": None,
+        "avg_ttm_yield_pct": None,
+        "avg_roe_pct": None,
+        "industry_concentration": None,
+    }
+    for key, body in sections.items():
+        if "KPI" in key:
+            kpi = _parse_kpi_table(body)
+            break
 
     # --- 漏斗：找标题含「过滤漏斗」的节 ---
     funnel: List[Dict[str, Any]] = []
@@ -155,14 +201,14 @@ def parse_report(md: str) -> Dict[str, Any]:
                     skipped[m.group(1).strip()] = int(m.group(2))
             break
 
-    return {"funnel": funnel, "missing": missing, "skipped_groups": skipped}
+    return {"funnel": funnel, "missing": missing, "skipped_groups": skipped, "kpi": kpi}
 
 
 # ---------------------------------------------------------------------------
 # 策略校验（PUT /api/strategy）
 # ---------------------------------------------------------------------------
 # 字段级 schema：{section: {field: (type, min, max, note)}}
-# type ∈ {"int","float","bool","str","enum","prefix_list"}
+# type ∈ {"int","float","bool","str","enum","prefix_list","float01"}
 _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
     "technical": {
         "ma_period": ("int", 20, 500),
@@ -192,6 +238,24 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "listing_min_trading_days": ("int", 60, 500),
         "st_name_keyword": ("str", None, None),
     },
+    # v2 打分模型（权重为嵌套 dict，单独校验；和≈1 由 screener.config.load_config 兜底）
+    "scoring": {
+        "mode": ("enum2", "zscore|legacy", None),
+        "top_n": ("int", 1, 500),
+        "missing_policy": ("enum2", "neutral_renorm|neutral|drop", None),
+        "weights": ("weights_dict", None, None),
+        "sub_weights": ("sub_weights_dict", None, None),
+    },
+    # v2 Web badge 阈值（百分数口径）。高股息(绿)复用 dividend.min_yield_pct，不另设键。
+    "badges": {
+        "industry_top_pct": ("float", 1, 100),
+        "fscore_min": ("int", 0, 9),
+    },
+    # v2 硬性剔除开关
+    "hard_filter": {
+        "st_enabled": ("bool", None, None),
+        "listing_min_trading_days": ("int", 60, 500),
+    },
     "data": {
         "kline_calendar_days_back": ("int", 250, 800),
         "retry_max_attempts": ("int", 1, 20),
@@ -204,6 +268,8 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "batch_size": ("int", 1, 200),
     },
 }
+
+_DIMS = ("technical", "dividend", "industry", "fundamental")
 
 # 所有必须出现的 (section, field) —— 「所有 key 必须齐全」
 _REQUIRED_KEYS = [
@@ -272,6 +338,30 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
                         errors.append(
                             f"{section}.{field} 项非法: {p!r}（应形如 sh.60）"
                         )
+            elif typ == "weights_dict":
+                if not isinstance(v, dict) or set(v) != set(_DIMS):
+                    errors.append(
+                        f"scoring.weights 必须恰好含 technical/dividend/industry/fundamental"
+                    )
+                else:
+                    for d in _DIMS:
+                        wv = v[d]
+                        if isinstance(wv, bool) or not isinstance(wv, (int, float)) or wv < 0:
+                            errors.append(f"scoring.weights.{d} 必须是非负数值")
+            elif typ == "sub_weights_dict":
+                if not isinstance(v, dict):
+                    errors.append("scoring.sub_weights 必须是映射（每维度→子因子权重映射）")
+                else:
+                    for d in _DIMS:
+                        sub = v.get(d)
+                        if not isinstance(sub, dict) or not sub:
+                            errors.append(f"scoring.sub_weights.{d} 必须是非空映射")
+                            continue
+                        for k, wv in sub.items():
+                            if isinstance(wv, bool) or not isinstance(wv, (int, float)) or wv < 0:
+                                errors.append(
+                                    f"scoring.sub_weights.{d}.{k} 必须是非负数值"
+                                )
 
     # 4) 跨字段语义（与 screener.config.load_config 保持一致，提前给出友好报错）
     tech = cfg.get("technical", {})
@@ -614,8 +704,17 @@ def list_runs() -> Dict[str, Any]:
             rows = _read_csv_rows(csv_p)
         except Exception:  # noqa: BLE001
             rows = []
-        selected = sum(1 for r in rows if (r.get("pass_all") or "").strip() == "是")
+        selected = sum(1 for r in rows if (r.get("top_n_selected") or "").strip() == "1")
+        if not selected:  # legacy 报告无 top_n_selected 列 → 回退 pass_all
+            selected = sum(1 for r in rows if (r.get("pass_all") or "").strip() == "是")
         report_p = OUTPUT_DIR / f"report_{day}.md"
+        # v2 KPI（从报告「一、KPI 概览」解析；旧报告 → None）
+        kpi: Dict[str, Any] = {}
+        if report_p.exists():
+            try:
+                kpi = parse_report(report_p.read_text(encoding="utf-8")).get("kpi", {})
+            except Exception:  # noqa: BLE001
+                kpi = {}
         runs.append(
             {
                 "date": date_iso,
@@ -623,6 +722,8 @@ def list_runs() -> Dict[str, Any]:
                 "total_candidates": len(rows),
                 "generated_at": _mtime_iso(csv_p),
                 "has_report": report_p.exists(),
+                "avg_ttm_yield_pct": kpi.get("avg_ttm_yield_pct"),
+                "avg_roe_pct": kpi.get("avg_roe_pct"),
             }
         )
     # 倒序（最新在前）
@@ -650,20 +751,40 @@ def run_detail(day: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"无该日运行结果: {day}")
 
     rows = _read_csv_rows(csv_p)
-    selected = [r for r in rows if (r.get("pass_all") or "").strip() == "是"]
+    # v2(zscore) 入选 = top_n_selected==1；legacy 入选 = pass_all=="是"。
+    # 优先按 top_n_selected（v2 列），为空再回退 legacy 语义，保证两种模式都正确。
+    selected = [r for r in rows if (r.get("top_n_selected") or "").strip() == "1"]
+    if not selected:
+        selected = [r for r in rows if (r.get("pass_all") or "").strip() == "是"]
 
     md = ""
-    parsed = {"funnel": [], "missing": [], "skipped_groups": {}}
+    parsed: Dict[str, Any] = {"funnel": [], "missing": [], "skipped_groups": {}, "kpi": {}}
     if report_p.exists():
         md = report_p.read_text(encoding="utf-8")
         parsed = parse_report(md)
+
+    # badge 阈值全部来自 config（前端不得硬编码）。
+    # 高股息(绿) 阈值 = dividend.min_yield_pct（brief R5 指定，单一事实来源）；
+    # 行业TopN% / F-Score 来自 badges 段。
+    try:
+        _cfg_doc = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        _badges_cfg = _cfg_doc.get("badges", {}) or {}
+        _div_cfg = _cfg_doc.get("dividend", {}) or {}
+    except Exception:  # noqa: BLE001
+        _badges_cfg, _div_cfg = {}, {}
 
     return {
         "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
         "generated_at": _mtime_iso(csv_p),
         "funnel": parsed["funnel"],
+        "kpi": parsed.get("kpi", {}),
+        "badges": {
+            "high_dividend_pct": float(_div_cfg.get("min_yield_pct", 0)),
+            "industry_top_pct": float(_badges_cfg.get("industry_top_pct", 10)),
+            "fscore_min": int(_badges_cfg.get("fscore_min", 7)),
+        },
         "selected": selected,
-        "survivors": rows,  # 全部技术面幸存者（CSV 全量）
+        "survivors": rows,  # v2 CSV 全量列（zscore 模式=全体打分候选）
         "missing_fundamental": parsed["missing"],
         "skipped_groups": parsed["skipped_groups"],
         "report_md": md,
@@ -725,6 +846,183 @@ def run_status(task_id: str) -> Dict[str, Any]:
     if not re.fullmatch(r"web_[A-Za-z0-9_]+", task_id):
         raise HTTPException(status_code=400, detail="非法 task_id")
     return tm.status(task_id)
+
+
+# ---------------------------------------------------------------------------
+# SSE 实时日志（R5：tail logs/web_run_{task_id}.log，按字节偏移增量推）
+# ---------------------------------------------------------------------------
+def _classify_log_line(line: str) -> Dict[str, Any]:
+    """把一行运行日志分类为 SSE 事件（报告 R5 classify()）。
+
+    - [PROGRESS] stage=... done=N total=M → progress（结构化进度标记，v2 新增）
+    - 「筛选完成」→ done；「运行失败」/Traceback/Error → error；其余 → log。
+    """
+    m = re.search(r"\[PROGRESS\]\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)", line)
+    if m:
+        return {"type": "progress", "stage": m.group(1),
+                "done": int(m.group(2)), "total": int(m.group(3))}
+    if "筛选完成" in line:
+        return {"type": "done"}
+    if "运行失败" in line or "Traceback" in line or re.search(r"\bError\b", line):
+        return {"type": "error"}
+    return {"type": "log", "text": line}
+
+
+@app.get("/api/runs/{task_id}/events")
+async def run_events(task_id: str, request: Request) -> StreamingResponse:
+    """SSE 事件流：log / progress / done / error + 15s 心跳。
+
+    - `id: <offset>` = 已推送到该字节偏移；断线重连带 Last-Event-ID 从该偏移续读
+      （自动补发断连期间错过的日志）。无 offset → 从头补发全量历史。
+    - 子进程结束且日志读完 → 发送终态事件后关闭流（前端据此停止轮询兜底）。
+    - X-Accel-Buffering:no：禁止代理缓冲（内网 nginx/uvicorn 场景，报告 R5）。
+    """
+    if not re.fullmatch(r"web_[A-Za-z0-9_]+", task_id):
+        raise HTTPException(status_code=400, detail="非法 task_id")
+    log_path = LOGS_DIR / f"web_run_{task_id}.log"
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail=f"任务日志不存在: {task_id}")
+
+    last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get(
+        "last_event_id")
+    try:
+        start_offset = int(last_event_id) if last_event_id else 0
+    except (TypeError, ValueError):
+        start_offset = 0
+
+    async def gen():
+        sent_terminal = False
+        idle_ticks = 0
+        offset = start_offset
+        while True:
+            # 客户端断开 → 尽快退出，不空转
+            if await request.is_disconnected():
+                break
+            try:
+                size = log_path.stat().st_size
+            except OSError:
+                break
+            if size > offset:
+                with open(log_path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(size - offset)
+                    offset = size
+                for line in chunk.decode("utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue  # 空行（TaskManager 启动横幅前的换行）不推
+                    ev = _classify_log_line(line)
+                    sent_terminal = sent_terminal or ev["type"] in ("done", "error")
+                    yield f"id: {offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                idle_ticks = 0
+            else:
+                idle_ticks += 1
+                if idle_ticks % 15 == 0:  # ~15s 心跳（poll=1s）
+                    yield "data: {\"type\":\"heartbeat\"}\n\n"
+                if sent_terminal and offset >= size:
+                    break
+                await asyncio.sleep(1)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 个股明细（R5：本地稳定键缓存重建 af1 + MA，只读文件、离线可用）
+# ---------------------------------------------------------------------------
+@app.get("/api/stocks/{code}/detail")
+def stock_detail(code: str, run_day: str) -> Dict[str, Any]:
+    """GET /api/stocks/{code}/detail?run_day=YYYY-MM-DD
+
+    响应 schema（报告 R5）：
+    {code, name, industry, factors:{...四维原始因子值...}, scores:{z_*, score_*},
+     kline:{dates:[], close_af1:[], close_af3:[], ma20:[], ma60:[]}}
+
+    K线数据源 = 本地 `kline_af3_{code}` + `adjfactor_{code}` 稳定键缓存重建 af=1
+    （不拉 BaoStock）；MA20/60 由 close_af1 计算。截断到 run_day（含）为止。
+    """
+    if not re.fullmatch(r"(sh|sz)\.\d{6}", code):
+        raise HTTPException(status_code=400, detail=f"非法代码: {code}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_day):
+        raise HTTPException(status_code=400, detail="run_day 应为 YYYY-MM-DD")
+
+    # 1) factors/scores：从该 run_day 的 result CSV 取（若存在）
+    compact = run_day.replace("-", "")
+    csv_p = OUTPUT_DIR / f"result_{compact}.csv"
+    row: Optional[Dict[str, str]] = None
+    if csv_p.exists():
+        for r in _read_csv_rows(csv_p):
+            if r.get("code") == code:
+                row = r
+                break
+
+    factor_cols = [
+        "ma_bullish", "window_return_pct", "annual_vol_pct", "rsi14",
+        "macd_golden_cross", "ttm_dividend_yield_pct", "payout_ratio_pct",
+        "industry_roe_rank_pct", "industry_yoy_pni_rank_pct", "roe_pct",
+        "roe_3y_mean_pct", "roe_3y_std_pct", "liability_pct", "gross_margin_pct",
+        "piotroski_fscore", "piotroski_valid",
+    ]
+    score_cols = ["z_technical", "z_dividend", "z_industry", "z_fundamental",
+                  "score_technical", "score_dividend", "score_industry",
+                  "score_fundamental", "total_score", "rank", "top_n_selected"]
+
+    def _num(v: Optional[str]) -> Optional[float]:
+        if v is None or str(v).strip() in ("", "nan"):
+            return None
+        try:
+            f = float(v)
+            return None if f != f else f  # NaN → None
+        except (TypeError, ValueError):
+            return None
+
+    factors: Dict[str, Any] = {c: _num(row.get(c)) for c in factor_cols} if row else {}
+    scores: Dict[str, Any] = {c: _num(row.get(c)) for c in score_cols} if row else {}
+
+    # 2) kline：本地稳定键缓存重建（离线、纯文件读取，不实例化 BaoStock 客户端）
+    kline_out: Dict[str, Any] = {"dates": [], "close_af1": [],
+                                 "close_af3": [], "ma20": [], "ma60": []}
+    try:
+        from screener.data.cache import DiskCache, make_cache_name
+        from screener.reconstruct import moving_average, rebuild_kline_series
+
+        cache = DiskCache(str(PROJECT_ROOT / "cache"))
+        kl = cache.get(make_cache_name("kline_af3", code))
+        if kl and kl["rows"]:
+            af = cache.get(make_cache_name("adjfactor", code))
+            factor_rows = list(af["rows"]) if af else []
+            rebuilt = rebuild_kline_series(kl["rows"], factor_rows, kl["columns"])
+            dates, af3, af1 = (
+                rebuilt["dates"], rebuilt["af3_close"], rebuilt["af1_close"])
+            cut = len(dates)
+            for i, d in enumerate(dates):
+                if d > run_day:
+                    cut = i
+                    break
+            ma20_full = moving_average(af1, 20)
+            ma60_full = moving_average(af1, 60)
+            kline_out = {
+                "dates": dates[:cut],
+                "close_af1": [None if v is None else round(float(v), 4) for v in af1[:cut]],
+                "close_af3": [None if v is None else round(float(v), 4) for v in af3[:cut]],
+                "ma20": [None if v is None else round(float(v), 4) for v in ma20_full[:cut]],
+                "ma60": [None if v is None else round(float(v), 4) for v in ma60_full[:cut]],
+            }
+    except Exception as exc:  # noqa: BLE001 - 缓存缺失/损坏时仍返回 factors/scores
+        kline_out["error"] = f"本地缓存重建失败: {exc}"
+
+    return {
+        "code": code,
+        "name": (row or {}).get("name", ""),
+        "industry": (row or {}).get("industry", ""),
+        "run_day": run_day,
+        "factors": factors,
+        "scores": scores,
+        "kline": kline_out,
+    }
 
 
 @app.get("/api/health")

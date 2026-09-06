@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # 技术面
@@ -331,3 +331,310 @@ def industry_pass(res: IndustryResult, top_pct: float) -> bool:
     if res.percentile is None:
         return False
     return res.percentile <= top_pct * 100.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# v2 新因子（纯函数，离线可测；调研报告 R3 口径）
+# ---------------------------------------------------------------------------
+# 说明：RSI(14)/MACD(12,26,9) 的周期是指标**定义**的一部分（同 TRADING_DAYS_PER_YEAR），
+# 不是策略阈值 → 以命名常量给出，不参与 pass/fail 判定。
+
+RSI_PERIOD = 14          # RSI Wilder 平滑周期（指标定义）
+MACD_FAST = 12           # MACD EMA 快线（指标定义）
+MACD_SLOW = 26           # MACD EMA 慢线（指标定义）
+MACD_SIGNAL = 9          # MACD DEA 信号线（指标定义）
+MACD_CROSS_LOOKBACK = 5  # "金叉"判定回看根数（近 N 根内 DIF 上穿 DEA）
+
+
+def rsi_wilder(closes: Sequence[float], period: int = RSI_PERIOD) -> Optional[float]:
+    """Wilder RSI：RSI = 100 - 100/(1+avgGain/avgLoss)，首值用简单均值、其后 Wilder 平滑。
+
+    < period+1 根 → None（数据不足）。全涨（avgLoss=0）→ 100.0；全跌 → 0.0。
+    """
+    n = len(closes)
+    if n < period + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+
+def ema_series(values: Sequence[float], span: int) -> List[float]:
+    """指数移动平均（首值=首个数据点，k=2/(span+1)）。"""
+    k = 2.0 / (span + 1)
+    out: List[float] = []
+    e = values[0]
+    for v in values:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def compute_macd(
+    closes: Sequence[float],
+    fast: int = MACD_FAST,
+    slow: int = MACD_SLOW,
+    signal: int = MACD_SIGNAL,
+) -> Optional[Dict[str, List[float]]]:
+    """MACD：DIF=EMA(fast)-EMA(slow)，DEA=EMA(DIF,signal)，bar=(DIF-DEA)×2（A股惯例）。
+
+    < slow+signal 根 → None。
+    """
+    if len(closes) < slow + signal:
+        return None
+    e_fast = ema_series(list(closes), fast)
+    e_slow = ema_series(list(closes), slow)
+    dif = [a - b for a, b in zip(e_fast, e_slow)]
+    dea = ema_series(dif, signal)
+    bar = [(a - b) * 2.0 for a, b in zip(dif, dea)]
+    return {"dif": dif, "dea": dea, "bar": bar}
+
+
+def macd_golden_cross(closes: Sequence[float], lookback: int = MACD_CROSS_LOOKBACK) -> Optional[bool]:
+    """近 lookback 根内 DIF 上穿 DEA（金叉）→ True/False；数据不足 → None。"""
+    m = compute_macd(closes)
+    if m is None:
+        return None
+    dif, dea = m["dif"], m["dea"]
+    lo = max(1, len(dif) - lookback)
+    for i in range(lo, len(dif)):
+        if dif[i] > dea[i] and dif[i - 1] <= dea[i - 1]:
+            return True
+    return False
+
+
+def dedup_dividends(
+    dividend_records: Sequence[Dict[str, Any]],
+    window_start: date,
+    run_day: date,
+) -> Tuple[float, List[str]]:
+    """窗口内已除权分红：按 (code, dividOperateDate) 去重后求和。
+
+    返回 (每股税前现金分红之和, 除权日列表升序)。与 compute_dividend_yield 同口径，
+    但**不含** pass/fail 语义（v2 打分因子用）。
+    """
+    in_window: List[Dict[str, Any]] = []
+    for d in dividend_records:
+        op_s = (d.get("dividOperateDate") or "").strip()
+        if not op_s:
+            continue
+        try:
+            op = date.fromisoformat(op_s)
+        except ValueError:
+            continue
+        if window_start <= op <= run_day:
+            in_window.append(d)
+    seen = set()
+    cash_sum = 0.0
+    ex_dates: List[str] = []
+    for d in sorted(in_window, key=lambda x: x["dividOperateDate"]):
+        key = (d.get("code"), d["dividOperateDate"])
+        if key in seen:
+            continue
+        seen.add(key)
+        ex_dates.append(d["dividOperateDate"])
+        cash = d.get("dividCashPsBeforeTax")
+        if cash is not None:
+            cash_sum += cash
+    return cash_sum, ex_dates
+
+
+def ttm_dividend_yield(
+    dividend_records: Sequence[Dict[str, Any]],
+    window_start: date,
+    run_day: date,
+    current_price: Optional[float],
+) -> Optional[float]:
+    """TTM 滚动股息率（小数）= 窗口内去重每股分红和 ÷ 当前价(af3)。
+
+    窗口内无已除权分红或当前价缺失 → None（非报错）。
+    """
+    cash_sum, _ = dedup_dividends(dividend_records, window_start, run_day)
+    if current_price is None or current_price <= 0:
+        return None
+    if cash_sum <= 0:
+        return None
+    return cash_sum / current_price
+
+
+def payout_ratio(
+    cash_per_share_annual: Optional[float],
+    total_share: Optional[float],
+    net_profit: Optional[float],
+) -> Optional[float]:
+    """股利支付率（小数）= (每股分红Σ × totalShare) ÷ netProfit。
+
+    无分红 / 缺股本 / netProfit<=0 → None。
+    """
+    if cash_per_share_annual is None or total_share is None or net_profit is None:
+        return None
+    if net_profit <= 0:
+        return None
+    return (cash_per_share_annual * total_share) / net_profit
+
+
+def roe_stability(roe_values: Sequence[Optional[float]]) -> Tuple[Optional[float], Optional[float]]:
+    """ROE 近3年（年度Q4）稳定性：返回 (mean, std)。
+
+    - 用可得 n（上市<3年自然成立）；
+    - n < 2 → std=None（均值仍给，n>=1）；
+    - std 用总体标准差 pstdev（与调研报告 r3_piotroski.py 同口径）。
+    """
+    vals = [v for v in roe_values if v is not None]
+    if not vals:
+        return None, None
+    mean = sum(vals) / len(vals)
+    if len(vals) < 2:
+        return mean, None
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return mean, math.sqrt(var)
+
+
+@dataclass
+class PiotroskiResult:
+    """Piotroski F-Score（9 信号，金融业 S6/S8 N/A）。
+
+    F = 有效信号和 / 有效信号数；N/A 信号不计入分母（不得当 0 分）。
+    """
+    code: str
+    signals: Dict[str, Optional[int]] = field(default_factory=dict)  # {S1..S9: 0/1/None}
+    fscore: int = 0            # 有效信号之和
+    n_valid: int = 0           # 有效信号数（分母）
+    n_na: int = 0              # N/A 信号数
+    na_signals: List[str] = field(default_factory=list)
+
+    @property
+    def ratio(self) -> Optional[float]:
+        """F/有效数（0~1），打分因子用；无有效信号 → None。"""
+        if self.n_valid == 0:
+            return None
+        return self.fscore / self.n_valid
+
+
+def piotroski_fscore(
+    code: str,
+    profit_cur: Optional[Dict[str, Any]],
+    profit_prior: Optional[Dict[str, Any]],
+    balance_cur: Optional[Dict[str, Any]],
+    balance_prior: Optional[Dict[str, Any]],
+    growth_cur: Optional[Dict[str, Any]],
+    cashflow_cur: Optional[Dict[str, Any]],
+) -> PiotroskiResult:
+    """Piotroski 9 信号 → BaoStock 字段映射（调研报告 R3 表，年度 Q4 口径）。
+
+    - S1 ROA>0        == netProfit > 0                          （精确）
+    - S2 CFO>0        ~ sign(netProfit × CFOToNP) > 0            （代理：无 OCF 绝对额）
+    - S3 ΔROA>0       ~ roeAvg(cur) > roeAvg(prior)              （代理：用 ΔROE）
+    - S4 CFO>NI       == CFOToNP > 1 且 netProfit > 0            （精确，经比率）
+    - S5 去杠杆        ~ YOYLiability < 0                        （代理：总负债同比）
+    - S6 流动性升      == currentRatio(cur) > (prior)             （精确；金融业空→N/A）
+    - S7 未增发       == totalShare(cur) <= (prior)               （精确）
+    - S8 毛利率升     == gpMargin(cur) > (prior)                  （精确；金融业空→N/A）
+    - S9 资产周转升   ~ MBRevenue 增速 > YOYAsset                 （代理：无绝对营收/资产）
+
+    信号所需字段缺失 → 该信号 N/A（不计入分母）。
+    """
+    def g(d: Optional[Dict[str, Any]], key: str) -> Optional[float]:
+        if not d:
+            return None
+        v = d.get(key)
+        try:
+            return float(v) if v is not None and str(v).strip() != "" else None
+        except (TypeError, ValueError):
+            return None
+
+    ni_c = g(profit_cur, "netProfit")
+    cfo_np = g(cashflow_cur, "CFOToNP")
+    roe_c = g(profit_cur, "roeAvg")
+    roe_p = g(profit_prior, "roeAvg")
+    yoy_liab = g(balance_cur, "YOYLiability")
+    cr_c = g(balance_cur, "currentRatio")
+    cr_p = g(balance_prior, "currentRatio")
+    ts_c = g(profit_cur, "totalShare")
+    ts_p = g(profit_prior, "totalShare")
+    gm_c = g(profit_cur, "gpMargin")
+    gm_p = g(profit_prior, "gpMargin")
+    mb_c = g(profit_cur, "MBRevenue")
+    mb_p = g(profit_prior, "MBRevenue")
+    yoy_asset = g(growth_cur, "YOYAsset")
+
+    sig: Dict[str, Optional[int]] = {}
+    # S1 ROA>0（totalAssets 恒>0，netProfit>0 等价）
+    sig["S1_ROA_pos"] = None if ni_c is None else (1 if ni_c > 0 else 0)
+    # S2 CFO>0 ~ sign(netProfit × CFOToNP) > 0（代理）
+    if ni_c is not None and cfo_np is not None:
+        sig["S2_CFO_pos"] = 1 if (ni_c * cfo_np) > 0 else 0
+    else:
+        sig["S2_CFO_pos"] = None
+    # S3 ΔROA>0 ~ ΔROE（代理）
+    if roe_c is not None and roe_p is not None:
+        sig["S3_dROA_up"] = 1 if roe_c > roe_p else 0
+    else:
+        sig["S3_dROA_up"] = None
+    # S4 CFO>NI == CFOToNP>1（需 NI>0）
+    if ni_c is not None and cfo_np is not None and ni_c > 0:
+        sig["S4_CFO_gt_NI"] = 1 if cfo_np > 1 else 0
+    else:
+        sig["S4_CFO_gt_NI"] = None
+    # S5 去杠杆 ~ YOYLiability<0（代理）
+    sig["S5_deleveraging"] = None if yoy_liab is None else (1 if yoy_liab < 0 else 0)
+    # S6 流动性升 == currentRatio 升（金融业空 → N/A）
+    if cr_c is not None and cr_p is not None:
+        sig["S6_liquidity_up"] = 1 if cr_c > cr_p else 0
+    else:
+        sig["S6_liquidity_up"] = None
+    # S7 未增发 == totalShare 未增
+    if ts_c is not None and ts_p is not None:
+        sig["S7_no_new_shares"] = 1 if ts_c <= ts_p else 0
+    else:
+        sig["S7_no_new_shares"] = None
+    # S8 毛利率升 == gpMargin 升（金融业空 → N/A）
+    if gm_c is not None and gm_p is not None:
+        sig["S8_gm_up"] = 1 if gm_c > gm_p else 0
+    else:
+        sig["S8_gm_up"] = None
+    # S9 资产周转升 ~ 营收增速 > 资产增速（代理）
+    if mb_c and mb_p and yoy_asset is not None:
+        rev_g = mb_c / mb_p - 1.0
+        sig["S9_turnover_up"] = 1 if rev_g > yoy_asset else 0
+    else:
+        sig["S9_turnover_up"] = None
+
+    res = PiotroskiResult(code=code, signals=sig)
+    res.na_signals = [k for k, v in sig.items() if v is None]
+    valid = {k: v for k, v in sig.items() if v is not None}
+    res.n_valid = len(valid)
+    res.n_na = len(res.na_signals)
+    res.fscore = sum(valid.values())
+    return res
+
+
+def rank_percentile(
+    code: str,
+    group_codes: Sequence[str],
+    value_map: Dict[str, Optional[float]],
+) -> Tuple[Optional[int], Optional[float]]:
+    """组内按值降序排名 → (rank, percentile=rank/size×100)。
+
+    值缺失的股票排组末（稳定排序，code 升序兜底）。通用版：ROE/YOYPNI 等任意
+    "越大越好"的因子都可用（v2 行业维度两个分位因子共用）。
+    """
+    def sort_key(c: str):
+        v = value_map.get(c)
+        return (v is None, -(v or 0.0), c)
+
+    ordered = sorted(group_codes, key=sort_key)
+    rank_of = {c: i + 1 for i, c in enumerate(ordered)}
+    r = rank_of[code]
+    return r, round(r / len(group_codes) * 100.0, 2)

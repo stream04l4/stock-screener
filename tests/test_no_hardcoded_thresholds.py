@@ -18,6 +18,8 @@ THRESHOLD_KEYWORDS = [
     "min_return", "max_return", "max_vol", "ma_period", "min_yield",
     "roe_min", "liability_max", "gross_margin_min", "top_pct",
     "min_group_size", "listing_min", "window_days", "kline_calendar",
+    # v2：打分权重 / 榜单规模 / badge 阈值（R6：纳入单一事实来源约束）
+    "weights", "sub_weights", "top_n", "fscore_min",
 ]
 
 # 允许的非阈值数字模式（行内注释/字符串里的说明、下标、日期等）
@@ -55,6 +57,12 @@ def test_no_hardcoded_thresholds():
         r"liability_max|gross_margin_min|top_pct|min_group_size)\w*)\s*=\s*\d+(\.\d+)?\s*$",
         re.MULTILINE,
     )
+    # 模式3（v2）: 权重/子权重字面量——维度名后直接跟数字（weights={"technical": 0.25}
+    # 或 weights["technical"] = 0.25）。权重必须来自 strategy.yaml scoring 段，
+    # 代码里出现 "technical"/"dividend"/"industry"/"fundamental": <数字> 即判失败。
+    pat_weight = re.compile(
+        r"['\"](?:technical|dividend|industry|fundamental)['\"]\s*:\s*\d+(\.\d+)?\b"
+    )
     for path in _iter_py_files():
         with open(path, encoding="utf-8") as f:
             src = f.read()
@@ -65,6 +73,8 @@ def test_no_hardcoded_thresholds():
             violations.append(f"{os.path.relpath(path, PROJECT)}: {m.group(0)}")
         for m in pat_assign.finditer(code):
             violations.append(f"{os.path.relpath(path, PROJECT)}: {m.group(0).strip()}")
+        for m in pat_weight.finditer(code):
+            violations.append(f"{os.path.relpath(path, PROJECT)}: 权重字面量 {m.group(0)}")
 
     assert not violations, "疑似硬编码阈值:\n" + "\n".join(violations)
 
@@ -84,6 +94,20 @@ def test_strategy_yaml_is_single_source_of_truth():
         ("fundamental", "roe_min_pct"), ("fundamental", "net_profit_yoy_field"),
         ("fundamental", "liability_max_pct"), ("fundamental", "gross_margin_min_pct"),
         ("universe", "listing_min_trading_days"),
+        # v2 打分模型（R6：scoring.weights/sub_weights 纳入单一事实来源）
+        ("scoring", "mode"), ("scoring", "top_n"), ("scoring", "missing_policy"),
+        ("scoring", "weights"), ("scoring", "sub_weights"),
+        # v2 badge 阈值 / 硬剔除开关（高股息(绿)复用 dividend.min_yield_pct，不另设键）
+        ("badges", "industry_top_pct"), ("badges", "fscore_min"),
+        ("hard_filter", "st_enabled"), ("hard_filter", "listing_min_trading_days"),
     }
     missing = [k for k in required if not (isinstance(cfg.get(k[0]), dict) and k[1] in cfg[k[0]])]
     assert not missing, f"strategy.yaml 缺少可配置项: {missing}"
+
+    # v2：四维权重键齐全（代码不得出现字面量权重，必须从这里取）
+    weights = cfg["scoring"]["weights"]
+    for dim in ("technical", "dividend", "industry", "fundamental"):
+        assert dim in weights, f"scoring.weights 缺少维度 {dim}"
+    sub = cfg["scoring"]["sub_weights"]
+    for dim in ("technical", "dividend", "industry", "fundamental"):
+        assert isinstance(sub.get(dim), dict) and sub[dim], f"scoring.sub_weights.{dim} 缺失"

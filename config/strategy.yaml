@@ -33,6 +33,31 @@ universe:
   listing_min_trading_days: 250     # 上市满 N 个交易日（窗口内K线行数判断）
   st_name_keyword: ST               # 名称辅助标记（剔除以日K isST=1 为准）
 
+scoring:                            # v2 打分模型（TL 拍板：默认 zscore，保留 legacy 可回退）
+  mode: zscore                      # zscore(新) | legacy(旧四维AND硬过滤)
+  top_n: 50                         # 榜单输出前 N 名
+  missing_policy: neutral_renorm    # neutral_renorm | neutral | drop（缺失因子 z=0 + 按可用权重归一化）
+  normalize: cross_section          # 截面标准化集合 = 硬剔除后全体候选
+  weights:                          # 四维权重（和必须为1；代码零硬编码，全部在此）
+    technical: 0.25                 # 技术面（MA多头/区间收益/波动率/RSI/MACD）
+    dividend: 0.30                  # 股息（TTM股息率 + 股利支付率）
+    industry: 0.15                  # 行业（ROE排名分位 + YOYPNI排名分位，证监会二级口径）
+    fundamental: 0.30               # 基本面（ROE水平+稳定性/负债率/毛利率/Piotroski F-Score）
+  sub_weights:                      # 维度内子因子权重（每维度和必须为1；缺省=等权）
+    technical: {ma_bullish: 0.2, window_return: 0.2, low_vol: 0.2, rsi: 0.2, macd: 0.2}
+    dividend: {ttm_yield: 0.6, payout_ratio: 0.4}
+    industry: {roe_rank_pct: 0.5, yoy_pni_rank_pct: 0.5}
+    fundamental: {roe_level: 0.3, roe_stability: 0.2, low_liability: 0.15, gross_margin: 0.15, piotroski: 0.2}
+
+badges:                             # Web 主表格 badge 阈值（百分数口径，与 CSV *_pct 列同单位）
+  industry_top_pct: 10              # 行业TopN% = industry_roe_rank_pct <= 该值
+  fscore_min: 7                     # F-Score badge = piotroski_fscore >= 该值
+  # 高股息(绿) 阈值复用 dividend.min_yield_pct（brief R5：单一事实来源，不另设键）
+
+hard_filter:                        # 硬性剔除开关（v2 打分前的硬剔除，可配置）
+  st_enabled: true                  # ST 剔除（日K isST=1）
+  listing_min_trading_days: 250     # 上市未满 N 个交易日剔除（全历史K线行数判断）
+
 data:
   kline_calendar_days_back: 420     # 后复权窗口K线回溯日历天（覆盖250个交易日+节假日余量）
   retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）

@@ -54,6 +54,22 @@ def load_config(path: str) -> Dict[str, Any]:
         "universe.a_share_prefixes",
         "universe.listing_min_trading_days",
         "data.kline_calendar_days_back",
+        # v2 打分模型（scoring）与 badge / 硬剔除开关
+        "scoring.mode",
+        "scoring.top_n",
+        "scoring.missing_policy",
+        "scoring.weights.technical",
+        "scoring.weights.dividend",
+        "scoring.weights.industry",
+        "scoring.weights.fundamental",
+        "scoring.sub_weights.technical",
+        "scoring.sub_weights.dividend",
+        "scoring.sub_weights.industry",
+        "scoring.sub_weights.fundamental",
+        "badges.industry_top_pct",
+        "badges.fscore_min",
+        "hard_filter.st_enabled",
+        "hard_filter.listing_min_trading_days",
     ):
         _require(cfg, key)
 
@@ -78,6 +94,40 @@ def load_config(path: str) -> Dict[str, Any]:
     for p in uni["a_share_prefixes"]:
         if not isinstance(p, str) or "." not in p:
             raise ConfigError(f"universe.a_share_prefixes 项非法: {p!r}（应形如 sh.60）")
+
+    # --- v2 scoring 段语义校验 ---
+    sc = cfg["scoring"]
+    if sc["mode"] not in ("zscore", "legacy"):
+        raise ConfigError("scoring.mode 只能是 zscore 或 legacy")
+    if int(sc["top_n"]) < 1:
+        raise ConfigError("scoring.top_n 必须 >= 1")
+    if sc["missing_policy"] not in ("neutral_renorm", "neutral", "drop"):
+        raise ConfigError("scoring.missing_policy 只能是 neutral_renorm/neutral/drop")
+    w = {k: float(v) for k, v in sc["weights"].items()}
+    if len(w) != 4 or any(v < 0 for v in w.values()):
+        raise ConfigError("scoring.weights 必须恰好含 technical/dividend/industry/fundamental 且 >= 0")
+    # 权重和必须 ≈1（归一化基准；容差 1e-6）
+    if abs(sum(w.values()) - 1.0) > 1e-6:
+        raise ConfigError(f"scoring.weights 之和必须为 1（当前 {sum(w.values()):.6f}）")
+    # sub_weights：每维度的子因子权重和 ≈1
+    for dim, subs in sc["sub_weights"].items():
+        if not isinstance(subs, dict) or not subs:
+            raise ConfigError(f"scoring.sub_weights.{dim} 必须是非空映射")
+        s = sum(float(v) for v in subs.values())
+        if abs(s - 1.0) > 1e-6:
+            raise ConfigError(f"scoring.sub_weights.{dim} 之和必须为 1（当前 {s:.6f}）")
+
+    # --- v2 badge / 硬剔除开关 ---
+    bd = cfg["badges"]
+    if not (0 < float(bd["industry_top_pct"]) <= 100):
+        raise ConfigError("badges.industry_top_pct 必须在 (0,100]")
+    if int(bd["fscore_min"]) < 0:
+        raise ConfigError("badges.fscore_min 必须 >= 0")
+    hf = cfg["hard_filter"]
+    if not isinstance(hf["st_enabled"], bool):
+        raise ConfigError("hard_filter.st_enabled 必须是布尔值")
+    if int(hf["listing_min_trading_days"]) < 1:
+        raise ConfigError("hard_filter.listing_min_trading_days 必须 >= 1")
 
     return cfg
 
@@ -152,4 +202,27 @@ def crosscheck_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "sample_size": int(c.get("sample_size", 20)),
         "price_tolerance_pct": float(c.get("price_tolerance_pct", 0.5)) / 100.0,
         "batch_size": int(c.get("batch_size", 50)),
+    }
+
+
+def scoring_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v2 打分模型配置（权重/子权重全部来自 strategy.yaml，代码零硬编码）。"""
+    s = cfg["scoring"]
+    return {
+        "mode": str(s["mode"]),
+        "top_n": int(s["top_n"]),
+        "missing_policy": str(s["missing_policy"]),
+        "normalize": str(s.get("normalize", "cross_section")),
+        "weights": {k: float(v) for k, v in s["weights"].items()},
+        "sub_weights": {d: {k: float(v) for k, v in subs.items()}
+                        for d, subs in s["sub_weights"].items()},
+    }
+
+
+def hard_filter_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """硬性剔除开关（ST / 上市天数）。"""
+    h = cfg["hard_filter"]
+    return {
+        "st_enabled": bool(h["st_enabled"]),
+        "listing_min_trading_days": int(h["listing_min_trading_days"]),
     }

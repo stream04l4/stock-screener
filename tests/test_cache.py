@@ -62,3 +62,25 @@ def test_cache_name_stable():
     assert a == b
     c = make_cache_name("kline", "sh.601398", "2025-07-19", "2026-09-05", "af1")
     assert a != c
+
+
+def test_stable_key_naming_v2():
+    """v2 稳定键（R1-c）：kline_af3_{code} / adjfactor_{code}——**不含漂移日期**。
+
+    稳定性是增量方案的核心：缓存名只由 code 决定，任何运行日/窗口都不改变它，
+    因此"尾部追加 + 事件驱动因子刷新"永远命中同一文件（断点续跑天然成立）。
+    """
+    from screener.data.fetchers import DataFetcher
+
+    # 不实例化（构造需要 client/cache）——直接验证键生成约定
+    key_kl = make_cache_name("kline_af3", "sh.601398")
+    key_af = make_cache_name("adjfactor", "sh.601398")
+    assert key_kl == "kline_af3_sh.601398"
+    assert key_af == "adjfactor_sh.601398"
+    # 与 DataFetcher 的私有键方法一致（防止两处约定漂移）
+    f = DataFetcher.__new__(DataFetcher)
+    assert f._kline_af3_key("sh.601398") == key_kl
+    assert f._adjfactor_key("sh.601398") == key_af
+    # 不同 code → 不同键；同 code 重复调用 → 同键（稳定）
+    assert make_cache_name("kline_af3", "sz.000002") != key_kl
+    assert make_cache_name("kline_af3", "sh.601398") == key_kl
