@@ -629,7 +629,15 @@ def rank_percentile(
 
     值缺失的股票排组末（稳定排序，code 升序兜底）。通用版：ROE/YOYPNI 等任意
     "越大越好"的因子都可用（v2 行业维度两个分位因子共用）。
+
+    **全组无信号**（组内所有 value 均为 None）→ 返回 (None, None)：没有基本面
+    数据就不产生排名，避免按 code 升序派生噪声分位冒充行业信号（D-01 修复；
+    TL 硬性要求6"不得用缺失数据冒充"）。v2 live 路径不受影响——当前季度财报
+    总是已披露，正常组不会全 None。
     """
+    if all(value_map.get(c) is None for c in group_codes):
+        return None, None
+
     def sort_key(c: str):
         v = value_map.get(c)
         return (v is None, -(v or 0.0), c)
