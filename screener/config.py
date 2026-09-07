@@ -129,7 +129,85 @@ def load_config(path: str) -> Dict[str, Any]:
     if int(hf["listing_min_trading_days"]) < 1:
         raise ConfigError("hard_filter.listing_min_trading_days 必须 >= 1")
 
+    # --- v3 回测段（可选：主筛选流程不依赖；存在则严格校验）---
+    if "backtest" in cfg:
+        _validate_backtest(cfg["backtest"])
+
     return cfg
+
+
+def _validate_backtest(b: Dict[str, Any]) -> None:
+    """backtest 段结构/语义校验（报告 R5 schema）。缺项直接报错。"""
+    from datetime import date as _date
+
+    for key in ("start", "end", "rebalance", "top_n", "weights_ref",
+                "execution", "costs", "suspension", "benchmarks", "risk_free_pct"):
+        if key not in b:
+            raise ConfigError(f"backtest.{key} 缺失")
+
+    try:
+        start = _date.fromisoformat(str(b["start"]))
+        end = _date.fromisoformat(str(b["end"]))
+    except ValueError as exc:
+        raise ConfigError(f"backtest.start/end 必须是 YYYY-MM-DD: {exc}")
+    if not (start < end):
+        raise ConfigError("backtest.start 必须早于 end")
+
+    if b["rebalance"] not in ("monthly", "quarterly"):
+        raise ConfigError("backtest.rebalance 只能是 monthly 或 quarterly")
+    if int(b["top_n"]) < 1:
+        raise ConfigError("backtest.top_n 必须 >= 1")
+    if b["weights_ref"] != "scoring.weights":
+        # 单一事实来源：回测权重只允许引用 scoring.weights（TL 拍板）
+        raise ConfigError("backtest.weights_ref 目前只支持 'scoring.weights'")
+    if b["execution"] not in ("t1_open", "t1_close", "t_close"):
+        raise ConfigError("backtest.execution 只能是 t1_open/t1_close/t_close")
+
+    c = b["costs"]
+    for key in ("commission_bp", "min_commission_cny", "transfer_fee_bp",
+                "slippage_bp", "delisting_haircut_pct"):
+        if key not in c:
+            raise ConfigError(f"backtest.costs.{key} 缺失")
+        v = float(c[key])
+        if v < 0:
+            raise ConfigError(f"backtest.costs.{key} 必须 >= 0")
+    if not (0 <= float(c["delisting_haircut_pct"]) <= 100):
+        raise ConfigError("backtest.costs.delisting_haircut_pct 必须在 [0,100]")
+    segs = c.get("stamp_tax_sell", [])
+    if not isinstance(segs, list):
+        raise ConfigError("backtest.costs.stamp_tax_sell 必须是列表（日期分段）")
+    for i, seg in enumerate(segs):
+        for k in ("from", "to", "bp"):
+            if k not in seg:
+                raise ConfigError(f"backtest.costs.stamp_tax_sell[{i}].{k} 缺失")
+        try:
+            d1 = _date.fromisoformat(str(seg["from"]))
+            d2 = _date.fromisoformat(str(seg["to"]))
+        except ValueError as exc:
+            raise ConfigError(f"stamp_tax_sell[{i}] 日期非法: {exc}")
+        if not (d1 <= d2):
+            raise ConfigError(f"stamp_tax_sell[{i}].from 必须 <= to")
+        if float(seg["bp"]) < 0:
+            raise ConfigError(f"stamp_tax_sell[{i}].bp 必须 >= 0")
+
+    s = b["suspension"]
+    for key in ("max_defer_days", "on_timeout"):
+        if key not in s:
+            raise ConfigError(f"backtest.suspension.{key} 缺失")
+    if int(s["max_defer_days"]) < 0:
+        raise ConfigError("backtest.suspension.max_defer_days 必须 >= 0")
+    if s["on_timeout"] not in ("drop_to_cash", "hold"):
+        raise ConfigError("backtest.suspension.on_timeout 只能是 drop_to_cash/hold")
+
+    bm = b["benchmarks"]
+    if not isinstance(bm, list) or any(not isinstance(x, str) for x in bm):
+        raise ConfigError("backtest.benchmarks 必须是代码字符串列表")
+    try:
+        rf = float(b["risk_free_pct"])
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"backtest.risk_free_pct 必须是数值（年化%）: {exc}")
+    if not (-100.0 <= rf <= 100.0):
+        raise ConfigError("backtest.risk_free_pct 超出合理范围 [-100,100]")
 
 
 def tech(cfg: Dict[str, Any]) -> Dict[str, float]:
@@ -225,4 +303,42 @@ def hard_filter_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "st_enabled": bool(h["st_enabled"]),
         "listing_min_trading_days": int(h["listing_min_trading_days"]),
+    }
+
+
+def backtest_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v3 回测配置（strategy.yaml backtest 段；零硬编码，全部来自 config）。
+
+    :raises ConfigError: backtest 段缺失或非法（_validate_backtest 已兜底结构）。
+    """
+    b = cfg.get("backtest")
+    if not isinstance(b, dict):
+        raise ConfigError("strategy.yaml 缺少 backtest 段（回测引擎需要）")
+    c = b["costs"]
+    return {
+        "start": str(b["start"]),
+        "end": str(b["end"]),
+        "rebalance": str(b["rebalance"]),
+        "top_n": int(b["top_n"]),
+        "weights_ref": str(b["weights_ref"]),
+        "execution": str(b["execution"]),
+        "costs": {
+            "commission_bp": float(c["commission_bp"]),
+            "min_commission_cny": float(c["min_commission_cny"]),
+            # 初始资金（元）：佣金下限(元)折算归一化净值用；缺省 100 万（兼容旧 config）
+            "initial_capital_cny": float(c.get("initial_capital_cny", 1_000_000)),
+            "stamp_tax_sell": [
+                {"from": str(s["from"]), "to": str(s["to"]), "bp": float(s["bp"])}
+                for s in c.get("stamp_tax_sell", [])
+            ],
+            "transfer_fee_bp": float(c["transfer_fee_bp"]),
+            "slippage_bp": float(c["slippage_bp"]),
+            "delisting_haircut_pct": float(c["delisting_haircut_pct"]),
+        },
+        "suspension": {
+            "max_defer_days": int(b["suspension"]["max_defer_days"]),
+            "on_timeout": str(b["suspension"]["on_timeout"]),
+        },
+        "benchmarks": [str(x) for x in b["benchmarks"]],
+        "risk_free_pct": float(b["risk_free_pct"]),
     }

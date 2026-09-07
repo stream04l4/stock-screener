@@ -73,6 +73,55 @@ function switchTab(name) {
   $$(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "results") loadRuns();
   if (name === "strategy") loadStrategy();
+  if (name === "backtest") loadBacktest();
+}
+
+// ---------------------------------------------------------------------------
+// 回测页（v3：/api/backtest → ECharts 净值曲线 + 基准叠加；不展开 UI，能看图即可）
+// ---------------------------------------------------------------------------
+let btChart = null;
+async function loadBacktest() {
+  const box = $("#bt-chart");
+  const meta = $("#bt-metrics");
+  if (!box) return;
+  let d;
+  try {
+    d = await api("/api/backtest");
+  } catch (e) {
+    if (btChart) { try { btChart.dispose(); } catch { /* ignore */ } btChart = null; }
+    box.innerHTML = "";
+    meta.textContent = "回测产物不存在：" + e.message;
+    return;
+  }
+  const m = d.metrics || {};
+  const f = m.full || {};
+  const s1 = (m.slices || {})["1y"] || {};
+  meta.textContent =
+    `窗口 ${m.window ? m.window.start + " ~ " + m.window.end : "—"}（${m.window ? m.window.n_days : 0} 交易日）· ` +
+    `全期年化 ${fmtNum(f.annual_return_pct, 2)}% / 夏普 ${fmtNum(f.sharpe, 2)} / 最大回撤 ${fmtNum(f.max_drawdown_pct, 2)}% · ` +
+    `近1y 年化 ${fmtNum(s1.annual_return_pct, 2)}%`;
+
+  try {
+    const echarts = await loadEcharts();
+    if (!btChart) btChart = echarts.init(box);
+    const dates = d.equity_curve.map((r) => r.date);
+    const series = [{ name: "策略", type: "line", showSymbol: false, data: d.equity_curve.map((r) => r.strategy), lineStyle: { width: 2 } }];
+    for (const b of d.benchmarks || []) {
+      series.push({ name: b, type: "line", showSymbol: false, data: d.equity_curve.map((r) => r[b]), lineStyle: { width: 1, type: "dashed" } });
+    }
+    btChart.setOption({
+      tooltip: { trigger: "axis" },
+      legend: { data: series.map((s) => s.name) },
+      grid: { left: 50, right: 20, top: 40, bottom: 60 },
+      xAxis: { type: "category", data: dates },
+      yAxis: { type: "value", scale: true },
+      dataZoom: [{ type: "inside" }, { type: "slider", height: 18 }],
+      series,
+    }, true);
+    btChart.resize();
+  } catch (e) {
+    meta.textContent = "图表渲染失败：" + e.message;
+  }
 }
 
 // ---------------------------------------------------------------------------

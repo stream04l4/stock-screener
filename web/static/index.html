@@ -12,6 +12,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="results">结果</button>
     <button class="tab" data-tab="strategy">策略</button>
+    <button class="tab" data-tab="backtest">回测</button>
     <button class="tab" data-tab="run">运行</button>
   </nav>
   <div id="global-status" class="global-status"></div>
@@ -41,6 +42,16 @@
     </div>
     <div id="strategy-cards" class="cards"></div>
     <div id="strategy-msg" class="msg-box"></div>
+  </section>
+
+  <!-- ============ 回测（v3：多因子策略历史回测） ============ -->
+  <section id="tab-backtest" class="tab-panel">
+    <div class="card">
+      <h3>净值曲线（策略 vs 基准）</h3>
+      <p class="muted small">数据源 output/backtest/（离线回测产物）；未跑回测时显示 404 提示。</p>
+      <div id="bt-chart" style="width:100%;height:420px;"></div>
+      <div id="bt-metrics" class="muted small"></div>
+    </div>
   </section>
 
   <!-- ============ 运行 ============ -->

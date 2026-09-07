@@ -58,6 +58,29 @@ hard_filter:                        # 硬性剔除开关（v2 打分前的硬剔
   st_enabled: true                  # ST 剔除（日K isST=1）
   listing_min_trading_days: 250     # 上市未满 N 个交易日剔除（全历史K线行数判断）
 
+backtest:                           # v3 多因子策略历史回测（报告 R5 schema，零硬编码）
+  start: "2021-09-30"               # 首调仓月(月末交易日)；5y 默认窗口(TL Q1)
+  end: "2026-09-04"                  # 末调仓月(月末交易日)
+  rebalance: monthly                # monthly | quarterly
+  top_n: 50                         # 等权持仓数
+  weights_ref: scoring.weights      # 引用 strategy.yaml scoring.weights(单一事实来源)
+  execution: t1_open                # t1_open(T+1开盘,TL Q2) | t1_close | t_close
+                                    # 注：缓存仅 23/5216 只K线含 open 列 → open 缺失自动
+                                    # close 兜底（仍 T+1 成交、PIT 安全），报告披露兜底笔数
+  costs:
+    commission_bp: 2.5              # 佣金 万2.5 双边
+    min_commission_cny: 5           # 单笔佣金下限(元)
+    initial_capital_cny: 1000000    # 初始资金(元)：佣金下限折算归一化净值用(5元/100万=5e-6)
+    stamp_tax_sell:                 # 印花税 卖出单边, 日期分段(可配)
+      - {from: "1900-01-01", to: "2023-08-27", bp: 10}   # 0.1%
+      - {from: "2023-08-28", to: "2999-12-31", bp: 5}    # 0.05%(财政部2023年第39号公告)
+    transfer_fee_bp: 0.1            # 过户费 双边 0.001%
+    slippage_bp: 5                  # 滑点(可配)
+    delisting_haircut_pct: 0        # 退市退出价打折(默认0, TL Q3 保留开关)
+  suspension: {max_defer_days: 5, on_timeout: drop_to_cash}   # R2 停牌规则
+  benchmarks: [sh.000300, sh.000905]   # + 自建全市场等权(自动); 指数K线待 Phase C 补拉
+  risk_free_pct: 2.0                # 夏普/alpha 无风险利率(年化%)
+
 data:
   kline_calendar_days_back: 420     # 后复权窗口K线回溯日历天（覆盖250个交易日+节假日余量）
   retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）

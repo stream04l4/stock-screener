@@ -25,7 +25,7 @@ import time
 import uuid
 from datetime import date as _date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -895,6 +895,109 @@ def get_strategy() -> Dict[str, Any]:
     raw = CONFIG_PATH.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
     return {"json": data, "raw": raw}
+
+
+# ---------------------------------------------------------------------------
+# v3 回测（读 output/backtest/*.csv → 结构化 JSON；前端 ECharts 画净值曲线）
+# ---------------------------------------------------------------------------
+BACKTEST_DIR = PROJECT_ROOT / "output" / "backtest"
+
+
+@app.get("/api/backtest")
+def get_backtest() -> Dict[str, Any]:
+    """回测三件套 → {equity_curve:[{date,strategy,<bench...>}], metrics:{...}, holdings:[...]}。
+
+    指标由 backtest.metrics_bt.summarize 从 equity_curve.csv 现算（与 report.md 同口径）。
+    产物不存在 → 404（提示先跑 .venv/bin/python -m backtest.engine）。
+    """
+    eq_p = BACKTEST_DIR / "equity_curve.csv"
+    mh_p = BACKTEST_DIR / "monthly_holdings.csv"
+    rp_p = BACKTEST_DIR / "report.md"
+    if not eq_p.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="output/backtest/ 产物不存在（先离线跑回测：.venv/bin/python -m backtest.engine）")
+
+    with open(eq_p, encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None) or []
+        rows = [r for r in reader if r]
+    if not header or len(rows) < 2:
+        raise HTTPException(status_code=404, detail="equity_curve.csv 为空")
+
+    bench_cols = [c for c in header[1:] if c != "strategy_nav"]
+    equity_curve: List[Dict[str, Any]] = []
+    dates: List[str] = []
+    navs: List[float] = []
+    bench_series: Dict[str, Tuple[List[str], List[float]]] = {c: ([], []) for c in bench_cols}
+    for r in rows:
+        if len(r) < 2:
+            continue
+        d = r[0].strip()
+        try:
+            v = float(r[1])
+        except ValueError:
+            continue
+        dates.append(d)
+        navs.append(v)
+        item: Dict[str, Any] = {"date": d, "strategy": round(v, 6)}
+        for j, c in enumerate(bench_cols):
+            cell = r[2 + j].strip() if len(r) > 2 + j else ""
+            item[c] = round(float(cell), 6) if cell else None
+            if cell:
+                bench_series[c][0].append(d)
+                bench_series[c][1].append(float(cell))
+        equity_curve.append(item)
+
+    # 指标（全窗口 + 1y/3y/5y 切片；基准取第一个可用序列）
+    from backtest.metrics_bt import slice_window, summarize
+    bt_cfg = (yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}).get("backtest") or {}
+    rf = float(bt_cfg.get("risk_free_pct", 2.0))
+    bd, bn = ([], [])
+    for c in bench_cols:
+        if len(bench_series[c][1]) >= 2:
+            bd, bn = bench_series[c]
+            break
+    full = summarize(dates, navs, rf, bench_dates=bd or None, bench_navs=bn or None)
+
+    def _win(days: int) -> Dict[str, Any]:
+        sd, sn = slice_window(dates, navs, days)
+        s = summarize(sd, sn, rf, bench_dates=bd or None, bench_navs=bn or None)
+        return {"start": s.start, "end": s.end,
+                "total_return_pct": _r2(s.total_return_pct),
+                "annual_return_pct": _r2(s.annual_return_pct),
+                "sharpe": _r2(s.sharpe), "max_drawdown_pct": _r2(s.max_drawdown_pct)}
+
+    metrics = {
+        "window": {"start": full.start, "end": full.end, "n_days": full.n_days},
+        "full": _win(10**9),
+        "slices": {"1y": _win(250), "3y": _win(750), "5y": _win(1250)},
+        "monthly_win_rate_pct": _r2(full.monthly_win_rate_pct),
+        "calmar": _r2(full.calmar), "beta": _r2(full.beta),
+        "alpha_annual_pct": _r2(full.alpha_annual_pct),
+        "info_ratio": _r2(full.info_ratio),
+    }
+
+    holdings: List[Dict[str, Any]] = []
+    if mh_p.exists():
+        with open(mh_p, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                holdings.append({
+                    "date": r.get("date", ""), "code": r.get("code", ""),
+                    "name": r.get("name", ""),
+                    "weight": float(r["weight"]) if r.get("weight") else None,
+                    "entry_price": float(r["entry_price"]) if r.get("entry_price") else None,
+                    "total_score": float(r["total_score"]) if r.get("total_score") else None,
+                })
+
+    report_md = rp_p.read_text(encoding="utf-8") if rp_p.exists() else ""
+    return {"equity_curve": equity_curve, "metrics": metrics,
+            "holdings": holdings, "benchmarks": bench_cols, "report_md": report_md}
+
+
+def _r2(v: Optional[float]) -> Optional[float]:
+    return None if v is None else round(float(v), 4)
 
 
 @app.put("/api/strategy")
