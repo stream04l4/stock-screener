@@ -84,13 +84,15 @@ def _worker_loop(
                 break
             code = item
             try:
-                # kline_af3：尾日期 == run_day → 跳过；否则全量拉取（2000 起）
+                # kline_af3：尾日期 == run_day → 跳过；否则全量拉取（1990 起，覆盖全部历史）
                 if fetcher.kline_af3_last_date(code) != run_day:
-                    fetcher.kline_af3_full(code, "2000-01-01", run_day)
+                    fetcher.kline_af3_full(code, "1990-01-01", run_day)
                     time.sleep(sleep_s)
-                # adjfactor：已有缓存（含空事件）→ 跳过；否则全量拉取
+                # adjfactor：已有缓存（含空事件）→ 跳过；否则全量拉取。
+                # 起点必须早于最早除权日——2000 会漏掉 1996-1997 除权的股票
+                # （F 恒 1.0，af1 重建退化为不复权）。用 1990 兜底。
                 if fetcher.adjfactor_history(code) is None:
-                    fetcher.adjfactor_full(code, "2000-01-01", run_day)
+                    fetcher.adjfactor_full(code, "1990-01-01", run_day)
                     time.sleep(sleep_s)
                 result_q.put(("ok", code))
             except Exception as exc:  # noqa: BLE001 - 单只失败不中断（断点续跑补齐）

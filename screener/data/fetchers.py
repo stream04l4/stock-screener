@@ -379,8 +379,9 @@ class DataFetcher:
         """
         last = self.kline_af3_last_date(code)
         if last is None:
-            # 首次：全量历史（断点续跑天然支持——写成功后下次走增量）
-            self.kline_af3_full(code, "2000-01-01", run_day)
+            # 首次：全量历史（断点续跑天然支持——写成功后下次走增量）。
+            # 1990 起覆盖全部 A 股历史。
+            self.kline_af3_full(code, "1990-01-01", run_day)
         elif last < run_day:
             start = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
             _, rows = self.kline_af3_fetch(code, start, run_day)
@@ -438,7 +439,9 @@ class DataFetcher:
         last = self.adjfactor_last_date(code)
         if not new_ex or (last is not None and new_ex <= last):
             return False  # 无新除权事件 → 0 次额外查询（绝大多数股票的稳态）
-        start = last if last else "2000-01-01"
+        # last=None（无缓存）时从 1990 起——backAdjustFactor 是 IPO 起累计值，
+        # 漏掉早期除权台阶会让该段 af1 重建退化为不复权（2000 起点曾漏 4 只）。
+        start = last if last else "1990-01-01"
         _, rows = self.adjfactor_fetch(code, start, self.run_day.isoformat())
         self.adjfactor_append(code, rows)
         log.info("复权因子事件驱动刷新: %s 新除权日 %s（start=%s）", code, new_ex, start)
