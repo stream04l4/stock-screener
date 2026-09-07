@@ -140,15 +140,24 @@ async function loadRuns() {
       return;
     }
     for (const r of runsData) {
-      const meta = `入选 ${r.selected_count} · ${r.total_candidates} 候选`;
-      const kpiMeta = (r.avg_ttm_yield_pct != null || r.avg_roe_pct != null)
+      const isFailed = r.status === "failed";
+      // 失败运行：红色"失败"badge + 错误摘要（绝不与"入选 0"的正常空结果混同）
+      let meta;
+      if (isFailed) {
+        meta = `✗ 运行失败`;
+      } else {
+        meta = `入选 ${r.selected_count} · ${r.total_candidates} 候选`;
+      }
+      const kpiMeta = !isFailed && (r.avg_ttm_yield_pct != null || r.avg_roe_pct != null)
         ? ` · TTM息率 ${fmtNum(r.avg_ttm_yield_pct, 2)}% · ROE ${fmtNum(r.avg_roe_pct, 1)}%` : "";
-      const li = el(
-        "li",
-        { "data-date": r.date, onclick: () => selectRun(r.date, li) },
+      const children = [
         el("span", { class: "r-date" }, r.date),
-        el("span", { class: "r-meta" }, meta + kpiMeta)
-      );
+      ];
+      if (isFailed) {
+        children.push(el("span", { class: "run-badge run-badge-failed" }, "失败"));
+      }
+      children.push(el("span", { class: "r-meta" + (isFailed ? " r-meta-failed" : "") }, meta + kpiMeta));
+      const li = el("li", { "data-date": r.date, onclick: () => selectRun(r.date, li) }, ...children);
       list.append(li);
     }
     // 默认选中最新
@@ -197,6 +206,21 @@ function renderKpiCards(kpi) {
 
 function renderRunDetail(d, box) {
   box.innerHTML = "";
+
+  // 失败运行（生产路径失败守卫）：顶部红色横幅 + 错误摘要，不渲染 KPI/漏斗/榜单。
+  // 与合法"0 只入选"严格区分——那种 status=ok，正常走下面的空结果渲染。
+  if (d.status === "failed") {
+    box.append(
+      el("div", { class: "card run-failed-card" },
+        el("h3", {}, el("span", { class: "run-badge run-badge-failed" }, "运行失败"),
+          ` · ${d.date}`),
+        el("p", { class: "muted small" }, `该日筛选因数据源级失败中止，未产出结果（不是"0 只入选"）。`),
+        el("pre", { class: "msg-err" }, (d.error_type ? d.error_type + ": " : "") + (d.error || "未知错误")),
+        el("p", { class: "muted small" }, `失败时间: ${d.generated_at || "—"} · 主数据源 BaoStock（封禁/降级/空股票池等）`)
+      )
+    );
+    return;
+  }
 
   // KPI 卡片（v2 报告才有；旧运行 kpi 全空 → 不显示）
   if (d.kpi && (d.kpi.selected != null || d.kpi.avg_ttm_yield_pct != null)) {

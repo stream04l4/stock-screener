@@ -23,7 +23,17 @@ import baostock as bs
 log = logging.getLogger("screener.data.bs")
 
 
-class BaoStockError(RuntimeError):
+class DataSourceError(RuntimeError):
+    """数据源级失败的基类。
+
+    语义：主数据源（BaoStock）不可用/返回无效数据，导致本次运行**无法产出可信结果**。
+    与"筛选后 0 只入选"（合法空结果）严格区分——数据源级失败必须显式失败
+    （非零退出 + sidecar），绝不写成误导性空 result/report。生产路径失败守卫
+    （9/7 缺陷修复）按本类型（含子类）路由到失败路径。
+    """
+
+
+class BaoStockError(DataSourceError):
     """BaoStock 调用失败（重试耗尽或登录失败）。"""
 
 

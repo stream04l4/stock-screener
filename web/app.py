@@ -790,12 +790,16 @@ tm = TaskManager()
 
 @app.get("/api/runs")
 def list_runs() -> Dict[str, Any]:
+    from screener import runstatus  # 数据源失败 sidecar 读取（与 screener 包同源）
+
     runs: List[Dict[str, Any]] = []
+    success_days = set()
     for csv_p in sorted(OUTPUT_DIR.glob("result_*.csv")):
         m = re.match(r"result_(\d{8})\.csv$", csv_p.name)
         if not m:
             continue
         day = m.group(1)
+        success_days.add(day)
         date_iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
         try:
             rows = _read_csv_rows(csv_p)
@@ -815,6 +819,7 @@ def list_runs() -> Dict[str, Any]:
         runs.append(
             {
                 "date": date_iso,
+                "status": "ok",
                 "selected_count": selected,
                 "total_candidates": len(rows),
                 "generated_at": _mtime_iso(csv_p),
@@ -823,6 +828,37 @@ def list_runs() -> Dict[str, Any]:
                 "avg_roe_pct": kpi.get("avg_roe_pct"),
             }
         )
+
+    # 失败运行（生产路径失败守卫）：扫描 run_status_*.json sidecar，status=failed
+    # 且无对应 result_*.csv 的日 = 数据源级失败。与成功 run 并列展示并标红，
+    # 绝不与"0 只入选"的正常空结果混同（那种有 result CSV → status=ok）。
+    for sc_p in sorted(OUTPUT_DIR.glob("run_status_*.json")):
+        m = re.match(r"run_status_(\d{8})\.json$", sc_p.name)
+        if not m:
+            continue
+        day = m.group(1)
+        if day in success_days:
+            continue  # 有 result CSV = 成功重跑已取代失败 → 不重复标红
+        sc = runstatus.read_sidecar(str(OUTPUT_DIR), day)
+        if not sc or sc.get("status") != "failed":
+            continue
+        date_iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+        runs.append(
+            {
+                "date": date_iso,
+                "status": "failed",
+                "selected_count": None,
+                "total_candidates": None,
+                "generated_at": sc.get("failed_at") or _mtime_iso(sc_p),
+                "has_report": False,
+                "error": sc.get("error"),
+                "error_type": sc.get("error_type"),
+                "reason_code": sc.get("reason_code"),
+                "avg_ttm_yield_pct": None,
+                "avg_roe_pct": None,
+            }
+        )
+
     # 倒序（最新在前）
     runs.sort(key=lambda r: r["date"], reverse=True)
     return {"runs": runs}
@@ -845,6 +881,29 @@ def run_detail(day: str) -> Dict[str, Any]:
     csv_p = OUTPUT_DIR / f"result_{compact}.csv"
     report_p = OUTPUT_DIR / f"report_{compact}.md"
     if not csv_p.exists():
+        # 生产路径失败守卫：无 result CSV 但有 status=failed sidecar → 该日是数据源级
+        # 失败（BaoStock 封禁/空池等）。返回 200 + status=failed + 错误摘要，前端标红
+        # "运行失败"，而不是 404"无结果"（后者会让用户以为只是没有数据）。
+        from screener import runstatus
+
+        sc = runstatus.read_sidecar(str(OUTPUT_DIR), compact)
+        if sc and sc.get("status") == "failed":
+            return {
+                "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
+                "status": "failed",
+                "generated_at": sc.get("failed_at"),
+                "error": sc.get("error"),
+                "error_type": sc.get("error_type"),
+                "reason_code": sc.get("reason_code"),
+                "funnel": [],
+                "kpi": {},
+                "badges": {},
+                "selected": [],
+                "survivors": [],
+                "missing_fundamental": [],
+                "skipped_groups": {},
+                "report_md": "",
+            }
         raise HTTPException(status_code=404, detail=f"无该日运行结果: {day}")
 
     rows = _read_csv_rows(csv_p)
@@ -872,6 +931,7 @@ def run_detail(day: str) -> Dict[str, Any]:
 
     return {
         "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
+        "status": "ok",
         "generated_at": _mtime_iso(csv_p),
         "funnel": parsed["funnel"],
         "kpi": parsed.get("kpi", {}),

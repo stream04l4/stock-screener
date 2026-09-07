@@ -21,6 +21,7 @@ from typing import Any, Dict
 
 import pandas as pd
 
+from .data.baostock_client import DataSourceError
 from .data.fetchers import DataFetcher
 
 log = logging.getLogger("screener.universe")
@@ -46,6 +47,19 @@ def build_universe(
     stats = UniverseStats()
     all_df = fetcher.all_stock(run_day)
     stats.total_securities = len(all_df)
+
+    # 数据源级失败守卫（9/7 缺陷修复）：run_day 恒为已定位的交易日，交易日的
+    # query_all_stock 返回 0 行证券不可能是真实市场状态——A 股全市场恒有数千只
+    # 证券。空结果只来自数据源异常（BaoStock 封禁/降级、接口故障）。若按"股票池=0
+    # → 硬剔除后无候选"继续走，会把失败伪装成"入选 0"的空 result/report（9/7 事故
+    # 现场：login ok 但 query_all_stock 返回 0 行）。此处显式抛 DataSourceError →
+    # 引擎失败路径（非零退出 + sidecar，不写误导性产物）。合法的"硬剔除后 0 只入选"
+    # 发生在股票池**正常拉取**之后（见 screener.py 的 _NoCandidates），不受影响。
+    if len(all_df) == 0:
+        raise DataSourceError(
+            f"数据源级失败: query_all_stock({run_day}) 返回 0 只证券"
+            "（交易日应有数千只）——主数据源不可用或返回空，拒绝产出误导性空结果"
+        )
 
     mask_prefix = all_df["code"].str.startswith(tuple(prefixes))
     a_share = all_df[mask_prefix].copy()

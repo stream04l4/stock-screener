@@ -343,7 +343,12 @@ def run_screener(
 
     except _NoCandidates:
         no_candidates = True
-
+    except Exception as exc:  # noqa: BLE001 - 失败守卫：附运行日后原样上抛（不吞异常）
+        # 把已解析的交易日附到异常对象上，供 CLI 写 failed sidecar 时命名
+        # （与 result_*.csv 命名口径一致；定位前失败 → run_day 为空 → 用请求日期）。
+        if not getattr(exc, "run_day", None):
+            setattr(exc, "run_day", result.run_day or None)
+        raise
     finally:
         client.close()
 

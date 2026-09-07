@@ -62,6 +62,7 @@ def main(argv=None) -> int:
         return 2
 
     from . import config as cfgmod
+    from . import runstatus
 
     try:
         cfg = cfgmod.load_config(_resolve(args.config, os.path.join(PROJECT_ROOT, "config", "strategy.yaml")))
@@ -94,6 +95,10 @@ def main(argv=None) -> int:
 
         log.info("输出: %s (%d 行)", csv_path, n_rows)
         log.info("输出: %s", md_path)
+        # 成功运行 → 清除同日可能残留的 failed sidecar（新结果取代旧失败），
+        # 避免 Web 把一次已成功重跑仍标红。run_day 是实际交易日（可能与请求日不同）。
+        runstatus.clear_failed_sidecar(output_dir, result.run_day.replace("-", ""))
+
         print()
         print("=" * 60)
         print(f"筛选完成 · 运行日 {result.run_day}")
@@ -106,6 +111,26 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001
         log.exception("运行失败")
         print(f"错误: 运行失败: {exc}", file=sys.stderr)
+        # 生产路径失败守卫（9/7 缺陷修复）：**仅数据源级失败**（DataSourceError 及其
+        # 子类 BaoStockError，如 BaoStock 封禁导致 query_all_stock 返回空池、登录失败、
+        # K线拉取中途被黑名单）→ 写 status=failed sidecar，**不写** result/report。
+        # Web 据此把该日标红"运行失败"，与合法"0 只入选"的空结果严格区分。
+        #
+        # 为什么只限 DataSourceError（而非所有异常）：用法错误（如 --date 未来日期被
+        # _resolve_run_day 拒绝）、非数据源的运行时 bug 都不是"数据源级失败"——若也写
+        # sidecar，会给一个**从未真正运行**的日期凭空造出"运行失败"记录（幻影 failed run），
+        # 且污染真实 output/。这类错误仍按原行为：非零退出 + ERROR 日志，但不落 sidecar。
+        from .data.baostock_client import DataSourceError
+
+        if isinstance(exc, DataSourceError):
+            try:
+                run_day = getattr(exc, "run_day", None) or args.date
+                sc_path = runstatus.write_failed_sidecar(
+                    output_dir, requested.isoformat(), run_day, exc
+                )
+                log.error("已写失败 sidecar（不产出误导性空结果）: %s", sc_path)
+            except Exception as sc_exc:  # noqa: BLE001 - sidecar 写入失败不得掩盖原始错误
+                log.error("写失败 sidecar 出错: %s", sc_exc)
         return 1
 
 

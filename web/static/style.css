@@ -94,6 +94,14 @@ h3 { margin: 0 0 10px; font-size: 15px; }
 .run-list li.active { background: var(--accent-soft); border-color: var(--accent); }
 .run-list .r-date { font-weight: 600; }
 .run-list .r-meta { font-size: 12px; color: var(--muted); text-align: right; }
+/* 生产路径失败守卫：失败运行红色 badge + 错误摘要（与"入选 0"正常空结果区分） */
+.run-badge {
+  font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  white-space: nowrap; flex: 0 0 auto;
+}
+.run-badge-failed { background: var(--bad); color: #fff; }
+.run-list .r-meta-failed { color: var(--bad); font-weight: 600; }
+.run-failed-card { border: 1px solid #fecaca; background: var(--bad-soft); }
 
 .funnel-box { margin-bottom: 18px; }
 .funnel-row { display: grid; grid-template-columns: 150px 1fr 90px; gap: 10px; align-items: center; margin-bottom: 7px; }
