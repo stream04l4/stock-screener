@@ -415,8 +415,79 @@ def _ruamel_yaml() -> YAML:
     """
     yml = YAML()
     yml.preserve_quotes = True
+    # D1（v2 round 1）：必须设足够大的行宽。ruamel 默认 width=80 会把 strategy.yaml
+    # 里的长 flow-style 行（sub_weights 的 {technical: {...}, dividend: {...}}）折成
+    # 多行 → _write_strategy_preserving_comments 自检 1（round-trip 逐字节还原）恒失败
+    # → 每次保存都退回 safe_dump，注释全丢（v1 D-W03 回归）。4096 覆盖当前最长行
+    # （~120 字符），保证 flow-style 原样输出。
+    yml.width = 4096
     yml.indent(mapping=2, sequence=4, offset=2)
     return yml
+
+
+def _new_scalar_like(old, v):
+    """新值沿用旧节点的字面风格（D1，v2 round 1）。
+
+    ruamel round-trip 解析时把数字的原始字面量信息记在 ScalarFloat/ScalarInt
+    子类的 _width/_prec 等属性上（"0.30" → width=4, prec=2），dump 时据此还原
+    尾零。直接赋 plain float 会丢失这些信息（"0.30"→"0.3"）；替换节点时把旧
+    节点的元数据拷给新值，改完再恢复原值即可逐字节还原（brief 判据：PUT 恢复
+    后 git diff HEAD 为空）。同数字位数的改动/恢复完全保真；位数变化（0.30→0.5）
+    后恢复只能恢复到相同精度风格（"0.3"），属表示层固有限制，注释与排版不受影响。
+    """
+    from ruamel.yaml.scalarfloat import ScalarFloat
+    from ruamel.yaml.scalarint import ScalarInt
+
+    if isinstance(old, ScalarFloat) and isinstance(v, float) and not isinstance(v, bool):
+        node = ScalarFloat(v)
+        for a in ("_width", "_prec", "_m_sign", "_m_lead0", "_exp", "_e_width", "_e_sign"):
+            setattr(node, a, getattr(old, a, None))
+        return node
+    if isinstance(old, ScalarInt) and isinstance(v, int) and not isinstance(v, bool):
+        node = ScalarInt(v)
+        # 与 ruamel 内部一致：_width 是动态属性（pyright 不识别，用 setattr）
+        setattr(node, "_width", getattr(old, "_width", None))
+        return node
+    return v
+
+
+def _apply_payload(old_map, new_dict) -> None:
+    """把 payload 递归应用到 ruamel round-trip 节点上（D1，v2 round 1）。
+
+    只替换**真正变化**的叶子值；未变化的键保留原 CommentedBase 节点。原因：
+    用 plain Python 标量整体覆盖会丢失 ruamel 记录在原节点上的表示信息——
+    `0.30` 变 `0.3`（plain 风格）、flow mapping `{a: 1, b: 2}` 被重排成块样式、
+    行尾注释错位——即使值语义未变，dump 也会产生噪声 diff。保留原节点则
+    no-op 保存逐字节还原（git diff 为空），改一个权重只动那一行。
+
+    比较规则：
+    - 嵌套 dict → 递归进原 CommentedMap（保持 flow/块样式与内部注释）。
+    - 其余（标量/序列）按**值**相等跳过。注意 ruamel round-trip 的数值是
+      ScalarFloat 子类（保留 "0.30" 这类原始字面风格），与 plain float 类型不同
+      但值相等 → 必须按值比较，不能用 type() 精确匹配，否则所有浮点行都会
+      被误判为"已变化"而丢失字面风格。
+    - bool 单独设防：Python 的 True==1 会把 `true`/`1` 互判为未变，
+      bool↔数值跨界时仍走替换（由调用方自检 2 兜底语义）。
+    """
+    from ruamel.yaml.comments import CommentedMap
+
+    for k, v in new_dict.items():
+        old = old_map.get(k)
+        if isinstance(v, dict):
+            if isinstance(old, CommentedMap):
+                _apply_payload(old, v)  # 递归：未变子键的原节点不动
+            else:
+                old_map[k] = v          # 原值不是 mapping → 整体替换（自检2兜底）
+            continue
+        if (
+            old is not None
+            and old == v
+            and not isinstance(old, bool)
+            and not isinstance(v, bool)
+        ):
+            continue  # 值未变 → 原节点（含标量风格/flow 表示/行尾注释）零改动
+        # 值变了：_new_scalar_like 按旧节点类型沿用字面风格（非数值原样返回 v）
+        old_map[k] = _new_scalar_like(old, v)
 
 
 def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
@@ -427,6 +498,9 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
     写回前自检：round-trip 原文件必须能逐字节还原（排版假设成立），且 dump 结果
     语义等于 payload；任一不满足则退回 safe_dump（丢注释但数据正确），
     绝不把格式错乱的文件写进仓库。
+
+    D1（v2 round 1）：覆盖逻辑改为 _apply_payload 的叶子级最小替换——
+    no-op 保存逐字节还原，真实改动只产生被修改行的 diff（行尾注释保留）。
     """
     import io
 
@@ -445,10 +519,7 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
         if probe_buf.getvalue() != orig:
             text = _safe_dump_text()
         else:
-            for section, fields in payload.items():
-                if isinstance(fields, dict):
-                    for k, v in fields.items():
-                        data[section][k] = v
+            _apply_payload(data, payload)
             buf = io.StringIO()
             yml.dump(data, buf)
             text = buf.getvalue()
@@ -658,14 +729,40 @@ def _infer_terminal_state(tail: List[str], t: Dict[str, Any]) -> str:
     return "failed"
 
 
-def _result_day_for(date_s: str, log_path: Path) -> Optional[str]:
-    """把请求日期映射到实际结果文件（处理非交易日回退）：找 output/result_*.csv 中最新且 mtime 晚于任务启动的。"""
+def _result_day_for(date_s: str, log_path) -> Optional[str]:
+    """把请求日期映射到实际结果文件（处理非交易日回退）：找 output/result_*.csv 中最新且 mtime 晚于任务启动的。
+
+    D2（v2 round 1）：log_path 可为 Path（status 端点）、日志行 list
+    （SSE done 事件补全字段用——流式端点拿不到 TaskManager 上下文，只能
+    从已读日志尾部抓 run_day）或 None。
+
+    无请求日期分支只信**本任务自己的日志证据**（「运行日」行 → 产物路径行），
+    不做 output/ 最新文件兜底：对 live 运行那是上一次运行的产物，对旧任务重放
+    可能是后来新运行的产物——宁缺毋错。output/ 兜底只保留在有请求日期分支
+    （status 端点语义：任务刚结束，最新文件 = 本任务产物）。
+    """
     if not date_s:
+        # 无请求日期时只能从日志尾部抓 run_day；log_path=None（调用方无上下文）→ 直接 None
+        if isinstance(log_path, Path):
+            tail_lines = _tail_lines(log_path, 200)
+        elif log_path is None:
+            return None
+        else:
+            tail_lines = list(log_path)[-200:]
         # 从日志里抓 run_day
-        m = re.search(r"run_day=(\d{8})|运行日 (\d{4}-\d{2}-\d{2})", "\n".join(_tail_lines(log_path, 200)))
+        m = re.search(r"run_day=(\d{8})|运行日 (\d{4}-\d{2}-\d{2})", "\n".join(tail_lines))
         if m:
             raw = m.group(1) or m.group(2)
-            return raw.replace("-", "") if len(raw) == 8 else raw
+            # 契约：恒返回紧凑 YYYYMMDD（调用方按 [4:6] 切片拼 ISO）。
+            # 原实现 len==8 才去横线，group(2) 的带横线日期会原样漏出 → 拼出 "2026--09-04"。
+            return raw.replace("-", "")
+        # 次选：日志里的产物路径行（引擎在最终「筛选完成 · 运行日」行之前先打印
+        # 「CSV: .../result_YYYYMMDD.csv」「报告: .../report_YYYYMMDD.md」）——
+        # 绑定到本任务自己的产物，比"output/ 最新文件"更准（旧任务重放时不会
+        # 误拿后来新运行的日期）。
+        m = re.search(r"(?:result|report)_(\d{8})\.(?:csv|md)", "\n".join(tail_lines))
+        if m:
+            return m.group(1)
         return None
     day = date_s.replace("-", "")
     # 直接命中
@@ -851,18 +948,34 @@ def run_status(task_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # SSE 实时日志（R5：tail logs/web_run_{task_id}.log，按字节偏移增量推）
 # ---------------------------------------------------------------------------
-def _classify_log_line(line: str) -> Dict[str, Any]:
+def _classify_log_line(line: str, task_date: str = "", tail_lines: Optional[List[str]] = None) -> Dict[str, Any]:
     """把一行运行日志分类为 SSE 事件（报告 R5 classify()）。
 
     - [PROGRESS] stage=... done=N total=M → progress（结构化进度标记，v2 新增）
     - 「筛选完成」→ done；「运行失败」/Traceback/Error → error；其余 → log。
+
+    D2（v2 round 1）：done 事件按 R5 规格补全 result_date/api 两字段。
+    解析优先级（都是"实际运行日"的证据，越靠前越精确）：
+    1. tail_lines 里的「运行日 YYYY-MM-DD」（done 行自带 = 回退后的交易日）；
+    2. tail_lines 里的产物路径 result_YYYYMMDD.csv / report_YYYYMMDD.md
+       （CLI 在最终运行日行之前打印，绑定本任务自己的产物）；
+    3. task_date（内存任务日期或日志启动横幅 --date）——仅当上面都还没有时
+       用：引擎的「筛选完成: mode=...」行先于 CLI 的运行日/产物行出现，第一条
+       done 事件到达时只有请求日期可用；非交易日回退场景下后续 done 行会带着
+       真实运行日覆盖语义（两条 done 事件各自独立解析）。
     """
     m = re.search(r"\[PROGRESS\]\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)", line)
     if m:
         return {"type": "progress", "stage": m.group(1),
                 "done": int(m.group(2)), "total": int(m.group(3))}
     if "筛选完成" in line:
-        return {"type": "done"}
+        ev: Dict[str, Any] = {"type": "done"}
+        run_day = _result_day_for("", tail_lines or []) or _result_day_for(task_date, None)
+        if run_day:
+            iso = f"{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}"
+            ev["result_date"] = iso
+            ev["api"] = f"/api/runs/{iso}"
+        return ev
     if "运行失败" in line or "Traceback" in line or re.search(r"\bError\b", line):
         return {"type": "error"}
     return {"type": "log", "text": line}
@@ -883,6 +996,20 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
     if not log_path.exists():
         raise HTTPException(status_code=404, detail=f"任务日志不存在: {task_id}")
 
+    # D2：done 事件补全 result_date/api 需要任务上下文（请求日期 + 已读日志尾部）。
+    # 内存里有该任务 → 用其 date；重启后内存为空 → 从日志首行启动横幅抓请求日期
+    # （cmd=... --date YYYY-MM-DD），再由 classify 的「运行日」/产物逻辑处理非交易日回退。
+    task = tm.tasks.get(task_id)
+    task_date = (task or {}).get("date") or ""
+    if not task_date:
+        try:
+            with open(log_path, "rb") as f:
+                head = f.read(2048).decode("utf-8", errors="replace")
+            m = re.search(r"--date (\d{4}-\d{2}-\d{2})", head)
+            task_date = m.group(1) if m else ""
+        except OSError:
+            pass
+
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id")
     try:
@@ -894,6 +1021,7 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
         sent_terminal = False
         idle_ticks = 0
         offset = start_offset
+        seen_lines: List[str] = []  # 本流已推送的日志行（供 done 事件抓「运行日」）
         while True:
             # 客户端断开 → 尽快退出，不空转
             if await request.is_disconnected():
@@ -910,7 +1038,8 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
                 for line in chunk.decode("utf-8", errors="replace").splitlines():
                     if not line.strip():
                         continue  # 空行（TaskManager 启动横幅前的换行）不推
-                    ev = _classify_log_line(line)
+                    seen_lines.append(line)  # 先入上下文：done 行自带「运行日」，classify 需要它
+                    ev = _classify_log_line(line, task_date=task_date, tail_lines=seen_lines)
                     sent_terminal = sent_terminal or ev["type"] in ("done", "error")
                     yield f"id: {offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 idle_ticks = 0

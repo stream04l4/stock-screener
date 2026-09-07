@@ -28,8 +28,16 @@ body {
   display: flex; align-items: center; gap: 24px;
   background: #101828; color: #fff; padding: 10px 22px;
 }
-.brand { font-size: 16px; font-weight: 700; white-space: nowrap; }
-.brand .sub { font-size: 12px; font-weight: 400; color: #98a2b3; margin-left: 8px; }
+/* D3（v2 round 1）：窄屏顶栏副标题硬裁切无省略号 → .brand 作为 flex 容器允许整体收缩
+   （min-width:0），.sub 可收缩 + ellipsis；宽屏空间充足时完整显示、桌面布局不变。 */
+.brand {
+  font-size: 16px; font-weight: 700; white-space: nowrap;
+  display: flex; align-items: baseline; min-width: 0;
+}
+.brand .sub {
+  font-size: 12px; font-weight: 400; color: #98a2b3; margin-left: 8px;
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .tabs { display: flex; gap: 6px; }
 .tab {
   border: 0; background: transparent; color: #cbd5e1; cursor: pointer;
