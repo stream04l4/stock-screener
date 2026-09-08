@@ -86,6 +86,28 @@ data:
   retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）
   cache_dir: cache                  # 本地缓存目录（相对路径基于项目根）
 
+datasource:                         # v4 数据源架构（报告 R3 + TL 修正）：高频K线/快照切腾讯批量
+  primary: tencent                  # tencent | baostock（baostock=回退旧行为，217 测试不变）
+  fallback: fail_fast               # fail_fast(推荐,TL D2) | baostock；全批失败时不自动回退 BaoStock
+  tencent:
+    snapshot_batch_size: 200        # 单批请求股票数（R1-a 实测上限的 40%，留 50% 余量）
+    snapshot_interval_s: 0.5        # 批间隔秒（生产 ~150 次/日，R1a 速率下零限流）
+    timeout_s: 15                   # 单请求超时
+    max_attempts: 3                 # 单批失败重试次数（指数退避）
+    kline_bars: 40                  # 新股回补/候选确认取数根数
+  exdate_detector:                  # TL 修正：preclose 信号除权检测（弃用 hfq/raw）
+    preclose_dev_threshold_pct: 0.5   # 信号 θ：|preclose_today/close_prevday - 1| > θ → 候选
+    factor_sanity_cap_pct: 30         # sanity 上界：|r_event-1|>30% 不写入、记告警（防异常昨收污染）
+    max_candidates_per_day: 200       # 日常防御：候选数超此值截断+告警
+    cutover_max_candidates: 300       # 切换日 bootstrap 截断（跨多日缺口放大误报，TL D3）
+  factor_reconcile:                 # C 兜底：BaoStock 低频对账（本期默认关，TL D3）
+    weekly_baostock_scan: false     # 每周 ~5200 次因子精确对账 + 检测器失效安全网
+    scan_days_spread: 2             # 5200 次分几天（≤3000/日 @0.3/s）
+    skip_during_disclosure: true    # 1月/5月年度突发期暂停周扫（错峰）
+  contract:                         # 契约监控（离线可算，零额外请求）
+    pct_sample_size: 20             # 抽样 N 只校验 pct 一致性（R1-b 基线 549/549）
+    pct_tolerance_pct: 0.5          # pct 偏离容忍度（%）
+
 crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
   enabled: true
   sample_size: 20                   # 从最终入选股中抽样 N 只验证收盘价

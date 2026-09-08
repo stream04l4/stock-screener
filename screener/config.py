@@ -283,6 +283,56 @@ def crosscheck_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def datasource_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v4 数据源架构配置（报告 R3 + TL 修正）。
+
+    ``datasource`` 段**可选**：缺失时返回 primary=baostock 的默认值（现有行为，
+    217 测试的 _base_cfg 无此段 → 走原 BaoStock 路径不变）。存在则严格校验结构。
+    所有阈值/批量参数都来自 strategy.yaml（零硬编码纪律）；本函数只做读取 + 校验。
+    """
+    d = cfg.get("datasource")
+    if not isinstance(d, dict) or not d:
+        # 默认：baostock 主源（回退旧行为），fail_fast 兜底——与 v4 上线前一致
+        return {
+            "primary": "baostock",
+            "fallback": "fail_fast",
+            "tencent": {"snapshot_batch_size": 200, "snapshot_interval_s": 0.5,
+                        "timeout_s": 15, "max_attempts": 3, "kline_bars": 40},
+            "exdate_detector": {"preclose_dev_threshold_pct": 0.5,
+                                "factor_sanity_cap_pct": 30,
+                                "max_candidates_per_day": 200,
+                                "cutover_max_candidates": 300},
+            "factor_reconcile": {"weekly_baostock_scan": False, "scan_days_spread": 2,
+                                 "skip_during_disclosure": True},
+            "contract": {"pct_sample_size": 20, "pct_tolerance_pct": 0.5},
+        }
+    _validate_datasource(d)
+    return d
+
+
+def _validate_datasource(d: Dict[str, Any]) -> None:
+    """datasource 段结构/语义校验（缺项直接报错，避免运行到一半才发现）。"""
+    if d.get("primary") not in ("tencent", "baostock"):
+        raise ConfigError("datasource.primary 只能是 tencent 或 baostock")
+    if d.get("fallback") not in ("fail_fast", "baostock"):
+        raise ConfigError("datasource.fallback 只能是 fail_fast 或 baostock")
+    t = d.get("tencent", {}) or {}
+    for key, lo, hi in (("snapshot_batch_size", 1, 500), ("timeout_s", 1, 300)):
+        if int(t.get(key, 200)) < lo or int(t.get(key, 200)) > hi:
+            raise ConfigError(f"datasource.tencent.{key} 非法")
+    if float(t.get("snapshot_interval_s", 0.5)) < 0:
+        raise ConfigError("datasource.tencent.snapshot_interval_s 必须 >= 0")
+    if int(t.get("max_attempts", 3)) < 1:
+        raise ConfigError("datasource.tencent.max_attempts 必须 >= 1")
+    ed = d.get("exdate_detector", {}) or {}
+    if float(ed.get("preclose_dev_threshold_pct", 0.5)) <= 0:
+        raise ConfigError("datasource.exdate_detector.preclose_dev_threshold_pct 必须 > 0")
+    if int(ed.get("max_candidates_per_day", 200)) < 1:
+        raise ConfigError("datasource.exdate_detector.max_candidates_per_day 必须 >= 1")
+    if int(ed.get("cutover_max_candidates", 300)) < 1:
+        raise ConfigError("datasource.exdate_detector.cutover_max_candidates 必须 >= 1")
+
+
 def scoring_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """v2 打分模型配置（权重/子权重全部来自 strategy.yaml，代码零硬编码）。"""
     s = cfg["scoring"]
