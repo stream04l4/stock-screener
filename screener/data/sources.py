@@ -301,7 +301,15 @@ class TencentKlineSource:
                 if resp.status_code != 200:
                     log.warning("腾讯K线 HTTP %d (attempt %d) %s", resp.status_code, attempt, code)
                     break
-                data = json.loads(resp.content.decode("utf-8", errors="replace"))["data"]
+                body = json.loads(resp.content.decode("utf-8", errors="replace"))
+                data = body.get("data")
+                if not isinstance(data, dict):
+                    # 腾讯对异常参数返回 {"code":0,"msg":"param error","data":[]}（data 是 list）：
+                    # 确定性错误，重试无意义 → 按"失败/无数据 → []"语义直接返回（根因修复：
+                    # 原 data.get(...) 会抛 AttributeError 且不在 except 列表 → 穿透炸掉 bootstrap）。
+                    log.warning("腾讯K线响应异常 data=%r %s: %s",
+                                type(data).__name__, code, body.get("msg", ""))
+                    return []
                 node = data.get(bs_code_to_tencent(code), {})
                 rows = node.get("day") if fq == "" else (node.get(fq + "day") or node.get("day"))
                 rows = rows or []

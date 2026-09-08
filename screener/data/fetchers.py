@@ -746,21 +746,26 @@ class DataFetcher:
         n_backfilled = 0
         n_failed = 0
         for i, code in enumerate(codes):
-            tail_rows = self._kline_af3_tail_rows(code, 1)
-            if not tail_rows:
-                continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
-            tail_date = str(tail_rows[-1][0]).strip()
-            closes = ksrc.kline_closes(code)  # 最近 N 根 raw (date, close)，升序
-            if not closes:
-                n_failed += 1  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导
-                continue
-            gap_rows = [
-                [d, code, f"{c:.4f}", "0", "0"]
-                for d, c in closes if tail_date < d < run_day
-            ]
-            if gap_rows:
-                self.kline_af3_append(code, gap_rows)  # 内部按日期去重，幂等
-                n_backfilled += 1
+            try:
+                tail_rows = self._kline_af3_tail_rows(code, 1)
+                if not tail_rows:
+                    continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
+                tail_date = str(tail_rows[-1][0]).strip()
+                closes = ksrc.kline_closes(code)  # 最近 N 根 raw (date, close)，升序
+                if not closes:
+                    n_failed += 1  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导
+                    continue
+                gap_rows = [
+                    [d, code, f"{c:.4f}", "0", "0"]
+                    for d, c in closes if tail_date < d < run_day
+                ]
+                if gap_rows:
+                    self.kline_af3_append(code, gap_rows)  # 内部按日期去重，幂等
+                    n_backfilled += 1
+            except Exception as exc:
+                # 防御纵深（fix r3）：单只股票任何异常不得炸掉全市场 bootstrap → 跳过该股、周扫兜底
+                n_failed += 1
+                log.warning("切换日非候选缺口回补失败 %s: %s", code, exc)
             if interval_s > 0 and i + 1 < len(codes):
                 time.sleep(interval_s)
         log.info(
@@ -787,29 +792,35 @@ class DataFetcher:
             ksrc = TencentKlineSource(self.datasource_cfg.get("tencent", {}) or {})
             self._kline_source = ksrc
         events_map: Dict[str, List[Tuple[str, float]]] = {}
+        n_failed = 0
         for code in list(self._candidates.keys()):
-            tail_rows = self._kline_af3_tail_rows(code, 1)
-            if not tail_rows:
-                continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
-            tail_date = str(tail_rows[-1][0]).strip()
-            raw_closes, events = ksrc.gap_events(code, start_after=tail_date, end_before=run_day)
-            if not raw_closes:
-                continue  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导因子
-            # (a) 回补缺口期缺失 K线行（严格 < run_day；run_day 由快照 bar 提供）
-            gap_rows = [
-                [d, code, f"{c:.4f}", "0", "0"]
-                for d, c in raw_closes if tail_date < d < run_day
-            ]
-            if gap_rows:
-                self.kline_af3_append(code, gap_rows)  # 内部按日期去重，幂等
-            # (b) 记录缺口期除权事件（升序）
-            if events:
-                events_map[code] = events
+            try:
+                tail_rows = self._kline_af3_tail_rows(code, 1)
+                if not tail_rows:
+                    continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
+                tail_date = str(tail_rows[-1][0]).strip()
+                raw_closes, events = ksrc.gap_events(code, start_after=tail_date, end_before=run_day)
+                if not raw_closes:
+                    continue  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导因子
+                # (a) 回补缺口期缺失 K线行（严格 < run_day；run_day 由快照 bar 提供）
+                gap_rows = [
+                    [d, code, f"{c:.4f}", "0", "0"]
+                    for d, c in raw_closes if tail_date < d < run_day
+                ]
+                if gap_rows:
+                    self.kline_af3_append(code, gap_rows)  # 内部按日期去重，幂等
+                # (b) 记录缺口期除权事件（升序）
+                if events:
+                    events_map[code] = events
+            except Exception as exc:
+                # 防御纵深（fix r3）：单只股票任何异常不得炸掉全市场 bootstrap → 跳过该股、周扫兜底
+                n_failed += 1
+                log.warning("切换日候选缺口事件检测失败 %s: %s", code, exc)
         self._cutover_events = events_map
         n_ev = sum(len(v) for v in events_map.values())
         log.info(
-            "切换日 bootstrap: %d 只候选取 K线，回补缺口行、检出缺口期除权事件 %d 个（%d 只）",
-            len(self._candidates), n_ev, len(events_map),
+            "切换日 bootstrap: %d 只候选取 K线（%d 只异常跳过），回补缺口行、检出缺口期除权事件 %d 个（%d 只）",
+            len(self._candidates), n_failed, n_ev, len(events_map),
         )
 
     def _append_run_day_from_bar(self, code: str, run_day: str, bar: StockBar) -> None:

@@ -749,4 +749,151 @@ def test_cutover_gap_event_sanity_cap_blocks_write(tmp_path):
     # 无 run_day 候选，仅缺口事件（r=2.0 超 sanity）→ 全部被拒 → False
     changed = f.maybe_refresh_adjfactor("sh.600036", [])
     assert changed is False
-    assert f.cache.get("adjfactor_sh.600036") is None
+    assert f.cache.get("adjfactor_sh.600036") is None   # 未写入
+
+
+# ===========================================================================
+# 11) fix round 3：腾讯 K线源异常响应健壮性（data=list / per-code 隔离）
+# ===========================================================================
+class FakeKlineSession:
+    """假 requests.Session：按 URL 中代码返回预置原始字节（注入真实端点同款异常响应）。
+
+    payloads={tcode: bytes}；缺省 → 腾讯 param-error 响应 {"code":0,"msg":"param error","data":[]}。
+    """
+
+    def __init__(self, payloads=None):
+        self._payloads = dict(payloads or {})
+        self.calls = []
+
+    def get(self, url, timeout=None):
+        import json as _json
+        import re as _re
+        m = _re.search(r"param=([^,&]+),", url)
+        tcode = m.group(1) if m else ""
+        self.calls.append(tcode)
+
+        class _R:
+            status_code = 200
+            content = self._payloads.get(
+                tcode, _json.dumps({"code": 0, "msg": "param error", "data": []}).encode("utf-8"))
+        return _R()
+
+
+def test_kline_closes_param_error_data_list_returns_empty():
+    """真实端点异常响应（TL 实测）：{"code":0,"msg":"param error","data":[]} → kline_closes 返回 []。
+
+    回归根因：原 data.get(...) 对 list 抛 AttributeError 且不在 except 列表 → 穿透炸掉 bootstrap。
+    """
+    from screener.data.sources import TencentKlineSource
+    ks = TencentKlineSource({"timeout_s": 15, "max_attempts": 3, "kline_bars": 40})
+    ks.client.session = FakeKlineSession()   # 缺省 payload = param-error data=list
+    assert ks.kline_closes("sh.600036") == []
+
+
+def test_kline_closes_missing_data_key_returns_empty():
+    """响应无 "data" 键（原 ["data"] 会 KeyError）→ 防御后返回 []，不抛。"""
+    import json as _json
+    from screener.data.sources import TencentKlineSource
+    ks = TencentKlineSource({"timeout_s": 15, "max_attempts": 3, "kline_bars": 40})
+    ks.client.session = FakeKlineSession(
+        {"sh600036": _json.dumps({"code": -1, "msg": "oops"}).encode("utf-8")})
+    assert ks.kline_closes("sh.600036") == []
+
+
+def test_kline_closes_malformed_json_returns_empty():
+    """响应非 JSON（ValueError 路径，既有 except 行为）→ 重试耗尽后返回 []。"""
+    from screener.data.sources import TencentKlineSource
+    ks = TencentKlineSource({"timeout_s": 15, "max_attempts": 3, "kline_bars": 40})
+    ks.client.session = FakeKlineSession({"sh600036": b"<html>gateway error</html>"})
+    assert ks.kline_closes("sh.600036") == []
+
+
+def test_gap_events_param_error_returns_empty_tuple():
+    """data=list 异常响应 → gap_events 返回 ([], [])（raw/qfq 两次取数均防御），不抛。"""
+    from screener.data.sources import TencentKlineSource
+    ks = TencentKlineSource({"timeout_s": 15, "max_attempts": 3, "kline_bars": 40})
+    ks.client.session = FakeKlineSession()   # raw + qfq 均返回 param-error data=list
+    assert ks.gap_events("sh.600036", "2026-09-04", "2026-09-08") == ([], [])
+
+
+def test_backfill_noncandidate_per_code_isolation(tmp_path, caplog):
+    """per-code 隔离（_backfill_noncandidate_gaps）：第 N 只抛异常 → 循环继续、n_failed 计数正确。
+
+    sh.600036（第 1 只）kline_closes 抛 AttributeError（TL 实测穿透异常的模拟），
+    sh.600037（第 2 只）正常取数回补 → 方法不抛出、sh.600037 缺口行落库、warning 含失败代码。
+    """
+    import logging as _logging
+    bars = make_bars({
+        "sh.600036": ("招商银行", 41.00, 40.95, 500000),
+        "sh.600037": ("兴业银行", 21.00, 20.98, 500000),
+    })
+    f = make_fetcher(tmp_path, tencent_ds_cfg(), all_stock_rows=[
+        ["sh.600036", "1", "招商银行"], ["sh.600037", "1", "兴业银行"]], snapshot_bars=bars)
+
+    class ExplodingKlineSource:
+        def kline_closes(self, code):
+            if code == "sh.600036":
+                raise AttributeError("'list' object has no attribute 'get'")  # 模拟根因异常穿透
+            return [("2026-09-04", 20.98), ("2026-09-07", 21.00)]
+
+    f._kline_source = ExplodingKlineSource()
+    seed_kline_af3(f.cache, "sh.600036", [["2026-09-04", "sh.600036", "40.9500", "0", "1"]])
+    seed_kline_af3(f.cache, "sh.600037", [["2026-09-04", "sh.600037", "20.9800", "0", "1"]])
+    f.set_run_day(date(2026, 9, 8))
+
+    with caplog.at_level(_logging.WARNING, logger="screener.data.fetch"):
+        f._backfill_noncandidate_gaps("2026-09-08", ["sh.600036", "sh.600037"])  # 不得抛出
+
+    # 第 2 只正常回补：缺口行 09-07 落库
+    tail = [r[0] for r in f.cache.get("kline_af3_sh.600037")["rows"]]
+    assert "2026-09-07" in tail
+    # 第 1 只被跳过：缓存无新增行（仍只有 09-04）
+    tail = [r[0] for r in f.cache.get("kline_af3_sh.600036")["rows"]]
+    assert "2026-09-07" not in tail
+    # n_failed 计数正确 → warning 含失败代码（log.info 汇总 %d 只取数失败=1）
+    warns = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("sh.600036" in w for w in warns)
+
+
+def test_populate_cutover_events_per_code_isolation(tmp_path, caplog):
+    """per-code 隔离（_populate_cutover_events）：候选第 1 只 gap_events 抛异常 → 循环继续。
+
+    sh.600036 抛异常被跳过；sh.600037 正常取数回补缺口行且无除权事件（qfq=raw）→
+    _cutover_events 只含成功路径产物，方法不抛出。
+    """
+    import logging as _logging
+    bars = make_bars({
+        "sh.600036": ("招商银行", 41.00, 40.95, 500000),
+        "sh.600037": ("兴业银行", 21.00, 20.98, 500000),
+    })
+    f = make_fetcher(tmp_path, tencent_ds_cfg(), all_stock_rows=[
+        ["sh.600036", "1", "招商银行"], ["sh.600037", "1", "兴业银行"]], snapshot_bars=bars)
+
+    class ExplodingGapSource:
+        def gap_events(self, code, start_after, end_before):
+            if code == "sh.600036":
+                raise AttributeError("'list' object has no attribute 'get'")  # 模拟根因异常穿透
+            return ([(start_after, 20.98), ("2026-09-07", 21.00)], [])   # raw，无事件
+
+    f._kline_source = ExplodingGapSource()
+    seed_kline_af3(f.cache, "sh.600036", [["2026-09-04", "sh.600036", "40.9500", "0", "1"]])
+    seed_kline_af3(f.cache, "sh.600037", [["2026-09-04", "sh.600037", "20.9800", "0", "1"]])
+    f.set_run_day(date(2026, 9, 8))
+    f._candidates = {
+        "sh.600036": ExdateCandidate("sh.600036", 41.00, 40.95, 0.0012, 1.0 / 1.0012, True),
+        "sh.600037": ExdateCandidate("sh.600037", 21.00, 20.98, 0.0009, 1.0 / 1.0009, True),
+    }
+    f._snapshot = bars
+
+    with caplog.at_level(_logging.WARNING, logger="screener.data.fetch"):
+        f._populate_cutover_events("2026-09-08")   # 不得抛出
+
+    # 成功股缺口行回补；异常股被跳过
+    tail = [r[0] for r in f.cache.get("kline_af3_sh.600037")["rows"]]
+    assert "2026-09-07" in tail
+    tail = [r[0] for r in f.cache.get("kline_af3_sh.600036")["rows"]]
+    assert "2026-09-07" not in tail
+    # 无除权事件（qfq=raw）→ events_map 为空；warning 含失败代码
+    assert f._cutover_events == {}
+    warns = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("sh.600036" in w for w in warns)
