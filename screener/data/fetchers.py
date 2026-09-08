@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -159,6 +161,10 @@ class DataFetcher:
         self._kline_source: Optional[TencentKlineSource] = None  # 切换日候选确认（可注入 fake）
         self._detector: Optional[ExdateDetector] = None
         self.contract_warnings: List[str] = []                 # 契约监控告警（供日志/报告）
+        # fix round 2：股票池/行业陈旧回退注记（半封禁态降级）。数据层无法直接写
+        # ScreenResult.data_notes（screener.py/report.py 冻结零改动），故注记落在本属性 +
+        # warning 日志；生产 cron 由 run_cron.sh 预取步骤兜底，Web/手动运行语义不变。
+        self.universe_notes: List[str] = []
 
     @property
     def datasource_cfg(self) -> Dict[str, Any]:
@@ -235,6 +241,49 @@ class DataFetcher:
         return None
 
     # ---------- 全市场股票列表 ----------
+    def _stale_allstock(self, day: str) -> Optional[Tuple[List[str], List[List[str]], int]]:
+        """找 ≤ stale_max_days 天前最近一个非空 allstock_*.csv 陈旧池（fix round 2）。
+
+        仅当 env ``BS_UNIVERSE_STALE_OK=1`` 时调用方才进入本路径。扫描缓存目录
+        ``allstock_YYYY-MM-DD.csv``，取日期 ≤ day 且 (day - d) <= stale_max_days 的最新一个
+        **非空**文件（空文件=D-01 污染件，视为无效）。
+
+        :return: (columns, rows, age_days)；无可用陈旧池 → None。
+        """
+        uni_cfg = self.datasource_cfg.get("universe", {}) or {}
+        max_age = int(uni_cfg.get("stale_max_days", 7))
+        try:
+            target = date.fromisoformat(day)
+        except ValueError:
+            return None
+        best_date: Optional[date] = None
+        best_hit: Optional[Dict[str, Any]] = None
+        cdir = self.cache.cache_dir
+        try:
+            names = os.listdir(cdir)
+        except OSError:
+            return None
+        for fn in names:
+            m = re.match(r"^allstock_(\d{4}-\d{2}-\d{2})\.csv$", fn)
+            if not m:
+                continue
+            try:
+                d = date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if d > target or (target - d).days > max_age:
+                continue
+            # 非空校验（读侧永远不把空文件当有效缓存）
+            hit = self.cache.get(make_cache_name("allstock", m.group(1)))
+            if not hit or not hit["rows"]:
+                continue
+            if best_date is None or d > best_date:
+                best_date, best_hit = d, hit
+        if best_date is None or best_hit is None:
+            return None
+        age = (target - best_date).days
+        return list(best_hit["columns"]), list(best_hit["rows"]), age
+
     def all_stock(self, day: str) -> pd.DataFrame:
         """某交易日全部证券。列: code, tradeStatus, code_name。始终显式传 day。
 
@@ -244,6 +293,21 @@ class DataFetcher:
           数据源异常），若按永久缓存落盘，该日真实运行会静默拿到空股票池。
         - 遗留的空缓存文件（如 D-01 污染产生的）读取时一律视为 miss 重新拉取；
           重拉到非空结果会覆盖它，仍为空则旧文件保持惰性（读侧永远不命中）。
+
+        fix round 2 —— 半封禁态陈旧回退：当日缓存 miss 且 env ``BS_UNIVERSE_STALE_OK=1``
+        （由 run_cron.sh 在 BaoStock 预取子进程失败/超时后导出）→ 用 ≤ stale_max_days 天前
+        的最近非空 allstock_*.csv 作**陈旧池**（warning + universe_notes），避免 live
+        ``query_all_stock`` 在半封禁态无限挂起（baostock 是 ctypes C 库，进程内无法超时）。
+
+        **安全性论证**：≤7 天陈旧池对筛选结果零实质影响——
+        - 新股：上市未满 hard_filter.listing_min_trading_days（250 交易日）本就被硬剔除，
+          漏几天 IPO 无影响；
+        - 退市股：留在池中但腾讯快照 vol=0 / 名称带"退" → tradestatus=0 → 当日正常交易
+          过滤（tradeStatus==1）剔除；
+        - ST 状态：不影响池成员（只影响 is_st 列，由快照/日K 提供）。
+
+        env 未设（Web/手动运行）→ 现状 live 尝试（45min 进程超时兜底，语义不变）；
+        env 设了但无足够新陈旧缓存 → 仍 live 尝试（最后手段）。
         """
         name = make_cache_name("allstock", day)
 
@@ -252,7 +316,24 @@ class DataFetcher:
         if hit is not None and len(hit["rows"]) > 0:
             self.calls["cache_hit"] += 1
             columns, rows = hit["columns"], hit["rows"]
+        elif os.environ.get("BS_UNIVERSE_STALE_OK") == "1":
+            # 半封禁态：优先陈旧池，规避 live query_all_stock 挂起
+            stale = self._stale_allstock(day)
+            if stale is not None:
+                columns, rows, age = stale
+                note = f"股票池为 {age} 天前快照（{day} 当日缓存缺失且 BaoStock 预取失败，" \
+                       f"启用 ≤{int((self.datasource_cfg.get('universe', {}) or {}).get('stale_max_days', 7))} 天陈旧池）"
+                self.universe_notes.append(note)
+                log.warning("all_stock(%s) 当日缓存 miss → 用 %d 天前陈旧池（%d 只）", day, age, len(rows))
+            else:
+                columns, rows = self.client.call_with_fields(
+                    bs.query_all_stock, label="all_stock", day=day
+                )
+                self.calls["fetched"] += 1
+                if rows:
+                    self.cache.put(name, columns, rows)
         else:
+            # Web/手动运行：现状 live 尝试（45min 进程超时兜底，语义不变）
             columns, rows = self.client.call_with_fields(
                 bs.query_all_stock, label="all_stock", day=day
             )
@@ -268,15 +349,41 @@ class DataFetcher:
 
     # ---------- 行业分类（全量，含退市股） ----------
     def industry(self) -> pd.DataFrame:
-        """列: code, code_name, industry。industry 可能为空串。"""
+        """列: code, code_name, industry。industry 可能为空串。
+
+        fix round 2 —— 半封禁态陈旧回退：TTL(24h) 过期/缺失且 env ``BS_UNIVERSE_STALE_OK=1``
+        → 用现有 industry.csv（**任意年龄**）+ warning + universe_notes，规避 live
+        ``query_stock_industry`` 在半封禁态无限挂起。行业分类周频更新、对筛选结果影响
+        极小（仅组内 ROE 排名），陈旧快照可接受。env 未设（Web/手动）→ 现状 live（TTL 24h，
+        语义不变）。
+        """
         name = make_cache_name("industry")
 
-        def fetch():
-            return self.client.call_with_fields(
-                bs.query_stock_industry, label="industry"
-            )
+        # 1) fresh（TTL 24h）→ 命中
+        hit = self.cache.get(name, ttl_hours=24.0)
+        if hit is not None and hit["rows"]:
+            self.calls["cache_hit"] += 1
+            columns, rows = hit["columns"], hit["rows"]
+        else:
+            # 2) 半封禁态：用现有 industry.csv（任意年龄）规避 live 挂起
+            stale = self.cache.get(name) if os.environ.get("BS_UNIVERSE_STALE_OK") == "1" else None
+            if stale is not None and stale["rows"]:
+                columns, rows = stale["columns"], stale["rows"]
+                idx = {c: i for i, c in enumerate(stale["columns"])}
+                upd = ""
+                if "updateDate" in idx and len(stale["rows"][0]) > idx["updateDate"]:
+                    upd = str(stale["rows"][0][idx["updateDate"]]).strip()
+                note = f"行业分类为陈旧快照（updateDate={upd or '未知'}，TTL 过期且 BaoStock 预取失败）"
+                self.universe_notes.append(note)
+                log.warning("industry() TTL 过期 → 用现有 industry.csv（updateDate=%s）", upd or "未知")
+            else:
+                # 3) Web/手动运行（或无陈旧文件）：现状 live（TTL 24h，_cached 语义不变）
+                def fetch():
+                    return self.client.call_with_fields(
+                        bs.query_stock_industry, label="industry"
+                    )
+                columns, rows = self._cached(name, fetch, ttl_hours=24.0)
 
-        columns, rows = self._cached(name, fetch, ttl_hours=24.0)
         df = pd.DataFrame(rows, columns=columns)
         keep = [c for c in ("updateDate", "code", "code_name", "industry") if c in df.columns]
         return df[keep].reset_index(drop=True)
@@ -493,27 +600,32 @@ class DataFetcher:
             data.append(s.split(","))
         return data[-n:]
 
-    def _build_prev_closes(self, codes: List[str], run_day: str) -> Dict[str, float]:
-        """构建检测器输入：本地 kline_af3 缓存 t-1 日 close {code: float}。
+    def _scan_cache_tails(self, codes: List[str], run_day: str) -> Tuple[Dict[str, float], Dict[str, str]]:
+        """单次遍历读全部 code 的 kline_af3 缓存尾（本地末行字节读，5207 文件 <1s）。
 
-        - 缓存尾 == run_day（今天 BaoStock cron 已跑过）→ t-1 = 倒数第 2 行 close；
-        - 缓存尾 < run_day（缺口/切换日）→ t-1 = 末行 close（可能跨多日，检测器对此免疫：
-          误报无害，且切换日由 cutover_max_candidates 截断）。
+        同时产出：
+        - prev_closes：检测器输入 t-1 日 close {code: float}（缓存尾==run_day → 倒数第 2 行；
+          否则末行）；
+        - tail_dates：{code: 末行日期}（无缓存/无尾 → 不含该 code）。
+
+        fix round 2：cutover 判定改为**全量扫描结果**（任一 code 尾 != run_day → 有缺口），
+        弃用 codes[:200] 抽样——抽样有漏检风险。稳态（无缺口）时全量扫描成本可接受
+        （本地末行读，不加载全历史）。一次遍历复用给检测器 + cutover 判定 + 缺口分组，
+        避免重复 I/O。
         """
-        out: Dict[str, float] = {}
+        prev_closes: Dict[str, float] = {}
+        tail_dates: Dict[str, str] = {}
         for code in codes:
             tail = self._kline_af3_tail_rows(code, 2)
             if not tail:
                 continue
             last_date = str(tail[-1][0]).strip()
-            if last_date == run_day and len(tail) >= 2:
-                row = tail[-2]
-            else:
-                row = tail[-1]
+            tail_dates[code] = last_date
+            row = tail[-2] if (last_date == run_day and len(tail) >= 2) else tail[-1]
             c = to_float(row[2]) if len(row) > 2 else None
             if c is not None and c > 0:
-                out[code] = c
-        return out
+                prev_closes[code] = c
+        return prev_closes, tail_dates
 
     def _ensure_snapshot(self, run_day: str) -> None:
         """惰性触发一次全市场腾讯快照 + 除权检测（引擎循环首只股票时调用，之后复用）。
@@ -525,6 +637,13 @@ class DataFetcher:
         - 契约监控 (a)(b) 在 TencentSnapshotSource.snapshot / pct_consistency_sample 内计算。
         - **失败语义**：全批失败（0 只解析）且 fallback=fail_fast → raise DataSourceError
           （绝不伪装空结果）；部分缺失由 kline_af3_incremental 逐股回退 BaoStock。
+
+        fix round 2 —— cutover 全量判定 + 非候选缺口回补：
+        - cutover 判定改为**全量扫描所有 codes 的缓存尾**（任一 code 尾 != run_day →
+          cutover=True），弃用 codes[:200] 抽样（漏检风险）。稳态零额外成本（本地末行读）。
+        - 切换日缺口股分两组：候选组 → _populate_cutover_events（回补 + qfq/raw 事件检测）；
+          **非候选缺口组** → _backfill_noncandidate_gaps（逐只腾讯 raw K线 append 缺失行，
+          消除日期洞）。这是**切换日一次性 bootstrap**（今日 ~1145 只），稳态 0 次。
         """
         if self._snapshot is not None:
             return
@@ -554,20 +673,27 @@ class DataFetcher:
             )
         self._snapshot = bars
 
-        # 除权检测（TL preclose 信号）：输入=快照 preclose + 本地缓存 t-1 close
-        prev_closes = self._build_prev_closes(codes, run_day)
+        # 全量扫描缓存尾（一次遍历）：检测器输入 + cutover 判定 + 缺口分组共用
+        prev_closes, tail_dates = self._scan_cache_tails(codes, run_day)
         self._prev_closes = prev_closes
-        cutover = any(
-            str(tail[-1][0]).strip() != run_day
-            for tail in (self._kline_af3_tail_rows(c, 1) for c in codes[:200]) if tail
-        )  # 抽样判断是否切换日（缓存尾非 run_day → 有缺口）
+        # cutover 判定 = 全量扫描结果（任一 code 尾 != run_day → 有缺口），弃用抽样
+        gapped_codes = [c for c in codes if tail_dates.get(c) and tail_dates[c] < run_day]
+        cutover = bool(gapped_codes)
+
         self._candidates, det_warnings = self._detector.detect(bars, prev_closes, cutover=cutover)
 
-        # 切换日 bootstrap（brief §6）：缓存尾是 BaoStock 旧数据（跨多日缺口），
-        # preclose/缓存尾比值跨多日放大误报 → 对命中候选取腾讯 raw+qfq K线 N 根，
-        # (a) 回补缺口期缺失 K线行，(b) 用 qfq/raw 比值检测缺口期除权事件（逐事件补因子）。
-        if cutover and self._candidates:
-            self._populate_cutover_events(run_day)
+        # 切换日 bootstrap（brief §6 + fix round 2）：缓存尾是 BaoStock 旧数据（跨多日缺口）。
+        # (1) 候选组 → _populate_cutover_events：raw+qfq K线回补缺口行 + qfq/raw 事件检测；
+        # (2) 非候选缺口组 → _backfill_noncandidate_gaps：raw K线回补缺口行（消除日期洞）。
+        # 非候选股检测器语义保证无除权事件（有除权必成候选）→ 只需补 close，isST/tradestatus
+        # 占位 0（历史日无快照可派生；run_day 行由快照提供准确值）。
+        if cutover:
+            self._cutover_events = {}
+            if self._candidates:
+                self._populate_cutover_events(run_day)
+            non_candidate_gapped = [c for c in gapped_codes if c not in self._candidates]
+            if non_candidate_gapped:
+                self._backfill_noncandidate_gaps(run_day, non_candidate_gapped)
 
         # 契约监控 (b)：抽样 pct 一致性（离线，零额外请求）
         xc = self.datasource_cfg.get("contract", {}) or {}
@@ -579,9 +705,68 @@ class DataFetcher:
         for w in self.contract_warnings:
             log.warning("[契约监控] %s", w)
         log.info(
-            "腾讯快照完成: 请求 %d / 解析 %d（失败批 %d/%d），除权候选 %d 只（切换日=%s）",
+            "腾讯快照完成: 请求 %d / 解析 %d（失败批 %d/%d），除权候选 %d 只（切换日=%s，缺口股 %d）",
             source.requested_count, source.parsed_count, source.failed_batches,
-            source.total_batches, len(self._candidates), cutover,
+            source.total_batches, len(self._candidates), cutover, len(gapped_codes),
+        )
+
+    def _backfill_noncandidate_gaps(self, run_day: str, gapped_codes: List[str]) -> None:
+        """切换日 bootstrap（fix round 2）：非候选缺口股逐只取腾讯 raw K线回补缺口行。
+
+        背景：cutover bootstrap 原先只对除权**候选**回补缺口行，但**非候选**缺口股
+        （缺口期波动 < θ、无除权事件——检测器语义保证有除权必成候选）不会得到缺失行
+        → 缓存出现日期洞，破坏"每日连续序列"不变量（回测 PIT 按日期取数踩空；技术面窗口
+        含洞时 MA 覆盖日历天数偏移）。本方法对非候选缺口股补 [tail_date, run_day) 的 raw close。
+
+        - 逐只 ``TencentKlineSource.kline_closes(code)``（N=kline_bars=40，足够覆盖缺口），
+          append 缺口行 ``[d, code, close:.4f, "0", "0"]``（tail_date < d < run_day；
+          isST/tradestatus 占位 0——历史日无快照可派生，run_day 行由快照提供准确值；与候选组
+          回补口径一致）。
+        - **上限保护**：非候选缺口数 > ``exdate_detector.cutover_max_gap_backfill``（默认 3000）
+          → 截断 + warning（正常切换日 ~1146 只远低于上限；上限防御异常放大）。
+        - **请求预算**：一次性成本 = 非候选缺口数（今日 ~1145）+ 候选数，串行、间隔
+          ``tencent.kline_interval_s``（默认 0.2s），约 6–10min。这是**切换日一次性 bootstrap**，
+          稳态 0 次。腾讯研究期 ~216 次 + e2e 27 批零限流，1145 次单次运行在其容量内（R1-a）。
+        - **幂等**：kline_af3_append 已按日期去重 → 重复运行不产生重复行。
+        """
+        ksrc = self._kline_source
+        if ksrc is None:
+            ksrc = TencentKlineSource(self.datasource_cfg.get("tencent", {}) or {})
+            self._kline_source = ksrc
+        interval_s = float((self.datasource_cfg.get("tencent", {}) or {}).get("kline_interval_s", 0.2))
+        cap = int((self.datasource_cfg.get("exdate_detector", {}) or {})
+                  .get("cutover_max_gap_backfill", 3000))
+        truncated = max(0, len(gapped_codes) - cap)
+        if truncated:
+            log.warning(
+                "切换日非候选缺口回补 %d 只超上限 %d → 截断（跳过 %d 只，周扫 BaoStock 兜底）",
+                len(gapped_codes), cap, truncated,
+            )
+        codes = gapped_codes[:cap]
+        n_backfilled = 0
+        n_failed = 0
+        for i, code in enumerate(codes):
+            tail_rows = self._kline_af3_tail_rows(code, 1)
+            if not tail_rows:
+                continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
+            tail_date = str(tail_rows[-1][0]).strip()
+            closes = ksrc.kline_closes(code)  # 最近 N 根 raw (date, close)，升序
+            if not closes:
+                n_failed += 1  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导
+                continue
+            gap_rows = [
+                [d, code, f"{c:.4f}", "0", "0"]
+                for d, c in closes if tail_date < d < run_day
+            ]
+            if gap_rows:
+                self.kline_af3_append(code, gap_rows)  # 内部按日期去重，幂等
+                n_backfilled += 1
+            if interval_s > 0 and i + 1 < len(codes):
+                time.sleep(interval_s)
+        log.info(
+            "切换日非候选缺口回补: %d/%d 只取腾讯 raw K线（%d 只成功回补缺口行、%d 只取数失败），"
+            "一次性 bootstrap（稳态 0 次）",
+            len(codes), len(gapped_codes), n_backfilled, n_failed,
         )
 
     def _populate_cutover_events(self, run_day: str) -> None:

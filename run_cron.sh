@@ -73,6 +73,27 @@ RUN_TIMEOUT=2700
 case "$GUARD_RC" in
   0)
     echo "[$TODAY] 交易日，开始选股 ..."
+
+    # ---- fix round 2：BaoStock 股票池/行业预取（子进程隔离）----
+    # v4 目标"日常路径不依赖 BaoStock 健康"，但 all_stock/industry 当日缓存 miss / TTL
+    # 过期时仍会 live 调 query_all_stock / query_stock_industry。BaoStock 是 ctypes C 库，
+    # Python setdefaulttimeout 无效 → 半封禁态下这些查询无限挂起，会把主运行拖到 45min
+    # 进程超时才失败。这里在独立子进程里预取（复用 DataFetcher/DiskCache 写路径、原子落盘、
+    # 幂等），父级用 timeout -k 30 180 兜底：成功 → 主运行命中缓存（0 次 live）；
+    # 失败/超时 → 导出 BS_UNIVERSE_STALE_OK=1，主运行走 ≤stale_max_days 天陈旧池回退。
+    # **不中断**：预取失败只降级股票池/行业为陈旧快照（安全性论证见 fetchers.all_stock
+    # docstring），主筛选继续。
+    set +e
+    timeout -k 30 180 .venv/bin/python scripts/prefetch_universe.py "$TODAY"
+    PF=$?
+    set -e
+    if [ "$PF" -ne 0 ]; then
+      export BS_UNIVERSE_STALE_OK=1
+      echo "[$TODAY] BaoStock 股票池/行业预取失败 (exit=$PF) → 主运行启用陈旧回退 (BS_UNIVERSE_STALE_OK=1)" >&2
+    else
+      echo "[$TODAY] BaoStock 股票池/行业预取成功（主运行命中缓存）"
+    fi
+
     set +e
     timeout -k 60 "$RUN_TIMEOUT" .venv/bin/python -m screener --date "$TODAY" --config config/strategy.yaml
     SC=$?

@@ -594,13 +594,21 @@ def test_datasource_cfg_bad_theta_raises():
 # ===========================================================================
 class FakeKlineSource:
     """假腾讯 raw+qfq K线源：按预置 (raw, qfq) 序列用与 TencentKlineSource.gap_events
-    相同的逻辑算比值跳变事件（隔离网络，验证检测算法 + fetcher 接线）。"""
+    相同的逻辑算比值跳变事件（隔离网络，验证检测算法 + fetcher 接线）。
+
+    fix round 2：实现完整 KlineSource 协议——除 gap_events 外还提供 kline_closes
+    （非候选缺口回补 _backfill_noncandidate_gaps 会调用它取 raw close）。"""
 
     def __init__(self, spec: dict, step_pct: float = 0.5):
         # spec={code: (raw_closes, qfq_closes)}，各为 [(date, close), ...] 升序
         self._spec = {c: (list(r), list(q)) for c, (r, q) in spec.items()}
         self.event_step_pct = step_pct / 100.0
         self.calls = []
+
+    def kline_closes(self, code):
+        """最近 N 根不复权(raw)日K (date, close)，升序；无预置 → []。"""
+        raw, _qfq = self._spec.get(code, ([], []))
+        return list(raw)
 
     def gap_events(self, code, start_after, end_before):
         self.calls.append(code)
