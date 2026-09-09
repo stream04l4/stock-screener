@@ -102,7 +102,9 @@ PYEOF
 # 主运行进程级超时上限（秒）。正常 v2 增量日运行约 1–3min；45min 上限足以覆盖
 # 冷启动，又能抓住 BaoStock 半封禁/限流态下"数据查询无限挂起"（baostock 是 ctypes
 # C 库，socket 在原生层，Python setdefaulttimeout 无效 → 只能进程级 timeout）。
-RUN_TIMEOUT=2700
+# TL 拍板 2026-09-09：首次切换日 bootstrap（cap=8000 → 全市场 ~5207 只各 1 次腾讯 K线
+# ≈38min + 快照/选股）会逼近 2700s → 临时提到 5400s；稳态日运行 1–3min，切换完成后可回退。
+RUN_TIMEOUT=5400
 
 case "$GUARD_RC" in
   0)
