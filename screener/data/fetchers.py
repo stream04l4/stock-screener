@@ -157,9 +157,10 @@ class DataFetcher:
         self._candidates: Dict[str, Any] = {}                  # 除权候选（detector 输出）
         self._cutover_events: Dict[str, List[Tuple[str, float]]] = {}  # 切换日 qfq/raw 多事件回补
         self._prev_closes: Dict[str, float] = {}               # 本地缓存 t-1 close（检测器输入）
-        # fix r4：cutover **检测时**的缺口股集合（tail<run_day）。maybe_refresh_adjfactor
-        # 据此判定候选是否为缺口股——生产流程 stage2 kline_af3_incremental 已把 run-day 行
-        # append 进缓存，maybe_refresh 当下重读 tail 恒==run_day，必须用检测时快照而非当下值。
+        # fix r4：cutover **检测时**的缺口股集合；fix r5 起语义修正为"真正陈旧"
+        # （tail < 上一交易日，见 _prev_trade_day）。maybe_refresh_adjfactor 据此判定候选是
+        # 否为缺口股——生产流程 stage2 kline_af3_incremental 已把 run-day 行 append 进缓存，
+        # maybe_refresh 当下重读 tail 恒==run_day，必须用检测时快照而非当下值。
         self._cutover_gapped: set = set()
         self._snapshot_source: Optional[TencentSnapshotSource] = None
         self._kline_source: Optional[TencentKlineSource] = None  # 切换日候选确认（可注入 fake）
@@ -604,6 +605,52 @@ class DataFetcher:
             data.append(s.split(","))
         return data[-n:]
 
+    # ---------- fix r5：本地静态交易日历（零 live BaoStock） ----------
+    _TRADE_CALENDAR_NAME = "trade_calendar"   # cache/trade_calendar.csv（守卫维护，数据层只读）
+    _CALENDAR_MAX_ROWS = 500                  # 保留最近 ~500 行（~2 年交易日，足够覆盖缺口窗口）
+
+    def _prev_trade_day(self, run_day: date) -> date:
+        """run_day 之前的最近**交易日**（本地静态日历，绝不 live 查 BaoStock）。
+
+        fix r5：缺口判定基准从"run_day 前一个日历日"升级为"上一交易日"——v4 生产时序下
+        每个交易日早上全市场 tail==D-1（前一晚 stage2 已 append），若以 run_day 为基准
+        会把**全部稳态股**误判成缺口（NEW-DEFECT#1/#2 同源根因）。
+
+        数据源：``cache/trade_calendar.csv``（列 date,is_trading；由 run_cron.sh 守卫在
+        query_trade_dates(today) 成功后 append，按日期去重、升序、保留最近 ~500 行；
+        历史段由 TL 一次性回填）。**只读**——数据层永不写该文件。
+
+        回退（保守方向）：文件缺失 / 无 < run_day 的行 → run_day 前一个**日历日**。
+        代价仅是周一早上若日历缺周六/周日行会多触发一次 bootstrap（(周五,周一) 区间
+        无交易日、gap_rows 恒空 + _backfill_noncandidate_gaps 的 tail>=prev_td 防御
+        continue → 0 次 K线请求），无害。
+        """
+        prev_cal = run_day - timedelta(days=1)
+        path = self.cache._path(self._TRADE_CALENDAR_NAME)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return prev_cal  # 文件缺失 → 回退前一个日历日（保守）
+        best: Optional[date] = None
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("stock-screener-cache") or s.startswith("date,"):
+                continue  # 哨兵 / 表头
+            parts = s.split(",")
+            if len(parts) < 2:
+                continue
+            d_s, flag = parts[0].strip(), parts[1].strip()
+            if flag != "1":
+                continue  # 非交易日行不参与"上一交易日"查找
+            try:
+                d = date.fromisoformat(d_s)
+            except ValueError:
+                continue
+            if d < run_day and (best is None or d > best):
+                best = d
+        return best if best is not None else prev_cal
+
     def _scan_cache_tails(self, codes: List[str], run_day: str) -> Tuple[Dict[str, float], Dict[str, str]]:
         """单次遍历读全部 code 的 kline_af3 缓存尾（本地末行字节读，5207 文件 <1s）。
 
@@ -648,6 +695,20 @@ class DataFetcher:
         - 切换日缺口股分两组：候选组 → _populate_cutover_events（回补 + qfq/raw 事件检测）；
           **非候选缺口组** → _backfill_noncandidate_gaps（逐只腾讯 raw K线 append 缺失行，
           消除日期洞）。这是**切换日一次性 bootstrap**（今日 ~1145 只），稳态 0 次。
+
+        fix r5 —— 缺口语义修正（NEW-DEFECT#1/#2 同源根因）：
+        "缺口" = ``tail < 上一交易日``（真正陈旧），而非旧实现的 ``tail < run_day``。
+        v4 生产时序下每个交易日早上全市场 tail==D-1（前一晚 stage2 已 append 到 D-1），
+        检测发生在任何 run-day 行 append **之前** → 旧判定把全部 ~5207 只稳态股误判成
+        缺口，导致 (a) maybe_refresh_adjfactor 的 ``not is_gapped`` 门控对全体候选恒 False
+        → 稳态日 run-day 除权因子全市场静默丢弃（NEW-DEFECT#1）；(b) cutover=True 每天
+        → _backfill_noncandidate_gaps 对全市场逐只发腾讯 K线请求（(D-1,D) 区间无交易日、
+        gap_rows 恒空）→ 每日 +~5207 次请求 + ~17min sleep（NEW-DEFECT#2）。
+        修正后：``tail==D-1`` 是正常稳态——prev_close=close(D-1) 正是当日除权的正确基准，
+        cand.r_event 是真除权比，run-day 因子照常写入；bootstrap 只在真缺口日（如首次
+        v4 切换、BaoStock 停更多日）触发，稳态 0 次。上一交易日取自本地静态日历
+        ``cache/trade_calendar.csv``（守卫维护、数据层只读、零 live BaoStock；文件缺失
+        回退"前一个日历日"——保守方向，周一缺周末行至多多触发一次空转 bootstrap）。
         """
         if self._snapshot is not None:
             return
@@ -680,11 +741,18 @@ class DataFetcher:
         # 全量扫描缓存尾（一次遍历）：检测器输入 + cutover 判定 + 缺口分组共用
         prev_closes, tail_dates = self._scan_cache_tails(codes, run_day)
         self._prev_closes = prev_closes
-        # cutover 判定 = 全量扫描结果（任一 code 尾 != run_day → 有缺口），弃用抽样
-        gapped_codes = [c for c in codes if tail_dates.get(c) and tail_dates[c] < run_day]
+        # cutover 判定 = 全量扫描结果（任一 code **真正陈旧** → 有缺口），弃用抽样。
+        # fix r5：基准从 run_day 改为**上一交易日** prev_td（本地静态日历，_prev_trade_day）。
+        # tail==D-1（prev_td）是正常稳态（前一晚 stage2 已 append 到 D-1，检测先于今日行
+        # append）→ 不判缺口；tail<prev_td 才是真陈旧（BaoStock 停更/首次切换等跨交易日缺口）。
+        # 旧实现 tail<run_day 在稳态日早上把全市场 ~5207 只误判成缺口（NEW-DEFECT#1/#2）。
+        prev_td = self._prev_trade_day(date.fromisoformat(run_day))
+        gapped_codes = [c for c in codes if tail_dates.get(c) and tail_dates[c] < prev_td.isoformat()]
         cutover = bool(gapped_codes)
-        # fix r4：记录检测时缺口股集合（maybe_refresh_adjfactor 判定"稳态 vs 缺口"用——
-        # 生产流程 stage2 已 append run-day 行，事后重读 tail 恒==run_day，必须留此快照）
+        # fix r4（r5 语义修正）：记录检测时缺口股集合（maybe_refresh_adjfactor 判定"稳态 vs
+        # 缺口"用——生产流程 stage2 已 append run-day 行，事后重读 tail 恒==run_day，必须留此快照）。
+        # r5 起 = "真正陈旧股"（tail < prev_td）：稳态候选（tail==D-1）不在集合内 → run-day
+        # 因子照常写入；真缺口股仍只写 gap_events。
         self._cutover_gapped = set(gapped_codes)
 
         self._candidates, det_warnings = self._detector.detect(bars, prev_closes, cutover=cutover)
@@ -738,7 +806,10 @@ class DataFetcher:
           → 截断 + warning（正常切换日 ~1146 只远低于上限；上限防御异常放大）。
         - **请求预算**：一次性成本 = 非候选缺口数（今日 ~1145）+ 候选数，串行、间隔
           ``tencent.kline_interval_s``（默认 0.2s），约 6–10min。这是**切换日一次性 bootstrap**，
-          稳态 0 次。腾讯研究期 ~216 次 + e2e 27 批零限流，1145 次单次运行在其容量内（R1-a）。
+          稳态 0 次（fix r5：稳态判定基准=上一交易日，tail==D-1 不进本方法）。腾讯研究期
+          ~216 次 + e2e 27 批零限流，1145 次单次运行在其容量内（R1-a）。
+        - **fix r5 / NEW-DEFECT#2 防御纵深**：循环内 ``tail_date >= prev_td``（tail 与 run_day
+          之间无交易日）→ 直接 continue、不发 K线请求——即使上游 gapped 判定有遗漏也不空转。
         - **幂等**：kline_af3_append 已按日期去重 → 重复运行不产生重复行。
         """
         ksrc = self._kline_source
@@ -748,6 +819,7 @@ class DataFetcher:
         interval_s = float((self.datasource_cfg.get("tencent", {}) or {}).get("kline_interval_s", 0.2))
         cap = int((self.datasource_cfg.get("exdate_detector", {}) or {})
                   .get("cutover_max_gap_backfill", 3000))
+        prev_td_iso = self._prev_trade_day(date.fromisoformat(run_day)).isoformat()
         truncated = max(0, len(gapped_codes) - cap)
         if truncated:
             log.warning(
@@ -763,6 +835,10 @@ class DataFetcher:
                 if not tail_rows:
                     continue  # 无缓存 → kline_af3_incremental 走 BaoStock 全量回补（不在此处理）
                 tail_date = str(tail_rows[-1][0]).strip()
+                if tail_date >= prev_td_iso:
+                    # fix r5 / NEW-DEFECT#2 防御纵深：tail 与 run_day 之间无交易日 → gap_rows
+                    # 恒空，直接 continue、不发 K线请求（即使上游 gapped 判定有遗漏也不空转）。
+                    continue
                 closes = ksrc.kline_closes(code)  # 最近 N 根 raw (date, close)，升序
                 if not closes:
                     n_failed += 1  # K线取数失败 → 该股跳过（周扫兜底），绝不从陈旧缓存推导
@@ -962,19 +1038,24 @@ class DataFetcher:
         new_factor=old_back×r_event、append adjfactor 行（**零额外请求**，全用已拉快照+缓存）；
         未命中 → 0 查询。hfq 不作因子来源（TL 强制）。primary=baostock → 走下方原事件驱动路径。
 
-        fix r4 / DEFECT#2 —— run-day preclose 事件**仅对稳态候选**写入：
+        fix r4 / DEFECT#2（fix r5 语义修正）—— run-day preclose 事件**仅对稳态候选**写入：
         cand.r_event = close_prevday / preclose_today，其中 prev_close 由 _scan_cache_tails
-        取自缓存尾。**稳态候选**（cutover 检测时 tail==run_day）prev_close=close(D-1) → 真当日
-        除权比 ✓；**缺口股**（tail<run_day）prev_close 是 stale tail（如 close(09-04)），
-        preclose_today=close(D-1) → cand.r_event=close(tail)/close(D-1) 是**多日累计漂移**，
-        不是除权比。无脑写入会：(a) 缺口期无真实除权时凭空造一个 run-day 伪因子（持久污染
-        adjfactor 缓存 → af1 重建从此错）；(b) 缺口期有真实除权（qfq/raw 已在真实 ex_date 记入
-        gap_events）时同一除权被重复计数。故缺口股只写 gap_events，不写 run-day 事件。
-        **不会永久丢失 run-day 当天除权**：若 D 日真有除权且缺口期没有，下一稳态日（tail 已=
-        D-1）会正确捕获（prev_close=close(D-1)、preclose_today 反映 D 日除权）。
+        取自缓存尾。**稳态候选**（cutover 检测时 tail==上一交易日 D-1）prev_close=close(D-1)
+        → 真当日除权比 ✓；**缺口股**（tail<D-1，真正陈旧）prev_close 是 stale tail（如
+        close(09-04)），preclose_today=close(D-1) → cand.r_event=close(tail)/close(D-1) 是
+        **多日累计漂移**，不是除权比。无脑写入会：(a) 缺口期无真实除权时凭空造一个 run-day
+        伪因子（持久污染 adjfactor 缓存 → af1 重建从此错）；(b) 缺口期有真实除权（qfq/raw 已
+        在真实 ex_date 记入 gap_events）时同一除权被重复计数。故缺口股只写 gap_events，不写
+        run-day 事件。**不会永久丢失 run-day 当天除权**：若 D 日真有除权且缺口期没有，下一
+        稳态日（tail 已=D-1）会正确捕获（prev_close=close(D-1)、preclose_today 反映 D 日除权）。
         稳态判定用 cutover **检测时**的缺口集合 self._cutover_gapped（而非当下重读 tail——
         生产流程 stage2 kline_af3_incremental 已把 run-day 行 append 进缓存，maybe_refresh 当下
         重读 tail 恒==run_day，会把缺口股误判成稳态）。
+        **fix r5**：该集合的判定基准从 ``tail<run_day`` 修正为 ``tail<上一交易日``（本地静态
+        日历 _prev_trade_day）——旧基准在 v4 生产时序下把每个稳态日早上全市场 tail==D-1 误判
+        成缺口，使本门控对全体候选恒 False → run-day 除权因子全市场静默丢弃（NEW-DEFECT#1）。
+        修正后稳态候选（tail==D-1）不在集合内 → run-day 因子照常写入；真缺口股（tail<D-1）
+        仍只写 gap_events。
         """
         # ---- v4 腾讯主路径：preclose 检测 + 本地推导（零额外请求）----
         if self._is_tencent_primary():
@@ -985,8 +1066,10 @@ class DataFetcher:
             cand = (self._candidates or {}).get(code)
             # 切换日缺口期多事件回补（brief §6）：该缓存尾 < run_day 的候选，用 qfq/raw
             # 比值检出的缺口期除权事件**逐事件**补因子（每个 r_event 独立、累乘）。
-            # fix r4 / DEFECT#2：稳态判定用 cutover 检测时缺口集合（生产 stage2 已 append
-            # run-day 行，当下重读 tail 恒==run_day，会把缺口股误判成稳态）
+            # fix r4 / DEFECT#2（r5 语义修正）：稳态判定用 cutover 检测时缺口集合（生产 stage2
+            # 已 append run-day 行，当下重读 tail 恒==run_day，会把缺口股误判成稳态）。
+            # r5 起集合 = "真正陈旧"（tail < 上一交易日）：稳态候选（tail==D-1）不在集合内
+            # → run-day 因子照常写入（NEW-DEFECT#1 修复点）。
             is_gapped = code in (self._cutover_gapped or set())
             gap_events = (self._cutover_events or {}).get(code)
             if cand is None and not gap_events:

@@ -10,6 +10,9 @@
 # 守卫退出码 3 = 数据源级失败 → 写 run_status sidecar + 向 cron 报告失败（不静默）
 # fix r4：login + query_trade_dates 加重试（最多 3 次、指数退避 2s/5s）——一次瞬时抖动
 # （如"网络接收错误"）不再直接 exit 3 跳过整个 cron；3 次全失败才走上述 exit 3。
+# fix r5：query_trade_dates 成功后把 (today,is_trading) append 到 cache/trade_calendar.csv
+# （本地静态交易日历，数据层 _prev_trade_day 只读它做"上一交易日"缺口判定，零 live 依赖；
+# 失败/超时不写，下次成功再补）。
 set -euo pipefail
 cd /home/ubuntu/stock-screener || exit 1
 
@@ -19,6 +22,7 @@ GUARD_RC=0
 # 守卫自身也加进程级超时（300s）：半封禁态下 query_trade_dates 可能挂起，
 # 挂起被 timeout 杀掉 → GUARD_RC=124 → 落入 * 分支显式失败（下方补 sidecar）。
 timeout -k 30 300 .venv/bin/python - "$TODAY" <<'PYEOF' || GUARD_RC=$?
+import os
 import sys
 import time
 import baostock as bs
@@ -95,16 +99,51 @@ for attempt in (1, 2, 3):
 if row is None:
     fail(f"baostock 交易日历查询重试 3 次均失败（数据源不可用，无法判定交易日）；最后错误: {last_err}")
 
+
+# fix r5：query_trade_dates **成功**后把 (today, is_trading) 落本地静态交易日历
+# cache/trade_calendar.csv——数据层 fetchers._prev_trade_day 只读该文件做"上一交易日"
+# 缺口判定（零 live BaoStock 依赖）。失败/超时不写（下次成功再补）；写失败不影响守卫
+# 退出码（日历是尽力增强，缺失时数据层回退"前一个日历日"，保守无害）。
+def _record_calendar(today, row):
+    try:
+        path = os.path.join("cache", "trade_calendar.csv")
+        rows = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                for ln in fh.read().splitlines():
+                    s = ln.strip()
+                    if not s or s.startswith("stock-screener-cache") or s.startswith("date,"):
+                        continue
+                    parts = s.split(",")
+                    if len(parts) >= 2 and parts[0].strip():
+                        rows[parts[0].strip()] = parts[1].strip()
+        rows[today] = row[1]                       # 按日期去重（同日重复运行→最新结果覆盖）
+        items = sorted(rows.items())[-500:]        # 升序 + 保留最近 ~500 行（~2 年交易日）
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + f".tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("date,is_trading\n")
+            for d, flag in items:
+                fh.write(f"{d},{flag}\n")
+        os.replace(tmp, path)                      # 原子写（与 DiskCache 同语义）
+    except Exception as e:
+        print(f"[guard] 交易日历写入失败（不影响守卫退出码）: {e}", file=sys.stderr)
+
+
+_record_calendar(today, row)
+
 # 退出码 0 = 交易日；1 = 非交易日（周末/节假日，数据源正常）
 raise SystemExit(0 if row[1] == "1" else 1)
 PYEOF
 
-# 主运行进程级超时上限（秒）。正常 v2 增量日运行约 1–3min；45min 上限足以覆盖
+# 主运行进程级超时上限（秒）。正常 v2 增量日运行约 1–3min；60min 上限足以覆盖
 # 冷启动，又能抓住 BaoStock 半封禁/限流态下"数据查询无限挂起"（baostock 是 ctypes
 # C 库，socket 在原生层，Python setdefaulttimeout 无效 → 只能进程级 timeout）。
 # TL 拍板 2026-09-09：首次切换日 bootstrap（cap=8000 → 全市场 ~5207 只各 1 次腾讯 K线
 # ≈38min + 快照/选股）会逼近 2700s → 临时提到 5400s；稳态日运行 1–3min，切换完成后可回退。
-RUN_TIMEOUT=5400
+# fix r5（TL 拍板 2026-09-09）：稳态日误判 gapped 修复后，稳态日运行 ~1-3min、真缺口日
+# bootstrap ≤~40min → 回退到 3600s（覆盖最坏真切换日，同时比 5400 更早抓住挂死）。
+RUN_TIMEOUT=3600
 
 case "$GUARD_RC" in
   0)
@@ -144,7 +183,7 @@ from screener.data.baostock_client import DataSourceError
 
 today, sc = sys.argv[1], int(sys.argv[2])
 msg = (f"选股运行异常终止 exit={sc}"
-       + ("（超过 45min 超时上限，疑似 BaoStock 数据查询挂起/半封禁态）" if sc == 124
+       + ("（超过 60min 超时上限，疑似 BaoStock 数据查询挂起/半封禁态）" if sc == 124
           else "（非零退出，详见 logs/）"))
 runstatus.write_failed_sidecar("output", today, today, DataSourceError(msg))
 print(f"[cron] 已补写失败 sidecar: {msg}", file=sys.stderr)
