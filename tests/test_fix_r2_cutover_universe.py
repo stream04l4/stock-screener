@@ -61,9 +61,10 @@ def test_noncandidate_gap_backfill_appends_missing_rows(tmp_path):
 
     dates = [r[0] for r in f.cache.get("kline_af3_sh.600001")["rows"]]
     assert "2026-09-07" in dates          # 缺口行已回补（消除日期洞）
-    # 回补行口径：[d, code, close:.4f, "0", "0"]（isST/tradestatus 占位 0）
+    # 回补行口径（fix r4 / DEFECT#1）：[d, code, close:.4f, "0", "1"]——tradestatus="1"
+    # （腾讯 raw K线有行⟺当日实际交易，停牌日无行）；isST 占位 "0"（M2）
     row = {r[0]: r for r in f.cache.get("kline_af3_sh.600001")["rows"]}["2026-09-07"]
-    assert row == ["2026-09-07", "sh.600001", "10.2000", "0", "0"]
+    assert row == ["2026-09-07", "sh.600001", "10.2000", "0", "1"]
     # 非候选 → 无除权事件（_cutover_events 空）
     assert f._cutover_events == {}
 

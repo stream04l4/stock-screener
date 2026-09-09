@@ -7,7 +7,9 @@
 # 跳过"（exit 0），静默吞掉数据源级失败。现在区分三种结果：
 #   守卫退出码 0 = 交易日 → 继续选股
 #   守卫退出码 1 = 非交易日（数据源正常）→ 跳过
-#   守卫退出码 3 = 数据源级失败 → 写 run_status sidecar + 向 cron 报告失败（不静默）
+# 守卫退出码 3 = 数据源级失败 → 写 run_status sidecar + 向 cron 报告失败（不静默）
+# fix r4：login + query_trade_dates 加重试（最多 3 次、指数退避 2s/5s）——一次瞬时抖动
+# （如"网络接收错误"）不再直接 exit 3 跳过整个 cron；3 次全失败才走上述 exit 3。
 set -euo pipefail
 cd /home/ubuntu/stock-screener || exit 1
 
@@ -18,6 +20,7 @@ GUARD_RC=0
 # 挂起被 timeout 杀掉 → GUARD_RC=124 → 落入 * 分支显式失败（下方补 sidecar）。
 timeout -k 30 300 .venv/bin/python - "$TODAY" <<'PYEOF' || GUARD_RC=$?
 import sys
+import time
 import baostock as bs
 
 today = sys.argv[1]
@@ -44,25 +47,56 @@ def fail(msg):
     raise SystemExit(3)
 
 
-lg = bs.login()
-if lg.error_code != "0":
-    fail(f"baostock login 失败: {lg.error_msg}（数据源不可用，无法判定交易日）")
+# fix r4：login + query_trade_dates 加**重试**（最多 3 次、指数退避 2s/5s）——今天 09:35
+# cron 死在守卫的 login 瞬时抖动（"网络接收错误"），旧实现一次抖动就 exit 3 跳过整个
+# cron。任一次成功即用；3 次全失败才走 fail()（exit 3 + sidecar）。
+# baostock 是 ctypes C 库，单次调用挂起无法进程内超时——重试循环总时长受外层
+# `timeout -k 30 300`（父级进程级）约束：某次 login/query 挂起 → 被 timeout 杀掉 →
+# 整个守卫 exit 124 → run_cron.sh * 分支补 sidecar（现有语义不变）。
+def _query_trade_row():
+    """login + query_trade_dates(today) 一次尝试。
 
-rs = bs.query_trade_dates(start_date=today, end_date=today)
+    :return: (ok, row_or_errmsg)。ok=True → row=[calendar_date, is_trading_day]；
+             ok=False → errmsg（失败原因，供重试日志/最终 fail）。
+    """
+    lg = bs.login()
+    if lg.error_code != "0":
+        return False, f"baostock login 失败: {lg.error_msg}"
+    try:
+        rs = bs.query_trade_dates(start_date=today, end_date=today)
+        if rs.error_code != "0":
+            return False, f"query_trade_dates 失败: error_code={rs.error_code} {rs.error_msg}"
+        row = None
+        while rs.next():
+            row = rs.get_row_data()
+        if row is None:
+            return False, "query_trade_dates 成功但无返回行（今日不在日历范围？）"
+        return True, row
+    finally:
+        # 无论成败都 logout：失败重试时若会话仍开着，bs.login() 重入行为未定义
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
 row = None
-if rs.error_code != "0":
-    fail(f"query_trade_dates 失败: error_code={rs.error_code} {rs.error_msg}")
-else:
-    while rs.next():
-        row = rs.get_row_data()
+last_err = ""
+for attempt in (1, 2, 3):
+    ok, val = _query_trade_row()
+    if ok:
+        row = val
+        break
+    last_err = val
+    print(f"[guard] 第 {attempt}/3 次尝试失败: {val}", file=sys.stderr)
+    if attempt < 3:
+        time.sleep(2 * (2 ** (attempt - 1)))   # 指数退避：2s、5s
 
-try:
-    bs.logout()
-except Exception:
-    pass
+if row is None:
+    fail(f"baostock 交易日历查询重试 3 次均失败（数据源不可用，无法判定交易日）；最后错误: {last_err}")
 
 # 退出码 0 = 交易日；1 = 非交易日（周末/节假日，数据源正常）
-raise SystemExit(0 if row and row[1] == "1" else 1)
+raise SystemExit(0 if row[1] == "1" else 1)
 PYEOF
 
 # 主运行进程级超时上限（秒）。正常 v2 增量日运行约 1–3min；45min 上限足以覆盖
