@@ -101,7 +101,7 @@ datasource:                         # v4 数据源架构（报告 R3 + TL 修正
     factor_sanity_cap_pct: 30         # sanity 上界：|r_event-1|>30% 不写入、记告警（防异常昨收污染）
     max_candidates_per_day: 200       # 日常防御：候选数超此值截断+告警
     cutover_max_candidates: 300       # 切换日 bootstrap 截断（跨多日缺口放大误报，TL D3）
-    cutover_max_gap_backfill: 3000    # 切换日非候选缺口回补上限（防御异常；正常切换日 ~1146 只远低于此）
+    cutover_max_gap_backfill: 8000   # 切换日非候选缺口回补上限（TL 拍板 2026-09-09：全市场 ~5215 只一次性 bootstrap 需全覆盖；池序下真缺口股可能全部位于前 3000 之外，3000 会 100% 截断 → 提到 >全市场规模，仅防御异常放大）
   universe:                         # 股票池/行业 BaoStock 依赖降级（半封禁态陈旧回退，fix round 2）
     stale_max_days: 7               # all_stock 当日缓存 miss 时，可用 ≤N 天前的最近 allstock_*.csv 作陈旧池
   factor_reconcile:                 # C 兜底：BaoStock 低频对账（本期默认关，TL D3）
