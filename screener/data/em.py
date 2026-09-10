@@ -235,12 +235,15 @@ class EMClient:
         sort_columns: str = "",
         sort_types: str = "1",
         checkpoint_path: Optional[str] = None,
+        busy_budget_s: float = 1800.0,
     ) -> Tuple[List[Dict[str, Any]], int]:
         """串行分页取全表。契约监控：累计行数必须 == count，否则 fail-fast（不写缓存）。
 
         :param checkpoint_path: 可选的**逐页持久检查点**（JSONL，每行一页 ``{"page","count","rows"}``）。
             长全表拉取（~100+ 页）中途被限流/中断时，重跑从最后完整页续取——不丢已取页、
             不整表重拉（整表重拉会再次撞限流窗口）。成功完成后自动删除检查点文件。
+        :param busy_budget_s: "服务器繁忙"累计等待预算（秒）。全表级取数用长预算(1800s)；
+            逐只取数用短预算(60s) fail-fast → 调用方降级代理（TL D6，避免 N 只候选挂起数小时）。
         """
         all_rows: List[Dict[str, Any]] = []
         count = -1
@@ -257,7 +260,8 @@ class EMClient:
                          report_name, last_page, len(all_rows), count, page)
 
         while True:
-            rows, c = self.get_page(report_name, columns, page, filter_expr, sort_columns, sort_types)
+            rows, c = self.get_page(report_name, columns, page, filter_expr, sort_columns,
+                                    sort_types, busy_budget_s=busy_budget_s)
             if count < 0:
                 count = c
             all_rows.extend(rows)
@@ -576,12 +580,18 @@ def _row_to_holder(r: Sequence[Any]) -> Dict[str, Any]:
 CASHFLOW_COLUMNS = ("code", "report_date", "notice_date", "date_type_code", "netcash_operate", "construct_long_asset")
 
 
-def fetch_cashflow(client: EMClient, code6: str, cache_dir: str) -> List[Dict[str, Any]]:
+def fetch_cashflow(client: EMClient, code6: str, cache_dir: str, busy_budget_s: float = 60.0) -> List[Dict[str, Any]]:
     """候选股 OCF/capex 逐只 → ``em_cashflow_{code}.csv``（幂等；单页足够，~84 期）。
 
     字段：NETCASH_OPERATE（经营现金流净额）+ CONSTRUCT_LONG_ASSET（购建固定资产等
     支付的现金=capex），绝对额（元）。年度行 = REPORT_DATE 以 -12-31 结尾且
     DATE_TYPE_CODE=001（实测口径）。PIT：调用方按 NOTICE_DATE <= run_day 取报告期。
+
+    ⚠️限流策略与全表拉取不同：**短预算 fail-fast**（busy_budget_s，默认 60s）——
+    逐只取数是 N 次独立请求，若每只在"服务器繁忙"时都 patient-wait 30min，N 只候选会
+    挂起数小时。TL D6：接口失败才降级代理 cfo_to_np/payout → 限流即抛 EMDataError，
+    调用方 catch 后对该股用代理值（不阻塞、不静默）。全表级取数（分红/股东/国债）
+    才用长预算+检查点续取。
 
     :param code6: 6 位证券代码（如 "601398"）
     """
@@ -596,6 +606,7 @@ def fetch_cashflow(client: EMClient, code6: str, cache_dir: str) -> List[Dict[st
         "SECURITY_CODE,REPORT_DATE,NOTICE_DATE,DATE_TYPE_CODE,NETCASH_OPERATE,CONSTRUCT_LONG_ASSET",
         filter_expr=f'(SECURITY_CODE="{code6}")',
         sort_columns="REPORT_DATE", sort_types="-1",
+        busy_budget_s=busy_budget_s,  # 逐只短预算：限流即 fail-fast → 调用方降级代理（TL D6）
     )
     rows = []
     for r in raw:

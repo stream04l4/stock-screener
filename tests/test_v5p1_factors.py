@@ -387,7 +387,7 @@ class _FakeEMClient(emmod.EMClient):
         self.busy_from_page = busy_from_page      # >=该页抛 EMDataError(服务器繁忙)
         self.calls = []
 
-    def get_page(self, report_name, columns, page, filter_expr=None, sort_columns="", sort_types="1"):
+    def get_page(self, report_name, columns, page, filter_expr=None, sort_columns="", sort_types="1", busy_budget_s=1800.0):
         self.calls.append(page)
         if self.busy_from_page and page >= self.busy_from_page:
             raise emmod.EMDataError("东财 %s page=%d 重试 3 次均失败: 服务器繁忙" % (report_name, page))
