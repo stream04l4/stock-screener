@@ -55,6 +55,15 @@ CSV_COLUMNS = [
     # --- legacy 兼容列（v1 四维AND语义；zscore 模式下按旧硬规则对照评估） ---
     "pass_technical", "pass_dividend", "pass_industry", "pass_fundamental",
     "pass_all",
+    # --- v5（TL D1/D3/D8；v4 模式/配置下为空，零回归） ---
+    "soe_flag",                    # 央国企标记 soe / soe_confirmed（空=非SOE或v4）
+    "total_mv_yi",                 # 总市值（亿元，腾讯快照 idx45）
+    "consecutive_div_years",       # 连续分红年数（TL D1；从 run_year-1 向前数）
+    "fcf_coverage",                # FCF 分红覆盖倍数（TL D6 真值/代理）
+    "div_stability_cv",            # 近5年 DPS 变异系数（越低越稳）
+    "reinvest_ref_price_4pct",     # 再投资参考价 = 年度DPS / 目标TTM股息率(4%)（TL D8）
+    "ttm_yield_pctile",            # 当前 TTM 股息率历史分位（0-100，TL D8）
+    "yield_spread_pct",            # TTM 股息率 − 10Y国债（百分点，TL D4）
     # --- v1 补充指标（复核用，legacy 模式填充） ---
     "ma", "cash_per_share", "dividend_yield_pct", "yoy_net_profit_pct",
     "industry_rank", "industry_percentile", "industry_group_size",
@@ -63,16 +72,17 @@ CSV_COLUMNS = [
 _BOOL_COLS = {"pass_technical", "pass_dividend", "pass_industry",
               "pass_fundamental", "pass_all"}
 _INT_COLS = {"ma_bullish", "macd_golden_cross", "piotroski_fscore", "piotroski_valid",
-             "rank", "top_n_selected", "industry_rank", "industry_group_size"}
+             "rank", "top_n_selected", "industry_rank", "industry_group_size",
+             "consecutive_div_years"}
 _F3_COLS = {"close", "rsi14", "ttm_dividend_yield_pct", "cash_per_share",
-            "dividend_yield_pct"}
+            "dividend_yield_pct", "reinvest_ref_price_4pct", "yield_spread_pct"}
 _F2_COLS = {"window_return_pct", "annual_vol_pct", "payout_ratio_pct",
             "industry_roe_rank_pct", "industry_yoy_pni_rank_pct", "roe_pct",
             "roe_3y_mean_pct", "roe_3y_std_pct", "liability_pct", "gross_margin_pct",
-            "yoy_net_profit_pct", "industry_percentile"}
+            "yoy_net_profit_pct", "industry_percentile", "total_mv_yi", "ttm_yield_pctile"}
 _F4_COLS = {"z_technical", "z_dividend", "z_industry", "z_fundamental",
             "score_technical", "score_dividend", "score_industry",
-            "score_fundamental", "total_score", "ma"}
+            "score_fundamental", "total_score", "ma", "fcf_coverage", "div_stability_cv"}
 
 
 def _fmt(v: Any, nd: int = 2) -> str:
@@ -236,22 +246,57 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
         ap("**无候选股票。**")
     else:
         sel = cands[cands["top_n_selected"].astype(str).isin(["1", "True"])]
+        v5_cols = ("soe_flag" in cands.columns) and (cands["soe_flag"].notna().any())
         ap(f"共 **{len(sel)}** 只（按 total_score 降序）：")
         ap("")
-        ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "
-           "综合得分 | TTM股息率% | ROE% | F-Score |")
-        ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for _, r in sel.iterrows():
-            fs = f"{_fmt(r['piotroski_fscore'], 0)}/{_fmt(r['piotroski_valid'], 0)}" \
-                if pd.notna(r.get("piotroski_fscore")) else "—"
-            ap(
-                f"| {r['rank']} | {r['code']} | {r['name']} | {r['industry']} "
-                f"| {_fmt(r['close'], 3)} | {_fmt(r['score_technical'])} | {_fmt(r['score_dividend'])} "
-                f"| {_fmt(r['score_industry'])} | {_fmt(r['score_fundamental'])} "
-                f"| **{_fmt(r['total_score'], 4)}** | {_fmt(r['ttm_dividend_yield_pct'], 3)} "
-                f"| {_fmt(r['roe_pct'])} | {fs} |"
-            )
+        if v5_cols:
+            # v5（TL D1/D3/D8）：榜单追加 SOE/市值/连续分红/再投资参考列
+            ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "
+               "综合得分 | TTM股息率% | ROE% | F-Score | SOE | 市值(亿) | 连续分红年 | 再投资参考价 | TTM分位% |")
+            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|")
+            for _, r in sel.iterrows():
+                fs = f"{_fmt(r['piotroski_fscore'], 0)}/{_fmt(r['piotroski_valid'], 0)}" \
+                    if pd.notna(r.get("piotroski_fscore")) else "—"
+                ap(
+                    f"| {r['rank']} | {r['code']} | {r['name']} | {r['industry']} "
+                    f"| {_fmt(r['close'], 3)} | {_fmt(r['score_technical'])} | {_fmt(r['score_dividend'])} "
+                    f"| {_fmt(r['score_industry'])} | {_fmt(r['score_fundamental'])} "
+                    f"| **{_fmt(r['total_score'], 4)}** | {_fmt(r['ttm_dividend_yield_pct'], 3)} "
+                    f"| {_fmt(r['roe_pct'])} | {fs} | {_fmt(r.get('soe_flag'))} | {_fmt(r.get('total_mv_yi'))} "
+                    f"| {_fmt(r.get('consecutive_div_years'), 0)} | {_fmt(r.get('reinvest_ref_price_4pct'), 2)} "
+                    f"| {_fmt(r.get('ttm_yield_pctile'))} |"
+                )
+        else:
+            ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "
+               "综合得分 | TTM股息率% | ROE% | F-Score |")
+            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            for _, r in sel.iterrows():
+                fs = f"{_fmt(r['piotroski_fscore'], 0)}/{_fmt(r['piotroski_valid'], 0)}" \
+                    if pd.notna(r.get("piotroski_fscore")) else "—"
+                ap(
+                    f"| {r['rank']} | {r['code']} | {r['name']} | {r['industry']} "
+                    f"| {_fmt(r['close'], 3)} | {_fmt(r['score_technical'])} | {_fmt(r['score_dividend'])} "
+                    f"| {_fmt(r['score_industry'])} | {_fmt(r['score_fundamental'])} "
+                    f"| **{_fmt(r['total_score'], 4)}** | {_fmt(r['ttm_dividend_yield_pct'], 3)} "
+                    f"| {_fmt(r['roe_pct'])} | {fs} |"
+                )
     ap("")
+
+    # ---------- 二-bis. v5 央国企复核清单（TL D3：仅 IS_SJKZR=1 未命中关键词）----------
+    sjkzr_list = getattr(result, "sjkzr_review_list", None) or []
+    if sjkzr_list:
+        ap(f"## 二-bis、央国企复核清单（仅 IS_SJKZR=1 未命中关键词，{len(sjkzr_list)} 只，供人工复核）")
+        ap("")
+        ap("> 规则（TL D3）：前十大股东名称命中关键词 → soe；IS_SJKZR=1 且命中 → soe_confirmed；"
+           "**仅** IS_SJKZR=1 未命中关键词 → 不判 soe、单列于此。")
+        ap("")
+        ap("| 代码 | 名称 |")
+        ap("|---|---|")
+        for m in sjkzr_list[:200]:
+            ap(f"| {m['code']} | {m.get('name', '')} |")
+        if len(sjkzr_list) > 200:
+            ap(f"| … | 其余 {len(sjkzr_list) - 200} 只略 |")
+        ap("")
 
     # ---------- 三、四维得分分解 ----------
     ap("## 三、四维得分分解")
@@ -301,6 +346,26 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
             ap(
                 f"| {c['code']} | {c['name']} | {_fmt(c['bs_close'], 3)} "
                 f"| {_fmt(c['tencent_price'], 3)} | {_fmt(c['diff_pct'], 3)} | {ok} |"
+            )
+        ap("")
+
+    # ---------- v5 ttm_yield 交叉验证（TL D8/验收④：vs 腾讯 idx64）----------
+    if getattr(result, "ttm_crosscheck", None):
+        tol = float((cfg.get("crosscheck") or {}).get("ttm_tolerance_pct", 0.1))
+        n_ok = sum(1 for c in result.ttm_crosscheck if c["ok"])
+        ap(f"## v5 TTM股息率交叉验证（自算 vs 腾讯idx64，抽样 {len(result.ttm_crosscheck)} 只，容忍 ≤{tol}pct）")
+        ap("")
+        ap("> 口径：我方=窗口内已除权分红和÷运行日af3收盘（PIT）；腾讯idx64=实时价口径。差异含当日价格波动。")
+        ap("")
+        ap(f"**{n_ok}/{len(result.ttm_crosscheck)} 只偏差 ≤{tol}pct。**")
+        ap("")
+        ap("| 代码 | 名称 | 自算TTM% | 腾讯idx64% | 偏差pct | 通过 |")
+        ap("|---|---|---:|---:|---:|---|")
+        for c in result.ttm_crosscheck:
+            ok = "✓" if c["ok"] else "✗"
+            ap(
+                f"| {c['code']} | {c['name']} | {_fmt(c['ours_pct'], 3)} "
+                f"| {_fmt(c['tencent_pct'], 3)} | {_fmt(c['diff_pct'], 3)} | {ok} |"
             )
         ap("")
 

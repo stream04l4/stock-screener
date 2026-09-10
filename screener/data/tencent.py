@@ -35,6 +35,9 @@ IDX_PE_TTM = 39
 IDX_FLOAT_MV = 44   # 亿元
 IDX_TOTAL_MV = 45   # 亿元
 IDX_PB = 46
+# v5（TL D8/验收④）：idx64 = TTM 股息率%（researcher probe11 双股验证：
+# 601398=3.83%、000001=5.03%，与东财分红数据手工计算一致）→ ttm_yield 交叉校验源。
+IDX_TTM_YIELD_PCT = 64
 
 
 def bs_code_to_tencent(code: str) -> str:
@@ -113,5 +116,6 @@ class TencentClient:
                 "float_mv_yi": _f(IDX_FLOAT_MV),
                 "total_mv_yi": _f(IDX_TOTAL_MV),
                 "pb": _f(IDX_PB),
+                "ttm_yield_pct": _f(IDX_TTM_YIELD_PCT),  # v5：TTM股息率%（idx64，短行→None）
             }
         return out

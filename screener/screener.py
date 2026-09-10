@@ -19,10 +19,11 @@ v2 架构（调研报告 R1/R4 + TL 拍板）：
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -36,21 +37,32 @@ from .metrics import (
     IndustryResult,
     PiotroskiResult,
     TechnicalResult,
+    annual_dps_from_em,
     build_industry_groups,
     compute_dividend_yield,
     compute_fundamental,
     compute_industry_rank,
     compute_macd,
     compute_technical,
+    consecutive_div_years,
     dedup_dividends,
+    dividend_yield_percentile,
+    div_stability_cv,
+    em_dividend_records,
+    fcf_coverage,
+    fcf_coverage_proxy,
     industry_pass,
+    is_sjkzr_only,
     macd_golden_cross,
+    new_stock_div_ok,
     payout_ratio,
     piotroski_fscore,
     rank_percentile,
     roe_stability,
     rsi_wilder,
+    soe_flag,
     ttm_dividend_yield,
+    yield_spread,
 )
 from .reconstruct import moving_average, rebuild_kline_series
 from .scoring import DIMENSIONS, ScoredStock, dimension_means, score_cross_section
@@ -102,6 +114,15 @@ class ScreenResult:
 
     # 交叉验证（腾讯）
     crosscheck: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ---- v5（TL D1/D3/D8，报告层消费；v4 路径保持空，零回归）----
+    soe_flag_map: Dict[str, Optional[str]] = field(default_factory=dict)   # code → soe/soe_confirmed/None
+    sjkzr_review_list: List[Dict[str, str]] = field(default_factory=list)  # "仅 IS_SJKZR" 人工复核清单 [{code,name}]
+    reinvest_cols: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
+    # code → {ref_price_4pct(DPS/4%), ttm_yield_pctile(0-100), ttm_yield_pctile_n(样本年数)}
+    ttm_crosscheck: List[Dict[str, Any]] = field(default_factory=list)     # ttm_yield vs 腾讯 idx64 抽样 [{code, ours, tencent, diff_pct, ok}]
+    holders_end_date: str = ""                                              # 前十大股东报告期（展示用）
+    total_mv_yi_map: Dict[str, float] = field(default_factory=dict)        # code → 总市值(亿元)（v5 市值过滤时填充）
 
     # 耗时与请求统计
     elapsed_seconds: float = 0.0
@@ -320,6 +341,16 @@ def run_screener(
         if "updateDate" in ind_df.columns and len(ind_df):
             result.industry_update_date = str(ind_df["updateDate"].iloc[0])
 
+        # ---------- 3b. v5 硬过滤（TL D1/D2/D3；config 未启用时原样返回，v4 零回归） ----------
+        set_div_fetcher(fetcher)  # _div_history_ok 读 kline_af3 首行（IPO 年）用
+        hard_pass = _v5_hard_filter(
+            cfg, fetcher, result, hard_pass, name_by_code, industry_map_all,
+            uc, hfc, datac, run_day,
+        )
+        if not hard_pass:
+            log.warning("v5 硬过滤后无候选，输出空结果")
+            raise _NoCandidates()
+
         # ---------- 4. 报告期 ----------
         period = _probe_latest_period(fetcher, run_day, fc["probe_quarters_back"])
         if period is None:
@@ -376,6 +407,180 @@ def _final_count(result: ScreenResult) -> int:
         return int(result.candidates["pass_all"].sum())
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _kline_first_date(fetcher: DataFetcher, code: str) -> Optional[str]:
+    """kline_af3 缓存**首行**日期（IPO 年代理；头部字节读，不加载全历史）。"""
+    path = fetcher.cache._path(fetcher._kline_af3_key(code))
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for ln in head.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("stock-screener-cache") or s.startswith("date,"):
+            continue  # 哨兵 / 表头
+        d = s.split(",")[0].strip()
+        return d[:10] if len(d) >= 10 else None
+    return None
+
+
+def _v5_hard_filter(
+    cfg: Dict[str, Any], fetcher: DataFetcher, result: ScreenResult,
+    hard_pass: List[str], name_by_code: Dict[str, str], industry_map_all: Dict[str, str],
+    uc: Dict[str, Any], hfc: Dict[str, Any], datac: Dict[str, Any], run_day: date,
+) -> List[str]:
+    """v5 硬过滤（TL D1/D2/D3，brief §4）：行业白名单 + SOE + 市值≥N亿 + 连续分红(D1)。
+
+    **v4 零回归**：config 未启用任何 v5 键（soe_required=False、白名单空、
+    min_total_mv_yi=None、min_consecutive_div_years=None）→ 原样返回，零 EM 请求。
+
+    管线顺序（brief §"运行管线顺序"）：universe → 行业白名单 + SOE + 市值 + 连续分红
+    → （候选股 OCF/capex 取数在 _run_zscore 内、打分前执行）。
+    PIT：分红事件锚 ex_date<=run_day；股东表 NOTICE_DATE<=run_day。
+    """
+    min_years = hfc.get("min_consecutive_div_years")
+    whitelist = uc.get("industry_whitelist_csric2") or []
+    min_mv = uc.get("min_total_mv_yi")
+    soe_required = bool(uc.get("soe_required"))
+    if not (soe_required or whitelist or min_mv is not None or min_years is not None):
+        return hard_pass  # v4 行为（零回归）
+
+    from .data import em as emmod
+    emc = cfgmod.em_cfg(cfg)
+    emmod.set_cgb10y_sanity(*emc["cgb10y_sanity_pct"])
+    keywords = cfgmod.soe_keywords_cfg(cfg)
+    em_client = emmod.EMClient(emc)
+    cache_dir = datac["cache_dir"]
+    run_day_s = run_day.isoformat()
+    run_year = run_day.year
+
+    # ---- 1. 东财分红全表（独立缓存键；幂等）→ 按 code6 分组 ----
+    div_rows, _meta = emmod.fetch_dividend_all(em_client, cache_dir)
+    div_by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for r in div_rows:
+        div_by_code.setdefault(r["code"], []).append(r)
+
+    # ---- 两次全表级取数之间的静默期（防 EM 滑动窗口限流）----
+    # 实测：一次 ~100+ 页全表拉取后，紧随的第二次全表拉取即使带冷却也在第 ~100 页撞墙
+    # （EM "服务器繁忙"窗口比单次退避长得多）。仅当**本次运行刚做完一次全表拉取**
+    # （source=fetched，非缓存命中）时才需要静默；日常增量（各命中缓存/1 页）无此成本。
+    if _meta.get("source") == "fetched":
+        gap_s = float(emc.get("full_table_gap_seconds", 600))
+        if gap_s > 0:
+            log.info("v5: 分红全表刚完成拉取 → 静默 %.0fs 再取股东表（防 EM 限流窗口）", gap_s)
+            time.sleep(gap_s)
+
+    # ---- 2. 前十大股东（最新报告期自动探测；PIT NOTICE_DATE<=run_day）----
+    end_date = emmod.detect_holders_end_date(em_client, run_day_s, min_rows=50000)
+    result.holders_end_date = end_date
+    holders_rows = emmod.fetch_holders_top10(em_client, end_date, cache_dir)
+    holders_by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for h in holders_rows:
+        if str(h.get("notice_date") or "") and str(h["notice_date"]) > run_day_s:
+            continue  # PIT：运行日未披露的报告期不可见
+        holders_by_code.setdefault(h["code"], []).append(h)
+
+    # ---- 3. SOE 标记（全体候选，供报告列 + 复核清单；TL D3）----
+    for c in hard_pass:
+        hs = holders_by_code.get(c.split(".")[1], [])
+        result.soe_flag_map[c] = soe_flag(hs, keywords)
+        if is_sjkzr_only(hs, keywords):
+            result.sjkzr_review_list.append({"code": c, "name": name_by_code.get(c, "")})
+
+    def _industry_code(ind: str) -> str:
+        m = re.match(r"^([A-Z]\d{2})", (ind or "").strip())
+        return m.group(1) if m else ""
+
+    # ---- 4. 逐层过滤（漏斗计数）----
+    kept = list(hard_pass)
+    n0 = len(kept)
+    if whitelist:
+        wl = set(whitelist)
+        kept = [c for c in kept if _industry_code(industry_map_all.get(c, "")) in wl]
+        result.funnel["L2b_行业白名单"] = len(kept)
+    if soe_required:
+        kept = [c for c in kept if result.soe_flag_map.get(c) is not None]
+        result.funnel["L2c_SOE央国企"] = len(kept)
+    if min_mv is not None:
+        kept, mv_map = _filter_min_market_cap(cfg, kept, min_mv)
+        result.total_mv_yi_map = mv_map
+        result.funnel["L2d_市值下限"] = len(kept)
+    if min_years is not None:
+        kept = [c for c in kept if _div_history_ok(c, div_by_code.get(c.split(".")[1], []),
+                                                    run_day_s, run_year, min_years)]
+        result.funnel["L2e_连续分红D1"] = len(kept)
+
+    log.info(
+        "v5硬过滤: %d → 白名单%d → SOE%d → 市值%d → 连续分红%d（holders报告期=%s，EM请求%d次）",
+        n0, result.funnel.get("L2b_行业白名单", n0), result.funnel.get("L2c_SOE央国企", n0),
+        result.funnel.get("L2d_市值下限", n0), len(kept), end_date, em_client.request_count,
+    )
+    return kept
+
+
+def _filter_min_market_cap(cfg: Dict[str, Any], codes: List[str], min_mv_yi: float) -> Tuple[List[str], Dict[str, float]]:
+    """总市值 ≥ min_mv_yi（腾讯快照 idx45，现有批量通道 tencent.py）。
+
+    快照缺失/未返回的 code → 剔除（保守：无市值证据不通过硬门槛）+ 告警。
+    :return: (kept, mv_map)——mv_map 覆盖全部请求 codes 的总市值（亿元），供报告列。
+    """
+    from .data.tencent import TencentClient
+    tc = cfg.get("datasource", {}).get("tencent", {}) or {}
+    batch = int(tc.get("snapshot_batch_size", 200))
+    client = TencentClient(
+        timeout=float(tc.get("timeout_s", 15)), max_attempts=int(tc.get("max_attempts", 3)),
+    )
+    quotes = client.fetch(codes, batch_size=batch)
+    kept: List[str] = []
+    mv_map: Dict[str, float] = {}
+    n_missing = 0
+    for c in codes:
+        q = quotes.get(c)
+        mv = (q or {}).get("total_mv_yi")
+        if mv is None:
+            n_missing += 1
+            continue
+        mv_map[c] = float(mv)
+        if mv >= min_mv_yi:
+            kept.append(c)
+    if n_missing:
+        log.warning("v5市值过滤: %d 只腾讯快照缺失/无总市值 → 剔除（保守方向）", n_missing)
+    return kept, mv_map
+
+
+def _div_history_ok(
+    code: str, div_rows: List[Dict[str, Any]], run_day_s: str, run_year: int, min_years: int
+) -> bool:
+    """TL D1 连续分红判定（新股规则精确化）。
+
+    - IPO 满 7 年（run_year - ipo_year >= 7）→ consecutive_div_years >= min_years；
+    - IPO 不满 7 年 → new_stock_div_ok（IPO 年份之后每个完整年度都有分红，
+      IPO 当年不要求——上市不足整年）。
+    IPO 年 = kline_af3 缓存首行日期年份（全史K线自 IPO 起，v2 稳定键保证）。
+    """
+    if _DIV_FETCHER is None:
+        return False  # 未注入 fetcher（不应发生）→ 保守剔除
+    first = _kline_first_date(_DIV_FETCHER, code)
+    if not first:
+        return False  # 无K线缓存 → 无法判定 IPO 年（保守剔除；正常不会发生：已过上市天数硬过滤）
+    ipo_year = int(first[:4])
+    annual = annual_dps_from_em(div_rows, code.split(".")[1], run_day_s)
+    if run_year - ipo_year >= 7:
+        n = consecutive_div_years(annual, run_year)
+        return n is not None and n >= min_years
+    return new_stock_div_ok(annual, ipo_year, run_year)
+
+
+# _DIV_FETCHER：_div_history_ok 需要读 kline_af3 首行（模块级注入，避免参数穿透）
+_DIV_FETCHER: Optional[DataFetcher] = None
+
+
+def set_div_fetcher(fetcher: DataFetcher) -> None:
+    """由 run_screener 在 v5 硬过滤前注入（_div_history_ok 读 IPO 年用）。"""
+    global _DIV_FETCHER
+    _DIV_FETCHER = fetcher
 
 
 # ===========================================================================
@@ -592,6 +797,58 @@ def _run_zscore(
         ind: len(g) for ind, g in groups.items() if len(g) < ic["min_group_size"]
     }
 
+    # ---- v5 数据准备（TL D1/D4/D6/D8；config 未启用 → 全部 None，走 v4 分红路径）----
+    from .data import em as emmod
+    uc5 = cfgmod.universe_cfg(cfg)
+    hf5 = cfgmod.hard_filter_cfg(cfg)
+    v5_on = bool(
+        uc5.get("soe_required") or uc5.get("industry_whitelist_csric2")
+        or uc5.get("min_total_mv_yi") is not None
+        or hf5.get("min_consecutive_div_years") is not None
+    )
+    em_div_records: Dict[str, List[Dict[str, Any]]] = {}
+    annual_dps_map: Dict[str, Dict[int, float]] = {}
+    rf_10y: Optional[float] = None
+    cf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}  # D6：code → 最近已披露年报年度 OCF/capex
+    code6_to_bs: Dict[str, str] = {c.split(".")[1]: c for c in hard_pass}
+    if v5_on:
+        emc = cfgmod.em_cfg(cfg)
+        emmod.set_cgb10y_sanity(*emc["cgb10y_sanity_pct"])
+        em_client = emmod.EMClient(emc)
+        cache_dir = cfg["data"]["cache_dir"]
+        run_day_s = run_day.isoformat()
+        # 分红全表（硬过滤阶段已拉过 → 此处命中缓存，0 请求）
+        div_rows_all, _m = emmod.fetch_dividend_all(em_client, cache_dir)
+        for r in div_rows_all:
+            em_div_records.setdefault(r["code"], []).append(r)
+        # 10Y 国债：增量 1 页（每日运行成本 ~1 请求）→ PIT as-of run_day
+        emmod.fetch_cgb10y(em_client, cache_dir)
+        rf_10y = emmod.load_cgb10y_asof(cache_dir, run_day_s)
+        # 逐年 DPS（D1/D5 因子输入；PIT ex_date<=run_day）
+        for c in hard_pass:
+            annual_dps_map[c] = annual_dps_from_em(
+                em_div_records.get(c.split(".")[1], []), c.split(".")[1], run_day_s
+            )
+        # ---- D6：候选股 OCF/capex 逐只取数（硬过滤后、打分前；~300-500 只 ≈ 3min）----
+        log.info("阶段4b(v5): 候选股 %d 只 OCF/capex 逐只取数（东财 RPT_DMSK_FN_CASHFLOW，串行限速）...",
+                 len(hard_pass))
+        cf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}
+        for i, code in enumerate(hard_pass):
+            c6 = code.split(".")[1]
+            try:
+                cf_rows = emmod.fetch_cashflow(em_client, c6, cache_dir)
+                # 年度行（-12-31 且 DATE_TYPE_CODE=001）+ PIT（NOTICE_DATE<=run_day）
+                ann = emmod.annual_cashflow_rows(cf_rows, run_day_s)
+                cf_annual_map[code] = ann[-1] if ann else None  # 最近一个已披露年报年度
+            except emmod.EMDataError as exc:
+                # 单只失败 → 该股 fcf_coverage 降级代理（TL D6），不炸全市场
+                log.warning("v5现金流取数失败 %s: %s（该因子降级代理 cfo_to_np/payout）", code, exc)
+                cf_annual_map[code] = None
+            if (i + 1) % 100 == 0 or i + 1 == len(hard_pass):
+                _progress("L3b_em_cashflow", i + 1, len(hard_pass))
+
+    reinvest_c = cfgmod.reinvest_cfg(cfg)  # D8：target_ttm_yield_pct / 分位回看年数
+
     # ---- 候选数据拉取（分红 + 基本面，年度Q4口径）----
     div_years = sorted({run_day.year - 1, run_day.year, annual_year})
     log.info(
@@ -603,9 +860,13 @@ def _run_zscore(
     fund_rows: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
     n_factor_refresh = 0
     for i, code in enumerate(hard_pass):
-        recs: List[Dict[str, Any]] = []
-        for y in div_years:
-            recs.extend(fetcher.dividend(code, y))
+        if v5_on:
+            # v5：分红走东财全表（BaoStock 零请求；单位已 /10、口径同 BaoStock）
+            recs = em_dividend_records(em_div_records.get(code.split(".")[1], []), code6_to_bs)
+        else:
+            recs = []
+            for y in div_years:
+                recs.extend(fetcher.dividend(code, y))
         div_records[code] = recs
         # 事件驱动因子刷新：仅新除权事件触发（绝大多数股票 0 次查询）
         if fetcher.maybe_refresh_adjfactor(code, recs):
@@ -648,6 +909,45 @@ def _run_zscore(
             _f(p_cur.get("totalShare")), _f(p_cur.get("netProfit")),
         )
 
+        # ---- v5 新因子（TL D1/D4/D6/D8；v4 路径下 annual_dps_map/rf_10y 为空/None → 全 None）----
+        cons_y = (consecutive_div_years(annual_dps_map.get(code, {}), run_day.year)
+                  if v5_on else None)
+        # div_stability：近5年 DPS 变异系数（越低越稳 → 打分取负；D5 dividend 子因子）
+        stab_cv = (div_stability_cv(annual_dps_map.get(code, {}), n=5, end_year=run_day.year - 1)
+                   if v5_on else None)
+        div_stab_score = None if stab_cv is None else -stab_cv
+        # fcf_coverage（TL D6 真值）：(OCF-capex)/(年度DPS×总股本)；接口失败 → 降级代理
+        cfo_to_np_v = _f((fr_["cashflow_cur"] or {}).get("CFOToNP"))
+        cf_row = cf_annual_map.get(code)
+        fcf_val: Optional[float] = None
+        if v5_on:
+            if cf_row is not None and cf_row.get("ocf") is not None \
+                    and annual_dps_map.get(code, {}).get(annual_year) is not None \
+                    and _f(p_cur.get("totalShare")) is not None:
+                fcf_val = fcf_coverage(
+                    cf_row["ocf"], cf_row.get("capex"),
+                    annual_dps_map[code][annual_year], _f(p_cur.get("totalShare")),
+                )
+            if fcf_val is None:
+                # 降级代理（TL D6：接口失败/缺输入时）= CFOToNP / payout
+                fcf_val = fcf_coverage_proxy(cfo_to_np_v, payout)
+        # technical v5 子因子（TL D5/D9：估值因子并入 technical 维度——引擎固定 4 维的务实选择）
+        div_yield_pct: Optional[float] = None
+        ttm_pctile: Optional[float] = None
+        ttm_pctile_n: int = 0
+        yld_spread: Optional[float] = None
+        if v5_on:
+            rebuilt_ = fetcher.kline_af3_rebuilt(code)
+            closes_map: Dict[str, float] = {}
+            if rebuilt_:
+                closes_map = {d: c for d, c in zip(rebuilt_["dates"], rebuilt_["af3_close"])
+                              if c is not None}
+            ttm_pctile, ttm_pctile_n = dividend_yield_percentile(
+                annual_dps_map.get(code, {}), closes_map, run_day.isoformat(),
+                reinvest_c["yield_pctile_lookback_years"], ttm_y,
+            )
+            yld_spread = yield_spread(ttm_y, rf_10y)
+
         # 行业维度（证监会二级；min_group_size 语义沿用：小组跳过排名→None）
         roe_level = _f((fr_["profit_cur"] or {}).get("roeAvg"))
         yoy_pni = _f((fr_["growth_cur"] or {}).get("YOYPNI"))
@@ -682,6 +982,16 @@ def _run_zscore(
         ):
             if val is None:
                 missing.append(fname)
+        if v5_on:
+            for fname, val in (
+                ("technical.div_yield_pctile", ttm_pctile),
+                ("technical.yield_spread", yld_spread),
+                ("dividend.consecutive_div_years", cons_y),
+                ("dividend.fcf_coverage", fcf_val),
+                ("dividend.div_stability", div_stab_score),
+            ):
+                if val is None:
+                    missing.append(fname)
         if piot.n_na:
             missing.append(f"piotroski_NA({';'.join(piot.na_signals)})")
         missing_by_code[code] = missing
@@ -689,8 +999,22 @@ def _run_zscore(
         stocks.append({
             "code": code,
             "factors": {
-                "technical": tech_factors[code],
-                "dividend": {"ttm_yield": ttm_y, "payout_ratio": payout},
+                # v5（TL D5/D9）：technical 子因子按 config sub_weights 供给——
+                # v4 配置只取 ma_bullish/low_vol；v5 配置追加 div_yield_pctile/yield_spread。
+                # 引擎按 sub_weights 键取值，多余键（v4 路径的 window_return/rsi/macd）被忽略，
+                # 故两代配置共用同一 raw dict，零回归。
+                "technical": {
+                    **tech_factors[code],
+                    "div_yield_pctile": ttm_pctile,
+                    "yield_spread": yld_spread,
+                },
+                "dividend": {
+                    "ttm_yield": ttm_y,
+                    "payout_ratio": payout,
+                    "consecutive_div_years": cons_y,
+                    "fcf_coverage": fcf_val,
+                    "div_stability": div_stab_score,
+                },
                 # 行业分位在下面统一填充（需要全体候选的组内映射）
                 "industry": {},
                 "fundamental": {
@@ -707,10 +1031,27 @@ def _run_zscore(
                 "roe_level": roe_level, "roe_mean": roe_mean, "roe_std": roe_std,
                 "yoy_pni": yoy_pni, "liability": liability, "gross_margin": gross_margin,
                 "piot": piot, "industry": cand_industry_map[code],
+                # v5 报告列输入（D8/D1）
+                "cons_y": cons_y, "ttm_pctile": ttm_pctile, "ttm_pctile_n": ttm_pctile_n,
+                "annual_dps": annual_dps_map.get(code, {}),
             },
         })
         if (i + 1) % 500 == 0 or i + 1 == len(hard_pass):
             _progress("L4_factor_compute", i + 1, len(hard_pass))
+
+    # ---- v5 再投资参考列（TL D8）：参考价 = 年度DPS / 目标TTM股息率(4%) + TTM 历史分位 ----
+    if v5_on:
+        target = reinvest_c["target_ttm_yield_pct"] / 100.0
+        for s in stocks:
+            c = s["code"]
+            a = s["_aux"]
+            dps_annual = (a.get("annual_dps") or {}).get(annual_year)
+            ref_price = None if (dps_annual is None or target <= 0) else dps_annual / target
+            result.reinvest_cols[c] = {
+                "ref_price": ref_price,
+                "ttm_yield_pctile": a.get("ttm_pctile"),
+                "ttm_yield_pctile_n": a.get("ttm_pctile_n") or 0,
+            }
 
     # ---- 行业组内分位（全体候选，O(N)）----
     roe_map_all: Dict[str, Optional[float]] = {s["code"]: s["_aux"]["roe_level"] for s in stocks}
@@ -795,6 +1136,22 @@ def _run_zscore(
             "rank": sc.rank,
             "top_n_selected": sc.top_n_selected,
             "na_factors": ",".join(sc.na_factors),
+            # ---- v5 报告列（TL D1/D3/D8；v4 路径下为空，零回归）----
+            "soe_flag": (result.soe_flag_map.get(code) if v5_on else None),
+            "total_mv_yi": (round(result.total_mv_yi_map[code], 2)
+                            if v5_on and code in result.total_mv_yi_map else None),
+            "consecutive_div_years": a.get("cons_y") if v5_on else None,
+            "fcf_coverage": _f4(sc.raw["dividend"].get("fcf_coverage")) if v5_on else None,
+            "div_stability_cv": (None if sc.raw["dividend"].get("div_stability") is None
+                                 else round(-float(sc.raw["dividend"]["div_stability"]), 4)) if v5_on else None,
+            "reinvest_ref_price_4pct": (
+                _f3(result.reinvest_cols[code]["ref_price"])
+                if v5_on and code in result.reinvest_cols else None),
+            "ttm_yield_pctile": (
+                result.reinvest_cols[code]["ttm_yield_pctile"]
+                if v5_on and code in result.reinvest_cols else None),
+            "yield_spread_pct": (None if sc.raw["technical"].get("yield_spread") is None
+                                 else round(float(sc.raw["technical"]["yield_spread"]) * 100.0, 3)) if v5_on else None,
             # legacy 兼容列（zscore 模式下 pass_* 按旧硬规则评估，仅供对照）
             "pass_technical": _legacy_pass_tech(sc.raw["technical"], cfg),
             "pass_dividend": (a["ttm_y"] is not None and a["ttm_y"] >= cfg["dividend"]["min_yield_pct"] / 100.0),
@@ -824,6 +1181,50 @@ def _run_zscore(
     if do_crosscheck and result.funnel["L4_TopN入选"] > 0:
         top_codes = [s.code for s in scored if s.top_n_selected]
         _crosscheck(cfg, fetcher, result, top_codes)
+
+    # v5（验收④）：ttm_yield vs 腾讯 idx64 抽样交叉校验（偏差 <0.1pct，超差告警）
+    if v5_on and do_crosscheck and result.funnel["L4_TopN入选"] > 0:
+        _ttm_crosscheck(cfg, result)
+
+
+def _ttm_crosscheck(cfg, result: ScreenResult) -> None:
+    """v5（TL D8/验收④）：自算 ttm_yield vs 腾讯 idx64 TTM 股息率% 抽样对比。
+
+    口径说明：我方 ttm_yield = 窗口内已除权分红和 ÷ **运行日** af3 收盘（PIT）；
+    腾讯 idx64 是实时价口径 → 两者差异含当日价格波动。验收阈值 <0.1pct（config
+    crosscheck.ttm_tolerance_pct）；超差逐只告警不静默，全部结果留档 result.ttm_crosscheck。
+    """
+    from .data.tencent import TencentClient
+    xc = cfgmod.crosscheck_cfg(cfg)
+    tol = float((cfg.get("crosscheck") or {}).get("ttm_tolerance_pct", 0.1))
+    top = [s.code for s in result.scored if s.top_n_selected]
+    sample = top[: int(xc["sample_size"])]
+    if not sample:
+        return
+    try:
+        tencent = TencentClient()
+        quotes = tencent.fetch(sample, batch_size=int(xc["batch_size"]))
+        for code in sample:
+            row = result.candidates.loc[result.candidates["code"] == code].iloc[0]
+            ours = _f(row.get("ttm_dividend_yield_pct"))  # 百分数口径（CSV 列）
+            q = quotes.get(code) or {}
+            theirs = q.get("ttm_yield_pct")
+            diff = None if (ours is None or theirs is None) else abs(ours - float(theirs))
+            result.ttm_crosscheck.append({
+                "code": code, "name": row["name"],
+                "ours_pct": ours, "tencent_pct": theirs,
+                "diff_pct": None if diff is None else round(diff, 3),
+                "ok": diff is not None and diff <= tol,
+            })
+        n_bad = sum(1 for c in result.ttm_crosscheck if not c["ok"])
+        log.info("v5 ttm_yield 交叉校验: %d/%d 只偏差 ≤%.2fpct（%d 只超差）",
+                 len(result.ttm_crosscheck) - n_bad, len(result.ttm_crosscheck), tol, n_bad)
+        for c in result.ttm_crosscheck:
+            if not c["ok"]:
+                log.warning("v5 ttm_yield 交叉校验超差 %s: 我方=%s%% 腾讯=%s%% diff=%s（>%.2fpct）",
+                            c["code"], c["ours_pct"], c["tencent_pct"], c["diff_pct"], tol)
+    except Exception as exc:  # noqa: BLE001 - 交叉校验失败不影响主流程
+        log.warning("v5 ttm_yield 交叉校验失败（不影响主结果）: %s", exc)
 
 
 def _legacy_pass_tech(tech_raw: Dict[str, Optional[float]], cfg) -> bool:
@@ -873,6 +1274,22 @@ def _zscore_data_notes(cfg, result, window_start) -> None:
         "→ 打分值统一为越大越好；CSV 中 *_pct 列为原始口径",
         "pass_* 兼容列按 legacy v1 硬规则评估（仅供对照）；v2 入选 = total_score Top N（pass_all=top_n_selected）",
     ]
+    # ---- v5 数据源/因子说明（TL D1-D9；config 未启用 v5 键时不追加，v4 报告零回归）----
+    uc5 = cfgmod.universe_cfg(cfg)
+    hf5 = cfgmod.hard_filter_cfg(cfg)
+    if (uc5.get("soe_required") or uc5.get("industry_whitelist_csric2")
+            or uc5.get("min_total_mv_yi") is not None
+            or hf5.get("min_consecutive_div_years") is not None):
+        result.data_notes += [
+            "v5 硬过滤: 行业白名单(证监会二级) + SOE央国企(前十大股东关键词/IS_SJKZR) + "
+            f"总市值≥{uc5.get('min_total_mv_yi')}亿(腾讯idx45) + 连续分红(D1, min={hf5.get('min_consecutive_div_years')})",
+            f"v5 分红数据源: 东财 RPT_SHAREBONUS_DET 全表（每10股→每股 /10；EX_DIVIDEND_DATE=null 未实施预案计算时过滤）",
+            f"v5 前十大股东报告期: {result.holders_end_date or '未知'}（NOTICE_DATE≤run_day PIT 过滤）",
+            "v5 新因子: consecutive_div_years / div_stability(近5年DPS CV) / fcf_coverage(东财OCF-capex真值,失败降级CFOToNP/payout代理) "
+            "/ div_yield_pctile(TTM股息率历史分位) / yield_spread(TTM-10Y国债)",
+            "v5 technical 维度含估值因子(div_yield_pctile/yield_spread)——TL D9：引擎固定4维的务实选择，非语义归类",
+            f"v5 再投资参考(TL D8): 参考价=年度DPS/目标TTM股息率{cfgmod.reinvest_cfg(cfg)['target_ttm_yield_pct']}% + TTM历史分位展示",
+        ]
 
 
 def _crosscheck(cfg, fetcher, result, final_codes: List[str]) -> None:
@@ -925,11 +1342,15 @@ def _f(v: Any) -> Optional[float]:
 
 
 def _f2(v: Optional[float]) -> Optional[float]:
-    return None if v is None else round(v, 2)
+    return None if v is None else round(float(v), 2)
+
+
+def _f3(v: Optional[float]) -> Optional[float]:
+    return None if v is None else round(float(v), 3)
 
 
 def _f4(v: Optional[float]) -> Optional[float]:
-    return None if v is None else round(v, 4)
+    return None if v is None else round(float(v), 4)
 
 
 def _pct2(v: Optional[float]) -> Optional[float]:
