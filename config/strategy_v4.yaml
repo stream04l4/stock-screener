@@ -1,0 +1,119 @@
+# A股选股策略配置 —— 所有筛选阈值都在这里，代码中不硬编码任何阈值。
+# 单位约定：带 _pct 的字段是百分数（3 表示 3%）；代码内部统一转小数比较。
+
+technical:
+  ma_period: 200                    # 收盘价 > MA{n}（后复权日K）
+  return_window_days: 250           # 区间收益率回看窗口（交易日）
+  min_return_pct: 0                 # 近250日区间收益率下限（%），含边界
+  max_return_pct: 100               # 近250日区间收益率上限（%），含边界
+  max_annual_volatility_pct: 45     # 年化波动率上限（%，不含边界）
+
+dividend:
+  window_days: 365                  # 股息率窗口：[运行日-365天, 运行日]
+  min_yield_pct: 3                  # 股息率下限（%），含边界
+
+industry:
+  rank_by: roeAvg                   # 组内排名依据（目前仅支持最近披露报告期 ROE）
+  top_pct: 30                       # 保留行业内前 30%（按 ROE 降序）
+  min_group_size: 5                 # 行业组不足该数量 → 跳过排名约束并在报告注明
+
+fundamental:
+  roe_min_pct: 10                   # ROE 下限（%，报告期累计口径、未年化，含边界）
+  net_profit_yoy_field: YOYPNI      # 净利同比字段：YOYPNI(归母) / YOYNI(净利润)，须 > 0
+  liability_max_pct: 60             # 资产负债率上限（%，含边界）
+  gross_margin_min_pct: 20          # 毛利率下限（%，不含边界）；金融业该字段为空 → 落缺失名单
+  probe_quarters_back: 3            # "最近披露报告期"从当前季度最多回退探测的季数
+
+universe:
+  a_share_prefixes:                 # 沪深A股代码前缀（排除指数/ETF/B股）
+    - sh.60
+    - sh.68
+    - sz.00
+    - sz.30
+  listing_min_trading_days: 250     # 上市满 N 个交易日（窗口内K线行数判断）
+  st_name_keyword: ST               # 名称辅助标记（剔除以日K isST=1 为准）
+
+scoring:                            # v2 打分模型（TL 拍板：默认 zscore，保留 legacy 可回退）
+  mode: zscore                      # zscore(新) | legacy(旧四维AND硬过滤)
+  top_n: 50                         # 榜单输出前 N 名
+  missing_policy: neutral_renorm    # neutral_renorm | neutral | drop（缺失因子 z=0 + 按可用权重归一化）
+  normalize: cross_section          # 截面标准化集合 = 硬剔除后全体候选
+  weights:                          # 四维权重（和必须为1；代码零硬编码，全部在此）
+    technical: 0.25                 # 技术面（MA多头/区间收益/波动率/RSI/MACD）
+    dividend: 0.30                  # 股息（TTM股息率 + 股利支付率）
+    industry: 0.15                  # 行业（ROE排名分位 + YOYPNI排名分位，证监会二级口径）
+    fundamental: 0.30               # 基本面（ROE水平+稳定性/负债率/毛利率/Piotroski F-Score）
+  sub_weights:                      # 维度内子因子权重（每维度和必须为1；缺省=等权）
+    technical: {ma_bullish: 0.2, window_return: 0.2, low_vol: 0.2, rsi: 0.2, macd: 0.2}
+    dividend: {ttm_yield: 0.6, payout_ratio: 0.4}
+    industry: {roe_rank_pct: 0.5, yoy_pni_rank_pct: 0.5}
+    fundamental: {roe_level: 0.3, roe_stability: 0.2, low_liability: 0.15, gross_margin: 0.15, piotroski: 0.2}
+
+badges:                             # Web 主表格 badge 阈值（百分数口径，与 CSV *_pct 列同单位）
+  industry_top_pct: 10              # 行业TopN% = industry_roe_rank_pct <= 该值
+  fscore_min: 7                     # F-Score badge = piotroski_fscore >= 该值
+  # 高股息(绿) 阈值复用 dividend.min_yield_pct（brief R5：单一事实来源，不另设键）
+
+hard_filter:                        # 硬性剔除开关（v2 打分前的硬剔除，可配置）
+  st_enabled: true                  # ST 剔除（日K isST=1）
+  listing_min_trading_days: 250     # 上市未满 N 个交易日剔除（全历史K线行数判断）
+
+backtest:                           # v3 多因子策略历史回测（报告 R5 schema，零硬编码）
+  start: "2021-09-30"               # 首调仓月(月末交易日)；5y 默认窗口(TL Q1)
+  end: "2026-09-04"                  # 末调仓月(月末交易日)
+  rebalance: monthly                # monthly | quarterly
+  top_n: 50                         # 等权持仓数
+  weights_ref: scoring.weights      # 引用 strategy.yaml scoring.weights(单一事实来源)
+  execution: t1_open                # t1_open(T+1开盘,TL Q2) | t1_close | t_close
+                                    # 注：缓存仅 23/5216 只K线含 open 列 → open 缺失自动
+                                    # close 兜底（仍 T+1 成交、PIT 安全），报告披露兜底笔数
+  costs:
+    commission_bp: 2.5              # 佣金 万2.5 双边
+    min_commission_cny: 5           # 单笔佣金下限(元)
+    initial_capital_cny: 1000000    # 初始资金(元)：佣金下限折算归一化净值用(5元/100万=5e-6)
+    stamp_tax_sell:                 # 印花税 卖出单边, 日期分段(可配)
+      - {from: "1900-01-01", to: "2023-08-27", bp: 10}   # 0.1%
+      - {from: "2023-08-28", to: "2999-12-31", bp: 5}    # 0.05%(财政部2023年第39号公告)
+    transfer_fee_bp: 0.1            # 过户费 双边 0.001%
+    slippage_bp: 5                  # 滑点(可配)
+    delisting_haircut_pct: 0        # 退市退出价打折(默认0, TL Q3 保留开关)
+  suspension: {max_defer_days: 5, on_timeout: drop_to_cash}   # R2 停牌规则
+  benchmarks: [sh.000300, sh.000905]   # + 自建全市场等权(自动); 指数K线待 Phase C 补拉
+  risk_free_pct: 2.0                # 夏普/alpha 无风险利率(年化%)
+
+data:
+  kline_calendar_days_back: 420     # 后复权窗口K线回溯日历天（覆盖250个交易日+节假日余量）
+  retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）
+  cache_dir: cache                  # 本地缓存目录（相对路径基于项目根）
+
+datasource:                         # v4 数据源架构（报告 R3 + TL 修正）：高频K线/快照切腾讯批量
+  primary: tencent                  # tencent | baostock（baostock=回退旧行为，217 测试不变）
+  fallback: fail_fast               # fail_fast(推荐,TL D2) | baostock；全批失败时不自动回退 BaoStock
+  tencent:
+    snapshot_batch_size: 200        # 单批请求股票数（R1-a 实测上限的 40%，留 50% 余量）
+    snapshot_interval_s: 0.5        # 批间隔秒（生产 ~150 次/日，R1a 速率下零限流）
+    timeout_s: 15                   # 单请求超时
+    max_attempts: 3                 # 单批失败重试次数（指数退避）
+    kline_bars: 40                  # 新股回补/候选确认取数根数
+    kline_interval_s: 0.2           # 切换日缺口回补逐股 K线请求间隔秒（一次性 bootstrap，串行防限流）
+  exdate_detector:                  # TL 修正：preclose 信号除权检测（弃用 hfq/raw）
+    preclose_dev_threshold_pct: 0.5   # 信号 θ：|preclose_today/close_prevday - 1| > θ → 候选
+    factor_sanity_cap_pct: 30         # sanity 上界：|r_event-1|>30% 不写入、记告警（防异常昨收污染）
+    max_candidates_per_day: 200       # 日常防御：候选数超此值截断+告警
+    cutover_max_candidates: 300       # 切换日 bootstrap 截断（跨多日缺口放大误报，TL D3）
+    cutover_max_gap_backfill: 8000   # 切换日非候选缺口回补上限（TL 拍板 2026-09-09：全市场 ~5215 只一次性 bootstrap 需全覆盖；池序下真缺口股可能全部位于前 3000 之外，3000 会 100% 截断 → 提到 >全市场规模，仅防御异常放大）
+  universe:                         # 股票池/行业 BaoStock 依赖降级（半封禁态陈旧回退，fix round 2）
+    stale_max_days: 7               # all_stock 当日缓存 miss 时，可用 ≤N 天前的最近 allstock_*.csv 作陈旧池
+  factor_reconcile:                 # C 兜底：BaoStock 低频对账（本期默认关，TL D3）
+    weekly_baostock_scan: false     # 每周 ~5200 次因子精确对账 + 检测器失效安全网
+    scan_days_spread: 2             # 5200 次分几天（≤3000/日 @0.3/s）
+    skip_during_disclosure: true    # 1月/5月年度突发期暂停周扫（错峰）
+  contract:                         # 契约监控（离线可算，零额外请求）
+    pct_sample_size: 20             # 抽样 N 只校验 pct 一致性（R1-b 基线 549/549）
+    pct_tolerance_pct: 0.5          # pct 偏离容忍度（%）
+
+crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
+  enabled: true
+  sample_size: 20                   # 从最终入选股中抽样 N 只验证收盘价
+  price_tolerance_pct: 0.5          # 收盘价偏差容忍度（%）
+  batch_size: 50                    # 腾讯接口单批请求股票数
