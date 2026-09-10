@@ -89,13 +89,16 @@ def test_d1_single_weight_change_diff_only_that_line(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "CONFIG_PATH", target)
 
     payload = yaml.safe_load(orig_text)
-    payload["scoring"]["weights"]["dividend"] = 0.45
+    # v5（TL D5）：权重值由 config 决定，从当前文件动态取旧值，不硬编码具体权重。
+    old_div = float(payload["scoring"]["weights"]["dividend"])
+    new_div = round(old_div + 0.05, 2)
+    payload["scoring"]["weights"]["dividend"] = new_div
     _write_strategy_preserving_comments(payload)
 
     new_text = target.read_text(encoding="utf-8")
     # 1) 语义正确：改的值已生效，其余字段不变
     reloaded = yaml.safe_load(new_text)
-    assert reloaded["scoring"]["weights"]["dividend"] == 0.45
+    assert abs(reloaded["scoring"]["weights"]["dividend"] - new_div) < 1e-9
     for section in payload:
         for k, v in payload[section].items():
             assert reloaded[section][k] == v, f"{section}.{k} 意外变化"
@@ -111,9 +114,10 @@ def test_d1_single_weight_change_diff_only_that_line(tmp_path, monkeypatch):
     ]
     assert len(changed) == 1, f"应恰好 1 行变化，实际 {len(changed)}: {changed}"
     idx, old_l, new_l = changed[0]
-    assert "dividend: 0.30" in old_l and "dividend: 0.45" in new_l
-    # 注释保留：原行尾的中文注释必须跟着新值一起出现
-    assert "# 股息" in new_l
+    # v5（TL D5）：不硬编码具体权重值——只断言改的是 dividend 行、且行尾注释保留。
+    assert "dividend:" in old_l and "dividend:" in new_l
+    if "#" in old_l:
+        assert "#" in new_l, "行尾注释在改值后丢失"
 
     # 3) 注释总数不变
     def _comment_lines(text):
@@ -138,8 +142,13 @@ def test_d1_change_then_revert_byte_identical(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "CONFIG_PATH", target)
 
     payload = yaml.safe_load(orig_text)
-    payload["scoring"]["weights"]["dividend"] = 0.45
-    payload["scoring"]["weights"]["technical"] = 0.10
+    # v5（TL D5）：权重值由 config 决定，动态取旧值再 +0.05，不硬编码具体权重。
+    old_div = float(payload["scoring"]["weights"]["dividend"])
+    old_tech = float(payload["scoring"]["weights"]["technical"])
+    new_div = round(old_div + 0.05, 2)
+    new_tech = round(old_tech + 0.05, 2)
+    payload["scoring"]["weights"]["dividend"] = new_div
+    payload["scoring"]["weights"]["technical"] = new_tech
     _write_strategy_preserving_comments(payload)
     changed_text = target.read_text(encoding="utf-8")
     # 中间态：恰好两行变化且值正确
@@ -147,13 +156,13 @@ def test_d1_change_then_revert_byte_identical(tmp_path, monkeypatch):
         (a, b) for a, b in zip(orig_text.splitlines(), changed_text.splitlines()) if a != b
     ]
     assert len(mid_changed) == 2
-    assert any("dividend:" in b and "0.45" in b for _, b in mid_changed)
-    assert any("technical:" in b and "0.1" in b for _, b in mid_changed)
+    assert any("dividend:" in b and f"{new_div}" in b for _, b in mid_changed)
+    assert any("technical:" in b and f"{new_tech}" in b for _, b in mid_changed)
 
-    # 恢复原值（模拟第二次 PUT：GET 当前 json → 改回 0.30/0.25 → 写回）
+    # 恢复原值（模拟第二次 PUT：GET 当前 json → 改回旧值 → 写回）
     restore = yaml.safe_load(changed_text)
-    restore["scoring"]["weights"]["dividend"] = 0.30
-    restore["scoring"]["weights"]["technical"] = 0.25
+    restore["scoring"]["weights"]["dividend"] = old_div
+    restore["scoring"]["weights"]["technical"] = old_tech
     _write_strategy_preserving_comments(restore)
     final_text = target.read_text(encoding="utf-8")
     assert final_text == orig_text, "恢复原值后文件未逐字节还原（git diff HEAD 不为空）"
@@ -171,8 +180,11 @@ def test_d1_two_weight_changes_diff_exactly_two_lines(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "CONFIG_PATH", target)
 
     payload = yaml.safe_load(orig_text)
-    payload["scoring"]["weights"]["dividend"] = 0.45
-    payload["scoring"]["weights"]["technical"] = 0.10
+    # v5（TL D5）：权重值由 config 决定，动态取旧值再 +0.05，不硬编码具体权重。
+    new_div = round(float(payload["scoring"]["weights"]["dividend"]) + 0.05, 2)
+    new_tech = round(float(payload["scoring"]["weights"]["technical"]) + 0.05, 2)
+    payload["scoring"]["weights"]["dividend"] = new_div
+    payload["scoring"]["weights"]["technical"] = new_tech
     _write_strategy_preserving_comments(payload)
 
     new_text = target.read_text(encoding="utf-8")
@@ -182,9 +194,9 @@ def test_d1_two_weight_changes_diff_exactly_two_lines(tmp_path, monkeypatch):
         if a != b
     ]
     assert len(changed) == 2, f"应恰好 2 行变化，实际 {len(changed)}: {changed}"
-    # 按值断言（ruamel 会把 plain float 0.10 dump 成 "0.1"，字面量不同但值正确）
-    assert any("dividend:" in b and "0.45" in b for _, b in changed)
-    assert any("technical:" in b and "0.1" in b for _, b in changed)
+    # 按值断言（ruamel 会把 plain float dump 成最简字面量，字面量不同但值正确）
+    assert any("dividend:" in b and f"{new_div}" in b for _, b in changed)
+    assert any("technical:" in b and f"{new_tech}" in b for _, b in changed)
     # 行尾注释保留
     assert all("#" in b for _, b in changed)
 

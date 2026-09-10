@@ -1,5 +1,8 @@
 # A股选股策略配置 —— 所有筛选阈值都在这里，代码中不硬编码任何阈值。
 # 单位约定：带 _pct 的字段是百分数（3 表示 3%）；代码内部统一转小数比较。
+#
+# v5（2026-09-10，TL 拍板 D1-D9）："攒股养老"选股器重构 Phase 1。
+# v4 原配置原样保存于 config/strategy_v4.yaml（零回归基线）。
 
 technical:
   ma_period: 200                    # 收盘价 > MA{n}（后复权日K）
@@ -32,20 +35,48 @@ universe:
     - sz.30
   listing_min_trading_days: 250     # 上市满 N 个交易日（窗口内K线行数判断）
   st_name_keyword: ST               # 名称辅助标记（剔除以日K isST=1 为准）
+  # ---- v5 硬过滤（TL D2/D3；键缺失时 universe_cfg 回退关闭，v4 配置零回归）----
+  soe_required: true                # 央国企过滤：前十大股东关键词命中即 soe（D3）
+  industry_whitelist_csric2:        # 证监会二级行业白名单（TL D2；已逐一对照 cache/industry.csv 84 类实测存在）
+    - B06                           # 煤炭开采和洗选业
+    - B07                           # 石油和天然气开采业
+    - C25                           # 石油、煤炭及其他燃料加工业
+    - D44                           # 电力、热力生产和供应业
+    - D45                           # 燃气生产和供应业
+    - D46                           # 水的生产和供应业
+    - G53                           # 铁路运输业
+    - G54                           # 道路运输业
+    - G55                           # 水上运输业
+    - G56                           # 航空运输业
+    - I63                           # 电信、广播电视和卫星传输服务
+    - J66                           # 货币金融服务（银行）
+  min_total_mv_yi: 200              # 总市值下限（亿元，腾讯快照 idx45；D2）
+  soe_keywords:                     # 央国企识别关键词（TL D3，config 驱动初值）
+    - 国务院
+    - 国资委
+    - 汇金
+    - 财政部
+    - 国资
+  # ⚠️实测结论：银行类前十大 IS_SJKZR 全为 0（evidence/probe20_summary.json，601398）——
+  # 纯标记规则会漏掉全部国有大行，必须靠关键词；"仅 IS_SJKZR=1 未命中关键词"单列复核清单。
 
-scoring:                            # v2 打分模型（TL 拍板：默认 zscore，保留 legacy 可回退）
+scoring:                            # v5 打分模型（TL D5：权重同步切，Phase 1 因子全部就绪后一次性改）
   mode: zscore                      # zscore(新) | legacy(旧四维AND硬过滤)
   top_n: 50                         # 榜单输出前 N 名
   missing_policy: neutral_renorm    # neutral_renorm | neutral | drop（缺失因子 z=0 + 按可用权重归一化）
   normalize: cross_section          # 截面标准化集合 = 硬剔除后全体候选
   weights:                          # 四维权重（和必须为1；代码零硬编码，全部在此）
-    technical: 0.25                 # 技术面（MA多头/区间收益/波动率/RSI/MACD）
-    dividend: 0.30                  # 股息（TTM股息率 + 股利支付率）
-    industry: 0.15                  # 行业（ROE排名分位 + YOYPNI排名分位，证监会二级口径）
-    fundamental: 0.30               # 基本面（ROE水平+稳定性/负债率/毛利率/Piotroski F-Score）
+    technical: 0.15                 # v5：0.25→0.15（TL D5）
+    dividend: 0.40                  # v5：0.30→0.40（TL D5）
+    industry: 0.15                  # 行业（不变）
+    fundamental: 0.30               # 基本面（不变）
   sub_weights:                      # 维度内子因子权重（每维度和必须为1；缺省=等权）
-    technical: {ma_bullish: 0.2, window_return: 0.2, low_vol: 0.2, rsi: 0.2, macd: 0.2}
-    dividend: {ttm_yield: 0.6, payout_ratio: 0.4}
+    # v5 technical：ma_bullish/low_vol/div_yield_pctile/yield_spread 各 0.25，剔除 window_return/rsi/macd。
+    # ⚠️TL D9：估值因子（div_yield_pctile/yield_spread）并入 technical 维度是引擎 DIMENSIONS
+    # 固定 4 维的**务实选择**（允许），非语义归类——technical 维度 = 技术面 + 估值相对水平。
+    technical: {ma_bullish: 0.25, low_vol: 0.25, div_yield_pctile: 0.25, yield_spread: 0.25}
+    # v5 dividend 五因子（报告 §4 草案权重）
+    dividend: {ttm_yield: 0.30, payout_ratio: 0.15, consecutive_div_years: 0.20, fcf_coverage: 0.20, div_stability: 0.15}
     industry: {roe_rank_pct: 0.5, yoy_pni_rank_pct: 0.5}
     fundamental: {roe_level: 0.3, roe_stability: 0.2, low_liability: 0.15, gross_margin: 0.15, piotroski: 0.2}
 
@@ -57,6 +88,10 @@ badges:                             # Web 主表格 badge 阈值（百分数口�
 hard_filter:                        # 硬性剔除开关（v2 打分前的硬剔除，可配置）
   st_enabled: true                  # ST 剔除（日K isST=1）
   listing_min_trading_days: 250     # 上市未满 N 个交易日剔除（全历史K线行数判断）
+  min_consecutive_div_years: 5      # v5（TL D1）：连续分红年数下限。新股规则精确化：
+                                    # IPO 满 7 年 → 要求连续 >=5 个自然年有分红；
+                                    # IPO 不满 7 年 → IPO 年份之后每个完整年度（ceil(IPO_year)..run_year-1）
+                                    # 每年都有至少一笔 ex_date 落在该年的分红，否则剔除。
 
 backtest:                           # v3 多因子策略历史回测（报告 R5 schema，零硬编码）
   start: "2021-09-30"               # 首调仓月(月末交易日)；5y 默认窗口(TL Q1)
@@ -111,9 +146,31 @@ datasource:                         # v4 数据源架构（报告 R3 + TL 修正
   contract:                         # 契约监控（离线可算，零额外请求）
     pct_sample_size: 20             # 抽样 N 只校验 pct 一致性（R1-b 基线 549/549）
     pct_tolerance_pct: 0.5          # pct 偏离容忍度（%）
+  em:                               # v5 东财 datacenter-web 客户端（TL D4；非官方接口，串行小步）
+    page_size: 500                  # 每页行数（brief §1）
+    interval_s: 1.0                 # 页间隔秒（brief 下限 >=0.5s/页；实测冷缓存全表 ~215 页
+                                    # 连续请求在 0.5s 下触发"服务器繁忙"限流 → 提到 1.0s，
+                                    # 日常增量路径只取 1-2 页，成本可忽略）
+    cooldown_every_pages: 25        # 每取 N 页插入一次长冷却（防 EM 滑动窗口限流：实测
+                                    # ~100 页连续请求后返回"服务器繁忙"，期间匀速仍会撞墙）
+    cooldown_seconds: 6.0           # 每次冷却秒数（25 页×1s≈25s 工作 + 6s 冷却 → 滑动窗口内
+                                    # 请求密度降到限流阈值之下；全表 ~113 页 ≈ +4~5 次冷却）
+    full_table_gap_seconds: 600     # 两次**全表级**取数（分红→股东）之间的间隔秒。实测 EM
+                                    # "服务器繁忙"窗口比单次退避长得多（一次 ~100+ 页全表拉取
+                                    # 后，紧随的第二次全表拉取即使带冷却也在第 100 页撞墙）→
+                                    # 两次全表之间必须留足静默期让限流窗口过期。日常增量路径
+                                    # （各 1 页）不经过此间隔，无成本。
+    timeout_s: 15                   # 单请求超时
+    max_attempts: 3                 # 重试 <=3 次（brief §1）
+    cgb10y_sanity_pct: [0.5, 4.0]   # 10Y国债 sanity 区间（越界告警不静默；字段标签系推断，防漂移）
+
+reinvest:                           # v5 再投资参考输出（TL D8：按 Joel 目标定档）
+  target_ttm_yield_pct: 4.0         # 目标 TTM 股息率（%）：报告列 = DPS/4% 参考价 + TTM 分位展示
+  yield_pctile_lookback_years: 10   # 历史股息率分位回看年数
 
 crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
   enabled: true
   sample_size: 20                   # 从最终入选股中抽样 N 只验证收盘价
   price_tolerance_pct: 0.5          # 收盘价偏差容忍度（%）
   batch_size: 50                    # 腾讯接口单批请求股票数
+  ttm_tolerance_pct: 0.1            # v5（验收④）：ttm_yield vs 腾讯 idx64 偏差容忍度（百分点）

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import yaml
 
@@ -259,6 +259,14 @@ def universe_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "prefixes": [str(p) for p in u["a_share_prefixes"]],
         "listing_min_trading_days": int(u["listing_min_trading_days"]),
         "st_name_keyword": str(u.get("st_name_keyword", "ST")),
+        # ---- v5 硬过滤（TL D2/D3）：键缺失 → 关闭（v4 配置零回归）----
+        # soe_required: 央国企过滤开关（前十大股东关键词/IS_SJKZR，em.py + metrics.soe_flag）
+        "soe_required": bool(u.get("soe_required", False)),
+        # industry_whitelist_csric2: 证监会二级行业白名单（代码清单显式枚举、可审计）。
+        # 空列表 = 不过滤（v4 行为）。
+        "industry_whitelist_csric2": [str(x) for x in (u.get("industry_whitelist_csric2") or [])],
+        # min_total_mv_yi: 总市值下限（亿元，腾讯快照 idx45）；None = 不启用
+        "min_total_mv_yi": (float(u["min_total_mv_yi"]) if u.get("min_total_mv_yi") is not None else None),
     }
 
 
@@ -348,11 +356,69 @@ def scoring_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def hard_filter_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """硬性剔除开关（ST / 上市天数）。"""
+    """硬性剔除开关（ST / 上市天数；v5 追加连续分红年数，键缺失 → None=v4 行为）。"""
     h = cfg["hard_filter"]
     return {
         "st_enabled": bool(h["st_enabled"]),
         "listing_min_trading_days": int(h["listing_min_trading_days"]),
+        # v5（TL D1）：连续分红年数下限；新股规则见 metrics.consecutive_div_years 调用方。
+        # None = 不启用（v4 配置零回归）。
+        "min_consecutive_div_years": (
+            int(h["min_consecutive_div_years"]) if h.get("min_consecutive_div_years") is not None else None
+        ),
+    }
+
+
+def em_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5 东财 datacenter-web 客户端参数（TL D4；键缺失 → 默认值，与 brief §1 一致）。
+
+    全部来自 strategy.yaml datasource.em 段（零硬编码纪律）：
+    page_size=500 / interval_s>=0.5（限速）/ timeout_s=15 / max_attempts<=3。
+    """
+    e = (cfg.get("datasource") or {}).get("em") or {}
+    out = {
+        "page_size": int(e.get("page_size", 500)),
+        "interval_s": float(e.get("interval_s", 0.5)),
+        "timeout_s": float(e.get("timeout_s", 15)),
+        "max_attempts": int(e.get("max_attempts", 3)),
+        # 周期性长冷却（防 EM 滑动窗口限流；实测 ~100 页连续请求后"服务器繁忙"）
+        "cooldown_every_pages": int(e.get("cooldown_every_pages", 25)),
+        "cooldown_seconds": float(e.get("cooldown_seconds", 6.0)),
+        # 两次全表级取数之间的静默期（分红→股东；日常增量路径不经过，无成本）
+        "full_table_gap_seconds": float(e.get("full_table_gap_seconds", 600)),
+        # 10Y 国债 sanity 区间（百分数；越界告警不静默，TL D4）
+        "cgb10y_sanity_pct": [float(x) for x in e.get("cgb10y_sanity_pct", [0.5, 4.0])],
+    }
+    if out["page_size"] < 1 or out["page_size"] > 500:
+        raise ConfigError("datasource.em.page_size 必须在 [1,500]")
+    if out["interval_s"] < 0.5:
+        # brief §1 硬约束：东财非官方接口限速 >=0.5s/页，防触发风控
+        raise ConfigError("datasource.em.interval_s 必须 >= 0.5（东财限速纪律）")
+    if out["max_attempts"] < 1 or out["max_attempts"] > 3:
+        raise ConfigError("datasource.em.max_attempts 必须在 [1,3]（brief §1：重试 <=3 次）")
+    lo, hi = out["cgb10y_sanity_pct"]
+    if not (0 < lo < hi):
+        raise ConfigError("datasource.em.cgb10y_sanity_pct 必须为 0<lo<hi 的百分数区间")
+    return out
+
+
+def soe_keywords_cfg(cfg: Dict[str, Any]) -> List[str]:
+    """v5 央国企识别关键词（TL D3，config 驱动；键缺失 → 空=不启用）。"""
+    u = cfg.get("universe") or {}
+    return [str(k) for k in (u.get("soe_keywords") or [])]
+
+
+def reinvest_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5 再投资参考输出参数（TL D8：按 Joel 目标定档 target_ttm_yield_pct=4.0）。
+
+    报告列 = DPS / (target/100) 参考价 + 当前 TTM 股息率历史分位展示。
+    键缺失 → 默认值（不改变主计算路径，纯输出层）。
+    """
+    r = cfg.get("reinvest") or {}
+    return {
+        "target_ttm_yield_pct": float(r.get("target_ttm_yield_pct", 4.0)),
+        # 历史分位回看年数（dividend_yield_percentile lookback）
+        "yield_pctile_lookback_years": int(r.get("yield_pctile_lookback_years", 10)),
     }
 
 
