@@ -646,3 +646,257 @@ def rank_percentile(
     rank_of = {c: i + 1 for i, c in enumerate(ordered)}
     r = rank_of[code]
     return r, round(r / len(group_codes) * 100.0, 2)
+
+
+# ===========================================================================
+# v5 新因子（TL D1/D3/D4/D6/D8，报告 §4 草案签名；纯函数、离线可测）
+# ===========================================================================
+# PIT 纪律（brief §3）：分红事件锚 = ex_date <= run_day（与 v4 一致）；
+# 股东/现金流表按 NOTICE_DATE <= run_day 取报告期。
+# 同除权日"预案+正式"去重沿用 v4 逻辑（dedup_dividends，上方 metrics.py:417-450）。
+
+def em_dividend_records(
+    em_rows: Sequence[Dict[str, Any]], code_map: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """东财分红全表行 → BaoStock 口径记录（复用 v4 dedup/ttm 函数，零口径漂移）。
+
+    :param em_rows: em_dividend_all.csv 行 {code(6位), ex_date, dps_pretax(元/股), ...}
+        —— dps_pretax 已在入库时 /10（每10股→每股），此处**不再除10**。
+    :param code_map: {6位代码: BaoStock格式代码 sh.601398}；未收录的 6 位代码跳过。
+    EX_DIVIDEND_DATE=null 的未实施预案行（ex_date=''）保留在输出里，
+    v4 的 dedup_dividends/ttm_dividend_yield 会自动按"无除权日=未实施"过滤。
+    """
+    out: List[Dict[str, Any]] = []
+    for r in em_rows:
+        c6 = str(r.get("code") or "")
+        bs_code = code_map.get(c6)
+        if not bs_code:
+            continue
+        out.append({
+            "code": bs_code,
+            "dividOperateDate": str(r.get("ex_date") or ""),
+            "dividCashPsBeforeTax": r.get("dps_pretax"),
+        })
+    # 同除权日"预案+正式"并存时，让**有现金（实施）的行排在前面**——v4 dedup_dividends
+    # 按 dividOperateDate 稳定排序后取每组首行（first-wins），此排序保证首行=实施行
+    # （cash=None 的预案行被跳过）。ex_date=''（未实施预案）排最前，dedup 会因无除权日过滤。
+    out.sort(key=lambda x: (x["dividOperateDate"], x["dividCashPsBeforeTax"] is None))
+    return out
+
+
+def annual_dps_from_em(
+    em_rows: Sequence[Dict[str, Any]], code6: str, run_day: str
+) -> Dict[int, float]:
+    """单只股票的逐年每股税前现金分红 {year: dps}（PIT：ex_date <= run_day）。
+
+    去重口径（沿用 v4"一个除权日=一次事件"）：同一 (code, ex_date) 多行
+    （预案+正式并存）只取一行——优先 ASSIGN_PROGRESS 含"实施"的行，其次
+    plan_notice_date 最新者；dps 为 null（纯送转/未填）的事件不计现金。
+    """
+    by_ex: Dict[str, List[Dict[str, Any]]] = {}
+    for r in em_rows:
+        if str(r.get("code") or "") != code6:
+            continue
+        ex = str(r.get("ex_date") or "")
+        if not ex or ex > run_day:  # PIT：未实施（null）或未来除权事件不可见
+            continue
+        by_ex.setdefault(ex, []).append(r)
+
+    def pick(rows_same_ex: List[Dict[str, Any]]) -> Dict[str, Any]:
+        impl = [x for x in rows_same_ex if "实施" in str(x.get("progress") or "")]
+        pool = impl or rows_same_ex
+        return max(pool, key=lambda x: str(x.get("plan_notice_date") or ""))
+
+    annual: Dict[int, float] = {}
+    for ex, rows_same_ex in by_ex.items():
+        rec = pick(rows_same_ex)
+        dps = rec.get("dps_pretax")
+        if dps is None or dps <= 0:
+            continue
+        y = int(ex[:4])
+        annual[y] = annual.get(y, 0.0) + float(dps)
+    return annual
+
+
+def consecutive_div_years(annual_dps: Dict[int, float], run_year: int) -> Optional[int]:
+    """从 run_year-1 向前数 dps>0 的连续自然年数（TL D1）。
+
+    - 无任何记录 → None（区分"从没分过红"与"断档=0 年"）；
+    - run_year-1 当年无分红 → 0（连续性从最近一年起算，中间断档即终止）。
+    """
+    if not annual_dps:
+        return None
+    n = 0
+    y = run_year - 1
+    while annual_dps.get(y, 0.0) > 0:
+        n += 1
+        y -= 1
+    return n
+
+
+def new_stock_div_ok(
+    annual_dps: Dict[int, float], ipo_year: int, run_year: int
+) -> bool:
+    """TL D1 新股规则：IPO 不满 7 年 → IPO 年份之后**每个完整年度**都有分红。
+
+    要求区间 = [ipo_year+1, run_year-1]（IPO 当年不要求——上市不足整年，
+    非"完整年度"；报告 §4 Q1 + 单测边界用例）。区间为空（IPO 次年即运行年）
+    → 视为满足（无完整年度可断档）。
+    """
+    for y in range(ipo_year + 1, run_year):
+        if annual_dps.get(y, 0.0) <= 0:
+            return False
+    return True
+
+
+def div_stability_cv(annual_dps: Dict[int, float], n: int = 5,
+                    end_year: Optional[int] = None) -> Optional[float]:
+    """近 n 年 DPS 变异系数 std/mean（越低越稳定；打分取负）。
+
+    窗口 = [end_year-n+1, end_year]（默认 end_year=调用方传 run_year-1）；
+    有效样本（dps>0 的年份）<3 → None（n<3 同样 None）。std 用总体标准差
+    pstdev（与 roe_stability 同口径）。
+    """
+    if n < 3:
+        return None
+    end = end_year if end_year is not None else max(annual_dps, default=0)
+    vals = [annual_dps[y] for y in range(end - n + 1, end + 1)
+            if annual_dps.get(y, 0.0) > 0]
+    if len(vals) < 3:
+        return None
+    mean = sum(vals) / len(vals)
+    if mean <= 0:
+        return None
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return math.sqrt(var) / mean
+
+
+def fcf_coverage(
+    ocf: Optional[float], capex: Optional[float],
+    dps_annual: Optional[float], total_share: Optional[float],
+) -> Optional[float]:
+    """FCF 分红覆盖倍数 = (OCF - capex) / (年度DPS × 总股本)（TL D6 真值口径）。
+
+    分母 <=0（无分红/缺股本）或任一输入缺失 → None。capex 缺失时按 0 处理
+    （保守方向由调用方决定是否改用代理 fcf_coverage_proxy）。
+    """
+    if ocf is None or dps_annual is None or total_share is None:
+        return None
+    cap = capex or 0.0
+    denom = float(dps_annual) * float(total_share)
+    if denom <= 0:
+        return None
+    return (float(ocf) - cap) / denom
+
+
+def fcf_coverage_proxy(
+    cfo_to_np: Optional[float], payout: Optional[float]
+) -> Optional[float]:
+    """兜底代理（TL D6：仅东财现金流接口失败时降级）= CFOToNP / payout。
+
+    推导：CFOToNP=CFO/净利，payout=分红/净利 → 比值 = CFO/分红 ≈ FCF 覆盖
+    （忽略 capex）。payout<=0 或缺失 → None。
+    """
+    if cfo_to_np is None or payout is None or payout <= 0:
+        return None
+    return float(cfo_to_np) / float(payout)
+
+
+def dividend_yield_percentile(
+    dps_history: Dict[int, float],
+    closes_af3_by_date: Dict[str, float],
+    run_day: str,
+    lookback_years: int,
+    current_ttm_yield: Optional[float] = None,
+) -> Tuple[Optional[float], int]:
+    """当前 TTM 股息率在自身历史年度股息率序列中的分位（0-100）+ 样本年数。
+
+    各历史年度 yield_Y = DPS(Y) / Y 年末参考日 close（af3 不复权，PIT：只用
+    ex_date<=run_day 的历史事件与 <=Y 年末的价格）。参考日 = Y-12-31 或之前
+    最近一个有 close 的交易日（停牌/退市兜底）。
+
+    :param dps_history: {year: 年度每股DPS}（annual_dps_from_em 输出，已 PIT 过滤）
+    :param closes_af3_by_date: {date: close} 全史不复权价（kline_af3 缓存）
+    :param current_ttm_yield: 当前 TTM 股息率（小数）；None → 只返回样本数、分位 None
+    :return: (分位0-100 或 None, 有效样本年数)。分位 = 历史 yield <= 当前值的占比×100。
+    """
+    run_year = int(run_day[:4])
+    yields: List[float] = []
+    for y in range(run_year - lookback_years, run_year):
+        dps = dps_history.get(y)
+        if not dps or dps <= 0:
+            continue
+        ref = _year_ref_close(closes_af3_by_date, y)
+        if ref is None or ref <= 0:
+            continue
+        yields.append(dps / ref)
+    if current_ttm_yield is None or not yields:
+        return None, len(yields)
+    n_le = sum(1 for v in yields if v <= current_ttm_yield)
+    return round(n_le / len(yields) * 100.0, 2), len(yields)
+
+
+def _year_ref_close(closes_af3_by_date: Dict[str, float], year: int) -> Optional[float]:
+    """year-12-31 或之前最近一个有 close 的交易日（二分查找，O(log n)）。"""
+    if not closes_af3_by_date:
+        return None
+    target = f"{year}-12-31"
+    keys = sorted(closes_af3_by_date)
+    lo, hi = 0, len(keys) - 1
+    best: Optional[str] = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if keys[mid] <= target:
+            best = keys[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return closes_af3_by_date.get(best) if best else None
+
+
+def yield_spread(ttm_yield: Optional[float], rf_10y: Optional[float]) -> Optional[float]:
+    """股息率 − 10Y 国债收益率（小数差值；TL D4）。任一缺失 → None。"""
+    if ttm_yield is None or rf_10y is None:
+        return None
+    return float(ttm_yield) - float(rf_10y)
+
+
+def soe_flag(holders: Sequence[Dict[str, Any]], keywords: Optional[Sequence[str]] = None) -> Optional[str]:
+    """央国企识别（TL D3，关键词 config 驱动）。
+
+    规则：前十大股东名称命中任一关键词 → 'soe'；且存在 IS_SJKZR=1 → 'soe_confirmed'。
+    **仅** IS_SJKZR=1 未命中关键词 → None（报告单列清单供人工复核，不判 soe）。
+
+    ⚠️实测结论（evidence/probe20_summary.json）：银行类前十大 IS_SJKZR 全为 0
+    （601398 汇金+财政部并列无单一实控人）→ 纯标记规则会漏掉全部国有大行，必须靠关键词。
+
+    :param holders: 单只股票的前十大股东 [{holder_name, is_sjkzr('0'/'1'), ...}]
+        （PIT：调用方已按 NOTICE_DATE <= run_day 过滤）
+    :param keywords: 关键词清单（config universe.soe_keywords）；None/空 → 永不命中
+    """
+    kws = [k for k in (keywords or []) if k]
+    kw_hit = False
+    sjkzr_hit = False
+    for h in holders:
+        name = str(h.get("holder_name") or "")
+        if any(k in name for k in kws):
+            kw_hit = True
+        if str(h.get("is_sjkzr") or "0").strip() == "1":
+            sjkzr_hit = True
+    if not kw_hit:
+        return None  # 含"仅 IS_SJKZR=1"情形 → 调用方另行列复核清单
+    return "soe_confirmed" if sjkzr_hit else "soe"
+
+
+def is_sjkzr_only(holders: Sequence[Dict[str, Any]], keywords: Optional[Sequence[str]] = None) -> bool:
+    """'仅 IS_SJKZR=1 未命中关键词'标记（TL D3：报告单列清单供人工复核）。"""
+    if soe_flag(holders, keywords) is not None:
+        return False
+    kws = [k for k in (keywords or []) if k]
+    for h in holders:
+        if str(h.get("is_sjkzr") or "0").strip() != "1":
+            continue
+        name = str(h.get("holder_name") or "")
+        if not any(k in name for k in kws):
+            return True
+    return False
