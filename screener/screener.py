@@ -833,17 +833,35 @@ def _run_zscore(
         log.info("阶段4b(v5): 候选股 %d 只 OCF/capex 逐只取数（东财 RPT_DMSK_FN_CASHFLOW，串行限速）...",
                  len(hard_pass))
         cf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}
+        # 限流熔断：连续 N 只取数失败（多为"服务器繁忙"）→ 停止逐只尝试，剩余全部降级代理。
+        # 否则 EM 处于限流窗口时，每只候选各烧 60s busy-budget → N×60s 挂起数小时。
+        # TL D6：接口失败才降级代理 cfo_to_np/payout（不阻塞、不静默）。缓存命中的取数不计数。
+        _cf_consec_fail = 0
+        _CF_BREAKER = 3
+        _cf_breaker_tripped = False
         for i, code in enumerate(hard_pass):
             c6 = code.split(".")[1]
+            if _cf_breaker_tripped:
+                cf_annual_map[code] = None  # 熔断后剩余全部降级代理
+                continue
             try:
                 cf_rows = emmod.fetch_cashflow(em_client, c6, cache_dir)
                 # 年度行（-12-31 且 DATE_TYPE_CODE=001）+ PIT（NOTICE_DATE<=run_day）
                 ann = emmod.annual_cashflow_rows(cf_rows, run_day_s)
                 cf_annual_map[code] = ann[-1] if ann else None  # 最近一个已披露年报年度
+                _cf_consec_fail = 0  # 成功（含缓存命中）→ 重置连续失败计数
             except emmod.EMDataError as exc:
                 # 单只失败 → 该股 fcf_coverage 降级代理（TL D6），不炸全市场
                 log.warning("v5现金流取数失败 %s: %s（该因子降级代理 cfo_to_np/payout）", code, exc)
                 cf_annual_map[code] = None
+                _cf_consec_fail += 1
+                if _cf_consec_fail >= _CF_BREAKER:
+                    _cf_breaker_tripped = True
+                    log.warning(
+                        "v5现金流限流熔断：连续 %d 只取数失败 → 剩余 %d 只全部降级代理"
+                        "（EM 处于'服务器繁忙'窗口；逐只真值待冷却后重跑补齐，缓存幂等）",
+                        _cf_consec_fail, len(hard_pass) - i - 1,
+                    )
             if (i + 1) % 100 == 0 or i + 1 == len(hard_pass):
                 _progress("L3b_em_cashflow", i + 1, len(hard_pass))
 
