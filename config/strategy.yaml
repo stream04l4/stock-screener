@@ -14,6 +14,8 @@ technical:
 dividend:
   window_days: 365                  # 股息率窗口：[运行日-365天, 运行日]
   min_yield_pct: 3                  # 股息率下限（%），含边界
+  payout_band_pct: {min: 30, max: 80}   # v5.1 软约束区间（%）：区间外降分不剔除
+  payout_out_of_band_decay: 0.5     # v5.1 区间外衰减系数（config 驱动，禁硬编码）
 
 industry:
   rank_by: roeAvg                   # 组内排名依据（目前仅支持最近披露报告期 ROE）
@@ -187,8 +189,10 @@ datasource:                         # v4 数据源架构（报告 R3 + TL 修正
     sanity_pct: [0.5, 4.0]          # sanity 区间（越界告警不静默；防页面改版漂移）
 
 reinvest:                           # v5 再投资参考输出（TL D8：按 Joel 目标定档）
-  target_ttm_yield_pct: 4.0         # 目标 TTM 股息率（%）：报告列 = DPS/4% 参考价 + TTM 分位展示
+  target_ttm_yield_pct: 4.0         # 目标 TTM 股息率（%）：参考价 = 近N年平均DPS/4% + TTM 分位展示
   yield_pctile_lookback_years: 10   # 历史股息率分位回看年数
+  dps_smooth_years: 3               # v5.1：参考价 = 近 N 年平均 DPS / 目标股息率（窗口内无分红年按 0；N<1=单年）
+  dps_growth_years: 5               # v5.1：DPS CAGR 回看年数（新增展示列 dps_cagr_5y_pct）
 
 crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
   enabled: true

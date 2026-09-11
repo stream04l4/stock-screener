@@ -225,10 +225,21 @@ def tech(cfg: Dict[str, Any]) -> Dict[str, float]:
 
 def dividend_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     d = cfg["dividend"]
+    # v5.1（TL V1-4）：payout_ratio 软约束区间（百分数；键缺失 → None/None，
+    # 引擎回退 v5 原行为=直接传原始 payout，v4 配置零回归）
+    band = d.get("payout_band_pct")
+    if not (isinstance(band, dict) and band.get("min") is not None and band.get("max") is not None):
+        band_out = None
+    else:
+        band_out = {"min": float(band["min"]), "max": float(band["max"])}
     return {
         "window_days": int(d["window_days"]),
         # 百分数 → 小数
         "min_yield": float(d["min_yield_pct"]) / 100.0,
+        "payout_band_pct": band_out,
+        "payout_out_of_band_decay": (
+            float(d["payout_out_of_band_decay"]) if d.get("payout_out_of_band_decay") is not None else None
+        ),
     }
 
 
@@ -462,14 +473,26 @@ def rf_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def reinvest_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """v5 再投资参考输出参数（TL D8：按 Joel 目标定档 target_ttm_yield_pct=4.0）。
 
-    报告列 = DPS / (target/100) 参考价 + 当前 TTM 股息率历史分位展示。
-    键缺失 → 默认值（不改变主计算路径，纯输出层）。
+    v5.1（TL V1-5）：参考价 = **近 N 年平均 DPS** / (target/100)（dps_smooth_years，
+    窗口内无分红年按 0 计入——断档应拉低参考价），并新增 dps_growth_years 年
+    DPS CAGR 展示列。
+
+    **键缺失回退（brief V1-5：v4 配置零回归）**：dps_smooth_years / dps_growth_years
+    缺失 → None → 引擎回退 v5 原行为（单年 DPS 参考价、无 CAGR 列值）。
+    生产 strategy.yaml 显式配置 N=3 / 5。
+
+    报告列 = 平滑DPS / (target/100) 参考价 + 当前 TTM 股息率历史分位展示。
+    target_ttm_yield_pct / yield_pctile_lookback_years 键缺失 → 默认值（纯输出层）。
     """
     r = cfg.get("reinvest") or {}
     return {
         "target_ttm_yield_pct": float(r.get("target_ttm_yield_pct", 4.0)),
         # 历史分位回看年数（dividend_yield_percentile lookback）
         "yield_pctile_lookback_years": int(r.get("yield_pctile_lookback_years", 10)),
+        # v5.1：参考价平滑窗口年数；None=键缺失 → 单年 DPS 原行为（<1 同义，引擎兜底）
+        "dps_smooth_years": (int(r["dps_smooth_years"]) if r.get("dps_smooth_years") is not None else None),
+        # v5.1：DPS CAGR 回看年数（展示列）；None=键缺失 → 不算 CAGR（列空）
+        "dps_growth_years": (int(r["dps_growth_years"]) if r.get("dps_growth_years") is not None else None),
     }
 
 

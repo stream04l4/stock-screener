@@ -484,6 +484,30 @@ def payout_ratio(
     return (cash_per_share_annual * total_share) / net_profit
 
 
+def payout_ratio_scored(payout: Optional[float], lo_pct: float, hi_pct: float,
+                        decay: float) -> Optional[float]:
+    """v5.1 支付率软约束（TL V1-4）：区间外降分、不剔除。
+
+    - [lo_pct, hi_pct] 内 → 原值（zscore 下越高越好，方向不变）；
+    - > hi_pct → hi_pct − (payout − hi_pct) × decay（下限 0）：超额透支降分；
+    - < lo_pct → payout × decay：分红意愿不足降分但不归零；
+    - None → None（缺失语义不变，走 missing_policy）。
+
+    **单位自洽**：payout 与 lo/hi 必须同口径（纯函数不感知单位）——引擎侧统一
+    传小数（payout_ratio 原值 + config 百分数区间 /100），单测可直接用小数验证
+    （如 payout=1.0, lo=0.3, hi=0.8, decay=0.5 → 0.7）。lo/hi/decay 全部来自
+    config dividend 段（payout_band_pct / payout_out_of_band_decay），代码零字面量。
+    """
+    if payout is None:
+        return None
+    p = float(payout)
+    if p > hi_pct:
+        return max(0.0, hi_pct - (p - hi_pct) * decay)
+    if p < lo_pct:
+        return p * decay
+    return p
+
+
 def roe_stability(roe_values: Sequence[Optional[float]]) -> Tuple[Optional[float], Optional[float]]:
     """ROE 近3年（年度Q4）稳定性：返回 (mean, std)。
 
@@ -779,6 +803,25 @@ def div_stability_cv(annual_dps: Dict[int, float], n: int = 5,
         return None
     var = sum((v - mean) ** 2 for v in vals) / len(vals)
     return math.sqrt(var) / mean
+
+
+def dps_cagr(annual_dps: Dict[int, float], n_years: int, run_year: int) -> Optional[float]:
+    """近 n_years 年 DPS 年化增长率（小数，0.15=15%；v5.1 TL V1-5 展示列）。
+
+    窗口 = [run_year - n_years, run_year - 1]（与 div_stability_cv 同锚点口径：
+    运行日前 n 个自然年）。**首末两年 dps 均 >0** 才计算
+    (end/start)^(1/(n-1)) − 1；否则 None——中间断档不影响 CAGR（首末锚定），
+    但首/末任一为 0 时增长无定义。窗口不足（n_years < 2）→ None。
+    """
+    if n_years < 2:
+        return None
+    start_y = run_year - n_years
+    end_y = run_year - 1
+    start_dps = annual_dps.get(start_y, 0.0)
+    end_dps = annual_dps.get(end_y, 0.0)
+    if start_dps <= 0 or end_dps <= 0:
+        return None
+    return (end_dps / start_dps) ** (1.0 / (n_years - 1)) - 1.0
 
 
 def fcf_coverage(
