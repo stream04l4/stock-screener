@@ -73,7 +73,8 @@ def _worker_loop(
         cache_dir = os.path.join(PROJECT_ROOT, cache_dir)
     datac = cfgmod.data_cfg({**cfg, "data": {**cfg["data"], "cache_dir": cache_dir}})
 
-    client = BaoStockClient(max_attempts=datac["retry_max_attempts"])
+    client = BaoStockClient(max_attempts=datac["retry_max_attempts"],
+                            daily_quota=datac["daily_quota"])  # v5.2-p2 配额守卫（TL D5）
     fetcher = DataFetcher(client, DiskCache(cache_dir))
     fetcher.set_run_day(date.fromisoformat(run_day))
 
@@ -144,7 +145,8 @@ def main(argv=None) -> int:
     )
 
     # 股票池：run_day（或其最近交易日）的 all_stock + A股前缀；**含停牌**
-    client = BaoStockClient(max_attempts=datac["retry_max_attempts"])
+    client = BaoStockClient(max_attempts=datac["retry_max_attempts"],
+                            daily_quota=datac["daily_quota"])  # v5.2-p2 配额守卫（TL D5）
     fetcher = DataFetcher(client, DiskCache(cache_dir))
     fetcher.set_run_day(run_day)
     pool_day = run_day.isoformat()

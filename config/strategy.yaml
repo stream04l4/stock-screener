@@ -126,6 +126,8 @@ data:
 datasource:                         # v4 数据源架构（报告 R3 + TL 修正）：高频K线/快照切腾讯批量
   primary: tencent                  # tencent | baostock（baostock=回退旧行为，217 测试不变）
   fallback: fail_fast               # fail_fast(推荐,TL D2) | baostock；全批失败时不自动回退 BaoStock
+  baostock:                         # v5.2-p2（TL D5）：BaoStock 每日配额守卫（防打穿配额被封禁）
+    daily_quota: 49900              # 官网限 50000/日/IP，超限封禁 6h×次数；留 100 余量
   tencent:
     snapshot_batch_size: 200        # 单批请求股票数（R1-a 实测上限的 40%，留 50% 余量）
     snapshot_interval_s: 0.5        # 批间隔秒（生产 ~150 次/日，R1a 速率下零限流）

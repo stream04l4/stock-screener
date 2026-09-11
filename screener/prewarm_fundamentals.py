@@ -44,7 +44,7 @@ def _setup_logging() -> None:
 
 def _universe_codes(run_day: date):
     """与引擎相同的股票池：query_all_stock(缓存) + A股前缀过滤 + 当日正常交易。"""
-    from screener.config import load_config
+    from screener.config import load_config, data_cfg
     from screener.data.baostock_client import BaoStockClient
     from screener.data.cache import DiskCache
     from screener.data.fetchers import DataFetcher
@@ -52,7 +52,9 @@ def _universe_codes(run_day: date):
 
     cfg = load_config(os.path.join(PROJECT_ROOT, "config", "strategy.yaml"))
     cache = DiskCache(os.path.join(PROJECT_ROOT, "cache"))
-    client = BaoStockClient()
+    # v5.2-p2（TL D5）：配额守卫与引擎同口径（daily_quota 来自 strategy.yaml）
+    datac = data_cfg(cfg)
+    client = BaoStockClient(daily_quota=datac["daily_quota"])
     try:
         fetcher = DataFetcher(client, cache)
         pool, _stats = build_universe(
@@ -70,13 +72,15 @@ def _annual_year(run_day: date) -> int:
     return y
 
 
-def _worker_init(cache_dir: str, max_attempts: int) -> None:
+def _worker_init(cache_dir: str, max_attempts: int, daily_quota: int) -> None:
     global _W_CACHE, _W_CLIENT
     from screener.data.baostock_client import BaoStockClient
     from screener.data.cache import DiskCache
 
     _W_CACHE = DiskCache(cache_dir)
-    _W_CLIENT = BaoStockClient(max_attempts=max_attempts, base_delay=0.5)
+    # v5.2-p2（TL D5）：worker 独立 client 也挂配额守卫（跨进程 flock 共享计数）
+    _W_CLIENT = BaoStockClient(max_attempts=max_attempts, base_delay=0.5,
+                               daily_quota=daily_quota)
 
 
 _W_CACHE = None
@@ -140,6 +144,10 @@ def main() -> int:
     annual_year = _annual_year(run_day)
     cache_dir = os.path.join(PROJECT_ROOT, "cache")
 
+    # v5.2-p2（TL D5）：worker 池共享配额硬上限（来自 strategy.yaml，与引擎同口径）
+    from screener.config import load_config as _lc, data_cfg as _dcfg
+    _datac = _dcfg(_lc(os.path.join(PROJECT_ROOT, "config", "strategy.yaml")))
+
     t0 = time.time()
     codes = _universe_codes(run_day)
     log.info("预热股票池: %d 只；分红年份=%s 基本面年度Q4=%s~%s；workers=%d",
@@ -151,7 +159,7 @@ def main() -> int:
     done = 0
     tasks = [(c, run_day.isoformat(), annual_year) for c in codes]
     with Pool(args.workers, initializer=_worker_init,
-              initargs=(cache_dir, 5)) as pool:
+              initargs=(cache_dir, 5, _datac["daily_quota"])) as pool:
         try:
             for f in pool.imap_unordered(_warm_task, tasks, chunksize=8):
                 done += 1

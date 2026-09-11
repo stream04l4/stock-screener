@@ -283,12 +283,17 @@ def universe_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def data_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     d = cfg["data"]
+    # v5.2-p2（TL D5）：BaoStock 每日调用配额硬上限。单一事实来源=
+    # strategy.yaml datasource.baostock.daily_quota（校验在 _validate_datasource；
+    # 键缺失 → 默认 49900，官网限 50000/日/IP 留 100 余量）。
+    bs = (cfg.get("datasource") or {}).get("baostock") or {}
     return {
         # 后复权窗口K线往前回溯的日历天数（需覆盖 ma_period/return_window_days 个交易日，
         # 250 个交易日 ≈ 375 个日历天；取 420 留足节假日余量）
         "kline_calendar_days_back": int(d["kline_calendar_days_back"]),
         "retry_max_attempts": int(d.get("retry_max_attempts", 5)),
         "cache_dir": str(d.get("cache_dir", "cache")),
+        "daily_quota": int(bs.get("daily_quota", 49900)),
     }
 
 
@@ -315,6 +320,9 @@ def datasource_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "primary": "baostock",
             "fallback": "fail_fast",
+            # v5.2-p2（TL D5）：BaoStock 每日配额硬上限（官网限 50000/日/IP，
+            # 超限封禁 6h×次数；留 100 余量）。单一事实来源=strategy.yaml。
+            "baostock": {"daily_quota": 49900},
             "tencent": {"snapshot_batch_size": 200, "snapshot_interval_s": 0.5,
                         "timeout_s": 15, "max_attempts": 3, "kline_bars": 40},
             "exdate_detector": {"preclose_dev_threshold_pct": 0.5,
@@ -335,6 +343,12 @@ def _validate_datasource(d: Dict[str, Any]) -> None:
         raise ConfigError("datasource.primary 只能是 tencent 或 baostock")
     if d.get("fallback") not in ("fail_fast", "baostock"):
         raise ConfigError("datasource.fallback 只能是 fail_fast 或 baostock")
+    # v5.2-p2（TL D5）：BaoStock 每日配额硬上限必须是正整数（键缺失 → 默认值，不校验）
+    bs = d.get("baostock", {}) or {}
+    if "daily_quota" in bs:
+        dq = bs["daily_quota"]
+        if not isinstance(dq, int) or isinstance(dq, bool) or dq < 1:
+            raise ConfigError(f"datasource.baostock.daily_quota 必须是正整数（当前 {dq!r}）")
     t = d.get("tencent", {}) or {}
     for key, lo, hi in (("snapshot_batch_size", 1, 500), ("timeout_s", 1, 300)):
         if int(t.get(key, 200)) < lo or int(t.get(key, 200)) > hi:

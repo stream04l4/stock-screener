@@ -73,7 +73,8 @@ def prefetch_universe(day: str, cache_dir: str, client=None, fetcher=None) -> in
     if fetcher is None:
         if own_client:
             datac = cfgmod.data_cfg({**cfg, "data": {**cfg["data"], "cache_dir": cache_dir}})
-            client = BaoStockClient(max_attempts=datac["retry_max_attempts"])
+            client = BaoStockClient(max_attempts=datac["retry_max_attempts"],
+                                    daily_quota=datac["daily_quota"])  # v5.2-p2 配额守卫（TL D5）
         fetcher = DataFetcher(client, DiskCache(cache_dir))
 
     try:

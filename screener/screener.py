@@ -277,7 +277,8 @@ def run_screener(
     hfc = cfgmod.hard_filter_cfg(cfg)
     mode = scfg["mode"]
 
-    client = BaoStockClient(max_attempts=datac["retry_max_attempts"])
+    client = BaoStockClient(max_attempts=datac["retry_max_attempts"],
+                            daily_quota=datac["daily_quota"])  # v5.2-p2 配额守卫（TL D5）
     cache = DiskCache(datac["cache_dir"])
     fetcher = DataFetcher(client, cache)
     result = ScreenResult(requested_date=requested_date.isoformat(), mode=mode, top_n=scfg["top_n"])
