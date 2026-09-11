@@ -55,8 +55,9 @@ CSV_COLUMNS = [
     # --- legacy 兼容列（v1 四维AND语义；zscore 模式下按旧硬规则对照评估） ---
     "pass_technical", "pass_dividend", "pass_industry", "pass_fundamental",
     "pass_all",
-    # --- v5（TL D1/D3/D8；v4 模式/配置下为空，零回归） ---
-    "soe_flag",                    # 央国企标记 soe / soe_confirmed（空=非SOE或v4）
+    # --- v5（TL D1/D3'/D8；v4 模式/配置下为空，零回归） ---
+    "soe_flag",                    # 央国企标记 soe / ''（空=非SOE或v4；Round-2 D3'：新浪双规则）
+    "soe_basis",                   # SOE 判定依据（国有股本性质/关键词命中(x)；供人工复核，TL Round-2 验收③）
     "total_mv_yi",                 # 总市值（亿元，腾讯快照 idx45）
     "consecutive_div_years",       # 连续分红年数（TL D1；从 run_year-1 向前数）
     "fcf_coverage",                # FCF 分红覆盖倍数（TL D6 真值/代理）
@@ -250,10 +251,10 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
         ap(f"共 **{len(sel)}** 只（按 total_score 降序）：")
         ap("")
         if v5_cols:
-            # v5（TL D1/D3/D8）：榜单追加 SOE/市值/连续分红/再投资参考列
+            # v5（TL D1/D3'/D8）：榜单追加 SOE/判定依据/市值/连续分红/再投资参考列
             ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "
-               "综合得分 | TTM股息率% | ROE% | F-Score | SOE | 市值(亿) | 连续分红年 | 再投资参考价 | TTM分位% |")
-            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|")
+               "综合得分 | TTM股息率% | ROE% | F-Score | SOE | SOE判定依据 | 市值(亿) | 连续分红年 | 再投资参考价 | TTM分位% |")
+            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|")
             for _, r in sel.iterrows():
                 fs = f"{_fmt(r['piotroski_fscore'], 0)}/{_fmt(r['piotroski_valid'], 0)}" \
                     if pd.notna(r.get("piotroski_fscore")) else "—"
@@ -262,7 +263,8 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
                     f"| {_fmt(r['close'], 3)} | {_fmt(r['score_technical'])} | {_fmt(r['score_dividend'])} "
                     f"| {_fmt(r['score_industry'])} | {_fmt(r['score_fundamental'])} "
                     f"| **{_fmt(r['total_score'], 4)}** | {_fmt(r['ttm_dividend_yield_pct'], 3)} "
-                    f"| {_fmt(r['roe_pct'])} | {fs} | {_fmt(r.get('soe_flag'))} | {_fmt(r.get('total_mv_yi'))} "
+                    f"| {_fmt(r['roe_pct'])} | {fs} | {_fmt(r.get('soe_flag'))} | {_fmt(r.get('soe_basis'))} "
+                    f"| {_fmt(r.get('total_mv_yi'))} "
                     f"| {_fmt(r.get('consecutive_div_years'), 0)} | {_fmt(r.get('reinvest_ref_price_4pct'), 2)} "
                     f"| {_fmt(r.get('ttm_yield_pctile'))} |"
                 )
@@ -282,20 +284,20 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
                 )
     ap("")
 
-    # ---------- 二-bis. v5 央国企复核清单（TL D3：仅 IS_SJKZR=1 未命中关键词）----------
-    sjkzr_list = getattr(result, "sjkzr_review_list", None) or []
-    if sjkzr_list:
-        ap(f"## 二-bis、央国企复核清单（仅 IS_SJKZR=1 未命中关键词，{len(sjkzr_list)} 只，供人工复核）")
+    # ---------- 二-bis. v5 SOE 剔除复核清单（Round-2 TL D3'：双规则皆无 → 剔除+单列）----------
+    soe_review = getattr(result, "soe_review_list", None) or []
+    if soe_review:
+        ap(f"## 二-bis、SOE 剔除复核清单（新浪F10双规则皆未命中，{len(soe_review)} 只，已剔除，供人工复核）")
         ap("")
-        ap("> 规则（TL D3）：前十大股东名称命中关键词 → soe；IS_SJKZR=1 且命中 → soe_confirmed；"
-           "**仅** IS_SJKZR=1 未命中关键词 → 不判 soe、单列于此。")
+        ap("> 规则（Round-2 TL D3'）：任一股东 股本性质=='国有股' → soe；或名称命中关键词"
+           "（国务院/国资委/汇金/财政部/国资）→ soe；**两者皆无** → 剔除并单列于此。")
         ap("")
         ap("| 代码 | 名称 |")
         ap("|---|---|")
-        for m in sjkzr_list[:200]:
+        for m in soe_review[:200]:
             ap(f"| {m['code']} | {m.get('name', '')} |")
-        if len(sjkzr_list) > 200:
-            ap(f"| … | 其余 {len(sjkzr_list) - 200} 只略 |")
+        if len(soe_review) > 200:
+            ap(f"| … | 其余 {len(soe_review) - 200} 只略 |")
         ap("")
 
     # ---------- 三、四维得分分解 ----------
