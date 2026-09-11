@@ -346,7 +346,19 @@ class DataFetcher:
             if rows:
                 # 非空：不可变历史数据 → 永久缓存
                 self.cache.put(name, columns, rows)
-            # 空结果：不落盘（见 docstring）
+            else:
+                # v5 fix (2026-09-11): live 返回空 = 半封禁态（交易日全市场恒有数千只，
+                # 空结果只可能来自数据源异常）。回退 ≤stale_max_days 陈旧池而非让
+                # build_universe 抛 DataSourceError——安全性论证与 BS_UNIVERSE_STALE_OK
+                # 路径相同（新股/退市/ST 均不受 ≤7 天池龄影响，见 docstring）。
+                stale = self._stale_allstock(day)
+                if stale is not None:
+                    columns, rows, age = stale
+                    note = (f"股票池为 {age} 天前快照（{day} 当日 live query_all_stock "
+                            f"返回空=数据源异常，启用 ≤{int((self.datasource_cfg.get('universe', {}) or {}).get('stale_max_days', 7))} 天陈旧池）")
+                    self.universe_notes.append(note)
+                    log.warning("all_stock(%s) live 返回空 → 用 %d 天前陈旧池（%d 只）", day, age, len(rows))
+            # 空结果且无可用陈旧池：不落盘、返回空 df（build_universe 守卫抛 DataSourceError）
 
         df = pd.DataFrame(rows, columns=["code", "tradeStatus", "code_name"])
         df["tradeStatus"] = df["tradeStatus"].map(to_int).fillna(0).astype(int)
