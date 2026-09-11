@@ -40,13 +40,18 @@ from screener.metrics import (  # noqa: E402
     fcf_coverage_proxy,
     is_sjkzr_only,
     new_stock_div_ok,
+    soe_basis,
     soe_flag,
     ttm_dividend_yield,
     yield_spread,
 )
-from screener.data import em as emmod  # noqa: E402
+from screener.data import em as emmod  # noqa: E402  (em.py 保留不删；D-EM：enabled=false 时引擎不调用，此处仅测其纯函数/IO)
+from screener.data import sina as sinamod  # noqa: E402
+from screener.data import rf as rfmod  # noqa: E402
+from screener.screener import _v5_hard_filter, ScreenResult  # noqa: E402
 
 RUN_DAY = "2026-09-09"  # 与 v4 基线运行日一致
+EV_R2 = "/home/ubuntu/.hermes/joint_project/stock-screener/v5_strategy/stages/02_code/evidence_r2"
 
 
 # ---------------------------------------------------------------------------
@@ -180,21 +185,173 @@ def test_bank_soe_by_keyword_not_flag():
     assert soe_flag(holders, []) is None
 
 
-def test_soe_confirmed_and_review_list():
-    """IS_SJKZR=1 + 关键词命中 → soe_confirmed；仅 IS_SJKZR=1 未命中 → None + 复核清单。"""
+def test_soe_dual_rule_d3prime():
+    """Round-2 TL D3'：双规则（股本性质=='国有股' OR 名称关键词）→ 'soe'；皆无 → None。"""
     kws = ["国务院", "国资委", "汇金", "财政部", "国资"]
-    # confirmed：实控人标记 + 名称命中
-    h1 = [{"holder_name": "国务院国有资产监督管理委员会", "is_sjkzr": "1"}]
-    assert soe_flag(h1, kws) == "soe_confirmed"
-    assert is_sjkzr_only(h1, kws) is False
-    # 仅标记未命中关键词 → None + 复核清单
-    h2 = [{"holder_name": "某某控股集团有限公司", "is_sjkzr": "1"}]
-    assert soe_flag(h2, kws) is None
-    assert is_sjkzr_only(h2, kws) is True
-    # 无标记无关键词 → None，不进复核清单（普通民企）
-    h3 = [{"holder_name": "自然人甲", "is_sjkzr": "0"}]
-    assert soe_flag(h3, kws) is None
-    assert is_sjkzr_only(h3, kws) is False
+    # 规则1：股本性质=国有股（601398 真实留样字段，比东财 IS_SJKZR 更直接）
+    h1 = [{"holder_name": "中央汇金投资有限责任公司", "share_nature": "国有股"}]
+    assert soe_flag(h1, kws) == "soe"
+    assert soe_basis(h1, kws) == "国有股本性质"
+    # 规则2：仅名称关键词命中（无股本性质字段）→ soe，basis=关键词命中(财政部)
+    h2 = [{"holder_name": "中华人民共和国财政部", "share_nature": ""}]
+    assert soe_flag(h2, kws) == "soe"
+    assert soe_basis(h2, kws) == "关键词命中(财政部)"
+    # 双规则同时命中 → basis 以股本性质为准（字段级证据强于名称推断）
+    h3 = [{"holder_name": "国务院国有资产监督管理委员会", "share_nature": "国有股"}]
+    assert soe_flag(h3, kws) == "soe"
+    assert soe_basis(h3, kws) == "国有股本性质"
+    # 两者皆无 → None（剔除 + 进报告复核清单；basis=''）
+    h4 = [{"holder_name": "某某控股集团有限公司", "share_nature": "境内法人股"}]
+    assert soe_flag(h4, kws) is None
+    assert soe_basis(h4, kws) == ""
+    # Round-1 的 IS_SJKZR 字段随东财停用弃用：无股本性质/关键词时恒 None
+    h5 = [{"holder_name": "某某控股集团有限公司", "is_sjkzr": "1"}]
+    assert soe_flag(h5, kws) is None
+    assert is_sjkzr_only(h5, kws) is False  # Round-2：函数恒 False（复核清单改由引擎按 soe=None 生成）
+
+
+# ---------------------------------------------------------------------------
+# 4b. Round-2 新浪 F10 / 财务JSON / TE fixture 离线用例（brief_round2 验收②必含）
+# ---------------------------------------------------------------------------
+
+def _sina_holders_html() -> str:
+    """601398 新浪 F10 流通股股东页真实留样（GBK→str；TL 实测 evidence_r2/sina_holders.html）。"""
+    raw = open(f"{EV_R2}/sina_holders.html", "rb").read()
+    return raw.decode("gbk", errors="replace")
+
+
+def test_sina_holders_parse_601398():
+    """F10 解析：多报告期 section + PIT 选期（截止日期/公告日期 <= run_day 最新）。"""
+    periods = sinamod.parse_holders_page(_sina_holders_html())
+    assert len(periods) >= 5, f"应解析出多个报告期: {len(periods)}"
+    # 升序 + 每段含股东行
+    dates = [p["end_date"] for p in periods]
+    assert dates == sorted(dates)
+    assert all(p["holders"] for p in periods)
+    # PIT：run_day=2026-09-10 → 最新可见报告期（TL 实测 2026-06-30，公告 2026-08-29）
+    picked = sinamod.pick_holders_asof(periods, "2026-09-10")
+    assert picked is not None and picked["end_date"] == "2026-06-30"
+    # 公告日期晚于 run_day 的期不可见（PIT）
+    future = [dict(p, notice_date="2026-10-01") for p in periods]
+    assert sinamod.pick_holders_asof(future, "2026-09-10") is None
+
+
+def test_soe_state_nature_rule_601398():
+    """必含用例：国有股本性质判定——601398 真实留样（汇金/财政部/社保基金会=国有股）。"""
+    periods = sinamod.parse_holders_page(_sina_holders_html())
+    picked = sinamod.pick_holders_asof(periods, "2026-09-10")
+    kws = ["国务院", "国资委", "汇金", "财政部", "国资"]
+    assert soe_flag(picked["holders"], kws) == "soe"
+    assert soe_basis(picked["holders"], kws) == "国有股本性质"
+    # 留样字段核对（TL 实测值）：汇金公司 34.79% / 财政部 31.14%，均国有股
+    by_name = {h["holder_name"]: h for h in picked["holders"]}
+    assert by_name["汇金公司"]["share_nature"] == "国有股"
+    assert abs(by_name["汇金公司"]["circ_ratio_pct"] - 34.793) < 1e-6
+    assert by_name["财政部"]["share_nature"] == "国有股"
+    # 契约 sanity：前十大持股比例合计 <100%（流通股口径）
+    ratio_sum = sum(h["circ_ratio_pct"] or 0.0 for h in picked["holders"])
+    assert ratio_sum < 100.0, f"前十大合计 {ratio_sum}% >= 100%（解析漂移?）"
+
+
+def test_soe_keyword_rule_ministry_of_finance():
+    """必含用例：关键词判定（财政部）——无股本性质字段时靠名称命中。"""
+    holders = [{"holder_name": "中华人民共和国财政部", "share_nature": ""}]
+    kws = ["国务院", "国资委", "汇金", "财政部", "国资"]
+    assert soe_flag(holders, kws) == "soe"
+    assert soe_basis(holders, kws) == "关键词命中(财政部)"
+
+
+def test_soe_non_soe_excluded():
+    """必含用例：非国企剔除——双规则皆无 → None（引擎侧剔除 + 进复核清单）。"""
+    holders = [
+        {"holder_name": "张三", "share_nature": "境内自然人"},
+        {"holder_name": "某某控股集团有限公司", "share_nature": "境内法人股"},
+    ]
+    kws = ["国务院", "国资委", "汇金", "财政部", "国资"]
+    assert soe_flag(holders, kws) is None
+    assert soe_basis(holders, kws) == ""
+
+
+def test_sina_cf_ocf_parse_601398():
+    """必含用例：OCF 解析——新浪财务 JSON 留样（MANANETR=经营现金流量净额，元）。
+
+    TL 实测值：2025-12-31 年报 OCF=1,890,530,000,000.0 元（publish 2026-03-28 ≤ run_day）。
+    """
+    payload = json.load(open(f"{EV_R2}/sina_cf_api.json", encoding="utf-8"))
+    reports = sinamod.parse_cf_report(payload)
+    assert reports, "解析出 0 期"
+    # 降序 + 字段齐全
+    dates = [r["report_date"] for r in reports]
+    assert dates == sorted(dates, reverse=True)
+    ann = sinamod.latest_annual_ocf(reports, "2026-09-10")
+    assert ann is not None, "应定位到最近已披露年报"
+    assert ann["report_date"] == "2025-12-31"
+    assert abs(ann["ocf"] - 1890530000000.0) < 1.0, f"OCF={ann['ocf']}（期望 1.89053e12）"
+    # PIT：run_day 早于该年报 publish_date(2026-03-28) → 不可见；fixture 无更早年报 → None
+    ann_old = sinamod.latest_annual_ocf(reports, "2026-03-01")
+    assert ann_old is None  # PIT 正确性：未披露的年报不得"看见"
+
+
+def test_fcf_coverage_ocf_based_d6prime():
+    """必含用例（D6'）：OCF-based 口径 = OCF/(年度DPS×总股本)（capex=None，新浪无 capex）。"""
+    # 601398 真实量级：OCF=1.89e12 元，年度 DPS≈0.30 元/股，总股本≈3.56e10 股
+    v = fcf_coverage(1.89053e12, None, 0.30, 3.564061e10)
+    assert v is not None and abs(v - 1.89053e12 / (0.30 * 3.564061e10)) < 1e-9
+    # capex=None → 不扣减（区别于 Round-1 FCF 口径）：OCF=1e10, DPS×股本=0.4*1e10=4e9 → 2.5
+    assert fcf_coverage(1e10, None, 0.4, 1e10) is not None
+    assert abs(fcf_coverage(1e10, None, 0.4, 1e10) - 2.5) < 1e-9
+    # 缺输入/分母<=0 → None
+    assert fcf_coverage(None, None, 0.4, 1e10) is None
+    assert fcf_coverage(1e10, None, 0.0, 1e10) is None
+    assert fcf_coverage(1e10, None, 0.4, None) is None
+
+
+def test_rf_te_parse_fixture():
+    """必含用例：TE 10Y 解析——留样 te_cn.html → (2026-09-10, 1.68%)（TL 实测值）。"""
+    html = open(f"{EV_R2}/te_cn.html", encoding="utf-8", errors="replace").read()
+    parsed = rfmod.parse_te_page(html)
+    assert parsed is not None, "TE 留样应可解析"
+    d_iso, y_pct = parsed
+    assert d_iso == "2026-09-10" and abs(y_pct - 1.68) < 1e-9
+    # 垃圾页面 → None（调用方走 fallback + 告警）
+    assert rfmod.parse_te_page("<html>no dataset here</html>") is None
+
+
+def test_rf_fetch_fallback_and_csv(tmp_path):
+    """D4'：解析失败 → config fallback(2.0%) + 告警；成功 → 落盘 rf_10y_daily.csv（date, yield_pct）。"""
+    rfc = {"url": "http://invalid.test/te", "fallback_pct": 2.0, "sanity_pct": [0.5, 4.0]}
+
+    class _Resp:
+        status_code = 200
+        content = (b'<html><meta name="description" '
+                   b'content="China 10-year government bond yield eased to 1.68% on September 10, 2026."></html>')
+
+    class _OKSession:
+        def get(self, url, timeout=None, headers=None):
+            return _Resp()
+
+    # 成功路径：metaDesc 通道解析 + 落盘（小数返回 0.0168）
+    rf_dec, meta = rfmod.fetch_rf_10y(rfc, str(tmp_path), "2026-09-10", session=_OKSession())
+    assert abs(rf_dec - 0.0168) < 1e-12 and meta["source"] == "tradingeconomics"
+    csv_p = tmp_path / rfmod.RF_CACHE_FILE
+    assert csv_p.exists()
+    rows = rfmod._read_rf_csv(str(csv_p))
+    assert rows == [["2026-09-10", "1.6800"]]
+    # PIT 读回（小数）
+    assert abs(rfmod.load_rf_10y_asof(str(tmp_path), "2026-09-10") - 0.0168) < 1e-12
+    assert rfmod.load_rf_10y_asof(str(tmp_path), "2026-09-09") is None  # run_day 之前不可见
+
+    # 失败路径：请求异常 → fallback 2.0%（小数 0.02）+ source=fallback，**不落盘**
+    import requests as _rq
+
+    class _FailSession:
+        def get(self, url, timeout=None, headers=None):
+            raise _rq.RequestException("connection refused")
+
+    rf_dec2, meta2 = rfmod.fetch_rf_10y(rfc, str(tmp_path), "2026-09-11", session=_FailSession())
+    assert abs(rf_dec2 - 0.02) < 1e-12 and meta2["source"] == "fallback"
+    # fallback 不污染追溯序列：仍只有 09-10 一行
+    assert rfmod._read_rf_csv(str(csv_p)) == [["2026-09-10", "1.6800"]]
 
 
 # ---------------------------------------------------------------------------
@@ -431,3 +588,94 @@ def test_checkpoint_truncated_last_line_self_heals(tmp_path):
     all_rows, count = c.fetch_all_pages("T", "ALL", checkpoint_path=ck)
     assert set(c.calls) == {2}, "截断的第 2 页应重取"
     assert len(all_rows) == 1000 and count == 1000
+
+
+# ---------------------------------------------------------------------------
+# 6. D-EM 守卫：em.enabled=false → 引擎零东财 import/调用（brief_round2 必含）
+# ---------------------------------------------------------------------------
+
+def test_em_disabled_zero_import_structural():
+    """结构断言：screener/screener.py 全文件**不 import screener.data.em**。
+
+    D-EM 最高优先级纪律：enabled=false 时所有取数路径不得 import/调用 em.py 的
+    fetch 函数。最强保证=引擎源码对 em 模块零引用（AST 扫描，防未来回归误引入）。
+    """
+    import ast
+    src = open(os.path.join(ROOT, "screener", "screener.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        # from .data import em  /  from screener.data import em
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            names = {a.name for a in node.names}
+            if (mod.endswith("data.em") or mod == "em"
+                    or (mod.endswith(".data") and "em" in names)
+                    or (mod == "screener.data" and "em" in names)):
+                bad.append(f"L{node.lineno}: from {mod} import {names}")
+        # import screener.data.em / import em
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "em" or a.name.endswith("data.em") or a.name.endswith(".em"):
+                    bad.append(f"L{node.lineno}: import {a.name}")
+    assert not bad, f"screener.py 不得引用东财 em 模块（D-EM）: {bad}"
+
+
+def test_em_disabled_zero_call_runtime(monkeypatch):
+    """运行时断言：em.enabled=false 时跑 _v5_hard_filter，东财客户端**零调用**。
+
+    做法：把 emmod.EMClient 替换为"一被实例化/调用即抛 AssertionError"的哨兵；
+    同时 stub 新浪 F10（离线）。若引擎任何路径触碰东财 → 立即失败。
+    """
+    from screener import config as cfgmod
+
+    cfg = cfgmod.load_config(os.path.join(ROOT, "config", "strategy.yaml"))
+    assert cfgmod.em_cfg(cfg)["enabled"] is False, "生产配置 em.enabled 必须为 false"
+
+    # 东财哨兵：任何实例化/方法调用 → 断言失败（证明零东财调用）
+    def _em_boom(*a, **k):
+        raise AssertionError("D-EM 违规：em.enabled=false 时引擎调用了东财客户端")
+    monkeypatch.setattr(emmod, "EMClient", _em_boom)
+    # em.py 的模块级 fetch 入口也一并哨兵化（防直接函数调用）
+    for fn in ("fetch_dividend_all", "fetch_holders_top10", "fetch_cashflow",
+               "load_cgb10y_asof", "detect_holders_end_date"):
+        if hasattr(emmod, fn):
+            monkeypatch.setattr(emmod, fn, _em_boom)
+
+    # 新浪 F10 stub（离线）：601398→国有股(soe)，000001→无(剔除+复核清单)
+    class _FakeSina:
+        request_count = 0
+        def __init__(self, sina_cfg):
+            pass
+        def fetch_holders(self, code6):
+            self.request_count += 1
+            if code6 == "601398":
+                return [{"end_date": "2026-06-30", "notice_date": "2026-08-29",
+                         "holders": [{"holder_name": "汇金公司", "share_nature": "国有股",
+                                      "circ_ratio_pct": 34.79, "hold_shares": None}]}]
+            return [{"end_date": "2026-06-30", "notice_date": "2026-08-29",
+                     "holders": [{"holder_name": "某某控股", "share_nature": "境内法人股",
+                                  "circ_ratio_pct": 50.0, "hold_shares": None}]}]
+    monkeypatch.setattr(sinamod, "SinaClient", _FakeSina)
+
+    from datetime import date as _date
+    res = ScreenResult()
+    # 只启用 SOE + 白名单（min_mv/min_years=None → 不触发腾讯市值/K线网络）
+    uc = {"soe_required": True, "industry_whitelist_csric2": ["D44"],
+          "min_total_mv_yi": None}
+    hfc = {"min_consecutive_div_years": None}
+    datac = {"cache_dir": os.path.join(ROOT, "cache")}
+    kept = _v5_hard_filter(
+        cfg, fetcher=None, result=res,
+        hard_pass=["sh.601398", "sz.000001"],
+        name_by_code={"sh.601398": "工商银行", "sz.000001": "平安银行"},
+        industry_map_all={"sh.601398": "D44 电力", "sz.000001": "D44 电力"},
+        uc=uc, hfc=hfc, datac=datac, run_day=_date(2026, 9, 10),
+    )
+    # 东财零调用（否则上面哨兵已抛）；SOE 双规则生效：601398=soe，000001=None+复核清单
+    assert res.soe_flag_map.get("sh.601398") == "soe"
+    assert res.soe_basis_map.get("sh.601398") == "国有股本性质"
+    assert res.soe_flag_map.get("sz.000001") is None
+    assert any(m["code"] == "sz.000001" for m in res.soe_review_list), "非SOE 应进复核清单"
+    # soe_required=True → 只有 soe 的 601398 通过硬过滤
+    assert kept == ["sh.601398"], f"soe_required 下应只留 SOE: {kept}"
