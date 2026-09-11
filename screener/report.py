@@ -62,7 +62,8 @@ CSV_COLUMNS = [
     "consecutive_div_years",       # 连续分红年数（TL D1；从 run_year-1 向前数）
     "fcf_coverage",                # FCF 分红覆盖倍数（TL D6 真值/代理）
     "div_stability_cv",            # 近5年 DPS 变异系数（越低越稳）
-    "reinvest_ref_price_4pct",     # 再投资参考价 = 年度DPS / 目标TTM股息率(4%)（TL D8）
+    "reinvest_ref_price_4pct",     # 再投资参考价 = 近N年平均DPS / 目标TTM股息率(4%)（TL D8；v5.1 V1-5 多期平滑）
+    "dps_cagr_5y_pct",             # 近 N 年 DPS CAGR %（v5.1 V1-5 展示列；None→空）
     "ttm_yield_pctile",            # 当前 TTM 股息率历史分位（0-100，TL D8）
     "yield_spread_pct",            # TTM 股息率 − 10Y国债（百分点，TL D4）
     # --- v1 补充指标（复核用，legacy 模式填充） ---
@@ -80,7 +81,8 @@ _F3_COLS = {"close", "rsi14", "ttm_dividend_yield_pct", "cash_per_share",
 _F2_COLS = {"window_return_pct", "annual_vol_pct", "payout_ratio_pct",
             "industry_roe_rank_pct", "industry_yoy_pni_rank_pct", "roe_pct",
             "roe_3y_mean_pct", "roe_3y_std_pct", "liability_pct", "gross_margin_pct",
-            "yoy_net_profit_pct", "industry_percentile", "total_mv_yi", "ttm_yield_pctile"}
+            "yoy_net_profit_pct", "industry_percentile", "total_mv_yi", "ttm_yield_pctile",
+            "dps_cagr_5y_pct"}
 _F4_COLS = {"z_technical", "z_dividend", "z_industry", "z_fundamental",
             "score_technical", "score_dividend", "score_industry",
             "score_fundamental", "total_score", "ma", "fcf_coverage", "div_stability_cv"}
@@ -253,8 +255,8 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
         if v5_cols:
             # v5（TL D1/D3'/D8）：榜单追加 SOE/判定依据/市值/连续分红/再投资参考列
             ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "
-               "综合得分 | TTM股息率% | ROE% | F-Score | SOE | SOE判定依据 | 市值(亿) | 连续分红年 | 再投资参考价 | TTM分位% |")
-            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|")
+               "综合得分 | TTM股息率% | ROE% | F-Score | SOE | SOE判定依据 | 市值(亿) | 连续分红年 | 再投资参考价 | DPS CAGR5y% | TTM分位% |")
+            ap("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|")
             for _, r in sel.iterrows():
                 fs = f"{_fmt(r['piotroski_fscore'], 0)}/{_fmt(r['piotroski_valid'], 0)}" \
                     if pd.notna(r.get("piotroski_fscore")) else "—"
@@ -266,7 +268,7 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
                     f"| {_fmt(r['roe_pct'])} | {fs} | {_fmt(r.get('soe_flag'))} | {_fmt(r.get('soe_basis'))} "
                     f"| {_fmt(r.get('total_mv_yi'))} "
                     f"| {_fmt(r.get('consecutive_div_years'), 0)} | {_fmt(r.get('reinvest_ref_price_4pct'), 2)} "
-                    f"| {_fmt(r.get('ttm_yield_pctile'))} |"
+                    f"| {_fmt(r.get('dps_cagr_5y_pct'))} | {_fmt(r.get('ttm_yield_pctile'))} |"
                 )
         else:
             ap("| 排名 | 代码 | 名称 | 行业 | 收盘 | 技术分 | 股息分 | 行业分 | 基本面分 | "

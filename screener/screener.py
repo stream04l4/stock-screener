@@ -48,6 +48,7 @@ from .metrics import (
     dedup_dividends,
     dividend_yield_percentile,
     div_stability_cv,
+    dps_cagr,
     em_dividend_records,
     fcf_coverage,
     fcf_coverage_proxy,
@@ -55,6 +56,7 @@ from .metrics import (
     macd_golden_cross,
     new_stock_div_ok,
     payout_ratio,
+    payout_ratio_scored,
     piotroski_fscore,
     rank_percentile,
     roe_stability,
@@ -922,6 +924,7 @@ def _run_zscore(
                 "（CFOToNP/payout）——重跑可补齐（幂等）")
 
     reinvest_c = cfgmod.reinvest_cfg(cfg)  # D8：target_ttm_yield_pct / 分位回看年数
+    divc5 = cfgmod.dividend_cfg(cfg)       # v5.1（V1-4）：payout 软约束区间/衰减（键缺失→None，v4 零回归）
 
     # ---- 候选数据拉取（分红 + 基本面，年度Q4口径）----
     div_years = sorted({run_day.year - 1, run_day.year, annual_year})
@@ -982,6 +985,18 @@ def _run_zscore(
             cash_annual if cash_annual > 0 else None,
             _f(p_cur.get("totalShare")), _f(p_cur.get("netProfit")),
         )
+        # v5.1（TL V1-4）：payout 软约束——**只有喂给打分的值**经 payout_ratio_scored
+        # 变换（区间外降分不剔除）；CSV/报告展示列仍用原始 payout（_aux["payout"]），不误导。
+        # v4 配置回退（dividend 段无 payout_band_pct/payout_out_of_band_decay 键）：
+        # 直接传原值，与 v5 行为完全一致（零回归）。
+        band5, decay5 = divc5["payout_band_pct"], divc5["payout_out_of_band_decay"]
+        if band5 is not None and decay5 is not None:
+            # 单位统一为小数（与 payout_ratio 原值同口径；config 区间是百分数 → /100）。
+            # zscore 对线性缩放不变，但保持小数口径使 factor_means/展示与 v5 一致。
+            payout_scored = payout_ratio_scored(
+                payout, band5["min"] / 100.0, band5["max"] / 100.0, decay5)
+        else:
+            payout_scored = payout
 
         # ---- v5 新因子（TL D1/D4/D6/D8；v4 路径下 annual_dps_map/rf_10y 为空/None → 全 None）----
         cons_y = (consecutive_div_years(annual_dps_map.get(code, {}), run_day.year)
@@ -1086,7 +1101,8 @@ def _run_zscore(
                 },
                 "dividend": {
                     "ttm_yield": ttm_y,
-                    "payout_ratio": payout,
+                    # v5.1（V1-4）：打分用软约束变换值；展示列仍取 _aux["payout"] 原值
+                    "payout_ratio": payout_scored,
                     "consecutive_div_years": cons_y,
                     "fcf_coverage": fcf_val,
                     "div_stability": div_stab_score,
@@ -1115,16 +1131,29 @@ def _run_zscore(
         if (i + 1) % 500 == 0 or i + 1 == len(hard_pass):
             _progress("L4_factor_compute", i + 1, len(hard_pass))
 
-    # ---- v5 再投资参考列（TL D8）：参考价 = 年度DPS / 目标TTM股息率(4%) + TTM 历史分位 ----
+    # ---- v5 再投资参考列（TL D8；v5.1 V1-5：多期平滑参考价 + DPS CAGR）----
     if v5_on:
         target = reinvest_c["target_ttm_yield_pct"] / 100.0
+        smooth_n = reinvest_c["dps_smooth_years"]   # None=键缺失 → 单年原行为（v4 零回归）
+        growth_n = reinvest_c["dps_growth_years"]   # None=键缺失 → CAGR 列空
         for s in stocks:
             c = s["code"]
             a = s["_aux"]
-            dps_annual = (a.get("annual_dps") or {}).get(annual_year)
-            ref_price = None if (dps_annual is None or target <= 0) else dps_annual / target
+            annual_dps = a.get("annual_dps") or {}
+            if smooth_n is None or smooth_n < 1:
+                # v5 原行为：单年（annual_year）DPS / 目标股息率
+                dps_ref = annual_dps.get(annual_year)
+                ref_price = None if (dps_ref is None or target <= 0) else dps_ref / target
+            else:
+                # v5.1（TL 拍板）：窗口 [run_year-N, run_year-1] **所有自然年**计入，
+                # 无分红年按 0——断档应拉低参考价（与连续分红哲学一致）。
+                years = list(range(run_day.year - smooth_n, run_day.year))
+                avg_dps = sum(annual_dps.get(y, 0.0) for y in years) / len(years)
+                ref_price = None if target <= 0 else (avg_dps / target if avg_dps > 0 else None)
+            cagr_v = dps_cagr(annual_dps, growth_n, run_day.year) if growth_n is not None else None
             result.reinvest_cols[c] = {
                 "ref_price": ref_price,
+                "dps_cagr": cagr_v,
                 "ttm_yield_pctile": a.get("ttm_pctile"),
                 "ttm_yield_pctile_n": a.get("ttm_pctile_n") or 0,
             }
@@ -1223,6 +1252,10 @@ def _run_zscore(
                                  else round(-float(sc.raw["dividend"]["div_stability"]), 4)) if v5_on else None,
             "reinvest_ref_price_4pct": (
                 _f3(result.reinvest_cols[code]["ref_price"])
+                if v5_on and code in result.reinvest_cols else None),
+            # v5.1（V1-5）：近 N 年 DPS CAGR 展示列（百分数；None→空）
+            "dps_cagr_5y_pct": (
+                _pct2(result.reinvest_cols[code]["dps_cagr"])
                 if v5_on and code in result.reinvest_cols else None),
             "ttm_yield_pctile": (
                 result.reinvest_cols[code]["ttm_yield_pctile"]
@@ -1362,6 +1395,7 @@ def _zscore_data_notes(cfg, result, window_start) -> None:
     if (uc5.get("soe_required") or uc5.get("industry_whitelist_csric2")
             or uc5.get("min_total_mv_yi") is not None
             or hf5.get("min_consecutive_div_years") is not None):
+        rinc = cfgmod.reinvest_cfg(cfg)  # v5.1：参考价平滑窗口/CAGR 回看年数（说明用）
         result.data_notes += [
             "v5 硬过滤: 行业白名单(证监会二级) + SOE央国企(新浪F10双规则: 股本性质'国有股' OR 名称关键词) + "
             f"总市值≥{uc5.get('min_total_mv_yi')}亿(腾讯idx45) + 连续分红(D1, min={hf5.get('min_consecutive_div_years')})",
@@ -1370,7 +1404,9 @@ def _zscore_data_notes(cfg, result, window_start) -> None:
             "v5 新因子: consecutive_div_years / div_stability(近5年DPS CV) / fcf_coverage(OCF-based: 新浪年报OCF/年度分红总额, D6'; "
             "失败降级CFOToNP/payout代理) / div_yield_pctile(TTM股息率历史分位) / yield_spread(TTM-10Y国债)",
             "v5 technical 维度含估值因子(div_yield_pctile/yield_spread)——TL D9：引擎固定4维的务实选择，非语义归类",
-            f"v5 再投资参考(TL D8): 参考价=年度DPS/目标TTM股息率{cfgmod.reinvest_cfg(cfg)['target_ttm_yield_pct']}% + TTM历史分位展示",
+            f"v5 再投资参考(TL D8): 参考价=近{rinc['dps_smooth_years']}年平均DPS/目标TTM股息率"
+            f"{rinc['target_ttm_yield_pct']}%（窗口内无分红年按0，v5.1）+ TTM历史分位展示 + "
+            f"近{rinc['dps_growth_years']}年DPS CAGR列（v5.1）",
         ]
 
 
