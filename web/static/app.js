@@ -222,6 +222,20 @@ function renderRunDetail(d, box) {
     return;
   }
 
+  // v5.2 Phase 1：数据源健康度 badge（Q5 双通道之 Web 侧）——**仅异常时显示**；
+  // 正常日/旧运行 data_health=null → 不渲染（零视觉回归）。
+  if (d.data_health && d.data_health.has_anomaly) {
+    const dh = d.data_health;
+    box.append(
+      el("div", { class: "card health-anomaly-card" },
+        el("h3", {}, el("span", { class: "run-badge run-badge-failed" }, "数据源异常"),
+          ` · ${d.date}`),
+        ...dh.anomalies.map((a) => el("p", { class: "muted small" }, "⚠️ " + a)),
+        el("p", { class: "muted small" }, "详见报告「数据源健康度」段（report_*.md）")
+      )
+    );
+  }
+
   // KPI 卡片（v2 报告才有；旧运行 kpi 全空 → 不显示）
   if (d.kpi && (d.kpi.selected != null || d.kpi.avg_ttm_yield_pct != null)) {
     box.append(renderKpiCards(d.kpi));

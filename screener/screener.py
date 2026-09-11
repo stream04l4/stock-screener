@@ -133,6 +133,9 @@ class ScreenResult:
     kline_requests: int = 0          # K线(af3)查询次数（增量方案生效的直接证据）
     cache_stats: Dict[str, int] = field(default_factory=dict)
 
+    # ---- v5.2 Phase 1（数据源健康度；canonical.enabled=false → None，零回归）----
+    data_health: Optional[Dict[str, Any]] = None   # health.HealthTracker.to_badge_payload() 摘要
+
 
 class _NoCandidates(Exception):
     """内部哨兵：硬剔除后无候选，跳过后续数据拉取（结果已在 result 中置空）。"""
@@ -280,6 +283,7 @@ def run_screener(
     result = ScreenResult(requested_date=requested_date.isoformat(), mode=mode, top_n=scfg["top_n"])
 
     no_candidates = False
+    tracker = None  # v5.2 HealthTracker（canonical.enabled=false → 保持 None，零回归）
     try:
         # ---------- 0. 交易日定位 ----------
         run_day, fallback = _resolve_run_day(fetcher, requested_date)
@@ -291,12 +295,33 @@ def run_screener(
                 "请求日期 %s 非交易日，回退到最近交易日 %s", result.requested_date, result.run_day
             )
 
+        # ---------- v5.2 Phase 1：数据源健康度记账器（canonical.enabled=false → None=零回归）----------
+        from . import health as _healthmod
+        hc = cfgmod.canonical_cfg(cfg)
+        tracker = (
+            _healthmod.HealthTracker(run_day=result.run_day) if hc["enabled"] else None
+        )
+
         # ---------- 1. 股票池 ----------
         pool, uni_stats = build_universe(fetcher, result.run_day, uc["prefixes"], uc["st_name_keyword"])
         result.universe_stats = uni_stats
         result.funnel["L1_股票池"] = len(pool)
         codes: List[str] = pool["code"].tolist()
         name_by_code: Dict[str, str] = dict(zip(pool["code"], pool["name"]))
+
+        # v5.2 EmptyPayloadGuard(b)：市场级接口(all_stock)交易日 rows<阈值 → 数据源异常（观测性守卫，
+        # 不改变既有陈旧池回退行为——universe.py 已兜底；这里只记健康度）。
+        if tracker is not None:
+            hcfg0 = cfgmod.health_cfg(cfg)
+            from .data import crosscheck as _xc
+            g = _xc.empty_payload_guard(
+                "baostock", "all_stock", len(pool), history_nonempty=True,
+                market_level=True, min_market_rows=hcfg0["market_min_rows"],
+            )
+            if g["status"] != "ok":
+                tracker.add_gap(g)
+                tracker.note(f"市场级接口 all_stock({result.run_day}) rows={len(pool)} < "
+                             f"{hcfg0['market_min_rows']} → 数据源异常（已按既有陈旧池回退语义处理）")
 
         # ---------- 2. 稳定键K线（全市场，af=3 尾部追加）+ 硬性剔除 ----------
         log.info("阶段2: 稳定键增量更新 %d 只股票K线(kline_af3, af=3) ...", len(codes))
@@ -328,6 +353,16 @@ def run_screener(
         hard_pass = [c for c in codes if c not in st_set and c not in short_list]
         result.kline_requests = client.request_count - req_before_kline
         result.funnel["L2_硬剔除后"] = len(hard_pass)
+        # v5.2 Phase 1：腾讯快照健康度记账（成功批/失败批逐批计；source 契约监控计数）
+        if tracker is not None:
+            _tsrc = getattr(fetcher, "_snapshot_source", None)
+            if _tsrc is not None:
+                _tot = int(getattr(_tsrc, "total_batches", 0) or 0)
+                _fb = int(getattr(_tsrc, "failed_batches", 0) or 0)
+                for _ in range(_fb):
+                    tracker.note_call("tencent", False)
+                for _ in range(max(0, _tot - _fb)):
+                    tracker.note_call("tencent", True)
         log.info(
             "阶段2完成: ST剔除 %d、上市不足%d日剔除 %d，剩余 %d（K线 BaoStock 请求 %d 次）",
             len(st_set), hfc["listing_min_trading_days"], len(short_list),
@@ -372,7 +407,7 @@ def run_screener(
         else:
             _run_zscore(
                 cfg, fetcher, client, result, hard_pass, name_by_code, industry_map_all,
-                snapshots, scfg, ic, window_start, run_day, do_crosscheck,
+                snapshots, scfg, ic, window_start, run_day, do_crosscheck, tracker,
             )
 
     except _NoCandidates:
@@ -391,6 +426,10 @@ def run_screener(
             f"主数据源: BaoStock，筛选运行日 {result.run_day}",
             "硬性剔除（ST/上市天数）后无候选 → 输出空结果",
         ]
+
+    # v5.2 Phase 1：健康度摘要挂到 result（report 固定段 + Web badge 消费；tracker=None → 零回归）
+    if tracker is not None:
+        result.data_health = tracker.to_badge_payload()
 
     result.elapsed_seconds = time.time() - t_start
     result.baostock_requests = client.request_count
@@ -813,7 +852,7 @@ def _legacy_data_notes(cfg, result, window_start) -> None:
 
 def _run_zscore(
     cfg, fetcher, client, result, hard_pass, name_by_code, industry_map_all,
-    snapshots, scfg, ic, window_start, run_day, do_crosscheck,
+    snapshots, scfg, ic, window_start, run_day, do_crosscheck, tracker=None,
 ) -> None:
     """v2：硬剔除后全体候选 → 因子计算 → 截面 Z-Score → Top N。"""
     annual_year = _resolve_annual_year(fetcher, run_day)
@@ -1295,6 +1334,221 @@ def _run_zscore(
     # v5（验收④）：ttm_yield vs 腾讯 idx64 抽样交叉校验（偏差 <0.1pct，超差告警）
     if v5_on and do_crosscheck and result.funnel["L4_TopN入选"] > 0:
         _ttm_crosscheck(cfg, result)
+
+    # v5.2 Phase 1：三字段交叉校验 v1（close/dps/roe；canonical.enabled=false → tracker=None 跳过）
+    if do_crosscheck and tracker is not None and result.funnel["L4_TopN入选"] > 0:
+        _v52_crosscheck(cfg, fetcher, client, result, scored, annual_year, run_day, tracker)
+
+
+def _v52_crosscheck(
+    cfg, fetcher, client, result: ScreenResult,
+    scored, annual_year: int, run_day, tracker,
+) -> None:
+    """v5.2 Phase 1：close/dps/roe 三字段交叉校验 v1（报告 §4，阈值=config health: 段）。
+
+    - **close**：腾讯快照(主, fetcher._snapshot) vs 新浪 akshare daily(校验源)。非除权日
+      |Δ|>tol% 告警；除权日（当日 r_event 候选）不校验 close 绝对值，改校验 r_event 一致性。
+    - **dps**：em_dividend_all 静态底表 vs akshare fhps_detail_em 增量（同源东财=一致性）。
+      |Δ|≥warn 告警、>stop 停算标"待复核"（不覆盖静态底表——静态表只读，本就不被写）。
+    - **roe**：BaoStock roeAvg(小数,平均; 本地缓存) vs 新浪 ROEWEIGHTED(百分数,加权;
+      v5 OCF 抓取同批 CF JSON 已含 → 零新增请求)。换算后 |Δ|>tol_pp 告警。
+
+    纪律：全部走既有快照/缓存 + akshare 串行限速（breaker 同构 D9'）；任何异常只降级
+    （warning + 健康度注记），绝不炸主流程。canonical 层同步 append 校验通过的派生值。
+    """
+    from .data import crosscheck as xc
+    from .data import canonical as canon
+    from .data import akshare_src
+
+    hc = cfgmod.health_cfg(cfg)
+    if not hc["enabled"]:
+        return
+    ccfg = cfgmod.canonical_cfg(cfg)
+    top = [s.code for s in scored if s.top_n_selected]
+    sample = top[: int(hc["sample_size"])]
+    if not sample:
+        return
+    run_day_s = run_day.isoformat()
+    c6_of = lambda c: c.split(".")[1]
+
+    # 除权日候选（当日 r_event）：close 校验改走 r_event 一致性。
+    # fetcher._candidates = {code: ExdateCandidate}（_ensure_snapshot 填充；未触发 → {}）。
+    cand_map = getattr(fetcher, "_candidates", None) or {}
+    exdate_candidates = set(cand_map.keys()) if isinstance(cand_map, dict) else set()
+
+    # 新浪 ROEWEIGHTED：v5 OCF 抓取已把 CF JSON 落 raw（sina/cf_{c6}_p*.json）——从 raw 读，
+    # **零新增网络请求**（Q4/硬约束：请求量 +0）。raw 缺失（enabled=false 或当日未抓）→ 跳过 roe。
+    from .data import rawstore as _raw
+
+    def _sina_roe_pct(code6: str) -> Optional[float]:
+        store = _raw.raw_store()
+        if store is None:
+            return None
+        for p in store.list_files(source="sina"):
+            env = store.read_envelope(p)
+            if env is None or not str(env.get("endpoint", "")).startswith(f"cf_{code6}_p"):
+                continue
+            rep = _latest_annual_from_cf_payload(env.get("data"), run_day_s)
+            return rep  # float|None
+        return None
+
+    # em 静态底表（本地只读，零网络）
+    em_by_code: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        from .data import sina as sinamod
+        div_rows_all, _dm = sinamod.load_local_dividends(cfg["data"]["cache_dir"])
+        for r in div_rows_all:
+            em_by_code.setdefault(r["code"], []).append(r)
+    except Exception as exc:  # noqa: BLE001 — 静态表缺失不阻塞校验（降级）
+        tracker.note(f"⚠️ v5.2 dps 校验：本地分红全表读取失败（{exc}）→ DPS 校验跳过")
+
+    bars = getattr(fetcher, "_snapshot", None) or {}
+    canon_store = canon.canonical_store() if ccfg["enabled"] else None
+
+    # ---- akshare 客户端（串行限速 + breaker；仅 close/dps 校验源）----
+    akc = akshare_src.AkshareValidationClient(hc)
+    start_s = (run_day - timedelta(days=14)).strftime("%Y%m%d")  # ~2 周窗口足够对齐最近交易日
+    end_s = run_day.strftime("%Y%m%d")
+
+    n_close_ok = n_dps_ok = n_roe_ok = 0
+    for code in sample:
+        c6 = c6_of(code)
+        is_exdate = code in exdate_candidates
+        # ---------- close：腾讯 vs 新浪 akshare daily ----------
+        tencent_close = None
+        _bar = bars.get(code) if isinstance(bars, dict) else None
+        if _bar is not None:
+            tencent_close = _bar.close
+        sina_rows = akc.daily_closes(c6, start_s, end_s)
+        tracker.note_call("akshare_sina", sina_rows is not None)
+        if sina_rows is not None:
+            from .data import rawstore as _raw2
+            _raw2.record_response("akshare_sina", f"daily_{c6}", sina_rows, date_s=run_day_s)
+            # 取与腾讯快照同日（或最近 <= run_day）的 close
+            target = None
+            for r in reversed(sina_rows):
+                if r["date"] <= run_day_s:
+                    target = r
+                    break
+            if not is_exdate and tencent_close is not None and target is not None:
+                chk = xc.check_close(code, tencent_close, target["close"], hc["close_tolerance_pct"])
+                tracker.add_check("close", chk)
+                if chk["ok"] is True:
+                    n_close_ok += 1
+                    # canonical：腾讯主源 close（校验通过才写——Q1 价格=腾讯主）
+                    if canon_store is not None and target is not None:
+                        canon_store.append("close", code, run_day_s, tencent_close,
+                                           source="tencent")
+            elif is_exdate:
+                # 除权日：改校验 r_event 一致性（腾讯推导 vs 本地 adjfactor 事件）
+                cand = cand_map.get(code)
+                r_tencent = getattr(cand, "r_event", None) if cand is not None else None
+                r_cache = _adjfactor_r_event(fetcher, code, run_day_s)
+                chk = xc.check_r_event(code, r_tencent, r_cache, hc["r_event_tolerance_pct"])
+                tracker.add_check("close", chk)
+                if chk["ok"] is True:
+                    n_close_ok += 1
+        # ---------- dps：em 静态 vs akshare fhps_detail_em（同源一致性）----------
+        em_recs = em_by_code.get(c6, [])
+        fhps = akc.fhps_detail(c6)
+        tracker.note_call("akshare_em", fhps is not None)
+        if fhps is not None:
+            _raw.record_response("akshare_em", f"fhps_{c6}", fhps, date_s=run_day_s)
+            # 对齐：同一除权日（PIT：ex_date<=run_day 且已实施）。em 表按文件序（旧→新）
+            # → reversed 取**最近**一个可对齐除权日（抽样校验，非全史）。
+            ak_by_exd = {r["ex_date"]: r for r in fhps if r["ex_date"] and r["ex_date"] <= run_day_s}
+            compared = False
+            for er in reversed(em_recs):
+                exd = er.get("ex_date") or ""
+                if not exd or exd > run_day_s:
+                    continue
+                ar = ak_by_exd.get(exd)
+                if ar is None or ar["dps_per_share"] is None or er.get("dps_pretax") is None:
+                    continue
+                chk = xc.check_dps(code, er["dps_pretax"], ar["dps_per_share"],
+                                   hc["dps_warn_at"], hc["dps_stop_at"])
+                tracker.add_check("dps", chk)
+                if chk["level"] == "ok":
+                    n_dps_ok += 1
+                    if canon_store is not None:
+                        canon_store.append("dps", code, exd, er["dps_pretax"], source="em_static")
+                elif chk["level"] == "review":
+                    tracker.add_review(code, f"dps {exd}: em={chk['em']} vs akshare={chk['akshare']} "
+                                             f"Δ={chk['diff']}元/股 > 停算阈值{hc['dps_stop_at']}")
+                compared = True
+                break  # 每只取最近一个可对齐除权日（抽样校验，非全史）
+            if not compared and em_recs:
+                tracker.note(f"v5.2 dps {code}: 无可对齐除权日（em/akshare 时间窗不重叠）")
+        # ---------- roe：BaoStock roeAvg(本地缓存) vs 新浪 ROEWEIGHTED(raw CF JSON) ----------
+        bs_row = None
+        try:
+            bs_row = fetcher.profit_data(code, annual_year, 4)
+        except Exception:  # noqa: BLE001 — 校验源读取失败不阻塞
+            bs_row = None
+        sina_roe = _sina_roe_pct(c6)
+        if bs_row is not None and bs_row.get("roeAvg") is not None and sina_roe is not None:
+            chk = xc.check_roe(code, bs_row["roeAvg"], sina_roe, hc["roe_tolerance_pp"])
+            tracker.add_check("roe", chk)
+            if chk["ok"] is True:
+                n_roe_ok += 1
+                if canon_store is not None:
+                    canon_store.append("roe", code, f"{annual_year}Q4",
+                                       round(bs_row["roeAvg"] * 100.0, 4), source="baostock")
+            elif chk["ok"] is False:
+                tracker.note(f"⚠️ v5.2 roe {code}: BaoStock={chk['bs_pct']}% vs 新浪加权="
+                             f"{chk['sina_pct']}% Δ={chk['diff_pp']}pp > {hc['roe_tolerance_pp']}pp")
+
+    # ---- 汇总注记（报告段消费）----
+    tracker.note(f"v5.2 交叉校验 v1: close {n_close_ok}/{len(sample)} 通过, "
+                 f"dps {n_dps_ok} 项一致, roe {n_roe_ok}/{len(sample)} 通过"
+                 f"（akshare HTTP {akc.request_count} 次，串行限速 >=1s）")
+
+
+def _latest_annual_from_cf_payload(payload: Any, run_day_s: str) -> Optional[float]:
+    """从新浪 CF JSON raw payload 提取最近已披露年报的 ROEWEIGHTED（百分数）。
+
+    PIT：publish_date <= run_day。结构异常/无可见年报 → None（校验跳过，不告警）。
+    """
+    try:
+        from .data import sina as sinamod
+        reports = sinamod.parse_cf_report(payload)  # 含 roe_weighted_pct（v5.2 附加字段）
+        for r in reports:  # 降序
+            if not str(r.get("report_date") or "").endswith("-12-31"):
+                continue
+            pd_ = str(r.get("publish_date") or "")
+            if pd_ and pd_ > run_day_s:
+                continue
+            return r.get("roe_weighted_pct")
+    except Exception:  # noqa: BLE001 — raw payload 结构漂移 → 跳过（旁路）
+        return None
+    return None
+
+
+def _adjfactor_r_event(fetcher, code: str, run_day_s: str) -> Optional[float]:
+    """本地 adjfactor 缓存中 run_day 当日除权事件的 r_event（=新因子/旧因子）。
+
+    无当日事件 → None（该日非除权日，调用方不应走到此分支）。
+    """
+    try:
+        hit = fetcher.adjfactor_history(code)
+        if not hit or not hit["rows"]:
+            return None
+        idx = {c: i for i, c in enumerate(hit["columns"])}
+        i_code, i_date, i_back = idx.get("code"), idx.get("date"), idx.get("backAdjustFactor")
+        if i_code is None or i_date is None or i_back is None:
+            return None
+        rows = [r for r in hit["rows"] if len(r) > max(i_code, i_date, i_back)]
+        ev = [r for r in rows if str(r[i_date]) == run_day_s and str(r[i_code]) == code]
+        prev = [r for r in rows if str(r[i_date]) < run_day_s]
+        if not ev or not prev:
+            return None
+        new_back = float(ev[-1][i_back])
+        old_back = float(prev[-1][i_back])
+        if old_back <= 0:
+            return None
+        return new_back / old_back
+    except (ValueError, IndexError, TypeError, KeyError):
+        return None
 
 
 def _ttm_crosscheck(cfg, result: ScreenResult) -> None:

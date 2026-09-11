@@ -13,3 +13,7 @@ __pycache__/
 cache/
 logs/
 output/
+
+# v5.2 Phase 1：raw/canonical 数据层（append-only 审计 + 派生 Schema；回滚=整删）。
+# ⚠️必须锚定仓库根 /data/——裸 data/ 会误伤 screener/data/ 源码目录。
+/data/

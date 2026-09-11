@@ -1,0 +1,96 @@
+{
+ "n_compared": 53,
+ "max_abs_diff_pct": 0.4908,
+ "rows": [
+  {
+   "date": "2026-08-24",
+   "akshare_sina": 7.89,
+   "local_af3": "7.8900",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-08-25",
+   "akshare_sina": 7.9,
+   "local_af3": "7.9000",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-08-26",
+   "akshare_sina": 7.92,
+   "local_af3": "7.9200",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-08-27",
+   "akshare_sina": 7.82,
+   "local_af3": "7.8200",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-08-28",
+   "akshare_sina": 7.86,
+   "local_af3": "7.8600",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-08-31",
+   "akshare_sina": 8.07,
+   "local_af3": "8.0700",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-01",
+   "akshare_sina": 8.15,
+   "local_af3": "8.1500",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-02",
+   "akshare_sina": 8.22,
+   "local_af3": "8.2200",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-03",
+   "akshare_sina": 8.1,
+   "local_af3": "8.1000",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-04",
+   "akshare_sina": 8.13,
+   "local_af3": "8.1300",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-07",
+   "akshare_sina": 7.97,
+   "local_af3": "7.9700",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-08",
+   "akshare_sina": 7.94,
+   "local_af3": "7.9400",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-09",
+   "akshare_sina": 8.0,
+   "local_af3": "8.0000",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-10",
+   "akshare_sina": 8.1,
+   "local_af3": "8.1000",
+   "diff_pct": 0.0
+  },
+  {
+   "date": "2026-09-11",
+   "akshare_sina": 8.11,
+   "local_af3": "8.1500",
+   "diff_pct": 0.4908
+  }
+ ]
+}

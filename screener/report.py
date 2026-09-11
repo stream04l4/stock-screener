@@ -406,6 +406,14 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
             ap(f"- …其余 {len(skipped) - 50} 个组略")
         ap("")
 
+    # ---------- v5.2 Phase 1：数据源健康度（固定段，双通道之 report 侧）----------
+    # 仅 data_health 存在时渲染（canonical.enabled=true 的运行必有该段——"固定段"语义；
+    # enabled=false/回滚 → 整段消失，报告与 v5.1 逐字节一致——brief 回滚硬约束优先）。
+    from . import health as _healthmod
+    dh = getattr(result, "data_health", None)
+    if isinstance(dh, dict) and isinstance(dh.get("summary"), dict):
+        lines.extend(_healthmod.render_report_section_from_summary(dh["summary"]))
+
     # ---------- 六、数据时间戳与来源说明 ----------
     ap("## 六、数据时间戳与来源说明")
     ap("")
@@ -533,6 +541,13 @@ def _write_report_legacy(result, cfg: Dict[str, Any], path: str) -> None:
         if len(skipped) > 50:
             ap(f"- …其余 {len(skipped) - 50} 个组略")
         ap("")
+
+    # ---------- v5.2 Phase 1：数据源健康度（固定段，双通道之 report 侧）----------
+    # 仅 data_health 存在时渲染（回滚 → 整段消失，与 v5.1 逐字节一致）。
+    from . import health as _healthmod
+    dh = getattr(result, "data_health", None)
+    if isinstance(dh, dict) and isinstance(dh.get("summary"), dict):
+        lines.extend(_healthmod.render_report_section_from_summary(dh["summary"]))
 
     # ---------- 五、数据时间戳与来源说明 ----------
     ap("## 五、数据时间戳与来源说明")

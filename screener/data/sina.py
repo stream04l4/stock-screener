@@ -223,14 +223,18 @@ def parse_cf_report(
         if not rd:
             continue
         ocf = None
+        roe_weighted_pct = None  # v5.2：ROEWEIGHTED（百分数,加权）——ROE 交叉校验源（报告 §4）
         for it in (rep.get("data") or []):
-            if it.get("item_field") == ocf_field:
-                ocf = _fnum(it.get("item_value"))
-                break
+            fld = it.get("item_field")
+            if fld == ocf_field and ocf is None:
+                ocf = _fnum(it.get("item_value"))  # 首个匹配生效（与原 break 语义一致）
+            elif fld == "ROEWEIGHTED" and roe_weighted_pct is None:
+                roe_weighted_pct = _fnum(it.get("item_value"))
         out.append({
             "report_date": rd,
             "publish_date": _clean_date(rep.get("publish_date")),
             "ocf": ocf,
+            "roe_weighted_pct": roe_weighted_pct,  # v5.2 附加字段（旧调用方不读=零回归）
         })
     out.sort(key=lambda x: x["report_date"], reverse=True)
     return out
@@ -358,6 +362,9 @@ class SinaClient:
         except (LookupError, UnicodeError) as exc:  # pragma: no cover - gbk 恒可用
             raise SinaDataError(f"新浪 F10 {code6} GBK 解码失败: {exc}") from exc
         periods = parse_holders_page(html)
+        # v5.2 Phase 1：新浪 F10 股东页原始响应落 raw（零转换；canonical.enabled=false → no-op）
+        from . import rawstore as _raw
+        _raw.record_response("sina", f"f10_holders_{code6}", html, meta={"periods": len(periods)})
         if not periods:
             self._note_failure("holders")
             raise SinaDataError(f"新浪 F10 {code6} 未解析到任何股东表（页面结构漂移?）")
@@ -393,6 +400,9 @@ class SinaClient:
                 payload = resp.json()
             except ValueError as exc:
                 raise SinaDataError(f"新浪财务JSON {code6} 非 JSON 响应: {exc}") from exc
+            # v5.2 Phase 1：CF JSON 原始响应落 raw（零转换；canonical.enabled=false → no-op）
+            from . import rawstore as _raw
+            _raw.record_response("sina", f"cf_{code6}_p{page}", payload)
             page_reports = parse_cf_report(payload)
             if not page_reports:
                 break

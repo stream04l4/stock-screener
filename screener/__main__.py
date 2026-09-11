@@ -76,6 +76,14 @@ def main(argv=None) -> int:
         cache_dir = os.path.join(PROJECT_ROOT, cache_dir)
     cfg["data"]["cache_dir"] = cache_dir  # 回填，供 data_cfg 使用
 
+    # v5.2 Phase 1：raw/canonical 单例启用开关显式注入（尊重 --config 路径覆盖；
+    # 否则单例默认读仓库 config/strategy.yaml，与自定义 yaml 的 enabled=false 不一致）
+    from .data import rawstore as _rawmod
+    from .data import canonical as _canonmod
+    _v52_enabled = bool((cfg.get("canonical") or {}).get("enabled", True))
+    _rawmod.set_enabled(_v52_enabled)
+    _canonmod.set_enabled(_v52_enabled)
+
     run_tag = requested.strftime("%Y%m%d")
     _setup_logging(os.path.join(PROJECT_ROOT, "logs"), run_tag)
     log = logging.getLogger("screener.cli")
@@ -92,6 +100,17 @@ def main(argv=None) -> int:
         md_path = os.path.join(output_dir, f"report_{result.run_day.replace('-', '')}.md")
         n_rows = write_csv(result, csv_path)
         write_report(result, cfg, md_path)
+
+        # v5.2 Phase 1：健康度 JSON sidecar（Web badge 读取；canonical.enabled=false → 无 data_health）
+        _dh = getattr(result, "data_health", None)
+        if isinstance(_dh, dict):
+            from . import health as _healthmod
+            try:
+                hp = _healthmod.save_payload(output_dir, _dh)
+                if hp:
+                    log.info("输出: %s（数据源健康度，Web badge 用）", hp)
+            except Exception:  # noqa: BLE001 — sidecar 失败不得影响主路径
+                pass
 
         log.info("输出: %s (%d 行)", csv_path, n_rows)
         log.info("输出: %s", md_path)

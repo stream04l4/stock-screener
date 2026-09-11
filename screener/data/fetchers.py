@@ -209,7 +209,8 @@ class DataFetcher:
 
     # ---------- 缓存包装 ----------
     def _cached(
-        self, name: str, fetch_fn, ttl_hours: Optional[float] = None
+        self, name: str, fetch_fn, ttl_hours: Optional[float] = None,
+        raw_label: Optional[str] = None,
     ) -> Tuple[List[str], List[List[str]]]:
         hit = self.cache.get(name, ttl_hours)
         if hit is not None:
@@ -218,6 +219,11 @@ class DataFetcher:
         columns, rows = fetch_fn()
         self.cache.put(name, columns, rows)
         self.calls["fetched"] += 1
+        # v5.2 Phase 1：BaoStock live 响应原样落 raw（零转换、幂等；canonical.enabled=
+        # false → no-op）。仅 cache-miss 的 live 响应记录（cache-hit 是本地读，非"响应"）。
+        if raw_label is not None:
+            from . import rawstore as _raw
+            _raw.record_response("baostock", raw_label, rows, rows=len(rows))
         return columns, rows
 
     # ---------- 交易日历 ----------
@@ -750,6 +756,23 @@ class DataFetcher:
             )
         self._snapshot = bars
 
+        # v5.2 Phase 1：腾讯快照原始响应落 raw（零转换、幂等、旁路 no-op 安全）。
+        # canonical.enabled=false → record_response 内部返回 None，行为逐字节不变。
+        if bars:
+            from . import rawstore as _raw
+            _raw.record_response(
+                "tencent", "snapshot",
+                [
+                    {
+                        "code": b.code, "name": b.name, "close": b.close,
+                        "preclose": b.preclose, "ts": b.ts, "pct_chg": b.pct_chg,
+                    }
+                    for b in bars.values()
+                ],
+                date_s=run_day,
+                meta={"requested": source.requested_count, "parsed": len(bars)},
+            )
+
         # 全量扫描缓存尾（一次遍历）：检测器输入 + cutover 判定 + 缺口分组共用
         prev_closes, tail_dates = self._scan_cache_tails(codes, run_day)
         self._prev_closes = prev_closes
@@ -1165,7 +1188,8 @@ class DataFetcher:
                 yearType="operate",
             )
 
-        _, rows = self._cached(name, fetch, ttl_hours=self._dividend_ttl(year))
+        _, rows = self._cached(name, fetch, ttl_hours=self._dividend_ttl(year),
+                               raw_label=f"dividend_{code}_{year}")
         out: List[Dict[str, Any]] = []
         for r in rows:
             d = dict(zip(self.DIVIDEND_FIELDS, r))
@@ -1184,7 +1208,8 @@ class DataFetcher:
                 code=code, year=year, quarter=quarter,
             )
 
-        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter))
+        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter),
+                               raw_label=f"profit_{code}_{year}Q{quarter}")
         if not rows:
             return None
         d = dict(zip(["code", "pubDate", "statDate", "roeAvg", "npMargin", "gpMargin",
@@ -1203,7 +1228,8 @@ class DataFetcher:
                 code=code, year=year, quarter=quarter,
             )
 
-        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter))
+        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter),
+                               raw_label=f"growth_{code}_{year}Q{quarter}")
         if not rows:
             return None
         d = dict(zip(["code", "pubDate", "statDate", "YOYEquity", "YOYAsset",
@@ -1222,7 +1248,8 @@ class DataFetcher:
                 code=code, year=year, quarter=quarter,
             )
 
-        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter))
+        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter),
+                               raw_label=f"balance_{code}_{year}Q{quarter}")
         if not rows:
             return None
         d = dict(zip(["code", "pubDate", "statDate", "currentRatio", "quickRatio",
@@ -1241,7 +1268,8 @@ class DataFetcher:
                 code=code, year=year, quarter=quarter,
             )
 
-        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter))
+        _, rows = self._cached(name, fetch, ttl_hours=self._fundamental_ttl(year, quarter),
+                               raw_label=f"cashflow_{code}_{year}Q{quarter}")
         if not rows:
             return None
         d: Dict[str, Any] = dict(zip(["code", "pubDate", "statDate", "CAToAsset", "NCAToAsset",

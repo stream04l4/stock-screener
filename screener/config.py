@@ -451,6 +451,57 @@ def sina_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def canonical_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.2 Phase 1（TL Q2=选项 C / Q4=只增量）：canonical/raw 统一 Schema 层开关。
+
+    - enabled：false → raw/canonical 全 no-op + 报告段标注"已禁用"（回滚点，主路径
+      行为逐字节不变）。默认 true（brief：canonical.enabled 默认 true）。
+    - dir：canonical 目录（相对项目根）；data_version：溯源字段值。
+    """
+    c = cfg.get("canonical") or {}
+    return {
+        "enabled": bool(c.get("enabled", True)),
+        "dir": str(c.get("dir", "data/canonical")),
+        "data_version": str(c.get("data_version", "v5.2-p1")),
+    }
+
+
+def health_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.2 Phase 1：交叉校验 v1 阈值 + EmptyPayloadGuard + akshare 客户端参数。
+
+    全部来自 strategy.yaml ``health:`` 段（零硬编码纪律）。默认值=报告 §4 按实测校准的
+    阈值（close 0.1%——实测基线 52/52 零偏差；dps 0.01/0.05 元/股；roe 1pp——实测基线差
+    0.48pp=口径差非错误，勿收紧到 <0.5pp；market_min_rows 5000——交易日全市场恒数千只）。
+    这些是**数据质量阈值**（校验层），不是策略筛选阈值，故不在 test_no_hardcoded_
+    thresholds 的筛选关键词表内，但同样必须可配置（单一事实来源=strategy.yaml）。
+    """
+    h = cfg.get("health") or {}
+    out = {
+        "enabled": bool(h.get("enabled", True)),
+        # 交叉校验抽样规模（从最终入选股中抽 N 只做三字段校验，串行限速）
+        "sample_size": int(h.get("sample_size", 20)),
+        # close：腾讯 vs 新浪非除权日 |Δ|>此值(%) 告警；除权日改校验 r_event（同阈值量级）
+        "close_tolerance_pct": float(h.get("close_tolerance_pct", 0.1)),
+        "r_event_tolerance_pct": float(h.get("r_event_tolerance_pct", 1.0)),
+        # dps：em 静态 vs akshare-em |Δ|≥warn_at 告警、>stop_at 停算标"待复核"（元/股）
+        "dps_warn_at": float(h.get("dps_warn_at", 0.01)),
+        "dps_stop_at": float(h.get("dps_stop_at", 0.05)),
+        # roe：BaoStock roeAvg(小数) vs 新浪 ROEWEIGHTED(百分数) 换算后 |Δ|>此值(pp) 告警
+        "roe_tolerance_pp": float(h.get("roe_tolerance_pp", 1.0)),
+        # EmptyPayloadGuard：市场级接口(all_stock)交易日 rows<此值 → 数据源异常
+        "market_min_rows": int(h.get("market_min_rows", 5000)),
+        # akshare 校验源客户端（D9' 同构：串行 >=1s、重试 <=2、连续失败熔断）
+        "akshare_interval_s": float(h.get("akshare_interval_s", 1.0)),
+        "akshare_max_attempts": int(h.get("akshare_max_attempts", 2)),
+        "akshare_breaker": int(h.get("akshare_breaker", 5)),
+    }
+    if out["dps_warn_at"] < 0 or out["dps_stop_at"] <= out["dps_warn_at"]:
+        raise ConfigError("health.dps_warn_at / dps_stop_at 必须满足 0<=warn<stop")
+    if out["akshare_max_attempts"] < 1 or out["akshare_max_attempts"] > 2:
+        raise ConfigError("health.akshare_max_attempts 必须在 [1,2]（D9' 同构）")
+    return out
+
+
 def rf_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """v5 Round-2（TL D4'）：10Y 国债收益率源参数（TradingEconomics）。
 

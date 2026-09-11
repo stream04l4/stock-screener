@@ -200,3 +200,27 @@ crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进�
   price_tolerance_pct: 0.5          # 收盘价偏差容忍度（%）
   batch_size: 50                    # 腾讯接口单批请求股票数
   ttm_tolerance_pct: 0.1            # v5（验收④）：ttm_yield vs 腾讯 idx64 偏差容忍度（百分点）
+
+# ---------------------------------------------------------------------------
+# v5.2 Phase 1（TL 拍板 2026-09-11：Q2=选项 C / Q4=只增量 / Q5=双通道）
+# ---------------------------------------------------------------------------
+canonical:                          # raw + canonical 统一 Schema 派生层（data/raw、data/canonical）
+  enabled: true                     # ⚠️回滚点：false → raw/canonical 全 no-op，主路径行为逐字节不变
+                                    # （配合删除 data/raw、data/canonical 目录 = v5.1 状态）
+  dir: data/canonical               # canonical 输出目录（相对项目根；与 cache/ 平级的独立数据层）
+  data_version: v5.2-p1             # 溯源字段：canonical 每条记录的 schema 版本
+
+health:                             # 交叉校验 v1 阈值 + EmptyPayloadGuard（报告 §4，按实测校准）
+  enabled: true                     # false → 跳过三字段交叉校验（raw/canonical 落盘不受影响）
+  sample_size: 20                   # 从最终入选股中抽样 N 只做 close/dps/roe 三字段校验（串行限速）
+  close_tolerance_pct: 0.1          # 收盘价：腾讯 vs 新浪非除权日 |Δ|>此值(%) 告警（实测基线 52/52 零偏差）
+  r_event_tolerance_pct: 1.0        # 除权日改校验 r_event 一致性（|Δ|>此值(%) 告警；不校验 close 绝对值）
+  dps_warn_at: 0.01                 # DPS：em 静态 vs akshare-em |Δ|≥此值(元/股) 告警（同源=一致性检查）
+  dps_stop_at: 0.05                 # DPS：|Δ|>此值(元/股) 停算标"待复核"（不进计算、不覆盖静态底表）
+  roe_tolerance_pp: 1.0             # ROE：BaoStock roeAvg(小数,平均) vs 新浪 ROEWEIGHTED(百分数,加权)
+                                    # 换算后 |Δ|>此值(pp) 告警。实测基线差 0.48pp=口径差非错误，
+                                    # **勿收紧到 <0.5pp**（会误报全部正常股）
+  market_min_rows: 5000             # EmptyPayloadGuard：市场级接口(all_stock)交易日 rows<此值 → 数据源异常
+  akshare_interval_s: 1.0           # akshare 校验源限速（D9' 同构：串行 >=1s；仅校验用途，失败不阻塞）
+  akshare_max_attempts: 2           # akshare 重试 <=2 次（含首次共 <=3 次尝试）
+  akshare_breaker: 5                # akshare 某类接口连续失败 >=N → 该类当日整体降级（不得死磕）

@@ -913,6 +913,20 @@ def run_detail(day: str) -> Dict[str, Any]:
     if not selected:
         selected = [r for r in rows if (r.get("pass_all") or "").strip() == "是"]
 
+    # v5.2 Phase 1：数据源健康度（Q5 双通道之 Web 侧）——**仅异常时返回非空 payload**，
+    # 前端据此显示 badge；正常日/旧运行 → None（badge 不渲染，零视觉回归）。
+    # 直接读 JSON sidecar（不 import screener 包——web 是独立进程，避免 sys.path 依赖）。
+    data_health: Dict[str, Any] | None = None
+    try:
+        dh_path = OUTPUT_DIR / f"data_health_{compact}.json"
+        if dh_path.exists():
+            with open(dh_path, encoding="utf-8") as _f:
+                _dh = json.load(_f)
+            if isinstance(_dh, dict) and _dh.get("has_anomaly"):
+                data_health = _dh
+    except Exception:  # noqa: BLE001 — 健康度读取失败不影响运行详情
+        data_health = None
+
     md = ""
     parsed: Dict[str, Any] = {"funnel": [], "missing": [], "skipped_groups": {}, "kpi": {}}
     if report_p.exists():
@@ -944,6 +958,7 @@ def run_detail(day: str) -> Dict[str, Any]:
         "survivors": rows,  # v2 CSV 全量列（zscore 模式=全体打分候选）
         "missing_fundamental": parsed["missing"],
         "skipped_groups": parsed["skipped_groups"],
+        "data_health": data_health,  # v5.2：仅异常时非空（前端 badge 判据）
         "report_md": md,
     }
 

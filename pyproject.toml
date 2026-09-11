@@ -13,6 +13,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# v5.2 Phase 1：akshare 校验源（**pin 死版本**——非官方接口、迭代快，漂移风险高；
+# 仅交叉校验用途，不进主计算路径。装法：uv pip install 'akshare==1.18.88'）
+validate = ["akshare==1.18.88"]
 
 [build-system]
 requires = ["hatchling"]

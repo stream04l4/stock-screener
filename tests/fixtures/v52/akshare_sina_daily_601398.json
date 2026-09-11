@@ -1,0 +1,126 @@
+{
+ "cols": [
+  "date",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "amount",
+  "outstanding_share",
+  "turnover"
+ ],
+ "rows_tail": [
+  {
+   "date": "2026-08-31",
+   "open": 7.95,
+   "high": 8.08,
+   "low": 7.9,
+   "close": 8.07,
+   "volume": 403025909.0,
+   "amount": 3227091269.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0014948355091359276
+  },
+  {
+   "date": "2026-09-01",
+   "open": 8.04,
+   "high": 8.18,
+   "low": 8.02,
+   "close": 8.15,
+   "volume": 357285975.0,
+   "amount": 2900099958.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0013251846852015941
+  },
+  {
+   "date": "2026-09-02",
+   "open": 8.19,
+   "high": 8.29,
+   "low": 8.14,
+   "close": 8.22,
+   "volume": 371799852.0,
+   "amount": 3052234794.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0013790171020024485
+  },
+  {
+   "date": "2026-09-03",
+   "open": 8.16,
+   "high": 8.27,
+   "low": 8.07,
+   "close": 8.1,
+   "volume": 331645535.0,
+   "amount": 2704794753.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0012300835035505922
+  },
+  {
+   "date": "2026-09-04",
+   "open": 8.07,
+   "high": 8.21,
+   "low": 8.06,
+   "close": 8.13,
+   "volume": 243890503.0,
+   "amount": 1988309961.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0009045973871258547
+  },
+  {
+   "date": "2026-09-07",
+   "open": 8.15,
+   "high": 8.2,
+   "low": 7.95,
+   "close": 7.97,
+   "volume": 341549255.0,
+   "amount": 2743356399.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.001266816706051823
+  },
+  {
+   "date": "2026-09-08",
+   "open": 7.97,
+   "high": 8.02,
+   "low": 7.85,
+   "close": 7.94,
+   "volume": 283569164.0,
+   "amount": 2245910881.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0010517667628241474
+  },
+  {
+   "date": "2026-09-09",
+   "open": 7.91,
+   "high": 8.02,
+   "low": 7.88,
+   "close": 8.0,
+   "volume": 215443212.0,
+   "amount": 1717501611.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0007990855086686241
+  },
+  {
+   "date": "2026-09-10",
+   "open": 8.02,
+   "high": 8.13,
+   "low": 8.02,
+   "close": 8.1,
+   "volume": 209994090.0,
+   "amount": 1694761554.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0007788745473450091
+  },
+  {
+   "date": "2026-09-11",
+   "open": 8.13,
+   "high": 8.21,
+   "low": 8.03,
+   "close": 8.11,
+   "volume": 360705357.0,
+   "amount": 2938950664.0,
+   "outstanding_share": 269612212539.0,
+   "turnover": 0.0013378672783519521
+  }
+ ],
+ "n_rows": 53
+}
