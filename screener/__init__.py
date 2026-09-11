@@ -4,4 +4,4 @@
 详见 README.md 与 config/strategy.yaml。
 """
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"

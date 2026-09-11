@@ -17,9 +17,11 @@
 | v4 | 数据源架构 | 高频日K/快照切**腾讯批量接口**，BaoStock 降为低频；除权检测 preclose 信号 |
 | **v5** | **策略重构** | **"攒股养老"因子体系**：分红五因子、央国企过滤、行业白名单、估值分位因子、再投资参考价输出（Phase 1） |
 | **v5.1** | **评审精加工** | payout 软约束区间 / reinvest 多期平滑参考价 + DPS CAGR 列 / 边界测试补全 |
+| **v5.2** | **数据源强化** | raw/canonical 本地数据层 + 多源交叉校验 v1 + 数据源健康度报告（Phase 1；Phase 2/3 见 §11） |
 
-当前默认配置 = v5（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
-作零回归基线，任何时刻可回退对照。
+当前默认配置 = v5.2（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
+作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
+（raw/canonical 全 no-op，主路径行为与 v5.1 逐字节一致）。
 
 ## 1. 环境安装
 
@@ -108,7 +110,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 | `universe.a_share_prefixes` | sh.60/68, sz.00/30 | A股前缀过滤（剔除指数/ETF/B股） |
 | `universe.listing_min_trading_days` | 250 | 上市满 N 个交易日 |
 
-## 4. 数据源架构（v4/v5）
+## 4. 数据源架构（v4/v5/v5.2）
 
 多源分工，**单一主源失效不阻塞整体**：
 
@@ -119,10 +121,27 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 | 前十大股东（央国企识别）/ 经营现金流（FCF覆盖） | **新浪 F10** `vip.stock.finance.sina.com.cn` + `quotes.sina.cn` JSON API | v5 新增；对硬过滤后候选股逐只取，串行限速 ≥1s、WAF(456) 长退避、连续失败降级 None |
 | 10Y 国债收益率（yield_spread 的 rf） | **TradingEconomics** 页面解析 | v5 新增；每日抓现值落盘 `cache/rf_10y_daily.csv`，解析失败回退 config `2.0%` + 告警 |
 | 分红全史（连续年数/稳定性/股息率分位） | 本地缓存 `cache/em_dividend_all.csv` | 静态历史数据源（1991→今），零网络；Phase 2 用 BaoStock 对账修正 |
+| **交叉校验备源**（close/dps/roe 三字段） | **akshare**（pin `==1.18.88`，validate extra） | v5.2 新增；仅校验用途不进主路径——从最终入选股抽样 N 只（默认 20）串行限速 ≥1s 复核，失败不阻塞、连续失败该类当日降级（breaker） |
 | ~~东财 datacenter-web~~ | **已停用**（`datasource.em.enabled: false`） | 海外 IP 封禁（本机在欧洲）。代码保留不删，引擎侧 D-EM 守卫 + 单测断言零调用 |
 
 > **PIT（point-in-time）纪律**：分红事件锚 = 除权日 ≤ 运行日；股东/现金流表按公告日 ≤ 运行日取报告期。
 > 回测与实盘共用同一数据口径，无未来函数。
+
+### v5.2 本地数据层 + 交叉校验（Phase 1）
+
+在缓存之上加两层**只增量、不改主路径读写语义**的数据设施：
+
+- **raw 层** `data/raw/{source}/{date}/*.json`：append-only 原始响应信封（零数据转换、
+  文件级幂等 seq+sha256、原子写 tmp+rename）。腾讯快照 / 新浪 F10/CF 响应落盘，可追溯每个数字的出处。
+- **canonical 层** `data/canonical/{close,dps,roe}.csv`：统一 Schema 派生表，每条带
+  `source/fetched_at/data_version`；只增量不回填，可从 raw 重建（`build_from_raw`）。
+- **交叉校验 v1**（`screener/data/crosscheck.py`，纯函数）：close 腾讯 vs 新浪非除权日 |Δ|>0.1% 告警、
+  除权日改校 r_event；DPS em 静态 vs akshare-em |Δ|≥0.01 元/股告警 / >0.05 停算标"待复核"；
+  ROE BaoStock(小数,平均) vs 新浪 ROEWEIGHTED(百分数,加权) 换算后 |Δ|>1pp 告警（实测基线差 0.48pp=口径差，勿收紧 <0.5pp）。
+  阈值全部 yaml 驱动（`health:` 段），零硬编码。
+- **EmptyPayloadGuard**：市场级接口（all_stock）交易日 rows<5000 → 判数据源异常而非"无股票"。
+- **健康度双通道**：report.md「数据源健康度」固定段 + JSON sidecar（Web badge 仅异常时显示）。
+  `canonical.enabled: false` → raw/canonical/校验全 no-op，主路径输出与 v5.1 逐字节一致（已 A/B/C 验证）。
 
 ## 5. 筛选逻辑（实现要点）
 
@@ -154,7 +173,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q          # 350 passed
+python -m pytest -q          # 388 passed
 ```
 
 覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
@@ -162,7 +181,9 @@ python -m pytest -q          # 350 passed
 **无硬编码阈值静态检查**、v5 新因子（连续分红年数/D1新股边界/FCF覆盖/股息率分位/soe双规则/
 每10股单位换算/同除权日去重）、**D-EM 零东财调用断言**（AST + runtime 双断言）、
 **v5.1 评审精加工**（payout 软约束区间外降分、reinvest 多期平滑参考价/DPS CAGR、
-consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回归）。
+consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回归）、
+**v5.2 Phase 1**（rawstore 幂等/原子写、canonical 增量不回填/build_from_raw、交叉校验三分支+
+EmptyPayloadGuard 两分支、akshare breaker 降级、健康度渲染回滚逐字节一致；全离线 fixture，零网络）。
 
 ## 8. Web 前端（控制台）
 
@@ -231,6 +252,7 @@ stock-screener/
 │   ├── screener.py           # 筛选引擎编排（硬过滤→取数→打分→报告）
 │   ├── report.py             # CSV + Markdown 报告输出（含再投资参考价/SOE复核清单）
 │   ├── runstatus.py          # 运行状态 sidecar
+│   ├── health.py             # v5.2：HealthTracker 记账 + 报告健康度段渲染 + JSON sidecar
 │   ├── migrate.py / prewarm_fundamentals.py / reconstruct.py   # 数据迁移/预热/后复权重建
 │   └── data/
 │       ├── baostock_client.py  # BaoStock 登录态/指数退避/手动翻页（pandas≥2.0 兼容）
@@ -238,22 +260,27 @@ stock-screener/
 │       ├── fetchers.py         # 各接口抓取（缓存优先 + 半封禁态陈旧回退）
 │       ├── sources.py          # 数据源抽象层（腾讯主源 / BaoStock 低频）
 │       ├── tencent.py          # 腾讯批量快照/日K（GBK 转码，除权检测）
-│       ├── sina.py             # v5：新浪 F10 股东 + 财务 JSON（OCF），WAF 鲁棒
+│       ├── sina.py             # v5：新浪 F10 股东 + 财务 JSON（OCF/ROEWEIGHTED），WAF 鲁棒
 │       ├── rf.py               # v5：TradingEconomics 10Y 国债收益率
+│       ├── rawstore.py         # v5.2：append-only 原始响应层 data/raw/{source}/{date}/*.json
+│       ├── canonical.py        # v5.2：统一 Schema 派生层 data/canonical/{close,dps,roe}.csv
+│       ├── crosscheck.py       # v5.2：交叉校验 v1 纯函数 + EmptyPayloadGuard（阈值 yaml 驱动）
+│       ├── akshare_src.py      # v5.2：akshare 校验源客户端（仅校验用途，breaker+限速）
 │       └── em.py               # 东财 datacenter-web 客户端（v5 已停用，代码保留）
-├── tests/                    # 350 个离线单测 + fixtures（真实样例数据）
-├── web/                      # Web 前端（FastAPI + 静态 SPA，端口 9090）
-│   ├── app.py                # FastAPI 应用（API + 子进程任务管理 + 策略校验）
-│   └── static/               # index.html / style.css / app.js（vanilla JS，无构建）
-├── cache/                    # 原始数据缓存（自动生成）
-├── output/                   # result_*.csv / report_*.md（自动生成）
-└── logs/                     # run_*.log / web_run_*.log / cron.log
+├── tests/                      # 388 个离线单测 + fixtures（真实样例数据）
+├── web/                        # Web 前端（FastAPI + 静态 SPA，端口 9090）
+│   ├── app.py                  # FastAPI 应用（API + 子进程任务管理 + 策略校验 + data_health badge）
+│   └── static/                 # index.html / style.css / app.js（vanilla JS，无构建）
+├── cache/                      # 原始数据缓存（自动生成）
+├── data/                       # v5.2：raw/（append-only 原始响应）+ canonical/（统一 Schema），已 gitignore
+├── output/                     # result_*.csv / report_*.md（自动生成，报告含数据源健康度段）
+└── logs/                       # run_*.log / web_run_*.log / cron.log
 ```
 
-## 11. 已知限制
+## 11. 已知限制与后续路线
 
 - **BaoStock 半封禁态**：全市场 `query_all_stock`/基本面接口间歇性返回空或挂起，
-  已用 ≤7 天陈旧池回退 + 进程级超时兜底；Phase 2 计划解封后做分红双源对账。
+  已用 ≤7 天陈旧池回退 + 进程级超时兜底；独立 probe 持续观测中。
 - **新浪 F10 WAF**：非官方接口，高频触发 HTTP 456，已用串行限速 ≥1s + 长退避 + 连续失败降级 None（missing_policy=neutral_renorm 兜底）。
 - **东财海外封禁**：本机在欧洲，datacenter-web 不可达；`em.py` 代码保留但 `enabled: false`，
   分红全史改用本地静态缓存。若迁回境内服务器可重新启用做对账源。
@@ -261,3 +288,12 @@ stock-screener/
 - **FCF 覆盖用 OCF 口径**：新浪财务 API 无资本开支字段，`fcf_coverage` = 经营现金流量净额 / 年度分红总额
   （比严格 FCF 略宽松，方向一致、更保守地衡量分红安全垫）；接口失败降级 `cfo_to_np/payout` 代理。
 - **rf 历史序列**：Phase 1 仅用 TE 现值算 yield_spread，不要求 rf 历史分位（div_yield_pctile 只用本地价格+分红史，与 rf 无关）。
+
+### v5.2 后续路线（Phase 2/3）
+
+- **Phase 2（BaoStock 对账）**：门槛 = BaoStock all_stock 连续 ≥5 个交易日 <10s 且非空。
+  probe 自 09-10 起持续 TIMEOUT，仍在观测；恢复后做分红双源对账修正 `em_dividend_all.csv`。
+- **Phase 3（Tushare Pro 备源）**：待决策。token 已就位（`.env`，gitignore 覆盖），
+  但当前账号积分不足——核心接口（daily/dividend/top10_holders/fina_indicator）全部
+  `40203 无访问权限`（网络可达、非封禁）。需充值/提升积分后启用；不启用则 akshare+新浪+BaoStock
+  三源交叉校验已覆盖 Phase 1/2 需求。
