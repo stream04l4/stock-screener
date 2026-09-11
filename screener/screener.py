@@ -52,7 +52,6 @@ from .metrics import (
     fcf_coverage,
     fcf_coverage_proxy,
     industry_pass,
-    is_sjkzr_only,
     macd_golden_cross,
     new_stock_div_ok,
     payout_ratio,
@@ -60,6 +59,7 @@ from .metrics import (
     rank_percentile,
     roe_stability,
     rsi_wilder,
+    soe_basis,
     soe_flag,
     ttm_dividend_yield,
     yield_spread,
@@ -116,8 +116,9 @@ class ScreenResult:
     crosscheck: List[Dict[str, Any]] = field(default_factory=list)
 
     # ---- v5（TL D1/D3/D8，报告层消费；v4 路径保持空，零回归）----
-    soe_flag_map: Dict[str, Optional[str]] = field(default_factory=dict)   # code → soe/soe_confirmed/None
-    sjkzr_review_list: List[Dict[str, str]] = field(default_factory=list)  # "仅 IS_SJKZR" 人工复核清单 [{code,name}]
+    soe_flag_map: Dict[str, Optional[str]] = field(default_factory=dict)   # code → 'soe'/None（Round-2 D3'：新浪双规则）
+    soe_basis_map: Dict[str, str] = field(default_factory=dict)            # code → 判定依据（国有股本性质/关键词命中(x)/''；报告列，人工复核）
+    soe_review_list: List[Dict[str, str]] = field(default_factory=list)    # SOE 剔除股复核清单 [{code,name}]（D3'：双规则皆无 → 剔除+单列）
     reinvest_cols: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
     # code → {ref_price_4pct(DPS/4%), ttm_yield_pctile(0-100), ttm_yield_pctile_n(样本年数)}
     ttm_crosscheck: List[Dict[str, Any]] = field(default_factory=list)     # ttm_yield vs 腾讯 idx64 抽样 [{code, ours, tencent, diff_pct, ok}]
@@ -431,14 +432,22 @@ def _v5_hard_filter(
     hard_pass: List[str], name_by_code: Dict[str, str], industry_map_all: Dict[str, str],
     uc: Dict[str, Any], hfc: Dict[str, Any], datac: Dict[str, Any], run_day: date,
 ) -> List[str]:
-    """v5 硬过滤（TL D1/D2/D3，brief §4）：行业白名单 + SOE + 市值≥N亿 + 连续分红(D1)。
+    """v5 硬过滤（TL D1/D2/D3'，brief §4 + Round-2 数据源切换）。
 
     **v4 零回归**：config 未启用任何 v5 键（soe_required=False、白名单空、
-    min_total_mv_yi=None、min_consecutive_div_years=None）→ 原样返回，零 EM 请求。
+    min_total_mv_yi=None、min_consecutive_div_years=None）→ 原样返回，零新浪请求。
+
+    Round-2 数据源（东财停用，TL D-EM/D1'/D3'）：
+    - 分红历史 = **本地静态** cache/em_dividend_all.csv（sina.load_local_dividends，
+      零网络；progress=="实施分配" 过滤在 metrics 层）；
+    - SOE 输入 = **新浪 F10 前十大股东**（逐只抓，串行限速 D9'；双规则判定）。
 
     管线顺序（brief §"运行管线顺序"）：universe → 行业白名单 + SOE + 市值 + 连续分红
-    → （候选股 OCF/capex 取数在 _run_zscore 内、打分前执行）。
-    PIT：分红事件锚 ex_date<=run_day；股东表 NOTICE_DATE<=run_day。
+    → （候选股 OCF 取数在 _run_zscore 内、打分前执行）。
+    PIT：分红事件锚 ex_date<=run_day；股东表截止日期/公告日期 <= run_day。
+
+    **D-EM 守卫**：本函数及 _run_zscore 的 v5 路径均不 import screener.data.em——
+    东财客户端只在 config em.enabled=true 时才可能被构造（当前生产配置 false）。
     """
     min_years = hfc.get("min_consecutive_div_years")
     whitelist = uc.get("industry_whitelist_csric2") or []
@@ -447,75 +456,108 @@ def _v5_hard_filter(
     if not (soe_required or whitelist or min_mv is not None or min_years is not None):
         return hard_pass  # v4 行为（零回归）
 
-    from .data import em as emmod
-    emc = cfgmod.em_cfg(cfg)
-    emmod.set_cgb10y_sanity(*emc["cgb10y_sanity_pct"])
+    from .data import sina as sinamod
+    scfg = cfgmod.sina_cfg(cfg)
     keywords = cfgmod.soe_keywords_cfg(cfg)
-    em_client = emmod.EMClient(emc)
     cache_dir = datac["cache_dir"]
     run_day_s = run_day.isoformat()
     run_year = run_day.year
 
-    # ---- 1. 东财分红全表（独立缓存键；幂等）→ 按 code6 分组 ----
-    div_rows, _meta = emmod.fetch_dividend_all(em_client, cache_dir)
+    # ---- 1. 本地静态分红全表（D1'：零网络；东财封禁前落盘快照，截至 2026-09-10）----
+    div_rows, div_meta = sinamod.load_local_dividends(cache_dir)
+    result.data_notes.append(
+        f"v5 分红数据源: 本地静态 em_dividend_all.csv（{div_meta['rows']} 行，实施分配 "
+        f"{div_meta['implemented_rows']} 行；快照截至 {div_meta['as_of']}，Phase 1 不做每日增量）")
     div_by_code: Dict[str, List[Dict[str, Any]]] = {}
     for r in div_rows:
         div_by_code.setdefault(r["code"], []).append(r)
 
-    # ---- 两次全表级取数之间的静默期（防 EM 滑动窗口限流）----
-    # 实测：一次 ~100+ 页全表拉取后，紧随的第二次全表拉取即使带冷却也在第 ~100 页撞墙
-    # （EM "服务器繁忙"窗口比单次退避长得多）。仅当**本次运行刚做完一次全表拉取**
-    # （source=fetched，非缓存命中）时才需要静默；日常增量（各命中缓存/1 页）无此成本。
-    if _meta.get("source") == "fetched":
-        gap_s = float(emc.get("full_table_gap_seconds", 600))
-        if gap_s > 0:
-            log.info("v5: 分红全表刚完成拉取 → 静默 %.0fs 再取股东表（防 EM 限流窗口）", gap_s)
-            time.sleep(gap_s)
-
-    # ---- 2. 前十大股东（最新报告期自动探测；PIT NOTICE_DATE<=run_day）----
-    end_date = emmod.detect_holders_end_date(em_client, run_day_s, min_rows=50000)
-    result.holders_end_date = end_date
-    holders_rows = emmod.fetch_holders_top10(em_client, end_date, cache_dir)
-    holders_by_code: Dict[str, List[Dict[str, Any]]] = {}
-    for h in holders_rows:
-        if str(h.get("notice_date") or "") and str(h["notice_date"]) > run_day_s:
-            continue  # PIT：运行日未披露的报告期不可见
-        holders_by_code.setdefault(h["code"], []).append(h)
-
-    # ---- 3. SOE 标记（全体候选，供报告列 + 复核清单；TL D3）----
-    for c in hard_pass:
-        hs = holders_by_code.get(c.split(".")[1], [])
-        result.soe_flag_map[c] = soe_flag(hs, keywords)
-        if is_sjkzr_only(hs, keywords):
-            result.sjkzr_review_list.append({"code": c, "name": name_by_code.get(c, "")})
-
+    # ---- 2. 白名单 + 市值先过滤（缩小 SOE 抓取面：brief_round2 预估候选 ~300-500 只，
+    #      全量 hard_pass 可达上千只 → 新浪请求超 D9' 预算；SOE/连续分红在子集上执行）----
     def _industry_code(ind: str) -> str:
         m = re.match(r"^([A-Z]\d{2})", (ind or "").strip())
         return m.group(1) if m else ""
 
-    # ---- 4. 逐层过滤（漏斗计数）----
     kept = list(hard_pass)
     n0 = len(kept)
     if whitelist:
         wl = set(whitelist)
         kept = [c for c in kept if _industry_code(industry_map_all.get(c, "")) in wl]
-        result.funnel["L2b_行业白名单"] = len(kept)
-    if soe_required:
-        kept = [c for c in kept if result.soe_flag_map.get(c) is not None]
-        result.funnel["L2c_SOE央国企"] = len(kept)
+    result.funnel["L2b_行业白名单"] = len(kept)
+    mv_map: Dict[str, float] = {}
     if min_mv is not None:
         kept, mv_map = _filter_min_market_cap(cfg, kept, min_mv)
         result.total_mv_yi_map = mv_map
-        result.funnel["L2d_市值下限"] = len(kept)
+    result.funnel["L2d_市值下限"] = len(kept)
+
+    # ---- 3. SOE：新浪 F10 前十大股东（D3'；白名单+市值子集逐只抓、串行限速 D9'、熔断）----
+    # soe_flag_map/soe_basis_map 供报告列 + 复核清单（TL D3'）。
+    # **按总市值降序抓取**：WAF 若在中途截断序列（实测 ~10-30 次后 HTTP 456），先保证
+    # 高市值候选（最可能进 Top50）完成 SOE 核验——降级运行时 Top 列表仍尽量完整。
+    # （排序只影响抓取顺序；最终入选由 total_score 决定，与输入顺序无关。）
+    if mv_map:
+        kept = sorted(kept, key=lambda c: mv_map.get(c, 0.0), reverse=True)
+    sina_client = sinamod.SinaClient(scfg)
+    soe_fetched: set = set()   # 成功取到 PIT 可见报告期的 code（区分"真非SOE"与"取数失败"）
+    n_consec_fail = 0
+    breaker_tripped = False
+    n_ok = 0
+    for i, c in enumerate(kept):
+        c6 = c.split(".")[1]
+        if breaker_tripped:
+            continue  # 熔断后剩余保持 soe_flag=None（取数失败，不进"非SOE复核清单"）
+        try:
+            periods = sina_client.fetch_holders(c6)
+            picked = sinamod.pick_holders_asof(periods, run_day_s)
+            n_consec_fail = 0
+            if picked is None:
+                log.warning("v5 SOE %s: 无 PIT 可见报告期（截止日期/公告日期均 > run_day）", c)
+                continue
+            soe_fetched.add(c)
+            result.soe_flag_map[c] = soe_flag(picked["holders"], keywords)
+            result.soe_basis_map[c] = soe_basis(picked["holders"], keywords)
+            n_ok += 1
+        except sinamod.SinaDataError as exc:
+            if "熔断" in str(exc):
+                breaker_tripped = True
+                log.warning("v5 SOE 新浪 F10 熔断：剩余 %d 只保持 soe=None（取数失败，不进复核清单）",
+                            len(kept) - i - 1)
+                continue
+            n_consec_fail += 1
+            if n_consec_fail >= scfg["consecutive_fail_breaker"]:
+                breaker_tripped = True
+                log.warning(
+                    "v5 SOE 新浪 F10 连续失败 %d 只 → 熔断：该类因子整体降级 None + 报告告警（D9'）",
+                    n_consec_fail)
+        if (i + 1) % 100 == 0 or i + 1 == len(kept):
+            _progress("L2b_sina_holders", i + 1, len(kept))
+    result.data_notes.append(
+        f"v5 SOE 数据源: 新浪 F10 前十大股东（{n_ok}/{len(kept)} 只取数成功，"
+        f"HTTP {sina_client.request_count} 次；双规则=股本性质'国有股' OR 名称关键词）")
+    if breaker_tripped:
+        result.data_notes.append(
+            "⚠️ v5 SOE 新浪 F10 接口连续失败熔断（D9'）：部分候选 soe_flag=None"
+            "（取数失败，非'判定为非SOE'），已剔除——人工核对后重跑可补齐（幂等）")
+
+    # D3'：soe_flag=None 且**成功取数**的候选 → 剔除 + 进报告复核清单（供人工复核）。
+    # 取数失败/熔断的股不进此清单（语义=数据缺失，已在 data_notes 告警）。
+    for c in kept:
+        if c in soe_fetched and result.soe_flag_map.get(c) is None:
+            result.soe_review_list.append({"code": c, "name": name_by_code.get(c, "")})
+
+    # ---- 4. SOE + 连续分红过滤（漏斗计数）----
+    if soe_required:
+        kept = [c for c in kept if result.soe_flag_map.get(c) is not None]
+    result.funnel["L2c_SOE央国企"] = len(kept)
     if min_years is not None:
         kept = [c for c in kept if _div_history_ok(c, div_by_code.get(c.split(".")[1], []),
-                                                    run_day_s, run_year, min_years)]
+                                                   run_day_s, run_year, min_years)]
         result.funnel["L2e_连续分红D1"] = len(kept)
 
     log.info(
-        "v5硬过滤: %d → 白名单%d → SOE%d → 市值%d → 连续分红%d（holders报告期=%s，EM请求%d次）",
-        n0, result.funnel.get("L2b_行业白名单", n0), result.funnel.get("L2c_SOE央国企", n0),
-        result.funnel.get("L2d_市值下限", n0), len(kept), end_date, em_client.request_count,
+        "v5硬过滤: %d → 白名单%d → 市值%d → SOE%d → 连续分红%d（新浪F10成功 %d/%d 只）",
+        n0, result.funnel.get("L2b_行业白名单", n0), result.funnel.get("L2d_市值下限", n0),
+        result.funnel.get("L2c_SOE央国企", n0), len(kept), n_ok, len(hard_pass),
     )
     return kept
 
@@ -797,8 +839,9 @@ def _run_zscore(
         ind: len(g) for ind, g in groups.items() if len(g) < ic["min_group_size"]
     }
 
-    # ---- v5 数据准备（TL D1/D4/D6/D8；config 未启用 → 全部 None，走 v4 分红路径）----
-    from .data import em as emmod
+    # ---- v5 数据准备（Round-2：本地静态分红 + TE rf + 新浪 OCF；东财停用）----
+    from .data import sina as sinamod
+    from .data import rf as rfmod
     uc5 = cfgmod.universe_cfg(cfg)
     hf5 = cfgmod.hard_filter_cfg(cfg)
     v5_on = bool(
@@ -809,61 +852,74 @@ def _run_zscore(
     em_div_records: Dict[str, List[Dict[str, Any]]] = {}
     annual_dps_map: Dict[str, Dict[int, float]] = {}
     rf_10y: Optional[float] = None
-    cf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}  # D6：code → 最近已披露年报年度 OCF/capex
+    rf_meta: Dict[str, Any] = {}
+    ocf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}  # D6'：code → 最近已披露年报 OCF（新浪）
     code6_to_bs: Dict[str, str] = {c.split(".")[1]: c for c in hard_pass}
     if v5_on:
-        emc = cfgmod.em_cfg(cfg)
-        emmod.set_cgb10y_sanity(*emc["cgb10y_sanity_pct"])
-        em_client = emmod.EMClient(emc)
+        sina_c = cfgmod.sina_cfg(cfg)   # ⚠️不得命名 scfg——会遮蔽 _run_zscore 的打分配置参数（scoring_cfg）
         cache_dir = cfg["data"]["cache_dir"]
         run_day_s = run_day.isoformat()
-        # 分红全表（硬过滤阶段已拉过 → 此处命中缓存，0 请求）
-        div_rows_all, _m = emmod.fetch_dividend_all(em_client, cache_dir)
+        # 分红全表：本地静态（D1'，零网络；硬过滤阶段已读过 → 此处再读一次纯 IO）
+        div_rows_all, _dm = sinamod.load_local_dividends(cache_dir)
         for r in div_rows_all:
             em_div_records.setdefault(r["code"], []).append(r)
-        # 10Y 国债：增量 1 页（每日运行成本 ~1 请求）→ PIT as-of run_day
-        emmod.fetch_cgb10y(em_client, cache_dir)
-        rf_10y = emmod.load_cgb10y_asof(cache_dir, run_day_s)
-        # 逐年 DPS（D1/D5 因子输入；PIT ex_date<=run_day）
+        # 10Y 国债（TL D4'）：TE 现值，每日运行抓取一次 → rf_10y_daily.csv 落盘；
+        # 解析失败 → config fallback + 告警（fetch_rf_10y 内部处理，不抛异常）。
+        rfc = cfgmod.rf_cfg(cfg)
+        rf_10y, rf_meta = rfmod.fetch_rf_10y(rfc, cache_dir, run_day_s)
+        if rf_meta.get("source") == "fallback":
+            result.data_notes.append(
+                f"⚠️ v5 rf 数据源: TE 解析失败 → 回退 config fallback={rfc['fallback_pct']}%（告警不静默，D4'）")
+        else:
+            result.data_notes.append(
+                f"v5 rf 数据源: TradingEconomics 10Y={rf_meta['yield_pct']}%（{rf_meta['date']}，"
+                f"落盘 cache/{rfmod.RF_CACHE_FILE}）")
+        # 逐年 DPS（D1/D5 因子输入；PIT ex_date<=run_day + progress=="实施分配"）
         for c in hard_pass:
             annual_dps_map[c] = annual_dps_from_em(
                 em_div_records.get(c.split(".")[1], []), c.split(".")[1], run_day_s
             )
-        # ---- D6：候选股 OCF/capex 逐只取数（硬过滤后、打分前；~300-500 只 ≈ 3min）----
-        log.info("阶段4b(v5): 候选股 %d 只 OCF/capex 逐只取数（东财 RPT_DMSK_FN_CASHFLOW，串行限速）...",
+        # ---- D6'：候选股 OCF 逐只取数（新浪财务 JSON；硬过滤后、打分前）----
+        log.info("阶段4b(v5): 候选股 %d 只 OCF 逐只取数（新浪 getFinanceReport2022，串行限速 >=1s）...",
                  len(hard_pass))
-        cf_annual_map: Dict[str, Optional[Dict[str, Any]]] = {}
-        # 限流熔断：连续 N 只取数失败（多为"服务器繁忙"）→ 停止逐只尝试，剩余全部降级代理。
-        # 否则 EM 处于限流窗口时，每只候选各烧 60s busy-budget → N×60s 挂起数小时。
-        # TL D6：接口失败才降级代理 cfo_to_np/payout（不阻塞、不静默）。缓存命中的取数不计数。
+        # 单客户端复用：全局限速锚点 + 连续失败熔断（D9'）跨逐只调用生效。
+        cf_client = sinamod.SinaClient(sina_c)
         _cf_consec_fail = 0
-        _CF_BREAKER = 3
         _cf_breaker_tripped = False
         for i, code in enumerate(hard_pass):
             c6 = code.split(".")[1]
             if _cf_breaker_tripped:
-                cf_annual_map[code] = None  # 熔断后剩余全部降级代理
+                ocf_annual_map[code] = None  # 熔断后剩余全部降级代理
                 continue
             try:
-                cf_rows = emmod.fetch_cashflow(em_client, c6, cache_dir)
-                # 年度行（-12-31 且 DATE_TYPE_CODE=001）+ PIT（NOTICE_DATE<=run_day）
-                ann = emmod.annual_cashflow_rows(cf_rows, run_day_s)
-                cf_annual_map[code] = ann[-1] if ann else None  # 最近一个已披露年报年度
-                _cf_consec_fail = 0  # 成功（含缓存命中）→ 重置连续失败计数
-            except emmod.EMDataError as exc:
+                ann = cf_client.fetch_annual_ocf(c6, run_day_s)
+                ocf_annual_map[code] = ann  # None=无可见年报 → 该股降级代理（非接口失败）
+                _cf_consec_fail = 0  # 成功（含"无可见年报"）→ 重置连续失败计数
+            except sinamod.SinaDataError as exc:
+                if "熔断" in str(exc):
+                    _cf_breaker_tripped = True
+                    log.warning("v5 OCF 新浪财务JSON 熔断：剩余 %d 只全部降级代理（D9'）",
+                                len(hard_pass) - i - 1)
+                    ocf_annual_map[code] = None
+                    continue
                 # 单只失败 → 该股 fcf_coverage 降级代理（TL D6），不炸全市场
-                log.warning("v5现金流取数失败 %s: %s（该因子降级代理 cfo_to_np/payout）", code, exc)
-                cf_annual_map[code] = None
+                log.warning("v5 OCF 取数失败 %s: %s（该因子降级代理 cfo_to_np/payout）", code, exc)
+                ocf_annual_map[code] = None
                 _cf_consec_fail += 1
-                if _cf_consec_fail >= _CF_BREAKER:
+                if _cf_consec_fail >= sina_c["consecutive_fail_breaker"]:
                     _cf_breaker_tripped = True
                     log.warning(
-                        "v5现金流限流熔断：连续 %d 只取数失败 → 剩余 %d 只全部降级代理"
-                        "（EM 处于'服务器繁忙'窗口；逐只真值待冷却后重跑补齐，缓存幂等）",
-                        _cf_consec_fail, len(hard_pass) - i - 1,
-                    )
+                        "v5 OCF 新浪财务JSON 连续失败 %d 只 → 熔断：剩余 %d 只全部降级代理（D9'）",
+                        _cf_consec_fail, len(hard_pass) - i - 1)
             if (i + 1) % 100 == 0 or i + 1 == len(hard_pass):
-                _progress("L3b_em_cashflow", i + 1, len(hard_pass))
+                _progress("L3b_sina_cashflow", i + 1, len(hard_pass))
+        result.data_notes.append(
+            f"v5 OCF 数据源: 新浪财务JSON getFinanceReport2022（MANANETR 经营现金流量净额，年报行；"
+            f"HTTP {cf_client.request_count} 次）")
+        if _cf_breaker_tripped:
+            result.data_notes.append(
+                "⚠️ v5 OCF 新浪财务JSON 接口连续失败熔断（D9'）：部分候选 fcf_coverage 降级代理"
+                "（CFOToNP/payout）——重跑可补齐（幂等）")
 
     reinvest_c = cfgmod.reinvest_cfg(cfg)  # D8：target_ttm_yield_pct / 分位回看年数
 
@@ -934,16 +990,18 @@ def _run_zscore(
         stab_cv = (div_stability_cv(annual_dps_map.get(code, {}), n=5, end_year=run_day.year - 1)
                    if v5_on else None)
         div_stab_score = None if stab_cv is None else -stab_cv
-        # fcf_coverage（TL D6 真值）：(OCF-capex)/(年度DPS×总股本)；接口失败 → 降级代理
+        # fcf_coverage（Round-2 TL D6'：OCF-based 真值）= OCF(年报) / (年度DPS×总股本)；
+        # 接口失败/无可见年报/缺输入 → 降级代理 CFOToNP/payout。
         cfo_to_np_v = _f((fr_["cashflow_cur"] or {}).get("CFOToNP"))
-        cf_row = cf_annual_map.get(code)
+        ocf_row = ocf_annual_map.get(code)
         fcf_val: Optional[float] = None
         if v5_on:
-            if cf_row is not None and cf_row.get("ocf") is not None \
+            if ocf_row is not None and ocf_row.get("ocf") is not None \
                     and annual_dps_map.get(code, {}).get(annual_year) is not None \
                     and _f(p_cur.get("totalShare")) is not None:
+                # capex=None → 纯 OCF 覆盖口径（D6'：新浪无 capex 字段）
                 fcf_val = fcf_coverage(
-                    cf_row["ocf"], cf_row.get("capex"),
+                    ocf_row["ocf"], None,
                     annual_dps_map[code][annual_year], _f(p_cur.get("totalShare")),
                 )
             if fcf_val is None:
@@ -1154,8 +1212,9 @@ def _run_zscore(
             "rank": sc.rank,
             "top_n_selected": sc.top_n_selected,
             "na_factors": ",".join(sc.na_factors),
-            # ---- v5 报告列（TL D1/D3/D8；v4 路径下为空，零回归）----
+            # ---- v5 报告列（TL D1/D3'/D8；v4 路径下为空，零回归）----
             "soe_flag": (result.soe_flag_map.get(code) if v5_on else None),
+            "soe_basis": (result.soe_basis_map.get(code, "") if v5_on else ""),
             "total_mv_yi": (round(result.total_mv_yi_map[code], 2)
                             if v5_on and code in result.total_mv_yi_map else None),
             "consecutive_div_years": a.get("cons_y") if v5_on else None,
@@ -1274,7 +1333,10 @@ def _legacy_pass_fund(a: Dict[str, Any], cfg) -> bool:
 def _zscore_data_notes(cfg, result, window_start) -> None:
     sc = cfg["scoring"]
     w = sc["weights"]
-    result.data_notes = [
+    # 保留前序阶段已 append 的 data_notes（v5：本地分红源/SOE F10 取数成功数/熔断告警等）——
+    # 原实现 `result.data_notes = [...]` 会整体覆盖，丢失 _v5_hard_filter 的 SOE 取数与 WAF
+    # 熔断记录（TL D9'：降级必须可追溯）。改为前置插入标准段。
+    standard_notes = [
         f"主数据源: BaoStock（日K/分红/季报/行业/股票列表），筛选运行日 {result.run_day}",
         "模式=zscore（截面Z-Score多因子打分）；后复权af=1由稳定键缓存(kline_af3×adjfactor)本地重建，"
         "历史不可变+尾部追加（新除权事件不改变事件日之前的值）",
@@ -1292,19 +1354,21 @@ def _zscore_data_notes(cfg, result, window_start) -> None:
         "→ 打分值统一为越大越好；CSV 中 *_pct 列为原始口径",
         "pass_* 兼容列按 legacy v1 硬规则评估（仅供对照）；v2 入选 = total_score Top N（pass_all=top_n_selected）",
     ]
-    # ---- v5 数据源/因子说明（TL D1-D9；config 未启用 v5 键时不追加，v4 报告零回归）----
+    # 标准段在前 + 前序阶段 notes 在后（SOE F10 取数成功数/熔断告警等不丢失）
+    result.data_notes = standard_notes + list(result.data_notes)
+    # ---- v5 数据源/因子说明（TL D1-D9 + Round-2；config 未启用 v5 键时不追加，v4 报告零回归）----
     uc5 = cfgmod.universe_cfg(cfg)
     hf5 = cfgmod.hard_filter_cfg(cfg)
     if (uc5.get("soe_required") or uc5.get("industry_whitelist_csric2")
             or uc5.get("min_total_mv_yi") is not None
             or hf5.get("min_consecutive_div_years") is not None):
         result.data_notes += [
-            "v5 硬过滤: 行业白名单(证监会二级) + SOE央国企(前十大股东关键词/IS_SJKZR) + "
+            "v5 硬过滤: 行业白名单(证监会二级) + SOE央国企(新浪F10双规则: 股本性质'国有股' OR 名称关键词) + "
             f"总市值≥{uc5.get('min_total_mv_yi')}亿(腾讯idx45) + 连续分红(D1, min={hf5.get('min_consecutive_div_years')})",
-            f"v5 分红数据源: 东财 RPT_SHAREBONUS_DET 全表（每10股→每股 /10；EX_DIVIDEND_DATE=null 未实施预案计算时过滤）",
-            f"v5 前十大股东报告期: {result.holders_end_date or '未知'}（NOTICE_DATE≤run_day PIT 过滤）",
-            "v5 新因子: consecutive_div_years / div_stability(近5年DPS CV) / fcf_coverage(东财OCF-capex真值,失败降级CFOToNP/payout代理) "
-            "/ div_yield_pctile(TTM股息率历史分位) / yield_spread(TTM-10Y国债)",
+            "v5 东财停用（TL D-EM：海外访问被禁）——em.enabled=false，本运行零东财请求；"
+            "本地静态缓存 em_dividend_all.csv 正常读取（D1' 唯一例外=本地文件）",
+            "v5 新因子: consecutive_div_years / div_stability(近5年DPS CV) / fcf_coverage(OCF-based: 新浪年报OCF/年度分红总额, D6'; "
+            "失败降级CFOToNP/payout代理) / div_yield_pctile(TTM股息率历史分位) / yield_spread(TTM-10Y国债)",
             "v5 technical 维度含估值因子(div_yield_pctile/yield_spread)——TL D9：引擎固定4维的务实选择，非语义归类",
             f"v5 再投资参考(TL D8): 参考价=年度DPS/目标TTM股息率{cfgmod.reinvest_cfg(cfg)['target_ttm_yield_pct']}% + TTM历史分位展示",
         ]
