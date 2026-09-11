@@ -16,6 +16,7 @@
 | v3 | 回测 | 多因子策略历史回测引擎（月度/季度调仓、真实成本模型、PIT 安全） |
 | v4 | 数据源架构 | 高频日K/快照切**腾讯批量接口**，BaoStock 降为低频；除权检测 preclose 信号 |
 | **v5** | **策略重构** | **"攒股养老"因子体系**：分红五因子、央国企过滤、行业白名单、估值分位因子、再投资参考价输出（Phase 1） |
+| **v5.1** | **评审精加工** | payout 软约束区间 / reinvest 多期平滑参考价 + DPS CAGR 列 / 边界测试补全 |
 
 当前默认配置 = v5（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
 作零回归基线，任何时刻可回退对照。
@@ -67,7 +68,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 | 维度 | 权重 | 子因子（维度内权重和=1） |
 |---|---|---|
 | technical | **0.15** | `ma_bullish` / `low_vol` / `div_yield_pctile`（股息率历史分位）/ `yield_spread`（股息率−10Y国债利差）各 0.25 |
-| dividend | **0.40** | `ttm_yield`(0.30) / `payout_ratio`(0.15) / `consecutive_div_years`(0.20) / `fcf_coverage`(0.20) / `div_stability`(0.15) |
+| dividend | **0.40** | `ttm_yield`(0.30) / `payout_ratio`(0.15，软约束 30~80%：区间外降分不剔除，v5.1) / `consecutive_div_years`(0.20) / `fcf_coverage`(0.20) / `div_stability`(0.15) |
 | industry | 0.15 | `roe_rank_pct`(0.5) / `yoy_pni_rank_pct`(0.5) |
 | fundamental | 0.30 | `roe_level`(0.3) / `roe_stability`(0.2) / `low_liability`(0.15) / `gross_margin`(0.15) / `piotroski` F-Score(0.2) |
 
@@ -86,11 +87,13 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 | `universe.soe_keywords` | 国务院/国资委/汇金/财政部/国资 | 央国企识别关键词（⚠️银行类前十大实控人标记全为 0，必须靠关键词兜住国有大行） |
 | `hard_filter.min_consecutive_div_years` | 5 | **连续分红年数**下限；IPO<7 年的新股改为"IPO 后每个完整年度均分红"（不硬砍优质次新） |
 
-### 再投资参考输出（v5，TL D8）
+### 再投资参考输出（v5，TL D8；v5.1 V1-5 多期平滑）
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `reinvest.target_ttm_yield_pct` | 4.0 | 目标 TTM 股息率；报告对每只入选股输出参考价 = **DPS / 4%** + 当前股息率历史分位，辅助判断买入窗口 |
+| `reinvest.target_ttm_yield_pct` | 4.0 | 目标 TTM 股息率（%）：参考价 = **近 N 年平均 DPS / 目标股息率**（默认 N=3，窗口内无分红年按 0——断档拉低参考价）+ 当前股息率历史分位，辅助判断买入窗口 |
+| `reinvest.dps_smooth_years` | 3 | v5.1：参考价平滑窗口年数（N<1 → 单年 DPS 原行为；键缺失同义） |
+| `reinvest.dps_growth_years` | 5 | v5.1：**近 5 年 DPS CAGR** 展示列（`dps_cagr_5y_pct`，首末年均有分红才计算，否则空） |
 
 ### 其他维度阈值（v1~v4 沿用）
 
@@ -127,7 +130,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
    空结果自动回退 ≤7 天陈旧池（半封禁态防护）。
 2. **ST 剔除以日K `isST=1` 为准**（名称含 ST 仅作辅助标记）。
 3. **技术面**：后复权日K `adjustflag="1"`（1=后复权,2=前复权,3=不复权，必须传字符串）。
-4. **分红可持续性五因子**：TTM 股息率、股利支付率（30%~80% 合理区间）、连续分红年数、
+4. **分红可持续性五因子**：TTM 股息率、股利支付率（软约束 30%~80%，区间外降分不剔除，v5.1）、连续分红年数、
    FCF/OCF 对分红的覆盖倍数、近 N 年 DPS 波动率（越低越好）。
 5. **估值安全边际**：当前 TTM 股息率在自身历史序列中的分位（越高=越低估）、
    股息率 − 10Y 国债利差（越大安全垫越厚）。
@@ -151,13 +154,15 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q          # 336 passed
+python -m pytest -q          # 350 passed
 ```
 
 覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
 行业排名、股票池（真实样例）、缓存（命中/过期/损坏/原子写）、腾讯 GBK 解析、配置校验、
 **无硬编码阈值静态检查**、v5 新因子（连续分红年数/D1新股边界/FCF覆盖/股息率分位/soe双规则/
-每10股单位换算/同除权日去重）、**D-EM 零东财调用断言**（AST + runtime 双断言）。
+每10股单位换算/同除权日去重）、**D-EM 零东财调用断言**（AST + runtime 双断言）、
+**v5.1 评审精加工**（payout 软约束区间外降分、reinvest 多期平滑参考价/DPS CAGR、
+consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回归）。
 
 ## 8. Web 前端（控制台）
 
@@ -236,7 +241,7 @@ stock-screener/
 │       ├── sina.py             # v5：新浪 F10 股东 + 财务 JSON（OCF），WAF 鲁棒
 │       ├── rf.py               # v5：TradingEconomics 10Y 国债收益率
 │       └── em.py               # 东财 datacenter-web 客户端（v5 已停用，代码保留）
-├── tests/                    # 336 个离线单测 + fixtures（真实样例数据）
+├── tests/                    # 350 个离线单测 + fixtures（真实样例数据）
 ├── web/                      # Web 前端（FastAPI + 静态 SPA，端口 9090）
 │   ├── app.py                # FastAPI 应用（API + 子进程任务管理 + 策略校验）
 │   └── static/               # index.html / style.css / app.js（vanilla JS，无构建）
