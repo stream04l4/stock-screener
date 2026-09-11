@@ -377,6 +377,9 @@ def em_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     e = (cfg.get("datasource") or {}).get("em") or {}
     out = {
+        # Round-2（TL D-EM）：东财整体开关。false = 禁止任何 datacenter-web 请求；
+        # 引擎侧守卫 + 单测断言 enabled=false 时零东财调用。本地静态缓存读取不受影响。
+        "enabled": bool(e.get("enabled", False)),
         "page_size": int(e.get("page_size", 500)),
         "interval_s": float(e.get("interval_s", 0.5)),
         "timeout_s": float(e.get("timeout_s", 15)),
@@ -406,6 +409,54 @@ def soe_keywords_cfg(cfg: Dict[str, Any]) -> List[str]:
     """v5 央国企识别关键词（TL D3，config 驱动；键缺失 → 空=不启用）。"""
     u = cfg.get("universe") or {}
     return [str(k) for k in (u.get("soe_keywords") or [])]
+
+
+def sina_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5 Round-2（TL D3'/D9'）：新浪非官方接口客户端参数。
+
+    全部来自 strategy.yaml datasource.sina 段（零硬编码纪律）：
+    interval_s>=1.0（限速）/ timeout_s=15 / max_attempts<=2（重试 <=2 次）。
+    键缺失 → 与 D9' 纪律一致的默认值。
+    """
+    s = (cfg.get("datasource") or {}).get("sina") or {}
+    out = {
+        "interval_s": float(s.get("interval_s", 1.0)),
+        "timeout_s": float(s.get("timeout_s", 15)),
+        "max_attempts": int(s.get("max_attempts", 2)),
+        # 连续失败熔断阈值（D9'：>=N 只 → 该类因子整体降级 None + 告警，不得死磕）
+        "consecutive_fail_breaker": int(s.get("consecutive_fail_breaker", 5)),
+        # 财务 JSON 单次取回报告期数（~5 年季频；足够定位最近已披露年报）
+        "cf_reports_num": int(s.get("cf_reports_num", 20)),
+        # WAF 滑动窗口限速（Round-2 实测：F10 持续 ~10-15 次请求后触发 HTTP 456，
+        # 与东财"服务器繁忙"同类）——周期性长冷却 + 456 专用退避，防单跑自触发封禁。
+        "cooldown_every_n": int(s.get("cooldown_every_n", 15)),
+        "cooldown_s": float(s.get("cooldown_s", 20.0)),
+        "waf_backoff_s": float(s.get("waf_backoff_s", 30.0)),
+    }
+    if out["interval_s"] < 1.0:
+        raise ConfigError("datasource.sina.interval_s 必须 >= 1.0（D9' 新浪限速纪律）")
+    if out["max_attempts"] < 1 or out["max_attempts"] > 2:
+        raise ConfigError("datasource.sina.max_attempts 必须在 [1,2]（D9'：重试 <=2 次）")
+    return out
+
+
+def rf_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v5 Round-2（TL D4'）：10Y 国债收益率源参数（TradingEconomics）。
+
+    - url：TE 中国 10Y 页面（HTML；解析 JSON-LD Dataset + 正文 "eased/rose to X%"）。
+    - fallback_pct：解析失败回退值（%）+ 告警不静默。
+    - sanity_pct：[lo, hi] 百分数区间，越界告警不静默（防页面改版漂移）。
+    """
+    r = (cfg.get("datasource") or {}).get("rf") or {}
+    out = {
+        "url": str(r.get("url", "https://tradingeconomics.com/china/government-bond-yield")),
+        "fallback_pct": float(r.get("fallback_pct", 2.0)),
+        "sanity_pct": [float(x) for x in r.get("sanity_pct", [0.5, 4.0])],
+    }
+    lo, hi = out["sanity_pct"]
+    if not (0 < lo < hi):
+        raise ConfigError("datasource.rf.sanity_pct 必须为 0<lo<hi 的百分数区间")
+    return out
 
 
 def reinvest_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:

@@ -147,7 +147,13 @@ datasource:                         # v4 数据源架构（报告 R3 + TL 修正
     pct_sample_size: 20             # 抽样 N 只校验 pct 一致性（R1-b 基线 549/549）
     pct_tolerance_pct: 0.5          # pct 偏离容忍度（%）
   em:                               # v5 东财 datacenter-web 客户端（TL D4；非官方接口，串行小步）
-    page_size: 500                  # 每页行数（brief §1）
+    enabled: false                  # ⚠️Round-2（TL D-EM，最高优先级纪律）：本机在欧洲，东财 API 禁止海外
+                                    # 访问（holders 第101页起持续"服务器繁忙"=封禁表现）。**禁用所有东财
+                                    # 网络请求**；em.py 代码保留不删。enabled=false 时引擎不得 import/调用
+                                    # em.py 的 fetch 函数（引擎侧守卫 + 单测断言）。已落盘的本地静态缓存
+                                    # （em_dividend_all.csv / .em_ck_*.jsonl）不受影响：前者正常读取
+                                    # （D1' 分红历史源），检查点保留不动、不再续取。
+    page_size: 500                  # 每页行数（brief §1；enabled=false 时不生效）
     interval_s: 1.0                 # 页间隔秒（brief 下限 >=0.5s/页；实测冷缓存全表 ~215 页
                                     # 连续请求在 0.5s 下触发"服务器繁忙"限流 → 提到 1.0s，
                                     # 日常增量路径只取 1-2 页，成本可忽略）
@@ -163,6 +169,22 @@ datasource:                         # v4 数据源架构（报告 R3 + TL 修正
     timeout_s: 15                   # 单请求超时
     max_attempts: 3                 # 重试 <=3 次（brief §1）
     cgb10y_sanity_pct: [0.5, 4.0]   # 10Y国债 sanity 区间（越界告警不静默；字段标签系推断，防漂移）
+  sina:                             # v5 Round-2（TL D3'/D9'）：新浪非官方接口客户端
+                                    # （东财停用后的替代源；F10 股东页 + 财务 JSON）
+    interval_s: 1.0                 # 请求间隔秒（D9' 限速纪律：串行、>=1s）
+    timeout_s: 15                   # 单请求超时秒（D9'）
+    max_attempts: 2                 # 重试 <=2 次（D9'；含首次共 <=3 次尝试）
+    consecutive_fail_breaker: 5     # 某类接口连续失败 >=N 只 → 该类因子整体降级 None
+                                    # （missing_policy=neutral_renorm 兜底）+ 报告告警，不得死磕（D9'）
+    cf_reports_num: 20              # 财务 JSON 单次取回报告期数（~5 年季频，足够定位最近年报）
+    cooldown_every_n: 15            # WAF 滑动窗口：每 N 次请求插入一次长冷却（Round-2 实测 F10
+                                    # 持续 ~10-15 次后触发 HTTP 456，与东财"服务器繁忙"同类）
+    cooldown_s: 20                  # 长冷却秒数（让 WAF 滑动窗口在饱和前复位）
+    waf_backoff_s: 30               # HTTP 456 专用重试退避秒（短退避无效，WAF 需要时间复位）
+  rf:                               # v5 Round-2（TL D4'）：10Y 国债收益率源 = TradingEconomics
+    url: "https://tradingeconomics.com/china/government-bond-yield"
+    fallback_pct: 2.0               # 页面解析失败时的回退值（%）+ 告警不静默（D4'）
+    sanity_pct: [0.5, 4.0]          # sanity 区间（越界告警不静默；防页面改版漂移）
 
 reinvest:                           # v5 再投资参考输出（TL D8：按 Joel 目标定档）
   target_ttm_yield_pct: 4.0         # 目标 TTM 股息率（%）：报告列 = DPS/4% 参考价 + TTM 分位展示
