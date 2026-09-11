@@ -663,8 +663,10 @@ def em_dividend_records(
     :param em_rows: em_dividend_all.csv 行 {code(6位), ex_date, dps_pretax(元/股), ...}
         —— dps_pretax 已在入库时 /10（每10股→每股），此处**不再除10**。
     :param code_map: {6位代码: BaoStock格式代码 sh.601398}；未收录的 6 位代码跳过。
-    EX_DIVIDEND_DATE=null 的未实施预案行（ex_date=''）保留在输出里，
-    v4 的 dedup_dividends/ttm_dividend_yield 会自动按"无除权日=未实施"过滤。
+
+    Round-2（TL D1'）：只保留 ``progress == "实施分配"`` 的行——**过滤掉**
+    EX_DIVIDEND_DATE=null 的未实施预案行及取消/否决行（原实现依赖 v4 dedup 的
+    "无除权日=未实施"兜底；D1' 要求显式按 progress 过滤，口径更严、更可读）。
     """
     out: List[Dict[str, Any]] = []
     for r in em_rows:
@@ -672,14 +674,16 @@ def em_dividend_records(
         bs_code = code_map.get(c6)
         if not bs_code:
             continue
+        # D1'：progress 过滤（"实施分配"=已实施；预案/取消/否决行剔除）
+        if str(r.get("progress") or "") != "实施分配":
+            continue
         out.append({
             "code": bs_code,
             "dividOperateDate": str(r.get("ex_date") or ""),
             "dividCashPsBeforeTax": r.get("dps_pretax"),
         })
     # 同除权日"预案+正式"并存时，让**有现金（实施）的行排在前面**——v4 dedup_dividends
-    # 按 dividOperateDate 稳定排序后取每组首行（first-wins），此排序保证首行=实施行
-    # （cash=None 的预案行被跳过）。ex_date=''（未实施预案）排最前，dedup 会因无除权日过滤。
+    # 按 dividOperateDate 稳定排序后取每组首行（first-wins），此排序保证首行=实施行。
     out.sort(key=lambda x: (x["dividOperateDate"], x["dividCashPsBeforeTax"] is None))
     return out
 
@@ -692,10 +696,16 @@ def annual_dps_from_em(
     去重口径（沿用 v4"一个除权日=一次事件"）：同一 (code, ex_date) 多行
     （预案+正式并存）只取一行——优先 ASSIGN_PROGRESS 含"实施"的行，其次
     plan_notice_date 最新者；dps 为 null（纯送转/未填）的事件不计现金。
+
+    Round-2（TL D1'）：入口先按 ``progress == "实施分配"`` 过滤（与
+    em_dividend_records 同口径）——取消分配/否决/未实施预案行不参与任何计算。
     """
     by_ex: Dict[str, List[Dict[str, Any]]] = {}
     for r in em_rows:
         if str(r.get("code") or "") != code6:
+            continue
+        # D1'：progress 过滤（"实施分配"=已实施）
+        if str(r.get("progress") or "") != "实施分配":
             continue
         ex = str(r.get("ex_date") or "")
         if not ex or ex > run_day:  # PIT：未实施（null）或未来除权事件不可见
@@ -775,14 +785,19 @@ def fcf_coverage(
     ocf: Optional[float], capex: Optional[float],
     dps_annual: Optional[float], total_share: Optional[float],
 ) -> Optional[float]:
-    """FCF 分红覆盖倍数 = (OCF - capex) / (年度DPS × 总股本)（TL D6 真值口径）。
+    """FCF 分红覆盖倍数（Round-2 TL D6'：**OCF-based 口径**）。
 
-    分母 <=0（无分红/缺股本）或任一输入缺失 → None。capex 缺失时按 0 处理
-    （保守方向由调用方决定是否改用代理 fcf_coverage_proxy）。
+    **口径（D6'）**：新浪财务 JSON 无 capex 字段 → 因子改为
+    ``OCF 覆盖 = 经营现金流量净额(年报) / (年度 DPS × 总股本)``，即"经营现金流
+    对分红总额的覆盖倍数"（比 FCF 略宽松、方向一致）。函数名保持 fcf_coverage。
+
+    参数兼容：capex 非 None 时按原 FCF 口径扣减（(OCF-capex)/分母）——保留东财
+    路径的向后兼容；新浪路径调用方传 capex=None → 纯 OCF 覆盖。
+    分母 <=0（无分红/缺股本）或 ocf/dps/total_share 任一缺失 → None。
     """
     if ocf is None or dps_annual is None or total_share is None:
         return None
-    cap = capex or 0.0
+    cap = float(capex) if capex is not None else 0.0
     denom = float(dps_annual) * float(total_share)
     if denom <= 0:
         return None
@@ -862,41 +877,55 @@ def yield_spread(ttm_yield: Optional[float], rf_10y: Optional[float]) -> Optiona
 
 
 def soe_flag(holders: Sequence[Dict[str, Any]], keywords: Optional[Sequence[str]] = None) -> Optional[str]:
-    """央国企识别（TL D3，关键词 config 驱动）。
+    """央国企识别（Round-2 TL D3'：**双规则**，输入=新浪 F10 前十大股东）。
 
-    规则：前十大股东名称命中任一关键词 → 'soe'；且存在 IS_SJKZR=1 → 'soe_confirmed'。
-    **仅** IS_SJKZR=1 未命中关键词 → None（报告单列清单供人工复核，不判 soe）。
+    规则（config 驱动）：
+    - 任一股东 ``share_nature == "国有股"``（股本性质字段，新浪比东财更直接）→ 'soe'；
+    - **或** 任一股东名称命中关键词（国务院/国资委/汇金/财政部/国资）→ 'soe'；
+    - 两者皆无 → None（剔除 + 进报告复核清单）。
 
-    ⚠️实测结论（evidence/probe20_summary.json）：银行类前十大 IS_SJKZR 全为 0
-    （601398 汇金+财政部并列无单一实控人）→ 纯标记规则会漏掉全部国有大行，必须靠关键词。
+    ⚠️口径说明（D3'）：新浪"占流通股比例"是**流通股口径**非总股本 → 股东数据只做
+    **定性识别**、不参与打分。东财 IS_SJKZR 字段随东财停用一并弃用（新浪无此字段）；
+    Round-1 的 'soe_confirmed' 二级标记不再产生（返回恒为 'soe' 或 None）。
 
-    :param holders: 单只股票的前十大股东 [{holder_name, is_sjkzr('0'/'1'), ...}]
-        （PIT：调用方已按 NOTICE_DATE <= run_day 过滤）
-    :param keywords: 关键词清单（config universe.soe_keywords）；None/空 → 永不命中
+    :param holders: 单只股票的前十大股东 [{holder_name, share_nature, ...}]
+        （sina.parse_holders_page + pick_holders_asof 输出，PIT 已按截止日期/公告日期过滤）
+    :param keywords: 关键词清单（config universe.soe_keywords）；None/空 → 该规则不命中
     """
     kws = [k for k in (keywords or []) if k]
-    kw_hit = False
-    sjkzr_hit = False
     for h in holders:
+        if str(h.get("share_nature") or "").strip() == "国有股":
+            return "soe"
         name = str(h.get("holder_name") or "")
         if any(k in name for k in kws):
-            kw_hit = True
-        if str(h.get("is_sjkzr") or "0").strip() == "1":
-            sjkzr_hit = True
-    if not kw_hit:
-        return None  # 含"仅 IS_SJKZR=1"情形 → 调用方另行列复核清单
-    return "soe_confirmed" if sjkzr_hit else "soe"
+            return "soe"
+    return None
+
+
+def soe_basis(holders: Sequence[Dict[str, Any]], keywords: Optional[Sequence[str]] = None) -> str:
+    """SOE 判定依据（报告列，供人工复核；TL Round-2 验收③）。
+
+    :return: '国有股本性质' / '关键词命中(汇金)' / ''（非 SOE）。
+        双规则同时命中时以股本性质为准（字段级证据强于名称推断）。
+    """
+    kws = [k for k in (keywords or []) if k]
+    kw_hit = ""
+    for h in holders:
+        name = str(h.get("holder_name") or "")
+        for k in kws:
+            if k in name and not kw_hit:
+                kw_hit = k
+    for h in holders:
+        if str(h.get("share_nature") or "").strip() == "国有股":
+            return "国有股本性质"
+    return f"关键词命中({kw_hit})" if kw_hit else ""
 
 
 def is_sjkzr_only(holders: Sequence[Dict[str, Any]], keywords: Optional[Sequence[str]] = None) -> bool:
-    """'仅 IS_SJKZR=1 未命中关键词'标记（TL D3：报告单列清单供人工复核）。"""
-    if soe_flag(holders, keywords) is not None:
-        return False
-    kws = [k for k in (keywords or []) if k]
-    for h in holders:
-        if str(h.get("is_sjkzr") or "0").strip() != "1":
-            continue
-        name = str(h.get("holder_name") or "")
-        if not any(k in name for k in kws):
-            return True
+    """'仅 IS_SJKZR=1 未命中关键词'标记（TL D3：报告单列清单供人工复核）。
+
+    Round-2（D3'）：新浪股东数据**无 IS_SJKZR 字段** → 本函数恒返回 False；
+    "soe_flag=None 的剔除股"改由引擎直接进 soe_review_list（语义见 screener.py）。
+    保留函数以维持既有单测/调用面兼容。
+    """
     return False
