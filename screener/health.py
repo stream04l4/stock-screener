@@ -238,10 +238,8 @@ def render_report_section_from_summary(s: Dict[str, Any]) -> List[str]:
 
     if _anomaly_from_summary(s):
         lines.insert(1, "**状态：⚠️ 异常**（详见下列明细）")
-        lines.insert(2, "")
     else:
         lines.insert(1, "**状态：正常**（无失败调用、无冲突、无疑似缺数据、无待复核标的）")
-        lines.insert(2, "")
     return lines
 
 
