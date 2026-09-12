@@ -18,6 +18,7 @@
 | **v5** | **策略重构** | **"攒股养老"因子体系**：分红五因子、央国企过滤、行业白名单、估值分位因子、再投资参考价输出（Phase 1） |
 | **v5.1** | **评审精加工** | payout 软约束区间 / reinvest 多期平滑参考价 + DPS CAGR 列 / 边界测试补全 |
 | **v5.2** | **数据源强化** | raw/canonical 本地数据层 + 多源交叉校验 v1 + 数据源健康度报告（Phase 1；Phase 2/3 见 §11） |
+| **v5.2-p2a** | **BaoStock 配额守卫** | 每日 49900 次硬上限（官网限 50000/日/IP，超限封禁 6h×年内次数），跨进程 flock 计数、超限显式失败不静默 |
 
 当前默认配置 = v5.2（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
 作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
@@ -117,7 +118,8 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 | 数据 | 源 | 说明 |
 |---|---|---|
 | 日K / 实时快照（高频） | **腾讯** `qt.gtimg.cn` 批量 | v4 起主源；后复权重建、除权检测（preclose 信号）、市值/股息率交叉校验 |
-| 全市场股票列表 / 行业分类 / 季度基本面 | **BaoStock**（低频） | 半封禁态有 ≤7 天陈旧池回退；`query_all_stock` 返回空时自动回退陈旧池而非伪装成空结果 |
+| 全市场股票列表 / 行业分类 / 季度基本面 | **BaoStock**（低频） | 半封禁态有 ≤7 天陈旧池回退；`query_all_stock` 返回空时自动回退陈旧池而非伪装成空结果；**每日配额守卫 49900 次**（v5.2-p2a，防打穿官网 5 万/日/IP 限被封禁） |
+| **备选日线源**（不进主链路） | **Tushare Pro** `api.tushare.pro` | v5.2 实测定位：基础日线权限——`daily` 按 trade_date 单次全市场 ~5500 行/1~3s；财报类接口（income/balancesheet/cashflow/fina_indicator/top10_holders）无权限，**不追积分升级**，仅作腾讯失效时的日线备源。token 存 `.env`（gitignore 覆盖，绝不入库） |
 | 前十大股东（央国企识别）/ 经营现金流（FCF覆盖） | **新浪 F10** `vip.stock.finance.sina.com.cn` + `quotes.sina.cn` JSON API | v5 新增；对硬过滤后候选股逐只取，串行限速 ≥1s、WAF(456) 长退避、连续失败降级 None |
 | 10Y 国债收益率（yield_spread 的 rf） | **TradingEconomics** 页面解析 | v5 新增；每日抓现值落盘 `cache/rf_10y_daily.csv`，解析失败回退 config `2.0%` + 告警 |
 | 分红全史（连续年数/稳定性/股息率分位） | 本地缓存 `cache/em_dividend_all.csv` | 静态历史数据源（1991→今），零网络；Phase 2 用 BaoStock 对账修正 |
@@ -173,7 +175,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q          # 388 passed
+python -m pytest -q          # 409 passed
 ```
 
 覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
@@ -183,7 +185,9 @@ python -m pytest -q          # 388 passed
 **v5.1 评审精加工**（payout 软约束区间外降分、reinvest 多期平滑参考价/DPS CAGR、
 consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回归）、
 **v5.2 Phase 1**（rawstore 幂等/原子写、canonical 增量不回填/build_from_raw、交叉校验三分支+
-EmptyPayloadGuard 两分支、akshare breaker 降级、健康度渲染回滚逐字节一致；全离线 fixture，零网络）。
+EmptyPayloadGuard 两分支、akshare breaker 降级、健康度渲染回滚逐字节一致；全离线 fixture，零网络）、
+**v5.2-p2a BaoStock 配额守卫**（QuotaGuard 计数/超限 raise/flock 并发原子性/CLI --show/--set-count，
+全离线 mock，零真实 baostock 调用）。
 
 ## 8. Web 前端（控制台）
 
@@ -255,7 +259,7 @@ stock-screener/
 │   ├── health.py             # v5.2：HealthTracker 记账 + 报告健康度段渲染 + JSON sidecar
 │   ├── migrate.py / prewarm_fundamentals.py / reconstruct.py   # 数据迁移/预热/后复权重建
 │   └── data/
-│       ├── baostock_client.py  # BaoStock 登录态/指数退避/手动翻页（pandas≥2.0 兼容）
+│       ├── baostock_client.py  # BaoStock 登录态/指数退避/手动翻页（pandas≥2.0 兼容）+ v5.2-p2a 每日配额守卫 QuotaGuard（flock 跨进程计数，CLI --show/--set-count）
 │       ├── cache.py            # 本地 CSV 缓存（原子写+哨兵+TTL）
 │       ├── fetchers.py         # 各接口抓取（缓存优先 + 半封禁态陈旧回退）
 │       ├── sources.py          # 数据源抽象层（腾讯主源 / BaoStock 低频）
@@ -280,7 +284,8 @@ stock-screener/
 ## 11. 已知限制与后续路线
 
 - **BaoStock 半封禁态**：全市场 `query_all_stock`/基本面接口间歇性返回空或挂起，
-  已用 ≤7 天陈旧池回退 + 进程级超时兜底；独立 probe 持续观测中。
+  已用 ≤7 天陈旧池回退 + 进程级超时兜底；每日配额守卫（49900）防打穿官网限频被封。
+  09-12 实测 login 正常但 `all_stock` 延迟波动大（22~30s，个别 >120s），低频用途需避开高峰。
 - **新浪 F10 WAF**：非官方接口，高频触发 HTTP 456，已用串行限速 ≥1s + 长退避 + 连续失败降级 None（missing_policy=neutral_renorm 兜底）。
 - **东财海外封禁**：本机在欧洲，datacenter-web 不可达；`em.py` 代码保留但 `enabled: false`，
   分红全史改用本地静态缓存。若迁回境内服务器可重新启用做对账源。
@@ -293,7 +298,7 @@ stock-screener/
 
 - **Phase 2（BaoStock 对账）**：门槛 = BaoStock all_stock 连续 ≥5 个交易日 <10s 且非空。
   probe 自 09-10 起持续 TIMEOUT，仍在观测；恢复后做分红双源对账修正 `em_dividend_all.csv`。
-- **Phase 3（Tushare Pro 备源）**：待决策。token 已就位（`.env`，gitignore 覆盖），
-  但当前账号积分不足——核心接口（daily/dividend/top10_holders/fina_indicator）全部
-  `40203 无访问权限`（网络可达、非封禁）。需充值/提升积分后启用；不启用则 akshare+新浪+BaoStock
-  三源交叉校验已覆盖 Phase 1/2 需求。
+- **Phase 3（Tushare Pro 备源）— 已定案（2026-09-12）**：账号仅基础日线权限
+  （`daily`/`dividend`/`daily_basic`/`adj_factor`/`share_float` 可用；财报类接口无权限，
+  提升需积分）。**决定：不追积分升级，Tushare 定位为备选日线源**——腾讯主源失效时按
+  trade_date 单次全市场拉取兜底（~5500 行/1~3s），不进主链路、不做财报交叉校验。
