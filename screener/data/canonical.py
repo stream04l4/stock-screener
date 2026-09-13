@@ -31,6 +31,12 @@ log = logging.getLogger("screener.data.canonical")
 CANONICAL_FIELDS = ("close", "dps", "roe")
 TRACE_COLS = ("source", "fetched_at", "data_version")
 
+# v5.3 D3：canonical 版本日志（追加式审计；同 canonical 的哨兵+原子写风格）
+VERSION_LOG_FILE = "version_log.csv"
+VERSION_LOG_SENTINEL = "stock-screener-canonical-version-log-v1"
+VERSION_LOG_COLS = ("seq", "ts_utc", "trigger", "data_version", "source",
+                    "rows_added", "raw_date_min", "raw_date_max", "note")
+
 
 def _safe(name: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in name)
@@ -66,6 +72,75 @@ class CanonicalStore:
 
     def _path(self, field: str) -> str:
         return os.path.join(self.root, f"{_safe(field)}.csv")
+
+    # ---------- v5.3 D3：version_log.csv（追加式版本日志） ----------
+    def _version_log_path(self) -> str:
+        return os.path.join(self.root, VERSION_LOG_FILE)
+
+    def read_version_log(self) -> List[Dict[str, str]]:
+        """读回 version_log 全部行；文件不存在/损坏 → []（哨兵校验同 canonical）。"""
+        path = self._version_log_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                sentinel = next(reader, None)
+                if not sentinel or sentinel[0] != VERSION_LOG_SENTINEL:
+                    return []
+                cols = next(reader, None)
+                if cols is None:
+                    return []
+                return [dict(zip(cols, row)) for row in reader if len(row) == len(cols)]
+        except (OSError, csv.Error) as exc:
+            log.warning("canonical version_log 读取失败 %s: %s", path, exc)
+            return []
+
+    def log_version(self, trigger: str, source: str, rows_added: int,
+                    raw_date_min: str = "", raw_date_max: str = "",
+                    note: str = "") -> Optional[str]:
+        """追加一行版本日志（原子写 tmp+rename，同 canonical 风格）。
+
+        - ``trigger`` ∈ {"append", "build_from_raw"}；
+        - **幂等**（brief D3-2）：写前读末行比对——末行 (ts_utc, trigger, source, note) 与本次
+          相同 → 跳过不写（同秒重放/重复落盘不产生重复行；note 含 field+code，故同秒的
+          **不同**记录仍各记一行）。seq=单调递增（max+1，与 rawstore 的 seq 风格一致），
+          作为每批唯一标识。
+        - 旁路纪律：写失败只告警不抛；返回本次写入行的 ts（跳过/失败 → None）。
+        """
+        if trigger not in ("append", "build_from_raw"):
+            raise ValueError(f"未知 version_log trigger: {trigger}")
+        ts = now_iso()
+        rows = self.read_version_log()
+        last = rows[-1] if rows else None
+        if (last is not None and last.get("ts_utc") == ts
+                and last.get("trigger") == trigger and last.get("source") == source
+                and last.get("note") == note):
+            return None  # 幂等跳过（同秒同批重复写）
+        tmp: Optional[str] = None
+        try:
+            seq = max((int(r["seq"]) for r in rows if str(r.get("seq", "")).isdigit()),
+                      default=0) + 1
+            tmp = f"{self._version_log_path()}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([VERSION_LOG_SENTINEL])
+                w.writerow(list(VERSION_LOG_COLS))
+                for r in rows:
+                    w.writerow([r.get(c, "") for c in VERSION_LOG_COLS])
+                w.writerow([str(seq), ts, trigger, self.data_version, source,
+                            str(int(rows_added)), raw_date_min, raw_date_max, note])
+            os.replace(tmp, self._version_log_path())
+        except OSError as exc:
+            log.warning("canonical version_log 写入失败 %s: %s（旁路，不阻塞主路径）",
+                        trigger, exc)
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return None
+        return ts
 
     # ---------- 读 ----------
     def read(self, field: str) -> List[Dict[str, str]]:
@@ -144,6 +219,9 @@ class CanonicalStore:
                 except OSError:
                     pass
             return False
+        # v5.3 D3：批量落盘后追加版本日志（rows_added=本次行数=1；raw 日期范围=本批信封日期）。
+        # 旁路纪律：log_version 内部写失败只告警，不影响 append 的 True 返回值。
+        self.log_version("append", source, 1, when, when, f"field={field} code={code}")
         return True
 
     # ---------- 从 raw 构建（回滚重放 / 补写） ----------
@@ -161,6 +239,10 @@ class CanonicalStore:
         counts = {f: 0 for f in CANONICAL_FIELDS}
         if not os.path.isdir(raw_root):
             return counts
+        # v5.3 D3：per-source 信封日期范围（raw 布局 {source}/{date}/...；供 build_from_raw
+        # 汇总日志行的 raw_date_min/max）+ 本源新写条数。
+        src_dates: Dict[str, List[str]] = {}
+        rows_by_src: Dict[str, int] = {}
         for src in sorted(os.listdir(raw_root)):
             field = source_map.get(src)
             if field is None:
@@ -178,12 +260,21 @@ class CanonicalStore:
                     env = self._read_envelope(os.path.join(ddir, fn))
                     if env is None or env.get("status") != "ok":
                         continue
+                    src_dates.setdefault(src, []).append(date_s)
                     fetched_at = str(env.get("fetched_at", ""))
                     for rec in self._derive(field, src, env.get("data")):
                         code, when, value = rec
                         if self.append(field, code, when, value, source=src,
                                        fetched_at=fetched_at or None):
                             counts[field] += 1
+                            rows_by_src[src] = rows_by_src.get(src, 0) + 1
+        # v5.3 D3：build_from_raw 完成后按 source 各追加一行汇总日志（rows_added=该源
+        # 新写条数；raw 日期范围=本源信封日期 min/max）。零写入的源不记行（幂等重放零噪音）。
+        for src, dts in sorted(src_dates.items()):
+            n_rows = rows_by_src.get(src, 0)
+            if n_rows > 0:
+                self.log_version("build_from_raw", src, n_rows,
+                                 min(dts), max(dts), "build_from_raw 汇总")
         return counts
 
     @staticmethod

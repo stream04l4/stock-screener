@@ -236,6 +236,14 @@ def _write_report_zscore(result, cfg: Dict[str, Any], path: str) -> None:
        f"本地缓存文件 {result.cache_stats.get('files', 0)} 个")
     ap("")
 
+    # ---------- v5.3 D1：数据源告警块（标题行之后、"一、KPI概览"之前）----------
+    # 有 alerts 才渲染（零噪音）；data_health=None（canonical.enabled=false/回滚）→ 整块消失。
+    # 下方"数据源健康度"固定段保持不动（全量明细），本块只做标红摘要。
+    from . import health as _healthmod
+    _dh = getattr(result, "data_health", None)
+    if isinstance(_dh, dict) and isinstance(_dh.get("summary"), dict):
+        lines.extend(_healthmod.render_alerts_block(_dh["summary"].get("alerts") or []))
+
     # ---------- 一、KPI 概览 ----------
     ap("## 一、KPI 概览")
     ap("")
@@ -448,6 +456,12 @@ def _write_report_legacy(result, cfg: Dict[str, Any], path: str) -> None:
     ap(f"- 总耗时: {result.elapsed_seconds:.0f}s；BaoStock 请求 {result.baostock_requests} 次"
        f"（其中K线 {result.kline_requests} 次）；本地缓存文件 {result.cache_stats.get('files', 0)} 个")
     ap("")
+
+    # ---------- v5.3 D1：数据源告警块（标题行之后、"一、过滤漏斗"之前；无 alerts → 不渲染）----------
+    from . import health as _healthmod
+    _dh = getattr(result, "data_health", None)
+    if isinstance(_dh, dict) and isinstance(_dh.get("summary"), dict):
+        lines.extend(_healthmod.render_alerts_block(_dh["summary"].get("alerts") or []))
 
     # ---------- 一、过滤漏斗 ----------
     ap("## 一、过滤漏斗")

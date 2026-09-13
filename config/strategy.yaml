@@ -226,3 +226,7 @@ health:                             # 交叉校验 v1 阈值 + EmptyPayloadGuard
   akshare_interval_s: 1.0           # akshare 校验源限速（D9' 同构：串行 >=1s；仅校验用途，失败不阻塞）
   akshare_max_attempts: 2           # akshare 重试 <=2 次（含首次共 <=3 次尝试）
   akshare_breaker: 5                # akshare 某类接口连续失败 >=N → 该类当日整体降级（不得死磕）
+  alerts:                           # v5.3 D1：健康度阈值告警（全部 yaml 驱动、零硬编码；HealthTracker 判定）
+    rf_fallback_max_per_run: 0      # 单次运行 rf 10Y 回退次数 > N → 告警（默认 0=一回退就告警）
+    f10_degraded_max: 5             # 当日新浪 F10 降级(接口失败/熔断取 None)标的数 > N → 告警
+    crosscheck_conflicts_max: 2     # 三字段交叉校验冲突总数 > N → 告警

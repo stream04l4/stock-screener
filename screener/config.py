@@ -509,6 +509,20 @@ def health_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "akshare_max_attempts": int(h.get("akshare_max_attempts", 2)),
         "akshare_breaker": int(h.get("akshare_breaker", 5)),
     }
+    # v5.3 D1：健康度阈值告警（子段 alerts；缺省=默认值，向后兼容旧 yaml——无 alerts 键时
+    # 行为与 v5.2 一致：tracker 收到 alert_cfg 后按上述默认阈值判定）。非负整数校验。
+    a = h.get("alerts") or {}
+    alerts_out: Dict[str, int] = {}
+    for k, default in (("rf_fallback_max_per_run", 0), ("f10_degraded_max", 5),
+                       ("crosscheck_conflicts_max", 2)):
+        try:
+            v = int(a.get(k, default))
+        except (TypeError, ValueError):
+            raise ConfigError(f"health.alerts.{k} 必须是整数（当前 {a.get(k)!r}）")
+        if v < 0:
+            raise ConfigError(f"health.alerts.{k} 必须是非负整数（当前 {v}）")
+        alerts_out[k] = v
+    out["alerts"] = alerts_out
     if out["dps_warn_at"] < 0 or out["dps_stop_at"] <= out["dps_warn_at"]:
         raise ConfigError("health.dps_warn_at / dps_stop_at 必须满足 0<=warn<stop")
     if out["akshare_max_attempts"] < 1 or out["akshare_max_attempts"] > 2:

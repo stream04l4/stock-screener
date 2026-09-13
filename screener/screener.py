@@ -300,7 +300,11 @@ def run_screener(
         from . import health as _healthmod
         hc = cfgmod.canonical_cfg(cfg)
         tracker = (
-            _healthmod.HealthTracker(run_day=result.run_day) if hc["enabled"] else None
+            # v5.3 D1：alert_cfg 构造注入（yaml health.alerts；缺省→默认阈值）。
+            # canonical.enabled=false → tracker=None → 告警逻辑整体不生效（回滚硬约束）。
+            _healthmod.HealthTracker(run_day=result.run_day,
+                                     alert_cfg=cfgmod.health_cfg(cfg)["alerts"])
+            if hc["enabled"] else None
         )
 
         # ---------- 1. 股票池 ----------
@@ -384,7 +388,7 @@ def run_screener(
         set_div_fetcher(fetcher)  # _div_history_ok 读 kline_af3 首行（IPO 年）用
         hard_pass = _v5_hard_filter(
             cfg, fetcher, result, hard_pass, name_by_code, industry_map_all,
-            uc, hfc, datac, run_day,
+            uc, hfc, datac, run_day, tracker,
         )
         if not hard_pass:
             log.warning("v5 硬过滤后无候选，输出空结果")
@@ -473,6 +477,7 @@ def _v5_hard_filter(
     cfg: Dict[str, Any], fetcher: DataFetcher, result: ScreenResult,
     hard_pass: List[str], name_by_code: Dict[str, str], industry_map_all: Dict[str, str],
     uc: Dict[str, Any], hfc: Dict[str, Any], datac: Dict[str, Any], run_day: date,
+    tracker: Optional[Any] = None,  # v5.3 D1：HealthTracker（F10 降级记账；None=回滚零回归）
 ) -> List[str]:
     """v5 硬过滤（TL D1/D2/D3'，brief §4 + Round-2 数据源切换）。
 
@@ -547,12 +552,16 @@ def _v5_hard_filter(
     for i, c in enumerate(kept):
         c6 = c.split(".")[1]
         if breaker_tripped:
+            # v5.3 D1：熔断后跳过的标的=接口降级路径 → 记账（"该股本就无数据"不记，见下）。
+            if tracker is not None:
+                tracker.note_f10_degraded(c, "holders")
             continue  # 熔断后剩余保持 soe_flag=None（取数失败，不进"非SOE复核清单"）
         try:
             periods = sina_client.fetch_holders(c6)
             picked = sinamod.pick_holders_asof(periods, run_day_s)
             n_consec_fail = 0
             if picked is None:
+                # v5.3 D1：取数成功但无 PIT 可见报告期=该股本就无可见数据（正常空响应）→ 不记账。
                 log.warning("v5 SOE %s: 无 PIT 可见报告期（截止日期/公告日期均 > run_day）", c)
                 continue
             soe_fetched.add(c)
@@ -560,6 +569,9 @@ def _v5_hard_filter(
             result.soe_basis_map[c] = soe_basis(picked["holders"], keywords)
             n_ok += 1
         except sinamod.SinaDataError as exc:
+            # v5.3 D1：接口失败/熔断路径 → 记账（fetch_holders 只在 HTTP 失败/解析漂移时抛）。
+            if tracker is not None:
+                tracker.note_f10_degraded(c, "holders")
             if "熔断" in str(exc):
                 breaker_tripped = True
                 log.warning("v5 SOE 新浪 F10 熔断：剩余 %d 只保持 soe=None（取数失败，不进复核清单）",
@@ -912,6 +924,11 @@ def _run_zscore(
         if rf_meta.get("source") == "fallback":
             result.data_notes.append(
                 f"⚠️ v5 rf 数据源: TE 解析失败 → 回退 config fallback={rfc['fallback_pct']}%（告警不静默，D4'）")
+            # v5.3 D1：rf 回退进健康度 tracker（此前只 log.warning + data_notes，易漏看）。
+            # rf 每次运行只取一次 → 计数语义=本次运行是否回退（0/1）。tracker=None（回滚）→ 跳过。
+            if tracker is not None:
+                tracker.note_rf_fallback(
+                    f"TE 解析失败 → config fallback={rfc['fallback_pct']}%")
         else:
             result.data_notes.append(
                 f"v5 rf 数据源: TradingEconomics 10Y={rf_meta['yield_pct']}%（{rf_meta['date']}，"
@@ -932,12 +949,22 @@ def _run_zscore(
             c6 = code.split(".")[1]
             if _cf_breaker_tripped:
                 ocf_annual_map[code] = None  # 熔断后剩余全部降级代理
+                # v5.3 D1：熔断路径=接口降级 → 记账（正常空响应不记，见下）。
+                if tracker is not None:
+                    tracker.note_f10_degraded(code, "cf")
                 continue
             try:
                 ann = cf_client.fetch_annual_ocf(c6, run_day_s)
                 ocf_annual_map[code] = ann  # None=无可见年报 → 该股降级代理（非接口失败）
                 _cf_consec_fail = 0  # 成功（含"无可见年报"）→ 重置连续失败计数
             except sinamod.SinaDataError as exc:
+                # v5.3 D1：只对**接口失败/熔断路径**记账（brief 硬约束）。fetch_annual_ocf
+                # 的 SinaDataError 有两类（见 sina.py 现有约定）：
+                #   a) "未取到可见年报 OCF" = 该股本就无可见年报（HTTP 成功、正常空响应）→ **不记**；
+                #   b) "重试 N 次均失败" / "熔断" = 接口失败路径 → 记账。
+                # （字符串匹配与既有 `"熔断" in str(exc)` 风格一致。）
+                if tracker is not None and "未取到可见年报 OCF" not in str(exc):
+                    tracker.note_f10_degraded(code, "cf")
                 if "熔断" in str(exc):
                     _cf_breaker_tripped = True
                     log.warning("v5 OCF 新浪财务JSON 熔断：剩余 %d 只全部降级代理（D9'）",
