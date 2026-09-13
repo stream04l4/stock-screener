@@ -88,9 +88,10 @@ def test_inventory_and_plan_missing_only(tmp_path):
         fund_keys=[("profit", 2024, 4), ("growth", 2024, 4)],
         div_years=[2025])
     inv = inventory_cache(cache)
-    assert (2024, 4) in inv["fund"]["profit"]
-    assert (2024, 4) in inv["fund"]["growth"]
+    assert (2024, 4) in inv["fund"]["profit"]["sh.600000"]
+    assert (2024, 4) in inv["fund"]["growth"]["sh.600000"]
     assert 2025 in inv["div_years"]
+    assert 2025 in inv["div_by_code"]["sh.600000"]
 
     plan = build_plan(cache, date(2025, 1, 31), date(2025, 6, 30),
                       include_delisted=False)
@@ -103,6 +104,43 @@ def test_inventory_and_plan_missing_only(tmp_path):
     # dividend 2025 已缓存 → 不在；2024 缺失 → 在
     divs = {it.year for it in plan.items if it.kind == "dividend"}
     assert 2025 not in divs and 2024 in divs
+
+
+def test_plan_per_stock_coverage_not_table_level(tmp_path):
+    """回归（2026-09-13 Phase C 实跑发现）：覆盖判定必须**逐股**。
+
+    旧表级口径下，任意一股有 profit_2024Q4 文件 → 全池该 (table,year) 判"已覆盖"，
+    其余股票的同键缺失从计划永久消失（实测全市场真实缺 103,292 键而旧口径报 0）。"""
+    codes = ("sh.600000", "sh.600004", "sh.600008")
+    d = tmp_path / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    for c in codes:
+        (d / f"kline_af3_{c}.csv").write_text(
+            "stock-screener-cache-v1\ndate,code,close,isST,tradestatus\n"
+            "2025-01-01," + c + ",10.0,0,1\n", encoding="utf-8")
+    # 只有 sh.600000 有 profit 2024Q4；其余两只必须仍在计划里
+    (d / "profit_sh.600000_2024_4.csv").write_text(
+        "stock-screener-cache-v1\ncode,pubDate,statDate,roeAvg\n"
+        "sh.600000,2025-04-30,2024-12-31,10.0\n", encoding="utf-8")
+
+    plan = build_plan(str(d), date(2025, 1, 31), date(2025, 6, 30),
+                      include_delisted=False)
+    fund_items = {(it.kind, it.code, it.year, it.quarter)
+                  for it in plan.items if it.kind == "profit"}
+    assert ("profit", "sh.600000", 2024, 4) not in fund_items   # 已缓存 → 跳过
+    assert ("profit", "sh.600004", 2024, 4) in fund_items       # 逐股缺失 → 必须补
+    assert ("profit", "sh.600008", 2024, 4) in fund_items
+
+    # 分红同口径：只有 sh.600000 缓存了 2025 → 其余两只 2025 仍在计划
+    (d / "dividend_sh.600000_2025.csv").write_text(
+        "stock-screener-cache-v1\ncode,dividOperateDate\nsh.600000,2025-07-01\n",
+        encoding="utf-8")
+    plan2 = build_plan(str(d), date(2025, 1, 31), date(2025, 6, 30),
+                       include_delisted=False)
+    div_items = {(it.code, it.year) for it in plan2.items if it.kind == "dividend"}
+    assert ("sh.600000", 2025) not in div_items
+    assert ("sh.600004", 2025) in div_items
+    assert ("sh.600008", 2025) in div_items
 
 
 def test_checkpoint_resume_skips_done(tmp_path):

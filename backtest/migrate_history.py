@@ -118,9 +118,15 @@ def monthly_rebalance_days(cal: Sequence[str]) -> List[str]:
 # 缓存盘点（离线）
 # ---------------------------------------------------------------------------
 def inventory_cache(cache_dir: str) -> Dict[str, Any]:
-    """扫描缓存目录：各表已缓存键集合 + K线/行业代码集合。"""
-    fund: Dict[str, set] = {t: set() for t in FUND_TABLES}
+    """扫描缓存目录：各表**逐股**已缓存键集合 + K线/行业代码集合。
+
+    fund 结构 = table → code → {(year, quarter)}（2026-09-13 修复：原为表级
+    (year,q) 集合，任意一股有文件即整池判"已覆盖"→ 其余 ~5200 只的缺失键从计划
+    永久消失；实测全市场真实缺 103,292 键而旧口径报 0）。div_years 保留为并集
+    （向后兼容/展示），逐股分红年见 div_by_code。"""
+    fund: Dict[str, Dict[str, set]] = {t: {} for t in FUND_TABLES}
     div_years: set = set()
+    div_by_code: Dict[str, set] = {}
     kline_codes: set = set()
     adjfactor_codes: set = set()
     allstock_days: set = set()
@@ -128,11 +134,14 @@ def inventory_cache(cache_dir: str) -> Dict[str, Any]:
     for fn in os.listdir(cache_dir):
         m = _RE_FUND.match(fn)
         if m:
-            fund[m.group(1)].add((int(m.group(3)), int(m.group(4))))
+            fund[m.group(1)].setdefault(m.group(2), set()).add(
+                (int(m.group(3)), int(m.group(4))))
             continue
         m = _RE_DIV.match(fn)
         if m:
-            div_years.add(int(m.group(2)))
+            y = int(m.group(2))
+            div_years.add(y)
+            div_by_code.setdefault(m.group(1), set()).add(y)
             continue
         m = _RE_KLINE.match(fn)
         if m:
@@ -149,9 +158,9 @@ def inventory_cache(cache_dir: str) -> Dict[str, Any]:
         if fn.startswith("kline_af3_sh.000") or fn.startswith("kline_af3_sz.399"):
             index_klines.add(fn[len("kline_af3_"):-len(".csv")])
     return {
-        "fund": fund, "div_years": div_years, "kline_codes": kline_codes,
-        "adjfactor_codes": adjfactor_codes, "allstock_days": allstock_days,
-        "index_klines": index_klines,
+        "fund": fund, "div_years": div_years, "div_by_code": div_by_code,
+        "kline_codes": kline_codes, "adjfactor_codes": adjfactor_codes,
+        "allstock_days": allstock_days, "index_klines": index_klines,
     }
 
 
@@ -269,17 +278,20 @@ def build_plan(
 
     plan = QueryPlan()
 
-    # ---- 1) 历史财报（逐股 × 缺失 (table,year,Q4) 键）----
-    missing_fund = sorted(k for k in need_fund if (k[1], 4) not in inv["fund"][k[0]])
+    # ---- 1) 历史财报（逐股 × **逐股**缺失 (table,year,Q4) 键）----
+    # 2026-09-13 修复：旧口径为表级（任意一股有文件 → 整池判"已覆盖"），run1 给前 ~10 只
+    # 写文件后其余 ~5200 只的缺失键从计划永久消失（实测真实缺 103,292 键而旧口径报 0）。
     for code in pool:
-        for t, y, q in missing_fund:
-            plan.add("fundamentals", QueryItem(kind=t, code=code, year=y, quarter=q))
+        for t, y, q in sorted(need_fund):
+            if (y, q) not in inv["fund"][t].get(code, ()):
+                plan.add("fundamentals", QueryItem(kind=t, code=code, year=y, quarter=q))
 
-    # ---- 2) 分红（逐股 × 缺失自然年）----
-    missing_div = sorted(y for y in div_years if y not in inv["div_years"])
+    # ---- 2) 分红（逐股 × **逐股**缺失自然年；同表级口径 bug，一并修复）----
     for code in pool:
-        for y in missing_div:
-            plan.add("dividends", QueryItem(kind="dividend", code=code, year=y))
+        have = inv["div_by_code"].get(code, ())
+        for y in sorted(div_years):
+            if y not in have:
+                plan.add("dividends", QueryItem(kind="dividend", code=code, year=y))
 
     # ---- 3) 退市股（K线+因子+分红年份+基本面键；引擎访问模式同 need_fund，逐股缺哪补哪）----
     if include_delisted:
