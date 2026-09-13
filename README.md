@@ -19,8 +19,9 @@
 | **v5.1** | **评审精加工** | payout 软约束区间 / reinvest 多期平滑参考价 + DPS CAGR 列 / 边界测试补全 |
 | **v5.2** | **数据源强化** | raw/canonical 本地数据层 + 多源交叉校验 v1 + 数据源健康度报告（Phase 1；Phase 2/3 见 §11） |
 | **v5.2-p2a** | **BaoStock 配额守卫** | 每日 49900 次硬上限（官网限 50000/日/IP，超限封禁 6h×年内次数），跨进程 flock 计数、超限显式失败不静默 |
+| **v5.3** | **可信度强化** | 健康度阈值告警（rf 回退 / F10 降级标的数 / 交叉校验冲突数，yaml 驱动，超阈值报告顶部标红）+ canonical `version_log.csv` 追加式数据版本日志 |
 
-当前默认配置 = v5.2（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
+当前默认配置 = v5.3（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
 作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
 （raw/canonical 全 no-op，主路径行为与 v5.1 逐字节一致）。
 
@@ -145,6 +146,17 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 - **健康度双通道**：report.md「数据源健康度」固定段 + JSON sidecar（Web badge 仅异常时显示）。
   `canonical.enabled: false` → raw/canonical/校验全 no-op，主路径输出与 v5.1 逐字节一致（已 A/B/C 验证）。
 
+### v5.3 阈值告警 + canonical 版本日志
+
+- **健康度阈值告警**（`health.alerts:` 段，yaml 驱动零硬编码）：三个关键指标超阈值时在
+  **报告顶部**渲染「⚠️ 数据源告警」块（无告警则整块不渲染、零噪音），Web badge anomalies 同步：
+  - `rf_fallback_max_per_run`（默认 0）：rf 使用 config fallback 值（TE 解析失败静默替换）→ 标红，防"rf 被换掉没人知道"；
+  - `f10_degraded_max`（默认 5）：当日新浪 F10 接口失败/熔断导致降级 None 的标的数 → 批量 WAF 触发时集体失真可见；
+  - `crosscheck_conflicts_max`（默认 2）：close/dps/roe 三字段交叉校验冲突总数。
+- **canonical 版本日志** `data/canonical/version_log.csv`：append-only，记录每次 append /
+  `build_from_raw` 的 ts_utc、trigger、data_version、source、rows_added、raw 日期范围（seq 幂等 + 原子写）。
+  回测发现某时段结果异常时可快速定位是否数据版本切换导致。
+
 ## 5. 筛选逻辑（实现要点）
 
 1. **股票池**：`query_all_stock(day=...)` 显式传 day → 前缀过滤 A股 → tradeStatus=1；
@@ -175,7 +187,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q          # 409 passed
+python -m pytest -q          # 436 passed
 ```
 
 覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
@@ -187,7 +199,9 @@ consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回�
 **v5.2 Phase 1**（rawstore 幂等/原子写、canonical 增量不回填/build_from_raw、交叉校验三分支+
 EmptyPayloadGuard 两分支、akshare breaker 降级、健康度渲染回滚逐字节一致；全离线 fixture，零网络）、
 **v5.2-p2a BaoStock 配额守卫**（QuotaGuard 计数/超限 raise/flock 并发原子性/CLI --show/--set-count，
-全离线 mock，零真实 baostock 调用）。
+全离线 mock，零真实 baostock 调用）、
+**v5.3 阈值告警 + 版本日志**（alerts 三 kind 触发/不触发、summary/badge 含 alerts、报告顶部块渲染与
+无告警不渲染、version_log 追加/seq 幂等/原子写、config alerts 缺省向后兼容；全离线 fixture，零网络）。
 
 ## 8. Web 前端（控制台）
 
@@ -276,7 +290,7 @@ stock-screener/
 │   ├── app.py                  # FastAPI 应用（API + 子进程任务管理 + 策略校验 + data_health badge）
 │   └── static/                 # index.html / style.css / app.js（vanilla JS，无构建）
 ├── cache/                      # 原始数据缓存（自动生成）
-├── data/                       # v5.2：raw/（append-only 原始响应）+ canonical/（统一 Schema），已 gitignore
+├── data/                       # v5.2：raw/（append-only 原始响应）+ canonical/（统一 Schema + v5.3 version_log.csv），已 gitignore
 ├── output/                     # result_*.csv / report_*.md（自动生成，报告含数据源健康度段）
 └── logs/                       # run_*.log / web_run_*.log / cron.log
 ```
