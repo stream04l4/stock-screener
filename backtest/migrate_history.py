@@ -458,6 +458,18 @@ def execute_plan(
     return 0
 
 
+# ---------------------------------------------------------------------------
+# baostock 基本面表 → 真实模块函数名
+# ---------------------------------------------------------------------------
+def _fund_query_fn_name(kind: str) -> str:
+    """kind → baostock 查询函数名。并非统一 f"query_{kind}_data"：
+    cashflow → query_cash_flow_data（多一个下划线）。
+
+    2026-09-13 Phase C 首日实跑发现 getattr(bs, "query_cashflow_data") AttributeError，
+    失败条目不标记断点 → 每轮无限重试烧配额；单测 _FakeBS 未覆盖真实属性名故漏网。"""
+    return {"cashflow": "query_cash_flow_data"}.get(kind, f"query_{kind}_data")
+
+
 def _run_one(bs, cache: Any, it: QueryItem):
     """执行单条查询并写缓存（列布局与 v2 fetchers 完全一致 → 回测层直接可读）。
 
@@ -476,7 +488,7 @@ def _run_one(bs, cache: Any, it: QueryItem):
         return list(rs.fields), rows
 
     if it.kind in FUND_TABLES:
-        fn = getattr(bs, f"query_{it.kind}_data")
+        fn = getattr(bs, _fund_query_fn_name(it.kind))
         _, rows = _fetch(fn, it.label, code=it.code, year=it.year, quarter=it.quarter)
         # 列布局同 v2 fetchers（单季一行）；历史年度无数据=永久缺失 → "empty"
         if not rows:

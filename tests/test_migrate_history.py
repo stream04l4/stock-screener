@@ -176,6 +176,25 @@ class _FakeBS:
         r = self.by_kind.get("profit")
         return self._mk(f, [r] if r else [])
 
+    def query_growth_data(self, **kw):
+        self.calls.append(("growth", kw))
+        f = ["code", "pubDate", "statDate", "YOYEquity"]
+        r = self.by_kind.get("growth")
+        return self._mk(f, [r] if r else [])
+
+    def query_balance_data(self, **kw):
+        self.calls.append(("balance", kw))
+        f = ["code", "pubDate", "statDate", "currentRatio"]
+        r = self.by_kind.get("balance")
+        return self._mk(f, [r] if r else [])
+
+    def query_cash_flow_data(self, **kw):
+        # 真实 baostock 函数名（query_cash_FLOW_data）——_run_one 经 _fund_query_fn_name 解析
+        self.calls.append(("cashflow", kw))
+        f = ["code", "pubDate", "statDate", "CFOToNP"]
+        r = self.by_kind.get("cashflow")
+        return self._mk(f, [r] if r else [])
+
     def query_dividend_data(self, **kw):
         self.calls.append(("dividend", kw))
         f = ["code", "dividOperateDate", "dividCashPsBeforeTax"]
@@ -274,3 +293,33 @@ def test_run_one_kline_uses_five_fields(tmp_path):
     kline_kw = bs.calls[0][1]
     assert kline_kw["fields"] == "date,code,close,isST,tradestatus"
     assert kline_kw["adjustflag"] == "3"   # 不复权（真实成交价）
+
+
+# ---------------------------------------------------------------------------
+# 回归：kind → baostock 函数名解析（2026-09-13 Phase C cashflow AttributeError）
+# ---------------------------------------------------------------------------
+def test_fund_query_fn_name_matches_real_baostock():
+    """_fund_query_fn_name 对四张表必须解析出**真实模块上存在**的属性名。
+
+    历史 bug：cashflow 拼成 query_cashflow_data（实际 query_cash_flow_data）→
+    实跑首日全量失败且断点不标记 → 无限重试烧配额。fake mock 无法暴露此类问题，
+    故直接对真实 baostock 模块做 hasattr 断言（纯属性检查，零网络）。"""
+    import baostock as bs
+    from backtest.migrate_history import FUND_TABLES, _fund_query_fn_name
+
+    for kind in FUND_TABLES:
+        name = _fund_query_fn_name(kind)
+        assert hasattr(bs, name), f"{kind} → {name} 在 baostock 模块不存在"
+
+
+def test_run_one_cashflow_uses_real_function_name(tmp_path):
+    """cashflow 条目经 _run_one 完整走通（fake 只提供真实名 query_cash_flow_data）。"""
+    from backtest.migrate_history import QueryItem, _run_one
+    from screener.data.cache import DiskCache
+
+    cache = DiskCache(str(tmp_path))
+    bs = _FakeBS({"cashflow": ["sh.600000", "2025-04-30", "2024-12-31", "0.8"]})
+    assert _run_one(bs, cache, QueryItem(kind="cashflow", code="sh.600000",
+                                         year=2024, quarter=4)) is True
+    assert (tmp_path / "cashflow_sh.600000_2024_4.csv").exists()
+    assert [c[0] for c in bs.calls] == ["cashflow"]
