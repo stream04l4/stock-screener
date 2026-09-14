@@ -3,7 +3,10 @@
 
 - duckdb 未装 → :func:`duckdb_available` False，:func:`get_conn` 抛 LakeUnavailable
   （调用方 lake.lake_conn() 已先行判断返回 None，正常路径不会到这里）。
-- 单例：同进程复用同一 Connection（DuckDB 连接内建多线程安全；写事务串行化）。
+- 单例：同进程复用同一 Connection，**仅供 backfill/ingest 写路径**（写事务由
+  LakeLock flock 跨进程串行化）。⚠️ 该单例**不得跨线程并发 execute**——实测
+  同一 Connection 对象并发执行不同 SQL 会交错结果集（v6.0.1 D-4）；Web 读路径
+  一律用 :func:`connect_existing` 每请求短连接。
 - advisory lock：跨进程并发写保护用文件锁（fcntl.flock）——数据湖是后台分析层，
   多进程（web + backfill cron）可能同时打开单文件 DuckDB；读多写少，DuckDB 自身
   对同文件多连接支持有限，故**写路径**（ingest/backfill）持 flock 串行化。
@@ -72,11 +75,39 @@ def open(db_path: Optional[str] = None):
 
 
 def get_conn():
-    """进程级单例（默认库）。未装 duckdb → LakeUnavailable。"""
+    """进程级单例（默认库）。未装 duckdb → LakeUnavailable。
+
+    ⚠️ 语义不变（D-4 修复说明）：本函数仍供 **backfill/ingest 写路径**使用
+    （单例 + LakeLock flock 串行化）。**Web 读路径不得跨线程共用该单例**——
+    实测同一 Connection 对象并发 execute(不同 SQL) 会交错结果集（v6.0.1 D-4，
+    旧 docstring "DuckDB 连接内建多线程安全" 不成立）。Web 端点一律走
+    :func:`connect_existing` 每请求短连接。
+    """
     global _conn
     if _conn is None:
         _conn = open()
     return _conn
+
+
+def connect_existing(db_path: Optional[str] = None):
+    """轻量只读短连接（Web 端点每请求专用）：仅 duckdb.connect，**不执行 init_schema**。
+
+    v6.0.1 D-4：lake.web_api 原用 get_conn() 进程级单例跨 FastAPI 线程池并发
+    execute → 结果集交错/500。改为每请求新开短连接（DuckDB 文件库支持多连接
+    并发读），用完即 close。
+
+    - **不走 :func:`open`**：open() 每次执行 init_schema 全量 DDL，每请求跑一遍
+      不可接受；Web 只读，schema 由 backfill（写路径）负责建立。
+    - 文件不存在/打不开 → duckdb 抛错，由调用方（web_api._con）转 503。
+    - 不触碰进程级单例 ``_conn``——与写路径完全隔离。
+
+    :param db_path: 缺省 = default_db_path()；测试可传 tmp 库路径。
+    """
+    if not duckdb_available():
+        raise LakeUnavailable("duckdb 未安装（uv sync --extra lake）")
+    import duckdb
+
+    return duckdb.connect(db_path or default_db_path())
 
 
 def reset_for_test() -> None:
