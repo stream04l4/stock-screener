@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import builtins
 import fcntl
 import logging
 import os
@@ -134,7 +135,12 @@ class LakeLock:
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
-        self._fh = open(self._lock_path, "a+")
+        # N-1 修复（v6.0.2）：必须用 builtins.open——本模块定义了模块级
+        # ``def open(db_path=None)``（DuckDB 连接工厂），裸调 open() 会被遮蔽，
+        # 把 "a+" 当作 DuckDB db_path 去 duckdb.connect("a+") → 必抛异常，
+        # LakeLock 完全不可用。同理检查过全文件：无其它被遮蔽的内置调用
+        # （abs/input 等未被本模块重定义）。
+        self._fh = builtins.open(self._lock_path, "a+")
         fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         return self
 
