@@ -122,6 +122,26 @@ def stock_detail(ts_code: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# GET /industries（v6.0.1 D-3：区块B 行业下拉动态填充）
+# ---------------------------------------------------------------------------
+@router.get("/industries")
+def industries() -> Dict[str, Any]:
+    """stock_master distinct industry_csric2 + 名称映射（code→name，取众数）。
+
+    供前端"全市场浏览"行业下拉动态填充；库为空 → ``{"industries": []}``
+    （前端保持"全部行业"占位 + 空态文案）。排序按 code 升序（稳定、可断言）。
+    """
+    con = _con()
+    rows = _rows_dicts(
+        con,
+        "SELECT industry_csric2 AS code, "
+        "ANY_VALUE(industry_name) FILTER (industry_name IS NOT NULL) AS name "
+        "FROM stock_master WHERE industry_csric2 IS NOT NULL AND industry_csric2 <> '' "
+        "GROUP BY industry_csric2 ORDER BY code")
+    return {"industries": [{"code": r["code"], "name": r["name"] or ""} for r in rows]}
+
+
+# ---------------------------------------------------------------------------
 # GET /market
 # ---------------------------------------------------------------------------
 @router.get("/market")

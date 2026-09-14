@@ -32,9 +32,11 @@ def lake_conn(db_path=None):
         return None
     if db_path is None:
         return _conn.get_conn()
-    con = _conn.open(db_path)
-    _conn.init_schema(con)
-    return con
+    # 显式路径：open() 内部已调用 ddl.init_schema（IF NOT EXISTS，幂等），
+    # 此处**不再**重复调 init_schema——v6.0.1 D-1 修复：原代码误写
+    # ``_conn.init_schema``（lake.conn 无此属性，必抛 AttributeError）；
+    # 删除该行而非改 import，因为 conn.open 已覆盖 schema 初始化职责。
+    return _conn.open(db_path)
 
 
 def duckdb_available() -> bool:

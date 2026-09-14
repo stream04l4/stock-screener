@@ -1197,7 +1197,8 @@ async function initLakePage() {
   $("#lake-industry-filter").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
   $("#lake-soe-filter").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
   $("#lake-sort-select").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
-  $("#btn-lake-refresh-status").addEventListener("click", loadLakeStatus);
+  // ⟳ 刷新：进度 + 行业下拉一并刷新（backfill 灌入新行业后无需整页 reload）
+  $("#btn-lake-refresh-status").addEventListener("click", () => { loadLakeStatus(); loadLakeIndustries(); });
 }
 
 async function selectLakeStock(ts_code) {
@@ -1286,6 +1287,40 @@ function renderLakeStock(d) {
 
 function lakeKv(k, v) {
   return `<div class="lake-kv"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+
+async function loadLakeIndustries() {
+  // v6.0.1 D-3：区块B 行业下拉动态填充（stock_master distinct industry_csric2 + 名称）。
+  // 三态：加载（select 禁用）/ 正常（选项 = code + 名称）/ 空库（保留"全部行业"占位 + 空态文案）。
+  const sel = $("#lake-industry-filter");
+  const hint = $("#lake-industry-hint");
+  const prev = sel.value;
+  sel.disabled = true;
+  try {
+    const d = await api("/api/lake/industries");
+    const list = d.industries || [];
+    if (!list.length) {
+      // 空态：库未灌入 / 无行业数据 → 保持占位 + 提示（不误导用户以为有筛选）
+      sel.innerHTML = '<option value="">全部行业</option>';
+      hint.textContent = "（暂无行业数据）";
+      hint.classList.remove("hidden");
+    } else {
+      let h = '<option value="">全部行业</option>';
+      for (const it of list) {
+        const label = it.name ? `${it.code} ${it.name}` : it.code;
+        h += `<option value="${esc(it.code)}">${esc(label)}</option>`;
+      }
+      sel.innerHTML = h;
+      hint.classList.add("hidden");
+    }
+    if (list.some((it) => it.code === prev)) sel.value = prev;  // 保留已有选择（若仍存在）
+  } catch (e) {
+    // 错误态：红横幅（与其他 lake 端点一致），下拉回退占位不阻塞浏览
+    lakeSetError(e.message);
+    sel.innerHTML = '<option value="">全部行业</option>';
+  } finally {
+    sel.disabled = false;
+  }
 }
 
 async function loadLakeMarket() {
@@ -1394,6 +1429,7 @@ function onLakeTab() {
   if (!lakeLoaded) {
     lakeLoaded = true;
     loadLakeStatus();
+    loadLakeIndustries();   // v6.0.1 D-3：区块B 行业下拉动态填充
     loadLakeMarket();
   }
 }

@@ -130,10 +130,13 @@ def export_parquet(table: str, out_dir: Optional[str] = None, con=None) -> str:
         _project_root(), "data", "lake", "parquet", table)
     os.makedirs(out_dir, exist_ok=True)
     target = os.path.join(out_dir, table)
-    # hive 分区：PARTITION_BY(date)；zstd 压缩（Q5）
+    # hive 分区：PARTITION_BY(date)；zstd 压缩（Q5）。
+    # OVERWRITE：目标目录非空时先清空再写——v6.0.1 D-2 修复：无此选项时
+    # 对同一目标二次导出必抛 "Directory ... is not empty! Enable OVERWRITE"，
+    # 破坏 P2 快照"同目录重导 = 幂等覆盖"的语义。
     con.execute(
         f"COPY (SELECT * FROM {table}) TO '{target}' "
-        "(FORMAT PARQUET, PARTITION_BY (date), COMPRESSION zstd)"
+        "(FORMAT PARQUET, PARTITION_BY (date), COMPRESSION zstd, OVERWRITE)"
     )
     return target
 
