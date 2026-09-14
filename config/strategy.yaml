@@ -230,3 +230,9 @@ health:                             # 交叉校验 v1 阈值 + EmptyPayloadGuard
     rf_fallback_max_per_run: 0      # 单次运行 rf 10Y 回退次数 > N → 告警（默认 0=一回退就告警）
     f10_degraded_max: 5             # 当日新浪 F10 降级(接口失败/熔断取 None)标的数 > N → 告警
     crosscheck_conflicts_max: 2     # 三字段交叉校验冲突总数 > N → 告警
+
+# ---------------------------------------------------------------------------
+# v6 数据湖（DuckDB 独立分析层，非筛选热路径；主路径零 import lake）
+# ---------------------------------------------------------------------------
+lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
+  baostock_daily_budget: 5000       # Q2：BaoStock 日预算上限（次/日，config 可调；到顶当日停、次日续）
