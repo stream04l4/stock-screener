@@ -74,6 +74,7 @@ function switchTab(name) {
   if (name === "results") loadRuns();
   if (name === "strategy") loadStrategy();
   if (name === "backtest") loadBacktest();
+  if (name === "lake") onLakeTab();
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1122,283 @@ function pollStatus(taskId) {
 }
 
 // ---------------------------------------------------------------------------
+// v6 数据湖页签（/api/lake/*；独立分析层，错误态降级不阻塞其他 tab）
+// ---------------------------------------------------------------------------
+let lakeLoaded = false;      // 首次进 tab 才拉 status/market（懒加载）
+let lakeInstalled = null;    // /status.installed（null=未知）
+let lakeMarketPage = 1;
+
+function lakeSetError(msg) {
+  const box = $("#lake-error");
+  if (!msg) { box.classList.add("hidden"); box.textContent = ""; return; }
+  box.textContent = "数据湖不可用：" + msg;
+  box.classList.remove("hidden");
+}
+
+// 加载态：骨架屏（切股/搜索时）
+function lakeSkeleton(n = 4) {
+  let h = '<div class="lake-loading-label">加载中…</div>';
+  for (let i = 0; i < n; i++) h += '<div class="lake-skeleton"></div>';
+  return h;
+}
+
+// NULL → "—"；百分比带 %；市值带"亿"（正常态格式约定，报告 §5）
+function lakeFmt(v, kind) {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (isNaN(n)) return String(v);
+  if (kind === "pct") return n.toFixed(2) + "%";
+  if (kind === "yi") return n.toFixed(1) + "亿";
+  if (kind === "num") return n.toFixed(2);
+  return String(v);
+}
+
+async function initLakePage() {
+  const input = $("#lake-search-input");
+  const resultsBox = $("#lake-search-results");
+
+  // 搜索（防抖 + 下拉）
+  let debounce = null;
+  async function doSearch() {
+    const q = input.value.trim();
+    try {
+      const d = await api("/api/lake/search?q=" + encodeURIComponent(q));
+      resultsBox.innerHTML = "";
+      if (!d.results || !d.results.length) {
+        // 空态：搜索无结果
+        resultsBox.append(el("div", { class: "sr-empty" }, "未找到匹配股票"));
+      } else {
+        for (const r of d.results) {
+          const item = el("div", { class: "sr-item" },
+            el("span", { class: "sr-code" }, r.ts_code),
+            el("span", { class: "sr-name" }, r.name || ""),
+            el("span", { class: "sr-ind" }, r.industry_name || ""));
+          item.addEventListener("click", () => { selectLakeStock(r.ts_code); });
+          resultsBox.append(item);
+        }
+      }
+      resultsBox.classList.remove("hidden");
+    } catch (e) {
+      lakeSetError(e.message);
+      resultsBox.classList.add("hidden");
+    }
+  }
+  input.addEventListener("input", () => {
+    clearTimeout(debounce); debounce = setTimeout(doSearch, 250);
+  });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  $("#btn-lake-search").addEventListener("click", doSearch);
+  // 点空白收起下拉
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".lake-toolbar")) resultsBox.classList.add("hidden");
+  });
+
+  // 区块B：筛选/排序/分页
+  $("#lake-industry-filter").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
+  $("#lake-soe-filter").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
+  $("#lake-sort-select").addEventListener("change", () => { lakeMarketPage = 1; loadLakeMarket(); });
+  $("#btn-lake-refresh-status").addEventListener("click", loadLakeStatus);
+}
+
+async function selectLakeStock(ts_code) {
+  $("#lake-search-results").classList.add("hidden");
+  const body = $("#lake-stock-body");
+  $("#lake-stock-title").textContent = "";
+  body.innerHTML = lakeSkeleton(5);   // 加载态：骨架屏
+  try {
+    const d = await api("/api/lake/stock/" + ts_code);
+    renderLakeStock(d);
+  } catch (e) {
+    if (e.status === 404) body.innerHTML = '<p class="placeholder">数据湖无此股（T1 未灌入）</p>';
+    else { lakeSetError(e.message); body.innerHTML = '<p class="placeholder">加载失败</p>'; }
+  }
+}
+
+function renderLakeStock(d) {
+  const b = d.base || {};
+  $("#lake-stock-title").textContent = ` ${d.ts_code} · ${b.name || ""}`;
+  const body = $("#lake-stock-body");
+  let h = "";
+  // 基础卡（名称/行业/板块/is_st/soe_flag+soe_basis）
+  h += '<div class="lake-base-grid">';
+  h += lakeKv("名称", b.name || "—");
+  h += lakeKv("行业", [b.industry_csric2, b.industry_name].filter(Boolean).join(" ") || "—");
+  h += lakeKv("板块", b.board || "—");
+  h += lakeKv("ST", b.is_st ? "是" : "否");
+  h += lakeKv("央国企", (b.soe_flag || "—") + (b.soe_basis ? "（" + b.soe_basis + "）" : ""));
+  h += "</div>";
+  // 估值行（total_mv/float_mv/pe/pb/turnover/ttm_yield）
+  h += '<div class="lake-section-title">估值</div><div class="lake-base-grid">';
+  h += lakeKv("总市值", lakeFmt(b.total_mv, "yi"));
+  h += lakeKv("流通市值", lakeFmt(b.float_mv, "yi"));
+  h += lakeKv("PE(TTM)", lakeFmt(b.pe_ttm, "num"));
+  h += lakeKv("PB", lakeFmt(b.pb, "num"));
+  h += lakeKv("换手率", lakeFmt(b.turnover_pct, "pct"));
+  h += lakeKv("TTM股息率", lakeFmt(b.ttm_yield_pct, "pct"));
+  h += "</div>";
+  // 因子网格（T8）
+  h += '<div class="lake-section-title">因子（T8' + (d.factors_as_of ? " · " + d.factors_as_of : "") + "）</div>";
+  const fkeys = Object.keys(d.factors || {});
+  if (!fkeys.length) {
+    h += '<p class="muted small">暂无数据（后台补齐中）</p>';
+  } else {
+    h += '<div class="lake-factor-grid">';
+    for (const k of fkeys) h += `<div class="lake-factor"><div class="k">${esc(k)}</div><div class="v">${lakeFmt(d.factors[k], "num")}</div></div>`;
+    h += "</div>";
+  }
+  // 最近分红
+  h += '<div class="lake-section-title">最近分红</div><div class="lake-base-grid">';
+  h += lakeKv("除权日", b.last_ex_date || "—");
+  h += lakeKv("每股分红(元)", lakeFmt(b.last_cash_dps, "num"));
+  h += "</div>";
+  // T5 最近季
+  const f = d.fundamental_latest;
+  h += '<div class="lake-section-title">最近季报（T5）</div>';
+  if (!f) {
+    h += '<p class="muted small">暂无数据（后台补齐中）</p>';
+  } else {
+    h += '<div class="lake-base-grid">';
+    h += lakeKv("报告期", f.period || "—");
+    h += lakeKv("披露日", f.pub_date || "—");
+    h += lakeKv("ROE(平均)", lakeFmt(f.roe_avg, "pct"));
+    h += lakeKv("ROE(加权)", lakeFmt(f.roe_weighted, "pct"));
+    h += lakeKv("净利同比", lakeFmt(f.yoy_pni, "pct"));
+    h += lakeKv("毛利率", lakeFmt(f.gross_margin, "pct"));
+    h += lakeKv("资产负债率", lakeFmt(f.liability_pct, "pct"));
+    h += "</div>";
+  }
+  // 前十大股东表（T6）
+  h += '<div class="lake-section-title">前十大股东（T6 · 流通股口径）</div>';
+  if (!d.holders_top10 || !d.holders_top10.length) {
+    h += '<p class="muted small">暂无数据（后台补齐中）</p>';
+  } else {
+    h += '<div class="tbl-wrap"><table class="data"><thead><tr>' +
+      "<th>#</th><th>股东名称</th><th class='num'>占流通股%</th><th>股本性质</th>" +
+      "</tr></thead><tbody>";
+    for (const r of d.holders_top10) {
+      h += `<tr><td>${esc(r.holder_rank)}</td><td>${esc(r.holder_name)}</td>` +
+        `<td class="num">${lakeFmt(r.hold_ratio, "pct")}</td><td>${esc(r.share_nature || "—")}</td></tr>`;
+    }
+    h += "</tbody></table></div>";
+  }
+  body.innerHTML = h;
+}
+
+function lakeKv(k, v) {
+  return `<div class="lake-kv"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+
+async function loadLakeMarket() {
+  const table = $("#lake-market-table");
+  const ind = $("#lake-industry-filter").value;
+  const soe = $("#lake-soe-filter").value;
+  const sort = $("#lake-sort-select").value;
+  let qs = `page=${lakeMarketPage}&sort=${sort}`;
+  if (ind) qs += "&industry=" + encodeURIComponent(ind);
+  if (soe) qs += "&soe=" + soe;
+  table.innerHTML = '<tr><td colspan="8" class="lake-loading-label">加载中…</td></tr>'; // 表格首行 spinner
+  try {
+    const d = await api("/api/lake/market?" + qs);
+    renderLakeMarket(d);
+  } catch (e) {
+    lakeSetError(e.message);
+    table.innerHTML = '<tr><td colspan="8" class="placeholder">加载失败</td></tr>';
+  }
+}
+
+function renderLakeMarket(d) {
+  const table = $("#lake-market-table");
+  let h = "<thead><tr>" +
+    "<th>代码</th><th>名称</th><th>行业</th><th class='num'>总市值(亿)</th>" +
+    "<th class='num'>PE</th><th class='num'>PB</th><th class='num'>股息率%</th><th>央国企</th>" +
+    "</tr></thead><tbody>";
+  if (!d.rows || !d.rows.length) {
+    // 空态：全市场 0 行
+    h += '<tr><td colspan="8" class="placeholder">数据湖尚未灌入数据，请先运行 backfill</td></tr>';
+  } else {
+    for (const r of d.rows) {
+      h += `<tr class="clickable" data-ts="${esc(r.ts_code)}">` +
+        `<td><span class="sr-code">${esc(r.ts_code)}</span></td>` +
+        `<td>${esc(r.name || "—")}</td><td>${esc(r.industry_name || "—")}</td>` +
+        `<td class="num">${lakeFmt(r.total_mv, "num")}</td>` +
+        `<td class="num">${lakeFmt(r.pe_ttm, "num")}</td>` +
+        `<td class="num">${lakeFmt(r.pb, "num")}</td>` +
+        `<td class="num">${lakeFmt(r.ttm_yield_pct, "pct")}</td>` +
+        `<td>${r.soe_flag === "央国企" ? '<span class="bdg bdg-ind">央国企</span>' : "—"}</td></tr>`;
+    }
+  }
+  h += "</tbody>";
+  table.innerHTML = h;
+  $("#lake-market-count").textContent = `共 ${d.total} 只 · 第 ${d.page}/${Math.max(1, d.pages)} 页`;
+  // 行点击 → 个股全景
+  table.querySelectorAll("tr.clickable").forEach((tr) =>
+    tr.addEventListener("click", () => {
+      selectLakeStock(tr.dataset.ts);
+      $("#lake-stock-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    }));
+  // 分页
+  const pager = $("#lake-market-pager");
+  pager.innerHTML = "";
+  const mkBtn = (label, page, disabled, cur) => {
+    const b = el("button", {}, label);
+    if (disabled) b.disabled = true;
+    if (cur) b.classList.add("cur");
+    if (!disabled && !cur) b.addEventListener("click", () => { lakeMarketPage = page; loadLakeMarket(); });
+    return b;
+  };
+  pager.append(mkBtn("«", 1, d.page <= 1), mkBtn("‹", d.page - 1, d.page <= 1));
+  pager.append(document.createTextNode(` ${d.page} / ${Math.max(1, d.pages)} `));
+  pager.append(mkBtn("›", d.page + 1, d.page >= d.pages), mkBtn("»", d.pages, d.page >= d.pages));
+}
+
+async function loadLakeStatus() {
+  const covBox = $("#lake-coverage");
+  const table = $("#lake-tasks-table");
+  try {
+    const d = await api("/api/lake/status");
+    lakeInstalled = !!d.installed;
+    if (!d.installed) { lakeSetError("duckdb 未安装（uv sync --extra lake）"); return; }
+    lakeSetError("");   // 正常态：清错误横幅
+    covBox.textContent = `DuckDB ${d.duckdb_version} · 进度更新于 ${d.updated_at || "—"}`;
+    // coverage 行
+    let ch = "";
+    const cov = d.coverage || {};
+    for (const [t, c] of Object.entries(cov)) {
+      const range = (c.date_min && c.date_max) ? `${c.date_min} ~ ${c.date_max}` : "—";
+      ch += `<div>${esc(t)}：${c.codes ?? "—"} 只 · ${range} · ${c.rows ?? "—"} 行</div>`;
+    }
+    covBox.innerHTML = (covBox.textContent + "<br>" + (ch || '<span class="muted">（暂无覆盖数据）</span>'));
+    // tasks 表
+    let th = "<thead><tr><th>表</th><th>层级</th><th>状态</th><th class='num'>进度</th><th class='num'>配额(今日)</th><th class='num'>ETA(min)</th></tr></thead><tbody>";
+    const tasks = d.tasks || [];
+    if (!tasks.length) th += '<tr><td colspan="6" class="placeholder">暂无后台补齐任务</td></tr>';
+    for (const t of tasks) {
+      const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+      th += `<tr><td>${esc(t.table)}</td><td>${esc(t.tier)}</td>` +
+        `<td><span class="badge ${esc(t.state || "idle")}">${esc(t.state || "idle")}</span></td>` +
+        `<td class="num lake-task-progress"><div class="progress-track" style="margin:0"><div class="progress-bar" style="width:${pct}%"></div></div>${t.done ?? 0}/${t.total ?? 0}</td>` +
+        `<td class="num">${t.quota_used_today ?? 0}/${t.quota_budget ?? "—"}</td>` +
+        `<td class="num">${t.eta_min ?? "—"}</td></tr>`;
+    }
+    th += "</tbody>";
+    table.innerHTML = th;
+  } catch (e) {
+    // 错误态：5xx / duckdb 未装 → 红色横幅 + 降级占位（不白屏）
+    lakeSetError(e.message);
+    covBox.textContent = "—";
+    table.innerHTML = '<tr><td colspan="6" class="placeholder">数据湖不可用</td></tr>';
+  }
+}
+
+function onLakeTab() {
+  if (!lakeLoaded) {
+    lakeLoaded = true;
+    loadLakeStatus();
+    loadLakeMarket();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------------------
 document.addEventListener("DOMContentLoaded", () => {
@@ -1128,6 +1406,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initStrategyButtons();
   initRunPage();
   initStockModal();
+  initLakePage();
   $("#btn-refresh-runs").addEventListener("click", loadRuns);
   loadRuns();
 });

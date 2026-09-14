@@ -14,6 +14,7 @@
     <button class="tab" data-tab="strategy">策略</button>
     <button class="tab" data-tab="backtest">回测</button>
     <button class="tab" data-tab="run">运行</button>
+    <button class="tab" data-tab="lake">数据湖</button>
   </nav>
   <div id="global-status" class="global-status"></div>
 </header>
@@ -74,6 +75,51 @@
       </div>
       <div id="task-progress-label" class="muted small"></div>
       <pre id="log-tail" class="log-tail"></pre>
+    </div>
+  </section>
+
+  <!-- ============ 数据湖（v6：DuckDB 独立分析层；/api/lake/*） ============ -->
+  <section id="tab-lake" class="tab-panel">
+    <!-- 错误态：API 5xx / duckdb 未装 → 顶部红色横幅 + 三区块降级占位（不白屏、不阻塞其他 tab） -->
+    <div id="lake-error" class="lake-error hidden"></div>
+
+    <div class="lake-toolbar card">
+      <input type="search" id="lake-search-input" placeholder="搜索代码 / 名称（如 601398 或 工行）" autocomplete="off">
+      <button id="btn-lake-search" class="primary-btn">🔍 搜索</button>
+      <div id="lake-search-results" class="lake-search-results hidden"></div>
+    </div>
+
+    <!-- 区块A：个股全景（选中股） -->
+    <div class="card" id="lake-stock-card">
+      <h3>个股全景 <span id="lake-stock-title" class="muted small"></span></h3>
+      <div id="lake-stock-body"><p class="placeholder">← 搜索并选择一只股票查看全景（基础 / 估值 / 因子 / 分红 / 前十大股东）</p></div>
+    </div>
+
+    <!-- 区块B：全市场浏览 -->
+    <div class="card" id="lake-market-card">
+      <h3>全市场浏览</h3>
+      <div class="tbl-toolbar">
+        <select id="lake-industry-filter"><option value="">全部行业</option></select>
+        <select id="lake-soe-filter">
+          <option value="">全部</option>
+          <option value="soe">央国企</option>
+          <option value="other">其他</option>
+        </select>
+        <select id="lake-sort-select">
+          <option value="total_mv">按总市值</option>
+          <option value="ttm_yield_pct">按股息率</option>
+        </select>
+        <span id="lake-market-count" class="count"></span>
+      </div>
+      <div class="tbl-wrap"><table class="data" id="lake-market-table"></table></div>
+      <div class="pager" id="lake-market-pager"></div>
+    </div>
+
+    <!-- 区块C：补齐进度 -->
+    <div class="card" id="lake-status-card">
+      <h3>数据湖状态 / 补齐进度 <button id="btn-lake-refresh-status" class="mini-btn" title="刷新">⟳</button></h3>
+      <div id="lake-coverage" class="muted small"></div>
+      <div class="tbl-wrap" style="margin-top:8px;"><table class="data" id="lake-tasks-table"></table></div>
     </div>
   </section>
 </main>

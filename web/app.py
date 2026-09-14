@@ -20,6 +20,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -1340,6 +1341,35 @@ def health() -> Dict[str, Any]:
         "project_root": str(PROJECT_ROOT),
         "active_task": tm.active_task_id(),
     }
+
+
+# ---------------------------------------------------------------------------
+# v6 数据湖页签（独立分析层）：仅当 duckdb 可导入时挂载 /api/lake/* router；
+# 否则注册轻量 stub（/api/lake/status → installed=false），前端页签显示
+# "数据湖未安装"。零 import 保证：screener/*、backtest/* 绝不 import lake；
+# 本段是 web/app.py 唯一与 lake 相关的改动，且全部在 try/except 内——
+# duckdb/lake 缺失或损坏时主路径行为逐字节不变（只多一个 stub 状态端点）。
+# ---------------------------------------------------------------------------
+_lake_router = None
+try:
+    import duckdb as _duckdb_probe  # noqa: F401 - 仅探测可导入性
+except ImportError:
+    _duckdb_probe = None
+
+if _duckdb_probe is not None:
+    try:
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))  # lake 包位于仓库根（与 screener 平级）
+        from lake.web_api import router as _lake_router
+        app.include_router(_lake_router)
+    except Exception:  # noqa: BLE001 - lake 包缺失/损坏 → 降级 stub，不阻断主路径
+        _lake_router = None
+
+if _lake_router is None:
+    @app.get("/api/lake/status")
+    def _lake_status_stub() -> Dict[str, Any]:
+        """duckdb/lake 未装时的降级端点：前端据此显示"数据湖未安装"。"""
+        return {"installed": False, "detail": "数据湖未安装（uv sync --extra lake）"}
 
 
 # ---------------------------------------------------------------------------

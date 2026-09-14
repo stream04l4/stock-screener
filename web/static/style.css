@@ -244,6 +244,46 @@ tr.clickable { cursor: pointer; }
 .progress-track { height: 10px; background: #edf1f7; border-radius: 999px; overflow: hidden; margin: 10px 0 4px; }
 .progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, #3b82f6, #60a5fa); transition: width .5s ease; border-radius: 999px; }
 
+/* ---------- v6 数据湖页签 ---------- */
+.lake-error {
+  background: var(--bad-soft); color: #991b1b; border: 1px solid #fecaca;
+  padding: 10px 14px; border-radius: 9px; margin-bottom: 14px; font-weight: 600;
+}
+.lake-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; position: relative; }
+.lake-toolbar input[type="search"] { flex: 1; min-width: 220px; max-width: 420px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.lake-search-results {
+  position: absolute; top: 100%; left: 0; right: 0; z-index: 30; margin-top: 4px;
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(16,24,40,.12); max-height: 320px; overflow-y: auto;
+}
+.lake-search-results .sr-item { padding: 8px 12px; cursor: pointer; display: flex; gap: 10px; align-items: baseline; border-bottom: 1px solid var(--line); }
+.lake-search-results .sr-item:last-child { border-bottom: 0; }
+.lake-search-results .sr-item:hover, .lake-search-results .sr-item.active { background: var(--accent-soft); }
+.lake-search-results .sr-code { font-family: var(--mono); font-weight: 600; color: var(--accent); }
+.lake-search-results .sr-name { font-weight: 500; }
+.lake-search-results .sr-ind { margin-left: auto; font-size: 12px; color: var(--muted); }
+.lake-search-results .sr-empty { padding: 14px; text-align: center; color: var(--muted); }
+
+/* 区块A：基础卡 + 估值行 + 因子网格 */
+.lake-base-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.lake-kv { background: #f8fafc; border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; }
+.lake-kv .k { font-size: 11.5px; color: var(--muted); }
+.lake-kv .v { font-size: 14px; font-weight: 600; font-family: var(--mono); margin-top: 2px; word-break: break-all; }
+.lake-factor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+.lake-factor { background: #f8fafc; border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; }
+.lake-factor .k { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.lake-factor .v { font-size: 14px; font-weight: 600; font-family: var(--mono); text-align: right; margin-top: 2px; }
+.lake-section-title { font-size: 13px; font-weight: 600; color: #374151; margin: 14px 0 8px; }
+/* 加载态：骨架屏（切股/搜索时） */
+.lake-skeleton { height: 14px; background: linear-gradient(90deg,#eef2f7 25%,#f8fafc 50%,#eef2f7 75%); background-size: 200% 100%; animation: lake-shimmer 1.2s infinite; border-radius: 6px; margin: 8px 0; }
+@keyframes lake-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.lake-loading-label { color: var(--muted); font-size: 12.5px; padding: 6px 0; }
+/* state 徽章（区块C） */
+.badge.idle { background: #eef2f7; color: #475569; }
+.badge.blocked_quota { background: #fef3c7; color: #92400e; }
+.badge.error { background: var(--bad-soft); color: #991b1b; }
+.lake-task-progress { min-width: 120px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }
