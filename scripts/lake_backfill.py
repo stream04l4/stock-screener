@@ -15,8 +15,9 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                         BackfillRunner done 键幂等 → **中断续跑**；限速 ≥0.3s/股）
 - T3 valuation_daily  ← tencent_ingest.fetch_snapshot + load_t3（批量快照 50/批，
                         批间小睡；done 键同样幂等）
-- history             ← P2 全史后台补（腾讯 K线 n=大值 + BaoStock adj_factor），
-                        走 BackfillRunner（budget_per_day 门 + 断点续传）。
+- history             ← P2 全史后台补（v6.0.7：腾讯 K线分页翻到 IPO + BaoStock
+                        adj_factor；done 键固定 "full_history" 跨天续传；取空/失败
+                        抛错不 mark_done），走 BackfillRunner（budget_per_day 门）。
                         **本批次只构建不跑**——TL 验收后由 TL 实际执行。
 
 纪律（v6.0.2）：
@@ -404,20 +405,28 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
 # ---------------------------------------------------------------------------
 def run_history(con, db_path: str, codes: Optional[List[str]],
                 start_date: str, end_date: str) -> Dict[str, Any]:
-    """P2 全史：腾讯 K线全史（n=大值）+ BaoStock adj_factor 前向填充。
+    """P2 全史：腾讯 K线全史（分页翻到 IPO）+ BaoStock adj_factor 前向填充。
 
     走 BackfillRunner（budget_per_day 门 + done 键断点续传）。**本批次只构建
     不跑**——TL 验收后由 TL 实际执行（后台长跑，日预算到顶当日停、次日续）。
+
+    v6.0.7 修复：
+    - 腾讯 n=12000 全市场取空（端点 n 上限=2000）→ 改 ``fetch_kline_full_history``
+      分页拉全史；单页重试耗尽/整轮取空 → worker 抛错（**不 mark_done**，下轮
+      重跑幂等）——杜绝"取空仍标 done"的 done 键毒化。
+    - done 键 ``period_or_date="full_history"``（固定字符串，不含日期）→ 断点续传
+      **跨天有效**（旧 f"{start}~{end}" 因 end 缺省=今日 → 每天重跑全量失配）。
     """
     from lake.backfill import BackfillRunner, Task
     from lake.ingest import baostock_ingest as bsi
-    from lake.ingest.tencent_ingest import fetch_kline_ohlcv, load_t2
+    from lake.ingest.tencent_ingest import fetch_kline_full_history, load_t2
     from screener.data.baostock_client import BaoStockClient
     from screener.data.tencent import TencentClient
 
     codes = codes or _universe_codes(con)
+    # v6.0.7：done 键稳定化——固定 "full_history"（不含日期），跨天断点续传有效
     tasks = [Task(priority=2, table="kline_history", ts_code=c,
-                  period_or_date=f"{start_date}~{end_date}", tier="P2") for c in codes]
+                  period_or_date="full_history", tier="P2") for c in codes]
     # B-2：coverage 走 runner 自身 db_path（与 run_p0 一致）
     runner = BackfillRunner(db_path=db_path)  # budget_per_day 门：到顶当日停（state=blocked_quota）
 
@@ -427,13 +436,16 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                              "start_date": start_date, "end_date": end_date}
 
     def worker(task: Task) -> None:
-        # 腾讯全史 K线（n=大值；raw 不复权）
-        kl = fetch_kline_ohlcv(tclient, task.ts_code, n=12000)
-        # BaoStock adj_factor 全史（仅除权日有行 → load_t2 前向填充）
+        # 腾讯全史 K线（v6.0.7：分页翻到 IPO；单页重试耗尽/整轮取空 → RuntimeError）
+        kl = fetch_kline_full_history(tclient, task.ts_code)
+        if not kl:
+            # 防御：fetch_kline_full_history 契约上取空即抛错，这里双保险——
+            # 绝不在无数据时 mark_done（旧 done 键毒化根因）
+            raise RuntimeError(f"腾讯K线全史为空 {task.ts_code}（不标 done，下轮重试）")
+        # BaoStock adj_factor 全史（仅除权日有行 → load_t2 前向填充；QuotaGuard 内）
         fields, adj_rows = bsi.fetch_adjust_factor(bs, task.ts_code, start_date, end_date)
         adj_map = bsi.load_t2_adj_factor(con, task.ts_code, adj_rows)
-        if kl:
-            load_t2(con, task.ts_code, kl, adj_map=adj_map)
+        load_t2(con, task.ts_code, kl, adj_map=adj_map)
         time.sleep(0.3)
 
     stats.update(runner.run(tasks, worker))
