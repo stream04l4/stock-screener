@@ -24,6 +24,8 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
   当日停、次日续（BackfillRunner._quota_state + QuotaGuard 日期翻转）。
 - 零回归红线：本脚本只 import lake/* + screener.data.*，**不改动 screener/**。
 - duckdb 未装 → LakeUnavailable 友好报错退出（exit 3），不崩 traceback。
+- **D-1（v6.0.3 rework）**：--db 指向 0 字节/无效库文件（duckdb 打不开）→
+  LakeInvalidFile 友好报错退出（exit 3），同样不崩裸 traceback。
 
 子命令：init / p0 / history / status（见 --help）。
 """
@@ -602,7 +604,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    from lake.conn import LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
+    from lake.conn import LakeInvalidFile, LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
     # B-4：写命令（init/p0/history）整段包在 LakeLock(flock) 内——connect + 写入 + close
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
@@ -614,6 +616,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         with _write_lock(args.db):
             return _run_unlocked(args)
+    except LakeInvalidFile as exc:  # D-1：无效库文件（0 字节/损坏）→ 友好报错，不崩 traceback
+        print(f"错误: {exc}", file=sys.stderr)
+        return EXIT_LAKE_UNAVAILABLE
     except LakeUnavailable as exc:
         print(f"错误: 数据湖不可用 —— {exc}", file=sys.stderr)
         return EXIT_LAKE_UNAVAILABLE
@@ -621,10 +626,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def _run_unlocked(args) -> int:
     """main() 主体（connect + 子命令 + close）。写路径由 main() 在 LakeLock 内调用。"""
-    from lake.conn import LakeUnavailable
+    from lake.conn import LakeInvalidFile, LakeUnavailable
 
     try:
         con = _open_db(args.db)
+    except LakeInvalidFile as exc:
+        # D-1：0 字节/无效库文件（duckdb 打不开）→ 友好报错，不崩裸 traceback。
+        # 与缺 duckdb 同用 EXIT_LAKE_UNAVAILABLE=3（库不可用的统一语义码）。
+        print(f"错误: {exc}\n"
+              f"       处理: 删除该空/损坏文件后重跑 init（python scripts/lake_backfill.py --db <path> init）",
+              file=sys.stderr)
+        return EXIT_LAKE_UNAVAILABLE
     except LakeUnavailable as exc:
         # brief 红线：lake extra 缺 duckdb → 友好报错，不崩 traceback
         print(f"错误: 数据湖不可用 —— {exc}\n"

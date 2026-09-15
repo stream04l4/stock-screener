@@ -26,6 +26,56 @@ class LakeUnavailable(RuntimeError):
     """duckdb 未安装或数据库不可用（主路径不应触发；lake 内部显式失败）。"""
 
 
+# D-1（v6.0.3 rework）：duckdb 对"存在但非合法库文件"（0 字节 touch / 内容损坏）
+# 抛 _duckdb.IOException，消息含此子串。用它把"连 duckdb 都打不开的库文件"归一为
+# LakeInvalidFile——语义 = schema 从未建立 = "未就绪"（Web→409），不是"服务不可用"
+# （503）。在 connect 层统一判定，Web 与 CLI 各自转译（见 web_api._con / lake_backfill）。
+_INVALID_DB_MARKERS = ("not a valid DuckDB database file",)
+
+
+def _is_invalid_db_error(exc: BaseException) -> bool:
+    """duckdb IO Error 消息匹配 → 该文件不是合法库文件（0 字节/损坏）。"""
+    return any(m in str(exc) for m in _INVALID_DB_MARKERS)
+
+
+class LakeInvalidFile(LakeUnavailable):
+    """库文件存在但**不是合法 DuckDB 库**（0 字节空文件 / 内容损坏，duckdb 打不开）。
+
+    D-1（v6.0.3 rework）：与"缺文件/未 init_schema"同属"未就绪"——schema 从未建立。
+    Web 数据端点 → LakeNotInitialized(409)；CLI → 友好报错退出码 3（不崩 traceback）。
+    继承 LakeUnavailable 使既有 ``except LakeUnavailable`` 兜底路径行为不变（仍友好
+    降级，只是消息更准）；精确处理方 catch 本类。
+    """
+
+    def __init__(self, db_path: str) -> None:
+        super().__init__(
+            f"库文件不是有效的 DuckDB 数据库（0 字节空文件或内容损坏）：{db_path}"
+            "——schema 从未建立，请先执行 init")
+        self.db_path = db_path
+
+
+def _check_invalid_db_file(db_path: str) -> None:
+    """connect 前探测：文件存在且 **size==0** → LakeInvalidFile（不 connect）。
+
+    为什么先探测而不是只靠 catch：duckdb.connect(0字节文件) 直接抛 IO Error，catch
+    也能兜住，但 size 探测零成本、消息更直白，且不依赖 duckdb 错误文案稳定性
+    （双保险：探测 + catch 两条路都归一到 LakeInvalidFile）。
+    """
+    if os.path.exists(db_path) and os.path.getsize(db_path) == 0:
+        raise LakeInvalidFile(db_path)
+
+
+def _connect_or_raise_invalid(duckdb, db_path: str):
+    """duckdb.connect 的归一包装：IO Error "not a valid DuckDB database file" →
+    LakeInvalidFile（覆盖非 0 字节但内容损坏的文件）。其余异常原样上抛。"""
+    try:
+        return duckdb.connect(db_path)
+    except Exception as exc:  # noqa: BLE001 - 仅归一"无效库文件"，其余透传
+        if _is_invalid_db_error(exc):
+            raise LakeInvalidFile(db_path) from exc
+        raise
+
+
 def duckdb_available() -> bool:
     try:
         import duckdb  # noqa: F401
@@ -70,7 +120,9 @@ def open(db_path: Optional[str] = None):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     from .ddl import init_schema
 
-    con = duckdb.connect(db_path)
+    # D-1：0 字节/无效库文件 → LakeInvalidFile（不 connect，避免裸 IO Error traceback）
+    _check_invalid_db_file(db_path)
+    con = _connect_or_raise_invalid(duckdb, db_path)
     init_schema(con)
     return con
 
@@ -100,6 +152,8 @@ def connect_existing(db_path: Optional[str] = None):
     - **不走 :func:`open`**：open() 每次执行 init_schema 全量 DDL，每请求跑一遍
       不可接受；Web 只读，schema 由 backfill（写路径）负责建立。
     - 文件不存在/打不开 → duckdb 抛错，由调用方（web_api._con）转 503。
+    - **D-1（v6.0.3 rework）**：0 字节/无效库文件 → :class:`LakeInvalidFile`
+      （connect 前 size 探测 + connect IO Error 归一，双保险）。
     - 不触碰进程级单例 ``_conn``——与写路径完全隔离。
 
     :param db_path: 缺省 = default_db_path()；测试可传 tmp 库路径。
@@ -108,7 +162,9 @@ def connect_existing(db_path: Optional[str] = None):
         raise LakeUnavailable("duckdb 未安装（uv sync --extra lake）")
     import duckdb
 
-    return duckdb.connect(db_path or default_db_path())
+    p = db_path or default_db_path()
+    _check_invalid_db_file(p)
+    return _connect_or_raise_invalid(duckdb, p)
 
 
 def reset_for_test() -> None:

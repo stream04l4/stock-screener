@@ -19,6 +19,10 @@ SELECT 1），但数据端点查表报 "table not found" → 500，状态自相�
   数据端点一致返回 **409** + ``{"error":"lake_not_initialized","hint":...}``；
 - **空/未初始化库**（文件在但无 core 表 stock_master，含手工 touch 出的空文件）：
   ``_ensure_initialized`` 探测 information_schema → 数据端点同样 **409**；
+- **D-1（v6.0.3 rework）0 字节/无效库文件**（存在但连 duckdb 都打不开，
+  ``conn.LakeInvalidFile``）：与"缺文件/未 init_schema"同属"未就绪" → 数据端点
+  同样 **409**（修复前漏网：duckdb IO Error 被通用 except 转成 503 + detail，
+  与 /status 的 initialized=false 自相矛盾——正是 B-1 要消除的问题）。
 - **/status** 例外：不抛 409，而是如实返回 200 + ``initialized=false`` + coverage
   全零（brief B-1 方案 b）——状态端点是"健康检查"，应反映真实状态而非报错。
   这样"库未就绪"在 status 可见、在数据端点一致降级，不再自相矛盾。
@@ -127,6 +131,9 @@ def _con():
       "status 200 / 数据端点 500"的自相矛盾，且会在生产目录留下一个 0 表脏文件。
       先 os.path.exists 探测即可避免副作用（Web 只读，绝不代建库）。
     - 文件存在但无 core 表（空文件 / 未 init）→ connect 后 _ensure_initialized 抛 409。
+    - **D-1：0 字节/无效库文件**（conn.LakeInvalidFile，duckdb 打不开）→ 同样
+      LakeNotInitialized(409)——"连 duckdb 都打不开 = schema 从未建立 = 未就绪"，
+      不是服务不可用(503)。修复前此场景漏网：IO Error 落进下方通用 except → 503。
     - 就绪 → 返回连接（happy path 行为与 D-4 修复后完全一致：每请求独立短连接）。
     """
     from . import conn as _conn
@@ -139,6 +146,10 @@ def _con():
         raise LakeNotInitialized(db_path)
     try:
         con = _conn.connect_existing(db_path)
+    except _conn.LakeInvalidFile as exc:  # noqa: BLE001
+        # D-1：0 字节/无效库文件 = 未就绪（409），与缺文件/未 init_schema 一致。
+        # 必须放在通用 except 之前——否则会被转成 503 + detail，绕过 409 契约体。
+        raise LakeNotInitialized(exc.db_path) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"数据湖不可用：{exc}")
     try:
