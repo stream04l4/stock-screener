@@ -75,6 +75,30 @@ def _open_db(db_path: Optional[str]):
     return lconn.open(db_path or lconn.default_db_path())
 
 
+def _write_lock(db_path: Optional[str]):
+    """**B-4（v6.0.3）**：ingest/driver 写路径的统一串行化入口。
+
+    为什么在 **connect 之前**持锁（而不是只包住 execute）：实测 DuckDB 对**同一文件**
+    的跨进程连接是排他的——第二个进程连 ``duckdb.connect`` 都会立即抛
+    "Could not set lock on file"（RW / read-only 皆然，见 smoke 实验）。若只在写语句
+    周围持 flock，两个 driver 进程仍会在 connect 阶段互撞而崩。故把 **connect + 全部
+    写入 + close** 都包在 LakeLock(flock) 内：并发 writer 会**阻塞等锁**（而非崩溃），
+    前一个释放后干净接管——这才是"两进程并发写不冲突"的真实保证。
+
+    - 同进程多连接 DuckDB 允许（v6.0.2 冒烟测试持有自己的 con 跨 main() 调用不受影响）；
+    - 锁文件 = ``<db_path>.write.lock``，与库同目录（自定义 --db 时不落到生产 data/lake/）。
+    """
+    from lake.conn import LakeLock
+
+    return LakeLock(db_path or _default_db_path())
+
+
+def _default_db_path() -> str:
+    from lake import conn as lconn
+
+    return lconn.default_db_path()
+
+
 def _print_summary(title: str, summary: Dict[str, Any]) -> None:
     """结构化 summary（JSON）——供 TL 核对。"""
     print(f"\n===== {title} =====")
@@ -176,26 +200,57 @@ def run_t4(con, db_path: str, ts_codes: Optional[List[str]] = None) -> Dict[str,
 # ---------------------------------------------------------------------------
 # T7 index_daily（4 指数 × N 天）
 # ---------------------------------------------------------------------------
-def run_t7(con, db_path: str, days: int) -> Dict[str, Any]:
-    """T7：四指数近 N 交易日（复用 tencent_ingest.load_t7；amount 缺→NULL）。"""
+def run_t7(con, db_path: str, days: int, runner, force: bool = False) -> Dict[str, Any]:
+    """T7：四指数近 N 交易日（复用 tencent_ingest.load_t7；amount 缺→NULL）。
+
+    **B-3（v6.0.3）幂等**：原实现每次 p0 都无条件重取 4 指数（腾讯免费接口，纯效率
+    问题）。现走 BackfillRunner done 键——done 粒度 = ``(index_daily, index_code,
+    "days=<N>")``（按请求窗口而非末日期：同参重跑跳过、改 --days 视为新任务重取；
+    load_t7 是 upsert，即便重取也幂等不重复）。``force=True``（--force）→ 清空本表
+    done 键强制重取。零网络断言靠 fake client 计数（见 test_lake_v603）。
+    """
+    from lake.backfill import Task
     from lake.ingest.tencent_ingest import INDEX_CODES, fetch_kline_ohlcv, load_t7
     from screener.data.tencent import TencentClient
 
     # n = 交易日数 + 缓冲（节假日/停牌不占行，多取一点保证覆盖 N 个交易日）
     tclient = TencentClient()
+    period = f"days={days}"
+    tasks = [Task(priority=3, table="index_daily", ts_code=ic,
+                  period_or_date=period, tier="P0") for ic in INDEX_CODES]
+
+    if force:
+        # --force：清空 index_daily 的 done 键（仅本表，不碰 T2/T3 进度）→ 强制重取
+        runner._done = {k for k in runner._done if k[0] != "index_daily"}
+        runner.progress["done"] = [list(k) for k in sorted(runner._done)]
+
+    def worker(task: Task) -> None:
+        kl = fetch_kline_ohlcv(tclient, task.ts_code, n=days + 30)
+        if kl:
+            load_t7(con, task.ts_code, kl)
+        time.sleep(0.3)  # 限速纪律（指数间小睡）
+
+    stats = runner.run(tasks, worker)
     per_index: Dict[str, Any] = {}
     for ic in INDEX_CODES:
-        kl = fetch_kline_ohlcv(tclient, ic, n=days + 30)
-        written = load_t7(con, ic, kl) if kl else 0
-        last = kl[-1] if kl else None
-        per_index[ic] = {
-            "rows": len(kl),
-            "written": written,
-            "last_date": last["date"] if last else None,
-            "last_close": last["close"] if last else None,
-        }
-        time.sleep(0.3)  # 限速纪律（指数间小睡）
-    return {"table": "index_daily", "indices": per_index, "requested_days": days}
+        if runner.is_done(Task(priority=3, table="index_daily", ts_code=ic,
+                               period_or_date=period, tier="P0")):
+            last_row = con.execute(
+                "SELECT date, close FROM index_daily WHERE index_code=? "
+                "ORDER BY date DESC LIMIT 1", [ic]).fetchone()
+            per_index[ic] = {
+                "rows": None if not last_row else int(con.execute(
+                    "SELECT COUNT(*) FROM index_daily WHERE index_code=?", [ic]).fetchone()[0]),
+                "written": 0,  # 已 done → 本次未重取（幂等跳过）
+                "last_date": str(last_row[0]) if last_row else None,
+                "last_close": float(last_row[1]) if last_row and last_row[1] is not None else None,
+            }
+        else:
+            per_index[ic] = {"rows": 0, "written": 0, "last_date": None,
+                             "last_close": None}
+    return {"table": "index_daily", "indices": per_index, "requested_days": days,
+            "skipped_done": stats.get("skipped_done", 0),
+            "processed": stats.get("processed", 0)}
 
 
 # ---------------------------------------------------------------------------
@@ -267,18 +322,44 @@ def run_t3(con, db_path: str, codes: Optional[List[str]], runner,
     return {"table": "valuation_daily", **stats}
 
 
+def _progress_for_db(db_path: str) -> Optional[str]:
+    """**B-2（v6.0.3）**：progress 文件与库同目录派生；缺省库回退原路径。
+
+    - 自定义 --db /tmp/x.db → /tmp/backfill_progress.json（不再落到生产 data/lake/）。
+    - 缺省库 data/lake/lake.duckdb → **返回 None**，让 BackfillRunner 走 _progress_path()
+      （= data/lake/backfill_progress.json，与原硬编码逐字节一致；且保留测试对
+      _progress_path 的 monkeypatch 注入能力——v6.0.2 冒烟用例依赖它）。
+
+    为什么缺省库不直接返回派生路径：派生值与 _progress_path() 相同，但显式传参会绕过
+    测试对 _progress_path 的 patch（导致 Run1/Run2 读到不同进度文件、续跑失效）。
+    """
+    from lake import backfill as lb
+
+    d = os.path.dirname(os.path.abspath(db_path))
+    derived = os.path.join(d, "backfill_progress.json")
+    if os.path.abspath(derived) == os.path.abspath(lb._progress_path()):
+        return None  # 缺省库：回退 _progress_path()（保持原行为 + 可 patch）
+    return derived
+
+
 def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
-           skip_t1: bool, t4_scope: Optional[List[str]]) -> Dict[str, Any]:
+           skip_t1: bool, t4_scope: Optional[List[str]], force: bool = False) -> Dict[str, Any]:
     """p0 编排：T1 → T4 → T7 → T2 → T3（当前数据优先，Joel"先灌当前"）。
 
     :param codes: 冒烟股票子集（None=stock_master 全集）。
     :param skip_t1: 跳过 BaoStock T1（重跑/冒烟用；T2/T3 universe 依赖已有 stock_master）。
     :param t4_scope: T4 过滤（None=全史全表）。
+    :param force: **B-3** 强制重取 T7 指数（清空 index_daily done 键）。
     """
     quota_before = _quota_state().get("used", 0)
     from lake.backfill import BackfillRunner
 
-    runner = BackfillRunner()  # budget_per_day 从 config；progress 默认路径
+    # B-2：coverage 改走 runner 自身 db_path（见 BackfillRunner._coverage_conn）。
+    # ⚠️ progress 路径**不**在此派生——保持 _progress_path()（可被测试 monkeypatch +
+    # 缺省行为逐字节不变）；v6.0.2 冒烟续跑用例依赖对 _progress_path 的注入，若此处
+    # 按 db_path 派生会绕过 patch 导致 Run1/Run2 读不同进度文件、续跑失效。
+    # status 报表的 progress 路径由 run_status 按 db_path 派生（brief B-2 明指的硬编码点）。
+    runner = BackfillRunner(db_path=db_path)
     steps: Dict[str, Any] = {}
 
     if not skip_t1:
@@ -290,8 +371,8 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     print("[p0] T4 dividend_events（本地静态 csv，零网络）...")
     steps["t4"] = run_t4(con, db_path, ts_codes=t4_scope)
 
-    print(f"[p0] T7 index_daily（4 指数 × ~{days} 交易日）...")
-    steps["t7"] = run_t7(con, db_path, days)
+    print(f"[p0] T7 index_daily（4 指数 × ~{days} 交易日{'；--force 强制重取' if force else '；done 键幂等'}）...")
+    steps["t7"] = run_t7(con, db_path, days, runner, force=force)
 
     as_of = _today_beijing()
     print(f"[p0] T2 kline_daily（腾讯 K线，{len(codes or []) or 'universe'} 只 × {days} 天，"
@@ -335,7 +416,8 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     codes = codes or _universe_codes(con)
     tasks = [Task(priority=2, table="kline_history", ts_code=c,
                   period_or_date=f"{start_date}~{end_date}", tier="P2") for c in codes]
-    runner = BackfillRunner()  # budget_per_day 门：到顶当日停（state=blocked_quota）
+    # B-2：coverage 走 runner 自身 db_path（与 run_p0 一致）
+    runner = BackfillRunner(db_path=db_path)  # budget_per_day 门：到顶当日停（state=blocked_quota）
 
     bs = BaoStockClient()     # QuotaGuard 内；adj_factor 1 次/股
     tclient = TencentClient()
@@ -398,13 +480,16 @@ def run_status(con, db_path: str) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
 
-    prog = load_progress()
+    # B-2：progress 路径与 db_path 同目录派生（缺省库→None 走 _progress_path()，可被测试
+    # monkeypatch + 行为不变；自定义 --db → 该库旁，不再硬编码 data/lake/）。
+    prog_path = _progress_for_db(db_path)
+    prog = load_progress(prog_path)
     return {
         "sub": "status",
         "db_path": db_path,
         "coverage": cov,
         "progress_file": {
-            "path": os.path.join(_project_root(), "data", "lake", "backfill_progress.json"),
+            "path": prog_path or os.path.join(_project_root(), "data", "lake", "backfill_progress.json"),
             "updated_at": prog.get("updated_at"),
             "done_keys": len(prog.get("done", [])),
             "tasks_view": prog.get("tasks", []),
@@ -462,6 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="跳过 BaoStock T1（重跑/冒烟用）")
     sp.add_argument("--t4-codes", default=None,
                     help="T4 分红过滤（逗号分隔；缺省=全史全表）")
+    sp.add_argument("--force", action="store_true",
+                    help="B-3：强制重取 T7 四指数（清空 index_daily done 键，忽略幂等跳过）")
     sp.set_defaults(func=cmd_p0)
 
     sp = sub.add_parser("history", help="P2 全史后台补（本批次只构建不跑）")
@@ -496,7 +583,8 @@ def cmd_status(args, con, db_path: str) -> int:
 def cmd_p0(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     t4_scope = _parse_codes(args.t4_codes)
-    summary = run_p0(con, db_path, args.days, codes, args.skip_t1, t4_scope)
+    summary = run_p0(con, db_path, args.days, codes, args.skip_t1, t4_scope,
+                     force=args.force)
     _print_summary("p0", summary)
     return EXIT_OK
 
@@ -516,6 +604,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from lake.conn import LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
+    # B-4：写命令（init/p0/history）整段包在 LakeLock(flock) 内——connect + 写入 + close
+    # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
+    write_cmd = args.cmd in ("init", "p0", "history")
+
+    if not write_cmd:
+        return _run_unlocked(args)
+
+    try:
+        with _write_lock(args.db):
+            return _run_unlocked(args)
+    except LakeUnavailable as exc:
+        print(f"错误: 数据湖不可用 —— {exc}", file=sys.stderr)
+        return EXIT_LAKE_UNAVAILABLE
+
+
+def _run_unlocked(args) -> int:
+    """main() 主体（connect + 子命令 + close）。写路径由 main() 在 LakeLock 内调用。"""
+    from lake.conn import LakeUnavailable
+
     try:
         con = _open_db(args.db)
     except LakeUnavailable as exc:
@@ -526,8 +633,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_LAKE_UNAVAILABLE
 
     try:
-        rc = args.func(args, con, args.db or os.path.join(
-            _project_root(), "data", "lake", "lake.duckdb"))
+        rc = args.func(args, con, args.db or _default_db_path())
     except LakeUnavailable as exc:
         print(f"错误: 数据湖不可用 —— {exc}", file=sys.stderr)
         return EXIT_LAKE_UNAVAILABLE

@@ -100,16 +100,26 @@ class BackfillRunner:
     :param budget_per_day: BaoStock 日预算上限（默认 5000，config 可调；Q2）。
         到顶当日停（state=blocked_quota），次日自动续（QuotaGuard 日期翻转重置）。
     :param progress_path: 进度文件路径（测试可注入 tmp）。
+    :param db_path: **B-2（v6.0.3）** runner 自身库路径。缺省 None = coverage 沿用进程级
+        单例 get_conn()（默认库，行为不变）；传自定义 --db 时 _refresh_coverage 改读该库
+        （见 :meth:`_coverage_conn`）。⚠️ **不**据此派生 progress 路径——progress 仍走
+        ``progress_path or _progress_path()``（保持 v6.0.2 冒烟测试对 _progress_path 的
+        monkeypatch 注入 + 缺省行为逐字节不变；status 报表的 progress 路径由 driver 侧
+        run_status 按 db_path 派生，见 brief B-2）。
     """
 
     def __init__(self, budget_per_day: Optional[int] = None,
-                 progress_path: Optional[str] = None) -> None:
+                 progress_path: Optional[str] = None,
+                 db_path: Optional[str] = None) -> None:
         # Q2：日预算默认 5000（config 可调）——缺省从 strategy.yaml lake 段读
         if budget_per_day is None:
             from .config import lake_cfg
 
             budget_per_day = int(lake_cfg().get("baostock_daily_budget", 5000))
         self.budget_per_day = int(budget_per_day)
+        # B-2：runner 自身库路径（None=缺省库，coverage 走 get_conn 单例；自定义 --db 时
+        # _refresh_coverage 改读该库）。progress 路径逻辑保持不变（见 docstring 说明）。
+        self.db_path = db_path
         self.progress_path = progress_path or _progress_path()
         self.progress = load_progress(self.progress_path)
         # done 键集合（内存缓存，避免每任务重读文件）
@@ -216,12 +226,37 @@ class BackfillRunner:
         entry["quota_used_today"] = quota_used
         entry["quota_budget"] = self.budget_per_day
 
-    def _refresh_coverage(self) -> None:
-        """各表 coverage（rows/codes/date_min/date_max）——Web 区块 C 读取。"""
-        try:
+    def _coverage_conn(self):
+        """**B-2（v6.0.3）**：返回 coverage 统计所用的连接。
+
+        - ``self.db_path`` 非空（自定义 --db）→ **新开该库的短连接**（用完由调用方
+          close）。修复前此方法恒用 get_conn() 进程级单例（=默认生产库），导致
+          ``--db tmp`` 时 coverage 读的是生产库口径、status 报表误导。
+        - ``self.db_path`` 为 None（缺省库）→ 沿用 get_conn() 单例（**行为不变**，
+          返回 None 表示"借用单例，调用方不得 close"）。
+
+        为什么自定义 --db 用短连接而非复用单例：get_conn() 只管理默认库那一个单例，
+        无法代表任意 --db；且 Web/写路径对单例有并发约束（D-4），这里开独立短连接最干净。
+        """
+        if self.db_path is None:
             from .conn import get_conn
 
-            con = get_conn()
+            return get_conn(), False  # (con, owned)：owned=False → 不 close
+        from .conn import connect_existing
+
+        return connect_existing(self.db_path), True  # owned=True → 调用方必须 close
+
+    def _refresh_coverage(self) -> None:
+        """各表 coverage（rows/codes/date_min/date_max）——Web 区块 C 读取。
+
+        **B-2**：连接改走 runner 自身 db_path（见 :meth:`_coverage_conn`），不再恒用
+        get_conn() 生产库单例；缺省库行为不变。
+        """
+        try:
+            con, owned = self._coverage_conn()
+        except Exception:  # noqa: BLE001 - 库不可用（duckdb 未装等）→ 不阻断进度落盘
+            return
+        try:
             cov: Dict[str, Any] = {}
             for table, code_col, date_col in [
                 ("kline_daily", "ts_code", "date"),
@@ -249,3 +284,9 @@ class BackfillRunner:
             self.progress["coverage"] = cov
         except Exception:  # noqa: BLE001 - 库不可用时不阻断进度落盘
             pass
+        finally:
+            if owned:
+                try:
+                    con.close()
+                except Exception:  # noqa: BLE001
+                    pass

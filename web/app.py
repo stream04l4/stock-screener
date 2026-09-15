@@ -1360,8 +1360,13 @@ if _duckdb_probe is not None:
     try:
         if str(PROJECT_ROOT) not in sys.path:
             sys.path.insert(0, str(PROJECT_ROOT))  # lake 包位于仓库根（与 screener 平级）
-        from lake.web_api import router as _lake_router
-        app.include_router(_lake_router)
+        from lake import web_api as _lake_web_api
+        app.include_router(_lake_web_api.router)
+        # B-1（v6.0.3）：注册库未就绪 → 409 lake_not_initialized 契约体 handler。
+        # APIRouter.exception_handler 在本版 FastAPI 不存在，只能挂 app；此调用与 router
+        # 挂载同在 duckdb 可导入的条件块内，不破坏"web/app.py 唯一 lake 接线点"边界。
+        _lake_web_api.install(app)
+        _lake_router = _lake_web_api.router
     except Exception:  # noqa: BLE001 - lake 包缺失/损坏 → 降级 stub，不阻断主路径
         _lake_router = None
 

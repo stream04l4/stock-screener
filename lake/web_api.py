@@ -11,14 +11,30 @@
 duckdb 可导入时 ``from lake.web_api import router`` 条件挂载；未装 duckdb 时
 app.py 注册一个轻量 stub router（/api/lake/status 返回 installed=false），
 前端页签显示"数据湖未安装"。本模块所有端点在库不可用 → 503 + 原因（不白屏）。
+
+**B-1（v6.0.3）缺库/空库行为一致**：原 ``_con()`` 走 ``connect_existing()``，
+而 duckdb.connect 对**不存在**的文件会**自动创建空库** → /status 返回 200（能
+SELECT 1），但数据端点查表报 "table not found" → 500，状态自相矛盾。现统一：
+- **缺库文件**：``_con()`` 先探测文件存在性再 connect（不再自动建空文件）→
+  数据端点一致返回 **409** + ``{"error":"lake_not_initialized","hint":...}``；
+- **空/未初始化库**（文件在但无 core 表 stock_master，含手工 touch 出的空文件）：
+  ``_ensure_initialized`` 探测 information_schema → 数据端点同样 **409**；
+- **/status** 例外：不抛 409，而是如实返回 200 + ``initialized=false`` + coverage
+  全零（brief B-1 方案 b）——状态端点是"健康检查"，应反映真实状态而非报错。
+  这样"库未就绪"在 status 可见、在数据端点一致降级，不再自相矛盾。
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("lake.web_api")
+
+# B-1：core 表（init_schema 必建的第一张表）。用它判定"库是否已初始化"——
+# 缺文件 / 空文件 / 未跑 init_schema 的库都没有它；正常灌数库必有。
+_CORE_TABLE = "stock_master"
 
 try:
     from fastapi import APIRouter, HTTPException, Query
@@ -31,27 +47,138 @@ router = APIRouter(prefix="/api/lake", tags=["lake"])
 
 
 # ---------------------------------------------------------------------------
-# 连接获取（每请求新开短连接——DuckDB 文件库支持多连接并发读；避免长连接占锁）
+# B-1（v6.0.3）：库未就绪（缺文件 / 空文件 / 未 init_schema）的一致降级
 #
-# v6.0.1 D-4：此处原实现返回 lake.conn.get_conn() **进程级单例**，与上述注释矛盾。
-# FastAPI 默认线程池下多个 /api/lake/* 请求并发 execute 同一 Connection 对象 →
-# 结果集交错（/industries 返回 market 的行）/HTTP 500。现改为每请求专用短连接：
-# - conn.connect_existing() 仅 duckdb.connect，**不执行 init_schema**（open() 每次
-#   跑全量 DDL，每请求一遍不可接受；Web 只读，schema 由 backfill 建）；
-# - 端点统一 `with _con() as con:`——上下文管理器保证请求结束（含异常路径）
-#   必 close，漏一个端点就是连接泄漏，故不逐函数手写 finally。
-# 写路径（backfill/ingest）仍走 get_conn() 单例 + flock，语义不变。
+# 为什么用自定义异常 + router 级 exception_handler，而不是在各端点里 raise
+# HTTPException(409, detail={"error":...,"hint":...})：
+#   FastAPI 把 HTTPException.detail 序列化进 **顶层 "detail"** 键 → 响应体变成
+#   {"detail":{"error":...,"hint":...}}，而 brief 要求**顶层** error/hint 契约体。
+#   自定义异常 + @router.exception_handler 才能精确控制 JSON 形状（顶层 error/hint）。
+#   代价：直接调 handler 的单测需自行 catch LakeNotInitialized（见 test_lake_v603），
+#   HTTP 层行为由 router 挂载后统一转 409（与前端 api() 的 !res.ok 分支兼容——
+#   前端读 body.detail 为空时回退 res.statusText="Conflict"，不白屏）。
 # ---------------------------------------------------------------------------
+INIT_HINT = "python scripts/lake_backfill.py init"
+
+
+class LakeNotInitialized(HTTPException):
+    """库文件缺失 / 空文件 / 未跑 init_schema（无 core 表 stock_master）。
+
+    数据端点命中 → 409 + {"error":"lake_not_initialized","hint":...}（顶层契约体，
+    由下方 handler 渲染）；/status 命中 → 不抛，改报 initialized=false。
+
+    ⚠️ FastAPI 0.141 的 ``APIRouter`` **没有** ``exception_handler``（那是 app 方法），
+    故 handler 由 web/app.py 条件挂载块经 :func:`install` 注册到 app；未注册时本异常
+    作为 HTTPException 子类仍被 FastAPI 默认处理器兜底为 409（detail="数据湖未初始化"）
+    ——行为仍一致降级，只是 body 形状不同。
+    """
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        super().__init__(status_code=409, detail="数据湖未初始化")
+        self.db_path = db_path or ""
+
+
+def _lake_not_initialized_handler(_request, exc: LakeNotInitialized):
+    """B-1 契约体渲染：顶层 error/hint（brief B-1 指定形状）。
+
+    为什么用自定义 handler 而非 HTTPException(detail={...})：FastAPI 把 detail 序列化进
+    **顶层 "detail"** 键 → body 变 {"detail":{...}}，而 brief 要求**顶层** error/hint。
+    """
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=409,
+        content={"error": "lake_not_initialized", "hint": INIT_HINT,
+                 "db_path": exc.db_path})
+
+
+def install(app) -> None:
+    """把 B-1 异常 handler 注册到 FastAPI app（由 web/app.py 条件挂载块调用）。
+
+    为什么放这里而不是 web_api 模块顶层：``APIRouter.exception_handler`` 在本版 FastAPI
+    不存在，handler 只能挂在 app 上；而 app 只存在于 web/app.py。此函数是 lake → web 的
+    唯一额外接线点（与 router 挂载同在 duckdb 可导入的条件块内），不破坏零 import 边界。
+    """
+    app.add_exception_handler(LakeNotInitialized, _lake_not_initialized_handler)
+
+
+def _ensure_initialized(con) -> None:
+    """B-1：探测 core 表（stock_master）是否存在；缺失 → LakeNotInitialized。
+
+    用 information_schema 查询而非直接 SELECT——后者对"表不存在"抛 CatalogException，
+    语义上等价但多一层 try/except；information_schema 恒可查、返回空集即可判定。
+    """
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_name=?", [_CORE_TABLE]).fetchone()[0]
+    except Exception:  # noqa: BLE001 - 连接异常等 → 视为未就绪（由 _con 的 503 兜底）
+        n = 0
+    if not n:
+        raise LakeNotInitialized()
+
+
 def _con():
+    """每请求短连接 + **B-1 就绪探测**（数据端点统一入口）。
+
+    - duckdb 未装 → 503（不变）。
+    - **库文件不存在** → 直接抛 LakeNotInitialized（409），**不再 connect**。
+      为什么：duckdb.connect(不存在的文件) 会**自动创建空库文件**——旧行为由此产生
+      "status 200 / 数据端点 500"的自相矛盾，且会在生产目录留下一个 0 表脏文件。
+      先 os.path.exists 探测即可避免副作用（Web 只读，绝不代建库）。
+    - 文件存在但无 core 表（空文件 / 未 init）→ connect 后 _ensure_initialized 抛 409。
+    - 就绪 → 返回连接（happy path 行为与 D-4 修复后完全一致：每请求独立短连接）。
+    """
     from . import conn as _conn
 
     if not _conn.duckdb_available():
         raise HTTPException(status_code=503, detail="数据湖不可用：duckdb 未安装（uv sync --extra lake）")
+    db_path = _conn.default_db_path()
+    if not os.path.exists(db_path):
+        # B-1：缺库文件 → 409（不 connect，避免 duckdb 自动建空库的副作用）
+        raise LakeNotInitialized(db_path)
     try:
-        # 每请求专用短连接（D-4）；文件不存在/打不开 → duckdb 抛错 → 下方转 503。
-        return _conn.connect_existing()
+        con = _conn.connect_existing(db_path)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"数据湖不可用：{exc}")
+    try:
+        _ensure_initialized(con)
+    except LakeNotInitialized:
+        con.close()  # 未就绪 → 不泄漏连接，交 exception_handler 渲染 409
+        raise
+    return con
+
+
+def _status_probe():
+    """/status 专用探测（B-1）：返回**就绪连接或 None**。
+
+    与 _con 的区别：**不抛** LakeNotInitialized——状态端点是健康检查，应如实报告
+    "未初始化"（initialized=false + coverage 全零），而不是像数据端点那样报 409。
+    - duckdb 未装 / 缺文件 / 空文件 / 无 core 表 → None（调用方据此 initialized=false）。
+    - 就绪 → 返回短连接，**调用方负责 close**。
+    """
+    from . import conn as _conn
+
+    if not _conn.duckdb_available():
+        return None
+    db_path = _conn.default_db_path()
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = _conn.connect_existing(db_path)
+    except Exception:  # noqa: BLE001 - 打不开 → 视为未就绪（status 不抛 503）
+        return None
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_name=?", [_CORE_TABLE]).fetchone()[0]
+    except Exception:  # noqa: BLE001
+        con.close()
+        return None
+    if not n:
+        con.close()
+        return None
+    return con
 
 
 def _rows_dicts(con, sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
@@ -206,19 +333,39 @@ def market(industry: Optional[str] = Query(default=None),
 # ---------------------------------------------------------------------------
 @router.get("/status")
 def status() -> Dict[str, Any]:
-    """补齐进度（§4 coverage + tasks）+ duckdb 安装状态。"""
+    """补齐进度（§4 coverage + tasks）+ duckdb 安装状态 + **B-1 initialized**。
+
+    B-1：库未就绪（缺文件/空文件/未 init_schema）时**不抛 409**，如实返回
+    ``initialized=false`` + coverage 全零 + tasks 空——状态端点是健康检查，
+    应反映真实状态。数据端点则一致降级为 409 lake_not_initialized（见 _con）。
+    """
     import duckdb
 
     from .backfill import load_progress
 
-    # D-4：每请求短连接，with 保证异常路径也 close（查询语义不变）
-    with _con() as con:
+    con = _status_probe()
+    if con is None:
+        # 库未就绪：coverage 全零、tasks 空（progress 文件即便存在也不代表库可用）
+        return {
+            "installed": True,
+            "duckdb_version": getattr(duckdb, "__version__", "?"),
+            "initialized": False,
+            "error": "lake_not_initialized",
+            "hint": INIT_HINT,
+            "coverage": {},
+            "tasks": [],
+            "updated_at": None,
+        }
+    try:
         # 端点可达性证明：对库执行一条轻量查询（进度本身来自 JSON 文件）。
         con.execute("SELECT 1").fetchone()
+    finally:
+        con.close()
     prog = load_progress()
     return {
         "installed": True,
         "duckdb_version": getattr(duckdb, "__version__", "?"),
+        "initialized": True,
         "coverage": prog.get("coverage", {}),
         "tasks": prog.get("tasks", []),
         "updated_at": prog.get("updated_at"),
