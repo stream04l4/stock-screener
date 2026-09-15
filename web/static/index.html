@@ -125,11 +125,17 @@
       <div class="pager" id="lake-market-pager"></div>
     </div>
 
-    <!-- 区块C：补齐进度 -->
+    <!-- 区块C：数据库状态 / 补齐进度（v6.0.5 重设计：汇总条 + 9表清单 + 视图区 + tasks） -->
     <div class="card" id="lake-status-card">
       <h3>数据湖状态 / 补齐进度 <button id="btn-lake-refresh-status" class="mini-btn" title="刷新">⟳</button></h3>
-      <div id="lake-coverage" class="muted small"></div>
-      <div class="tbl-wrap" style="margin-top:8px;"><table class="data" id="lake-tasks-table"></table></div>
+      <!-- v6.0.5 汇总条：N 表 + N 视图 · 库 X MB · DuckDB x.y.z · 最后同步 MM-DD HH:MM · [总体徽章] -->
+      <div id="lake-summary" class="lake-summary"><span class="muted">加载中…</span></div>
+      <!-- v6.0.5 表清单：9 行固定顺序（T1-T9）；零数据 P2/P3 表 muted 弱化 -->
+      <div class="tbl-wrap lake-tables-wrap"><table class="data" id="lake-tables"></table></div>
+      <!-- v6.0.5 视图区：3 view + 复权因子覆盖进度条（<5% 提示 history 补齐后全量可用） -->
+      <div id="lake-views" class="lake-views"></div>
+      <!-- 保留 v6.0.4 tasks 表（灌数中/正常态共用；灌数中时顶部琥珀块另有摘要副本） -->
+      <div class="tbl-wrap lake-tasks-wrap"><table class="data" id="lake-tasks-table"></table></div>
     </div>
   </section>
 </main>

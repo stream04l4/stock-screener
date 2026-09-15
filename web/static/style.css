@@ -290,6 +290,40 @@ tr.clickable { cursor: pointer; }
 .badge.error { background: var(--bad-soft); color: #991b1b; }
 .lake-task-progress { min-width: 120px; }
 
+/* ---------- v6.0.5 区块C「数据库状态」重设计（汇总条 + 9表清单 + 视图区） ---------- */
+.mono { font-family: var(--mono); }
+/* 汇总条：一行，卡片头下方；分隔符弱化、徽章右浮 */
+.lake-summary {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 2px 4px;
+  font-size: 13px; padding: 8px 12px; margin-bottom: 10px;
+  background: #f8fafc; border: 1px solid var(--line); border-radius: 9px;
+}
+.lake-summary-sep { color: var(--muted); margin: 0 6px; }
+/* 状态徽章四色（绿 fresh / 黄 lagging / 蓝 pending / 灰 empty；复用 CSS 变量体系） */
+.badge.lake-st-fresh { background: var(--good-soft); color: #166534; border: 1px solid #bbf7d0; }
+.badge.lake-st-lagging { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+.badge.lake-st-pending { background: var(--accent-soft); color: #1d4ed8; border: 1px solid #bfdbfe; }
+.badge.lake-st-empty { background: #eef2f7; color: #64748b; border: 1px solid var(--line); }
+/* 表清单：说明列限宽换行（防撑破）、状态列不换行 */
+.lake-tables-wrap { margin-bottom: 10px; }
+.lake-t-desc { max-width: 300px; }
+.lake-t-state { white-space: nowrap; }
+/* 零数据表（P2/P3 计划内未做）视觉弱化：muted 灰字 + 浅灰底，与有数据的 P0 表区分——
+   "待补" ≠ 错误，不得显示成红色/告警。底色用 #f1f5f9（slate-100，比卡片白底可辨但
+   仍柔和），避免 #f8fafc 过浅导致视觉上"看不出弱化" */
+tr.lake-row-muted { background: #f1f5f9; }
+tr.lake-row-muted td { color: var(--muted); }
+tr.lake-row-muted .badge { opacity: .85; }
+/* 视图区：小字行 ×3 + 复权因子覆盖细进度条 */
+.lake-views { margin-bottom: 10px; }
+.lake-views-title { font-weight: 600; margin-bottom: 4px; }
+.lake-view-row { font-size: 12.5px; padding: 2px 0; }
+.lake-af-line { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.lake-af-track { flex: 1; max-width: 320px; height: 7px; margin: 0; }
+.lake-af-hint { font-style: italic; }
+/* tasks 表（保留 v6.0.4）：与上方表清单间留白 */
+.lake-tasks-wrap { margin-top: 2px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }

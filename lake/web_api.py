@@ -38,9 +38,20 @@ lake_not_initialized，页面持续误导显示"不可用"）：
   + ``lock_holder_pid``（尽力解析，失败 None）+ coverage/tasks 降级读 progress 文件
   （backfill_progress.json 不受 DuckDB 锁影响，正好是灌数进度）；真未初始化保持
   v6.0.3 行为逐字节不变。
+
+**v6.0.5：/status 区块 C 重设计的数据源扩展**（Joel 反馈"数据库状态部分非常简陋，
+信息堆在一起不够直观"→ TL 定规格）：仅在 **initialized+ready 态**追加新字段
+（``tables`` 9 表逐表 state / ``views`` / ``adj_factor_coverage_pct`` / ``db`` /
+``sync``），locked 与 uninitialized 两态响应体**逐字节保持 v6.0.4**（三态契约测试
+test_lake_v604_lock 不得破坏）。state 判定全部运行时计算、零硬编码数据值：
+- fresh/lagging 只比"相对参考最新交易日的天数差"，不比较具体日期；
+- P2/P3 计划内未启动的 4 张表（T5/T6/T8/T9）即使 0 行也标 **pending** 而非 empty
+  （"计划内未做" ≠ "坏了"，前端据此 muted 弱化而非红色报错）；
+- 参考最新交易日 = kline_daily 全局 max(date)（无数据回退今日）。
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
@@ -415,10 +426,231 @@ def market(industry: Optional[str] = Query(default=None),
 # ---------------------------------------------------------------------------
 # GET /status
 # ---------------------------------------------------------------------------
+# v6.0.5：9 表元数据（固定顺序 = 数据湖文档 T1-T9，与 lake.ddl.TABLES 一致）。
+# kind 决定 state 判定分支；code_col 为"股票数"口径列（index_daily=index_code、
+# macro_rf=无代码维度 → None）；date_col 为"数据区间"口径列（dividend_events 用
+# ex_date——与 backfill coverage 同口径；stock_master 无日期维度 → None）。
+# desc/name_cn 是**展示文案**（非数据值），与 brief 规格逐字一致。
+_TABLE_META = [
+    ("stock_master", "T1", "股票主档", "代码/名称/行业/上市退市日/ST/央国企标记（当前快照）",
+     "snapshot", "ts_code", None),
+    ("kline_daily", "T2", "日K线（含复权因子）", "OHLCV+涨跌幅+adj_factor 全史",
+     "daily", "ts_code", "date"),
+    ("valuation_daily", "T3", "估值日线", "总市值/流通市值/PE-TTM/PB/换手/TTM股息率",
+     "daily", "ts_code", "date"),
+    ("dividend_events", "T4", "分红事件", "1991→今 全史静态快照（除权日可含未来）",
+     "snapshot", "ts_code", "ex_date"),
+    ("fundamentals_quarterly", "T5", "季度基本面", "PIT：ROE/净利同比/OCF/毛利率/负债率",
+     "pending_p2", "ts_code", "pub_date"),
+    ("holders_snapshot", "T6", "前十大股东+实控人", "季度快照（controller_* 待补源）",
+     "pending_p2", "ts_code", "as_of_date"),
+    ("index_daily", "T7", "指数日线", "沪深300/上证/深成/中证1000 四指数",
+     "daily", "index_code", "date"),
+    ("factor_snapshot", "T8", "因子快照（EAV）", "加因子零 schema 变更",
+     "pending_p2", "ts_code", "as_of_date"),
+    ("macro_rf", "T9", "无风险利率序列", "现值起步，历史缺口显式 NULL",
+     "pending_p3", None, "date"),
+]
+
+# v6.0.5：P2/P3 计划内未启动表的徽章副文案（brief 逐字）。
+_PENDING_DETAIL = {
+    "fundamentals_quarterly": "P2·季度基本面待补",
+    "holders_snapshot": "P2·股东+实控人待补",
+    "factor_snapshot": "依赖T5/T6后计算",
+    "macro_rf": "P3·rf现值序列未启动",
+}
+
+# v6.0.5：3 个派生 view（展示元数据；可用性由 adj_factor_coverage_pct 表达）。
+_VIEW_META = [
+    ("kline_daily_hfq", "后复权K线视图", "close×adj_factor"),
+    ("kline_daily_qfq", "前复权K线视图", "按最新因子归一"),
+    ("stock_panorama", "个股全景视图", "T1⋈T3 拼装"),
+]
+
+
+def _iso_date(v) -> Optional[str]:
+    """date/datetime/str → 'YYYY-MM-DD'（None 透传）。"""
+    if v is None:
+        return None
+    s = str(v)
+    return s[:10]
+
+
+def _iso_ts(v) -> Optional[str]:
+    """TIMESTAMP → 'YYYY-MM-DD HH:MM:SS'（None 透传）。"""
+    if v is None:
+        return None
+    s = str(v)
+    return s[:19]
+
+
+def _table_stats(con, table: str, code_col: Optional[str],
+                 date_col: Optional[str]) -> Dict[str, Any]:
+    """单表统计：rows / codes / date_min / date_max / last_sync_at（全运行时查询）。
+
+    任何异常 → 该表统计置零/None（防御：某表缺列不拖垮整个 /status；正常库不会触发）。
+    """
+    out: Dict[str, Any] = {"rows": 0, "codes": None, "date_min": None,
+                           "date_max": None, "last_sync_at": None}
+    try:
+        code_expr = f"COUNT(DISTINCT {code_col})" if code_col else "NULL"
+        min_expr = f"MIN({date_col})" if date_col else "NULL"
+        max_expr = f"MAX({date_col})" if date_col else "NULL"
+        r = con.execute(
+            f"SELECT COUNT(*), {code_expr}, {min_expr}, {max_expr}, MAX(fetched_at) "
+            f"FROM {table}").fetchone()
+    except Exception:  # noqa: BLE001 - 防御性降级（正常库不触发）
+        return out
+    out["rows"] = int(r[0] or 0)
+    out["codes"] = None if r[1] is None else int(r[1])
+    out["date_min"] = _iso_date(r[2])
+    out["date_max"] = _iso_date(r[3])
+    out["last_sync_at"] = _iso_ts(r[4])
+    return out
+
+
+def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
+                    ref_date: Optional[str], dividend_as_of: Optional[str]
+                    ) -> tuple:
+    """state 判定（brief v6.0.5 规则，全部运行时计算、零硬编码数据值）。
+
+    :return: (state, state_detail)
+    - pending：P2/P3 计划内未启动表——**即使 0 行也标 pending 而非 empty**
+      （"计划内未做" ≠ "坏了"；前端 muted 弱化、不得显示成错误）。
+    - daily（kline/valuation/index）：date_max 与参考最新交易日比**天数差**
+      （不比较具体日期值）：gap≤1 → fresh；>1 → lagging"滞后 N 日"。
+      ⚠️ 用日历天数而非交易日数——brief 字面规则即"−1 天/落后 >1 天"，且跨周末
+      的日历差 ≤2 仍会判 lagging，这是可接受的保守口径（宁可提示滞后不误导最新）。
+    - snapshot：stock_master rows>0 → fresh（周更语义，detail="快照"）；
+      dividend_events rows>0 → fresh + detail="快照截至<源 as_of>"（as_of 拿不到
+      就 "全史静态导入"）。
+    - empty：其余 0 行表（当前库实况无此态，留作防御）。
+    """
+    if kind in ("pending_p2", "pending_p3"):
+        return "pending", _PENDING_DETAIL[key]
+    if rows <= 0:
+        return "empty", "暂无数据"
+    if kind == "daily":
+        if not date_max or not ref_date:
+            # 有行但日期缺失（异常防御）→ 按滞后处理并提示核对，不猜 fresh
+            return "lagging", "日期缺失待核"
+        gap = (datetime.date.fromisoformat(ref_date)
+               - datetime.date.fromisoformat(date_max)).days
+        if gap <= 1:
+            return "fresh", "最新"
+        return "lagging", f"滞后 {gap} 日"
+    # snapshot（stock_master / dividend_events）
+    if key == "dividend_events":
+        as_of = (dividend_as_of or "").strip()
+        detail = f"快照截至{as_of}" if as_of else "全史静态导入"
+        return "fresh", detail
+    return "fresh", "快照"
+
+
+def _build_status_details(con, prog: Dict[str, Any]) -> Dict[str, Any]:
+    """v6.0.5 新字段（仅 initialized+ready 态追加）：tables/views/adj/db/sync。
+
+    - tables：9 张表固定顺序（T1-T9），逐表运行时统计 + state 判定；
+      参考最新交易日 = kline_daily 全局 max(date)（无数据回退今日）。
+    - dividend as_of 优先级：progress 文件 T4 记录 → dividend_events max(ann_date)
+      → None（前端显示"全史静态导入"）。为什么先 progress：它是灌数侧的**源快照
+      口径**（T4 全史一次性导入），比表内 max(ann_date) 更接近"源截至何时"。
+    - adj_factor_coverage_pct：kline_daily adj_factor 非空占比（0-100，一位小数）——
+      hfq/qfq view 可用性；P2 history 补全前大面积 NULL，前端 <5% 时加提示。
+    - db.size_mb：os.path.getsize（不查库，零 IO 放大）。
+    - sync.quota：读 progress 文件 tasks（不受 DuckDB 锁影响）——取今日已用/预算的
+      max（各 task 视图写的是同一 QuotaGuard 值；max 防御个别 task 视图滞后）。
+
+    ⚠️ **生产库只读纪律的实现口径（v6.0.5，实测约束）**：本函数全部为 SELECT，不写
+    data/lake/ 任何文件。brief 要求"read_only 连接"，但 DuckDB 1.5.5 **禁止同进程
+    混开 read_only 与默认连接**（实测 ConnectionException "Can't open a connection
+    to same database file with a different configuration"——即使 RO 连接立刻 close
+    也失败；而本进程已持有探测短连接，且该探测必须保持默认模式才能继续识别跨进程
+    LakeLocked，v6.0.4 三态契约依赖它）。故沿用与其余端点一致的每请求短连接 +
+    纯 SELECT（效果等价只读）；若未来 DuckDB 支持同进程混开，可升级为显式
+    read_only=True。此偏差已如实记录，待 TL/tester 知悉。
+    """
+    from . import conn as _conn
+
+    # 参考最新交易日：kline_daily 全局 max(date)；无数据回退今日（brief 规则）
+    try:
+        ref = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+    except Exception:  # noqa: BLE001 - 防御（正常库必有 kline_daily）
+        ref = None
+    ref_date = _iso_date(ref) or datetime.date.today().isoformat()
+
+    # dividend 源 as_of：progress T4 记录优先，回退表内 max(ann_date)
+    div_as_of: Optional[str] = None
+    for t in prog.get("tasks", []):
+        if isinstance(t, dict) and t.get("table") == "dividend_events":
+            for k in ("as_of", "source_as_of"):
+                if t.get(k):
+                    div_as_of = str(t[k])[:10]
+                    break
+    if not div_as_of:
+        try:
+            r = con.execute("SELECT MAX(ann_date) FROM dividend_events").fetchone()[0]
+            div_as_of = _iso_date(r)
+        except Exception:  # noqa: BLE001
+            div_as_of = None
+
+    tables: List[Dict[str, Any]] = []
+    for key, tier, name_cn, desc, kind, code_col, date_col in _TABLE_META:
+        st = _table_stats(con, key, code_col, date_col)
+        state, detail = _classify_state(key, kind, st["rows"], st["date_max"],
+                                        ref_date, div_as_of)
+        tables.append({
+            "key": key, "tier": tier, "name_cn": name_cn, "desc": desc,
+            "rows": st["rows"], "codes": st["codes"],
+            "date_min": st["date_min"], "date_max": st["date_max"],
+            "last_sync_at": st["last_sync_at"],
+            "state": state, "state_detail": detail,
+        })
+
+    # adj_factor 非空占比（复权 view 可用性）；kline 无行 → None（前端显示 —）
+    try:
+        tot, nn = con.execute(
+            "SELECT COUNT(*), COUNT(adj_factor) FROM kline_daily").fetchone()
+        af_pct = round(100.0 * int(nn or 0) / int(tot), 1) if tot else None
+    except Exception:  # noqa: BLE001
+        af_pct = None
+
+    db_path = _conn.default_db_path()
+    try:
+        size_mb = round(os.path.getsize(db_path) / (1024 * 1024), 1) \
+            if os.path.exists(db_path) else None
+    except OSError:
+        size_mb = None
+
+    # quota：progress tasks 今日已用/预算（max 防御滞后视图）；无 tasks → None
+    quota_used = quota_budget = None
+    for t in prog.get("tasks", []):
+        if not isinstance(t, dict):
+            continue
+        u, b = t.get("quota_used_today"), t.get("quota_budget")
+        if isinstance(u, int):
+            quota_used = max(quota_used or 0, u)
+        if isinstance(b, int):
+            quota_budget = max(quota_budget or 0, b)
+
+    return {
+        "tables": tables,
+        "views": [{"key": k, "name_cn": n, "desc": d} for k, n, d in _VIEW_META],
+        "adj_factor_coverage_pct": af_pct,
+        "db": {"path": db_path, "size_mb": size_mb},
+        "sync": {
+            "last_updated_at": prog.get("updated_at"),
+            "backfill_in_progress": False,
+            "quota_used_today": quota_used,
+            "quota_budget": quota_budget,
+        },
+    }
+
+
 @router.get("/status")
 def status() -> Dict[str, Any]:
     """补齐进度（§4 coverage + tasks）+ duckdb 安装状态 + **B-1 initialized**
-    + **v6.0.4 backfill_in_progress**。
+    + **v6.0.4 backfill_in_progress** + **v6.0.5 tables/views/adj/db/sync**。
 
     B-1：库未就绪（缺文件/空文件/未 init_schema）时**不抛 409**，如实返回
     ``initialized=false`` + coverage 全零 + tasks 空——状态端点是健康检查，
@@ -428,6 +660,10 @@ def status() -> Dict[str, Any]:
     ``initialized=true`` + ``backfill_in_progress=true`` + ``lock_holder_pid``
     （尽力解析，失败 None），coverage/tasks 降级读 progress 文件
     （backfill_progress.json 是纯 JSON、不受 DuckDB 锁影响，正好是灌数进度）。
+
+    v6.0.5：**仅 ready 态**追加 tables（9 表逐表 state）/views/adj_factor_coverage_pct/
+    db/sync——locked 与 uninitialized 两态响应体保持 v6.0.4 逐字节不变（三态契约
+    test_lake_v604_lock 依赖"新字段只在 initialized+ok 态追加"这一纪律）。
     """
     import duckdb
 
@@ -437,6 +673,7 @@ def status() -> Dict[str, Any]:
     if state == "locked":
         # v6.0.4：灌数持锁——库是好的（正在被写入），initialized=true；
         # coverage/tasks 来自 progress 文件降级（DuckDB 连不上，但 JSON 可读）。
+        # v6.0.5：本分支**不追加**新字段（brief：tables 数组可缺省，降级路径不变）。
         prog = load_progress()
         return {
             "installed": True,
@@ -463,10 +700,12 @@ def status() -> Dict[str, Any]:
     try:
         # 端点可达性证明：对库执行一条轻量查询（进度本身来自 JSON 文件）。
         con.execute("SELECT 1").fetchone()
+        # v6.0.5：9 表逐表统计 + state 判定（同一短连接内完成，全部只读 SELECT）
+        details = _build_status_details(con, load_progress())
     finally:
         con.close()
     prog = load_progress()
-    return {
+    resp: Dict[str, Any] = {
         "installed": True,
         "duckdb_version": getattr(duckdb, "__version__", "?"),
         "initialized": True,
@@ -474,3 +713,5 @@ def status() -> Dict[str, Any]:
         "tasks": prog.get("tasks", []),
         "updated_at": prog.get("updated_at"),
     }
+    resp.update(details)  # v6.0.5 新字段只在 ready 态追加（旧字段逐字节不动）
+    return resp

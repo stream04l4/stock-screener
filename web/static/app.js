@@ -1430,37 +1430,134 @@ function renderLakeMarket(d) {
   pager.append(mkBtn("›", d.page + 1, d.page >= d.pages), mkBtn("»", d.pages, d.page >= d.pages));
 }
 
+// ---------------------------------------------------------------------------
+// v6.0.5：区块 C「数据库状态 / 补齐进度」渲染（汇总条 + 9表清单 + 视图区）
+// ---------------------------------------------------------------------------
+// state → 徽章 class/文案（绿 fresh / 黄 lagging / 蓝 pending / 灰 empty）。
+// 复用现有 .badge 基类 + CSS 变量体系（style.css v6.0.5 段新增 lake-st-* 颜色）。
+const LAKE_STATE_BADGE = {
+  fresh: ["lake-st-fresh", "✅ 最新"],
+  lagging: ["lake-st-lagging", "🕓 滞后"],
+  pending: ["lake-st-pending", "⏳ 待补"],
+  empty: ["lake-st-empty", "— 空"],
+};
+
+// 状态徽章 + 副文案（state_detail）。detail 与徽章词完全相同 → 不重复显示；
+// detail 以"徽章词 + 空格"开头（如"滞后 3 日" vs 徽章"🕓 滞后"）→ 只留剩余部分。
+function lakeStateCell(t) {
+  const [cls, label] = LAKE_STATE_BADGE[t.state] || ["lake-st-empty", String(t.state ?? "—")];
+  let detail = t.state_detail || "";
+  const word = label.replace(/^[^\s]+\s*/, "");   // 去掉 emoji，留状态词（最新/滞后/待补/空）
+  if (detail === word) detail = "";
+  else if (word && detail.startsWith(word + " ")) detail = detail.slice(word.length).trim();
+  return `<span class="badge ${cls}">${esc(label)}</span>` +
+    (detail ? ` <span class="muted small">${esc(detail)}</span>` : "");
+}
+
+// 汇总条（brief §2.1）：N 表 + N 视图 · 库 X MB · DuckDB x.y.z · 最后同步 MM-DD HH:MM · [总体徽章]
+function lakeRenderSummary(d) {
+  const box = $("#lake-summary");
+  // 总体徽章：灌数中→⏳琥珀 / 任一 lagging→🕓琥珀 / 全 fresh+pending→✅绿
+  let badge;
+  if (d.backfill_in_progress) badge = '<span class="badge lake-st-lagging">⏳ 灌数中</span>';
+  else if ((d.tables || []).some((t) => t.state === "lagging")) badge = '<span class="badge lake-st-lagging">🕓 有滞后</span>';
+  else badge = '<span class="badge lake-st-fresh">✅ 正常</span>';
+
+  const parts = [];
+  if (d.initialized === false) {
+    // 未初始化空态（v6.0.3 语义保留）：不显示"正常/滞后"徽章，明确提示 init
+    box.innerHTML = `<span class="muted">库未初始化 —— 请先运行 <code>python scripts/lake_backfill.py init</code></span>`;
+    return;
+  }
+  const nTables = (d.tables || []).length, nViews = (d.views || []).length;
+  if (nTables) parts.push(`${nTables} 表` + (nViews ? ` + ${nViews} 视图` : ""));
+  if (d.db && d.db.size_mb != null) parts.push(`库 ${d.db.size_mb} MB`);
+  parts.push(`DuckDB ${esc(d.duckdb_version || "?")}`);
+  const ts = (d.sync && d.sync.last_updated_at) || d.updated_at;
+  parts.push(`最后同步 ${ts ? esc(String(ts).slice(5, 16)) : "—"}`);
+  box.innerHTML = parts.map((p) => `<span>${p}</span>`).join('<span class="lake-summary-sep">·</span>') + ` ${badge}`;
+}
+
+// 表清单（brief §2.2）：9 行固定顺序；零数据 P2/P3 表 muted 弱化（"计划内未做" ≠ 错误）。
+function lakeRenderTables(d) {
+  const table = $("#lake-tables");
+  const th = "<thead><tr><th>表</th><th>说明</th><th class='num'>行数</th><th class='num'>股票数</th>" +
+    "<th>数据区间</th><th>状态</th><th>最后同步</th></tr></thead>";
+  const tables = d.tables || [];
+  if (!tables.length) {
+    // locked（灌数中，tables 缺省）或降级：占位行（不白屏、不显示成错误）
+    table.innerHTML = th + '<tbody><tr><td colspan="7" class="placeholder">' +
+      (d.backfill_in_progress ? "灌数进行中 —— 表级状态完成后可见" : "暂无表级状态") +
+      "</td></tr></tbody>";
+    return;
+  }
+  let h = th + "<tbody>";
+  for (const t of tables) {
+    const muted = t.rows <= 0 ? " lake-row-muted" : "";   // 零数据表视觉弱化（P2/P3）
+    const range = (t.date_min && t.date_max) ? `${esc(t.date_min)} ~ ${esc(t.date_max)}` : "—";
+    h += `<tr class="lake-table-row${muted}">` +
+      `<td><div>${esc(t.name_cn)}</div><div class="muted small mono">${esc(t.tier || "")} · ${esc(t.key)}</div></td>` +
+      `<td class="lake-t-desc"><span class="muted small">${esc(t.desc || "—")}</span></td>` +
+      `<td class="num">${t.rows != null ? t.rows.toLocaleString("en-US") : "—"}</td>` +
+      `<td class="num">${t.codes != null ? t.codes.toLocaleString("en-US") : "—"}</td>` +
+      `<td class="mono small">${range}</td>` +
+      `<td class="lake-t-state">${lakeStateCell(t)}</td>` +
+      `<td class="muted small mono">${t.last_sync_at ? esc(String(t.last_sync_at).slice(5, 16)) : "—"}</td></tr>`;
+  }
+  table.innerHTML = h + "</tbody>";
+}
+
+// 视图区（brief §2.3）：3 view 小字行 + 复权因子覆盖进度条（<5% 加提示）。
+function lakeRenderViews(d) {
+  const box = $("#lake-views");
+  const views = d.views || [];
+  if (!views.length) { box.innerHTML = ""; return; }   // locked/降级态：不显示视图区
+  let h = '<div class="lake-views-title muted small">派生视图</div>';
+  for (const v of views) {
+    h += `<div class="lake-view-row"><span class="mono small">${esc(v.key)}</span> ` +
+      `<b>${esc(v.name_cn)}</b> <span class="muted small">—— ${esc(v.desc || "")}</span></div>`;
+  }
+  const pct = d.adj_factor_coverage_pct;
+  if (pct != null) {
+    const w = Math.max(0, Math.min(100, Number(pct)));
+    h += `<div class="lake-af-line"><span class="muted small">复权因子覆盖 ${w.toFixed(1)}%</span>` +
+      `<span class="progress-track lake-af-track"><span class="progress-bar" style="width:${w}%"></span></span>` +
+      (w < 5 ? '<span class="lake-af-hint muted small">history 补齐后 hfq/qfq 全量可用</span>' : "") +
+      `</div>`;
+  }
+  box.innerHTML = h;
+}
+
 async function loadLakeStatus() {
-  const covBox = $("#lake-coverage");
   const table = $("#lake-tasks-table");
   try {
     const d = await api("/api/lake/status");
     lakeInstalled = !!d.installed;
-    if (!d.installed) { lakeSetError("duckdb 未安装（uv sync --extra lake）"); return; }
+    if (!d.installed) {
+      lakeSetError("duckdb 未安装（uv sync --extra lake）");
+      $("#lake-summary").innerHTML = '<span class="muted">数据湖未安装</span>';
+      table.innerHTML = '<tr><td colspan="6" class="placeholder">数据湖不可用</td></tr>';
+      return;
+    }
     lakeSetError("");   // 正常态：清错误横幅
     // v6.0.4 三态渲染（互不串味）：
     //   ① backfill_in_progress=true → 琥珀色"⏳ 数据灌入中"块 + tasks 摘要；
-    //      coverage 来自 progress 文件降级，区块C 标注"灌数中·降级读取"。
-    //   ② initialized=false（真未初始化）→ 保持 v6.0.3 空态文案（"请先运行 backfill init"）。
-    //   ③ 正常 → coverage + tasks 表照旧。
+    //      coverage 来自 progress 文件降级，区块C 汇总条显示"灌数中"徽章。
+    //   ② initialized=false（真未初始化）→ 空态文案（"请先运行 backfill init"）。
+    //   ③ 正常 → v6.0.5 汇总条 + 9表清单 + 视图区 + tasks 表。
     lakeSetBackfill(d);
-    covBox.textContent = `DuckDB ${d.duckdb_version}` +
-      (d.backfill_in_progress ? " · ⏳ 灌数中（coverage 来自 progress 文件降级）" : "") +
-      ` · 进度更新于 ${d.updated_at || "—"}`;
-    // coverage 行
-    let ch = "";
-    const cov = d.coverage || {};
-    for (const [t, c] of Object.entries(cov)) {
-      const range = (c.date_min && c.date_max) ? `${c.date_min} ~ ${c.date_max}` : "—";
-      ch += `<div>${esc(t)}：${c.codes ?? "—"} 只 · ${range} · ${c.rows ?? "—"} 行</div>`;
-    }
-    covBox.innerHTML = (covBox.textContent + "<br>" + (ch || '<span class="muted">（暂无覆盖数据）</span>'));
+    lakeRenderSummary(d);
+    lakeRenderTables(d);
+    lakeRenderViews(d);
     // tasks 表（灌数中态与正常态共用同一渲染；灌数中时顶部琥珀块另有摘要副本）
     lakeRenderTasksTable(table, d.tasks || []);
   } catch (e) {
     // 错误态：5xx / duckdb 未装 → 红色横幅 + 降级占位（不白屏）
     lakeSetError(e.message);
-    covBox.textContent = "—";
+    $("#lake-summary").innerHTML = '<span class="muted">—</span>';
+    $("#lake-tables").innerHTML =
+      '<tbody><tr><td colspan="7" class="placeholder">数据湖不可用</td></tr></tbody>';
+    $("#lake-views").innerHTML = "";
     table.innerHTML = '<tr><td colspan="6" class="placeholder">数据湖不可用</td></tr>';
   }
 }
