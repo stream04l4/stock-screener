@@ -12,6 +12,9 @@
   --warn: #d97706;
   --bad: #dc2626;
   --bad-soft: #fdecec;
+  /* v6.0.6：A股配色——红涨绿跌（蜡烛图/成交量柱专用；与主题变量体系并列） */
+  --lake-up: #dc2626;
+  --lake-down: #16a34a;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 * { box-sizing: border-box; }
@@ -323,6 +326,41 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-af-hint { font-style: italic; }
 /* tasks 表（保留 v6.0.4）：与上方表清单间留白 */
 .lake-tasks-wrap { margin-top: 2px; }
+
+/* ---------- v6.0.6 个股全景·日K线蜡烛图（手绘 SVG，无图表库/CDN） ---------- */
+/* 区间切换按钮组：复用 .mini-btn 视觉语言，选中态用 accent 高亮 */
+.lake-kline-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; flex-wrap: wrap; }
+.lake-kline-range { border: 1px solid var(--line); background: #fff; color: var(--muted);
+  border-radius: 6px; cursor: pointer; padding: 2px 10px; font-size: 12px; }
+.lake-kline-range:hover { color: var(--accent); border-color: var(--accent); }
+.lake-kline-range.cur { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* 图容器：宽度自适应卡片（viewBox + preserveAspectRatio 缩放），窄屏不破版；
+   position:relative 是 tooltip（absolute）的定位基准 */
+.lake-kline-wrap { width: 100%; margin-bottom: 4px; position: relative; }
+.lake-kline-wrap svg { display: block; width: 100%; height: auto; }
+/* SVG 内部文字（viewBox 坐标系，随图缩放） */
+.lake-kline-svg .lk-tick { font-size: 11px; fill: var(--muted); font-family: var(--mono); }
+.lake-kline-svg .lk-grid { stroke: var(--line); stroke-width: 1; }
+.lake-kline-svg .lk-axis { stroke: var(--line); stroke-width: 1; }
+/* A股配色：红涨绿跌（close≥open → --lake-up，否则 --lake-down） */
+.lake-kline-svg .lk-up { fill: var(--lake-up); stroke: var(--lake-up); }
+.lake-kline-svg .lk-down { fill: var(--lake-down); stroke: var(--lake-down); }
+/* hover 十字线（跟随鼠标最近 K线点） */
+.lake-kline-svg .lk-cross { stroke: #94a3b8; stroke-width: 1; stroke-dasharray: 4 3; }
+.lake-kline-svg .lk-hoverdot { fill: none; stroke: #475569; stroke-width: 1.5; }
+/* tooltip：绝对定位于图容器内（不随 viewBox 缩放，字号恒定） */
+.lake-kline-tip {
+  position: absolute; pointer-events: none; z-index: 20; display: none;
+  background: rgba(16, 24, 40, .92); color: #f8fafc; border-radius: 8px;
+  padding: 7px 10px; font-size: 12px; line-height: 1.5; white-space: nowrap;
+  box-shadow: 0 6px 18px rgba(16,24,40,.25);
+}
+.lake-kline-tip .tt-date { font-weight: 700; margin-bottom: 2px; }
+.lake-kline-tip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
+.lake-kline-tip .tt-k { color: #98a2b3; }
+.lake-kline-tip .tt-v { font-family: var(--mono); }
+/* 空态/错误态占位（与页面既有 .placeholder 一致，不白屏） */
+.lake-kline-empty { padding: 46px 0; text-align: center; color: var(--muted); font-size: 13px; }
 
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }

@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """lake.web_api —— Web 数据湖页签 API（FastAPI APIRouter，prefix=/api/lake）。
 
-规格（调研报告 §5）：
+规格（调研报告 §5 + v6.0.6 增量）：
 - ``GET /search?q=``          ts_code/name 模糊匹配 T1，top20。
 - ``GET /stock/{ts_code}``    stock_panorama + T5 最近季 + T6 前十大 + T8 全因子（分节 dict）。
-- ``GET /market?industry=&soe=&sort=&page=``  T1⋈T3 分页 50/页。
+- ``GET /kline/{ts_code}?days=``  v6.0.6：日K线 OHLCV date 升序（前端 SVG 蜡烛图；
+  days 缺省 250，clamp [30,9999]，all=全量；空股 rows=[] count=0）。
+- ``GET /market?industry=&soe=&sort=&page=&page_size=``  T1⋈T3 分页（v6.0.6：默认
+  20/页，page_size clamp [10,50]、非法回退 20）。
 - ``GET /status``             §4 coverage + tasks（补齐进度）。
 
 **挂载约定（零 import 保证）**：web/app.py **不** import lake——由 app.py 在
@@ -53,6 +56,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -355,6 +359,67 @@ def stock_detail(ts_code: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# GET /kline/{ts_code}（v6.0.6：个股全景日线图数据源）
+# ---------------------------------------------------------------------------
+@router.get("/kline/{ts_code}")
+def stock_kline(ts_code: str, days: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """个股日K线 OHLCV（前端 SVG 蜡烛图数据源）。
+
+    :param ts_code: sh/sz/bj.6位数字（非法 → 400，与 /stock/{ts_code} 一致）。
+    :param days: 缺省 ``"250"``；clamp [30, 9999]（越界取边界值）；``"all"`` →
+        全量。非法/非数字且非 all → 回退 250（与 market page_size 同口径：
+        静默降级，不改变既有错误语义）。
+
+    响应契约（brief v6.0.6）：``{ts_code, name, rows:[{date,open,high,low,close,
+    volume}], count}``——rows **date 升序**；空股（无 K线）→ ``rows=[] count=0``
+    （200，不报错）。
+
+    连接纪律：D-4 每请求短连接（with 保证异常路径也 close）；库未就绪/locked 走
+    v6.0.3/v6.0.4 既有异常路径（_con → LakeNotInitialized / LakeBackfillInProgress
+    → 409 顶层契约体），**不新造错误语义**。
+
+    name：T1 stock_master 联取（无 T1 行 → None，前端回退显示 ts_code）——
+    空股判定只认 kline_daily 行数，不因 T1 缺行而 404（brief："空股→rows=[]"）。
+    """
+    if not _valid_ts_code(ts_code):
+        raise HTTPException(status_code=400, detail=f"非法代码: {ts_code}")
+    # days 解析：all → None（不加 LIMIT）；数字 clamp [30,9999]；其余回退 250。
+    # ⚠️ 直接函数调用（单测）时 days 默认值是 FastAPI Query() 返回的 FieldInfo
+    # 对象而非 None——isinstance 归一化，HTTP 路径（str）行为不变。
+    if not isinstance(days, str):
+        days = None
+    d = (days or "250").strip()
+    limit: Optional[int]
+    if d.lower() == "all":
+        limit = None
+    else:
+        try:
+            n = int(d)
+        except ValueError:
+            n = 250
+        limit = max(30, min(9999, n))
+    # D-4：每请求短连接，with 保证异常路径也 close（查询语义不变）
+    with _con() as con:
+        name_row = _rows_dicts(con, "SELECT name FROM stock_master WHERE ts_code=?",
+                               [ts_code])
+        sql = ("SELECT date, open, high, low, close, volume FROM kline_daily "
+               "WHERE ts_code=? ORDER BY date ASC")
+        params: List[Any] = [ts_code]
+        if limit is not None:
+            # 取**最近** N 根（date 升序尾部）：内层降序 LIMIT 后外层再升序。
+            sql = ("SELECT date, open, high, low, close, volume FROM "
+                   "(SELECT date, open, high, low, close, volume FROM kline_daily "
+                   f"WHERE ts_code=? ORDER BY date DESC LIMIT {limit}) "
+                   "ORDER BY date ASC")
+        rows = _rows_dicts(con, sql, params)
+        for r in rows:  # DATE → 'YYYY-MM-DD'（与全 API 日期口径一致）
+            r["date"] = _iso_date(r["date"])
+        return {"ts_code": ts_code,
+                "name": name_row[0]["name"] if name_row else None,
+                "rows": rows, "count": len(rows)}
+
+
+# ---------------------------------------------------------------------------
 # GET /industries（v6.0.1 D-3：区块B 行业下拉动态填充）
 # ---------------------------------------------------------------------------
 @router.get("/industries")
@@ -378,20 +443,71 @@ def industries() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # GET /market
 # ---------------------------------------------------------------------------
+def _clamp_page_size(v: Any) -> int:
+    """v6.0.6：market page_size clamp（brief 契约）。
+
+    :param v: 查询参数原值。端点声明为 **str**（见下方"为什么不声明 int"）→
+        HTTP 路径恒为 str/None；直接函数调用（单测）可能喂入 int/float/FieldInfo，
+        一并防御。**非法一律回退 20**（不抛、不 422）。
+
+    - None / 缺省（含 FieldInfo）→ 20（默认每页 20 条，Joel 反馈"每页太多"）；
+    - <10 → 10、>50 → 50（给以后想调大留口子但不暴露任意值）；
+    - 非法值（非数字字符串 / NaN / inf）→ 20。
+
+    **为什么端点把 page_size 声明为 str 而不是 int**：FastAPI 对 ``int`` 类型参数做
+    **请求级校验**——``page_size=abc`` 会在进函数前被打回 **422**，brief 要求的
+    "非法值回退 20"根本执行不到。声明 str 后解析权完全在本函数：abc→20、999→50、
+    30→30，HTTP 行为与 brief 契约逐字一致（响应 page_size 仍为 int 实际生效值）。
+    """
+    if v is None or isinstance(v, bool):
+        return 20
+    if isinstance(v, str):
+        try:
+            n = int(v.strip())
+        except ValueError:
+            return 20   # "abc" / "" / "12.5" → 回退 20
+    elif isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if not math.isfinite(v):
+            return 20   # NaN/inf → 回退 20
+        n = int(v)
+    else:
+        return 20       # FieldInfo（直接调用缺省）/ 其它垃圾 → 缺省语义
+    if not (10 <= n <= 50):
+        return 10 if n < 10 else 50
+    return n
+
+
 @router.get("/market")
 def market(industry: Optional[str] = Query(default=None),
            soe: Optional[str] = Query(default=None),
            sort: str = Query(default="total_mv"),
-           page: int = Query(default=1, ge=1)) -> Dict[str, Any]:
-    """T1⋈T3 全市场浏览（分页 50/页）。
+           page: int = Query(default=1, ge=1),
+           page_size: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """T1⋈T3 全市场浏览（v6.0.6：默认分页 20/页，page_size clamp [10,50]）。
 
     :param industry: industry_csric2 精确过滤（如 J66）。
     :param soe: all | soe | other（soe_flag='央国企' / 其余）。
     :param sort: total_mv | ttm_yield_pct（降序；NULL 排最后）。
+    :param page_size: 可选每页条数——**声明为 str**（若声明 int，FastAPI 会把
+        ``page_size=abc`` 请求级打回 422，brief 的"非法值回退 20"执行不到）；
+        缺省 20、clamp [10,50]、非法回退 20（_clamp_page_size）。响应
+        ``page_size`` 字段返回 **int 实际生效值**（brief：响应字段不变）。
     """
+    # ⚠️ 直接函数调用（单测）时缺省参数值是 FastAPI Query() 返回的 FieldInfo
+    # 对象而非 None/默认值——统一归一化，HTTP 路径（恒为实际值）行为不变。
+    if not isinstance(industry, str):
+        industry = None
+    if not isinstance(soe, str):
+        soe = None
+    if not isinstance(sort, str):
+        sort = "total_mv"
+    if not isinstance(page, int) or isinstance(page, bool):
+        page = 1
     # D-4：每请求短连接，with 保证异常路径也 close（查询语义不变）
     with _con() as con:
-        page_size = 50
+        ps = _clamp_page_size(page_size)   # 实际生效每页条数（int；page_size 参数保持 str 原值）
         where: List[str] = []
         params: List[Any] = []
         if industry:
@@ -409,7 +525,7 @@ def market(industry: Optional[str] = Query(default=None),
             f"ON v.ts_code=m.ts_code AND v.date=(SELECT MAX(date) FROM valuation_daily)"
             + where_sql, params).fetchone()[0]
 
-        offset = (page - 1) * page_size
+        offset = (page - 1) * ps
         rows = _rows_dicts(
             con,
             "SELECT m.ts_code,m.name,m.industry_csric2,m.industry_name,m.board,m.is_st,"
@@ -417,10 +533,10 @@ def market(industry: Optional[str] = Query(default=None),
             "FROM stock_master m LEFT JOIN valuation_daily v "
             "ON v.ts_code=m.ts_code AND v.date=(SELECT MAX(date) FROM valuation_daily)"
             + where_sql +
-            f" ORDER BY {sort_col} DESC NULLS LAST LIMIT {page_size} OFFSET {offset}",
+            f" ORDER BY {sort_col} DESC NULLS LAST LIMIT {ps} OFFSET {offset}",
             params)
-        return {"rows": rows, "total": total, "page": page, "page_size": page_size,
-                "pages": (total + page_size - 1) // page_size if total else 0}
+        return {"rows": rows, "total": total, "page": page, "page_size": ps,
+                "pages": (total + ps - 1) // ps if total else 0}
 
 
 # ---------------------------------------------------------------------------

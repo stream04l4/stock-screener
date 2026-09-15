@@ -1242,13 +1242,20 @@ async function selectLakeStock(ts_code) {
   const body = $("#lake-stock-body");
   $("#lake-stock-title").textContent = "";
   body.innerHTML = lakeSkeleton(5);   // 加载态：骨架屏
+  // v6.0.6：日K线区同步进加载态（切股后重取；区间选择保持当前值）
+  lakeKlineTs = ts_code;
+  const kwrap = $("#lake-kline-chart");
+  if (kwrap) kwrap.innerHTML = '<div class="lake-kline-empty">加载中…</div>';
   try {
     const d = await api("/api/lake/stock/" + ts_code);
     renderLakeStock(d);
+    loadLakeKline(ts_code, lakeKlineRange);   // v6.0.6：全景卡片顶部日K线蜡烛图
   } catch (e) {
     if (e.status === 404) body.innerHTML = '<p class="placeholder">数据湖无此股（T1 未灌入）</p>';
     else if (lakeIsBackfillErr(e)) body.innerHTML = '<p class="placeholder">⏳ 数据灌入中，个股查询暂不可用——稍后刷新</p>';
     else { lakeSetError(e.message); body.innerHTML = '<p class="placeholder">加载失败</p>'; }
+    // v6.0.6：以上分支整体替换卡片体（K线区随之消失，不残留"加载中…"）；
+    // /stock 成功而 /kline 失败的降级在 loadLakeKline 内处理（空态/409 占位）。
   }
 }
 
@@ -1257,6 +1264,10 @@ function renderLakeStock(d) {
   $("#lake-stock-title").textContent = ` ${d.ts_code} · ${b.name || ""}`;
   const body = $("#lake-stock-body");
   let h = "";
+  // v6.0.6：卡片顶部 = 日K线蜡烛图（区间切换 + SVG 手绘；数据由 loadLakeKline 异步填充）
+  h += '<div class="lake-section-title">日K线（T2 · 原始价）</div>';
+  h += '<div class="lake-kline-bar" id="lake-kline-bar"></div>';
+  h += '<div class="lake-kline-wrap" id="lake-kline-chart"><div class="lake-kline-empty">加载中…</div></div>';
   // 基础卡（名称/行业/板块/is_st/soe_flag+soe_basis）
   h += '<div class="lake-base-grid">';
   h += lakeKv("名称", b.name || "—");
@@ -1320,10 +1331,231 @@ function renderLakeStock(d) {
     h += "</tbody></table></div>";
   }
   body.innerHTML = h;
+  // v6.0.6：填充区间切换按钮组（DOM 就绪后；数据请求由 selectLakeStock 发起）
+  lakeKlineRenderBar(lakeKlineRange);
 }
 
 function lakeKv(k, v) {
   return `<div class="lake-kv"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// v6.0.6：个股全景·日K线蜡烛图（手绘 SVG，无图表库/CDN）
+//
+// 数据源：GET /api/lake/kline/{ts_code}?days=N（raw kline_daily，date 升序）。
+// 布局（viewBox 1000×480 坐标系，preserveAspectRatio 等比缩放 → 图宽自适应卡片）：
+//   - K线区上 ~72%（y: 26..350），成交量柱下 ~28%（y: 368..448），底部日期刻度；
+//   - x = 日期等距（第 i 根 → x = padL + slot*(i+0.5)）；y = 价格自适应
+//     （min/max 含 4% 上下留白，防最高/最低点贴边）。
+// A股配色：红涨绿跌——当日 close≥open → --lake-up（红），否则 --lake-down（绿）
+//   （.lk-up/.lk-down 走 style.css CSS 变量，与主题体系协调）。
+// hover：十字线 + tooltip（日期/开高低收/成交量）跟随**最近 K线点**（按 x 吸附）。
+// 刻度抽稀：价格 4~6 档、日期 4~6 档（步长取 ceil(n/target)，不挤叠）。
+// ---------------------------------------------------------------------------
+const LAKE_KLINE_RANGES = [
+  { key: "60", label: "60" },
+  { key: "120", label: "120" },
+  { key: "250", label: "250" },
+  { key: "all", label: "全部" },
+];
+let lakeKlineTs = null;      // 当前图所属 ts_code（切股时作废旧请求）
+let lakeKlineRange = "250";  // 默认 250（brief）
+
+// 409 灌数中占位：与页面既有降级文案一致（"⏳ 数据灌入中，…暂不可用——稍后刷新"）
+function lakeKlineStateHtml() {
+  return '<p class="lake-kline-empty">⏳ 数据灌入中，K线暂不可用——稍后刷新</p>';
+}
+
+// 空态/错误态占位（brief 逐字文案："该股暂无K线数据"；不白屏）
+function lakeKlinePlaceholder(msg) {
+  return `<div class="lake-kline-empty">${esc(msg)}</div>`;
+}
+
+// 刻度抽稀步长：ceil(n/target)，保证档数 ≤target（4~6 档区间内）、≥1（不挤叠）
+function lakeKlineTickStep(n, target = 5) {
+  return Math.max(1, Math.ceil(n / target));
+}
+
+// 成交量格式化（tooltip 用）：≥1亿 → x.xx亿、≥1万 → x.x万、其余整数
+function lakeKlineFmtVol(v) {
+  if (v === null || v === undefined || isNaN(Number(v))) return "—";
+  const n = Number(v);
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
+  return String(Math.round(n));
+}
+
+function lakeKlineRenderChart(wrap, data, ts_code) {
+  // 每次重绘先清空（区间切换/切股都会重进本函数，防残留）
+  wrap.innerHTML = "";
+  const rows = (data && data.rows) || [];
+  if (!rows.length) {
+    wrap.innerHTML = lakeKlinePlaceholder("该股暂无K线数据");
+    return;
+  }
+  // ---- viewBox 坐标系常量（1000×480；K线区上72% / 量区下28%）----
+  const W = 1000, H = 480, padL = 64, padR = 14;
+  const pTop = 26, pBot = 350;      // K线价格区（高 324 ≈ 72%）
+  const vTop = 368, vBot = 448;     // 成交量区（高 80 ≈ 28%）
+  const plotW = W - padL - padR;
+  const n = rows.length;
+  const slot = plotW / n;           // x=日期等距
+  const xi = (i) => padL + slot * (i + 0.5);
+
+  // ---- y 比例尺：价格自适应（min/max 含 4% 留白）；成交量 0..max ----
+  let pMin = Infinity, pMax = -Infinity, vMax = 0;
+  for (const r of rows) {
+    const lo = Math.min(Number(r.low), Number(r.open), Number(r.close));
+    const hi = Math.max(Number(r.high), Number(r.open), Number(r.close));
+    if (lo < pMin) pMin = lo;
+    if (hi > pMax) pMax = hi;
+    if (Number(r.volume) > vMax) vMax = Number(r.volume);
+  }
+  if (!isFinite(pMin) || !isFinite(pMax)) {
+    wrap.innerHTML = lakeKlinePlaceholder("该股暂无K线数据");
+    return;
+  }
+  const span = (pMax - pMin) || Math.abs(pMax) || 1;
+  pMin -= span * 0.04; pMax += span * 0.04;   // 上下留白（防最高/最低贴边）
+  const py = (p) => pBot - ((p - pMin) / (pMax - pMin)) * (pBot - pTop);
+  const vy = (v) => vBot - (vMax ? (Number(v) / vMax) * (vBot - vTop - 4) : 0);
+
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  svg.setAttribute("class", "lake-kline-svg");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${ts_code} 日K线蜡烛图（${n} 根）`);
+  const add = (tag, attrs, parent) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    (parent || svg).appendChild(e);
+    return e;
+  };
+
+  // ---- 价格刻度（4~6 档）+ 水平网格线 ----
+  {
+    const total = Math.max(1, Math.round((pMax - pMin) / span * 5));   // ≈5 档目标
+    for (let k = 0; k <= total; k++) {
+      const t = pMin + ((pMax - pMin) * k) / total;
+      const y = py(t);
+      add("line", { class: "lk-grid", x1: padL, y1: y, x2: W - padR, y2: y });
+      const tx = add("text", { class: "lk-tick", x: padL - 8, y: y + 4, "text-anchor": "end" });
+      tx.textContent = t.toFixed(2);
+    }
+  }
+
+  // ---- 日期刻度（4~6 档，自适应抽稀）----
+  const dStep = lakeKlineTickStep(n, 5);
+  for (let i = 0; i < n; i += dStep) {
+    const x = xi(i);
+    add("line", { class: "lk-axis", x1: x, y1: vBot, x2: x, y2: vBot + 5 });
+    const tx = add("text", { class: "lk-tick", x, y: vBot + 20, "text-anchor": "middle" });
+    tx.textContent = String(rows[i].date).slice(5);   // MM-DD（完整日期见 tooltip）
+  }
+
+  // ---- 蜡烛 + 成交量柱（A股配色：红涨绿跌，close≥open → lk-up 否则 lk-down）----
+  const bodyW = Math.max(1.5, Math.min(slot * 0.62, 14));   // 根数多/窄屏时自动收窄
+  for (let i = 0; i < n; i++) {
+    const r = rows[i], x = xi(i);
+    const up = Number(r.close) >= Number(r.open);           // A股：红涨绿跌
+    const cls = up ? "lk-up" : "lk-down";
+    add("line", { class: cls, x1: x, y1: py(r.high), x2: x, y2: py(r.low),
+                  "stroke-width": Math.max(1, Math.min(slot * 0.12, 2)) });   // 影线
+    const yO = py(r.open), yC = py(r.close);
+    add("rect", { class: cls, x: x - bodyW / 2, y: Math.min(yO, yC),
+                  width: bodyW, height: Math.max(1, Math.abs(yC - yO)) });    // 实体
+    const vv = Number(r.volume) || 0;
+    add("rect", { class: cls, x: x - bodyW / 2, y: vy(vv), width: bodyW,
+                  height: Math.max(1, vBot - vy(vv)), opacity: "0.75" });     // 量柱（同色弱化）
+  }
+
+  // ---- hover 层：十字线 + 高亮框 + 透明捕获层（事件挂捕获层，不挡渲染）----
+  const crossV = add("line", { class: "lk-cross", x1: 0, y1: pTop, x2: 0, y2: vBot, visibility: "hidden" });
+  const crossH = add("line", { class: "lk-cross", x1: padL, y1: 0, x2: W - padR, y2: 0, visibility: "hidden" });
+  const hoverBox = add("rect", { class: "lk-hoverdot", x: 0, y: 0, width: 0, height: 0, rx: 2, visibility: "hidden" });
+  const tip = document.createElement("div");
+  tip.className = "lake-kline-tip";
+
+  let lastClientY = 0;   // 闭包存最近一次事件坐标（tooltip 垂直跟随）
+  const capture = add("rect", { x: padL, y: pTop, width: plotW, height: vBot - pTop + 40,
+                                fill: "transparent" });
+  const showAt = (clientX) => {
+    // 屏幕坐标 → viewBox 坐标（getBoundingClientRect 反推，随缩放自适应）
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
+    const vx = ((clientX - rect.left) / rect.width) * W;
+    let i = Math.round((vx - padL) / slot - 0.5);
+    i = Math.max(0, Math.min(n - 1, i));            // 吸附最近 K线点
+    const r = rows[i], x = xi(i);
+    crossV.setAttribute("x1", x); crossV.setAttribute("x2", x);
+    crossH.setAttribute("y1", py(r.close)); crossH.setAttribute("y2", py(r.close));
+    hoverBox.setAttribute("x", x - bodyW / 2 - 3);
+    hoverBox.setAttribute("y", py(r.high) - 3);
+    hoverBox.setAttribute("width", bodyW + 6);
+    hoverBox.setAttribute("height", Math.max(py(r.low), vy(Number(r.volume) || 0)) - py(r.high) + 6);
+    crossV.setAttribute("visibility", "visible");
+    crossH.setAttribute("visibility", "visible");
+    hoverBox.setAttribute("visibility", "visible");
+    tip.innerHTML =
+      `<div class="tt-date">${esc(r.date)}</div>` +
+      `<div class="tt-row"><span class="tt-k">开</span><span class="tt-v">${Number(r.open).toFixed(2)}</span></div>` +
+      `<div class="tt-row"><span class="tt-k">高</span><span class="tt-v">${Number(r.high).toFixed(2)}</span></div>` +
+      `<div class="tt-row"><span class="tt-k">低</span><span class="tt-v">${Number(r.low).toFixed(2)}</span></div>` +
+      `<div class="tt-row"><span class="tt-k">收</span><span class="tt-v" style="color:${Number(r.close) >= Number(r.open) ? "#fca5a5" : "#86efac"}">${Number(r.close).toFixed(2)}</span></div>` +
+      `<div class="tt-row"><span class="tt-k">量</span><span class="tt-v">${lakeKlineFmtVol(r.volume)}</span></div>`;
+    tip.style.display = "block";
+    // tooltip 跟随鼠标（容器内坐标），右缘溢出时翻到左侧、上下夹在容器内
+    const wrapRect = wrap.getBoundingClientRect();
+    let left = clientX - wrapRect.left + 14;
+    if (left + tip.offsetWidth > wrapRect.width - 4) left = clientX - wrapRect.left - tip.offsetWidth - 14;
+    const top = Math.max(4, Math.min(lastClientY - wrapRect.top, wrapRect.height - tip.offsetHeight - 4));
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  };
+  capture.addEventListener("mousemove", (e) => { lastClientY = e.clientY; showAt(e.clientX); });
+  capture.addEventListener("mouseleave", () => {
+    tip.style.display = "none";
+    crossV.setAttribute("visibility", "hidden");
+    crossH.setAttribute("visibility", "hidden");
+    hoverBox.setAttribute("visibility", "hidden");
+  });
+
+  wrap.append(svg, tip);
+}
+
+async function loadLakeKline(ts_code, range) {
+  const wrap = $("#lake-kline-chart");
+  if (!wrap || ts_code !== lakeKlineTs) return;   // 已切股 → 丢弃过期请求
+  wrap.innerHTML = '<div class="lake-kline-empty">加载中…</div>';
+  try {
+    const d = await api(`/api/lake/kline/${ts_code}?days=${encodeURIComponent(range)}`);
+    if (ts_code !== lakeKlineTs) return;          // 响应回来时已切股 → 丢弃
+    lakeKlineRenderChart(wrap, d, ts_code);
+  } catch (e) {
+    if (ts_code !== lakeKlineTs) return;
+    if (lakeIsBackfillErr(e)) wrap.innerHTML = lakeKlineStateHtml();   // 409 灌数中：与页面既有降级一致
+    else if (e.status === 409) wrap.innerHTML = lakeKlinePlaceholder("数据湖未初始化，K线暂不可用");
+    else { wrap.innerHTML = lakeKlinePlaceholder("K线加载失败——稍后刷新"); }
+  }
+}
+
+// 区间切换按钮组（默认 250；"全部"= days=all）：切换即重取数据。
+function lakeKlineRenderBar(active) {
+  const bar = $("#lake-kline-bar");
+  if (!bar) return;
+  bar.innerHTML = "";
+  for (const r of LAKE_KLINE_RANGES) {
+    const b = el("button", { class: "lake-kline-range" + (r.key === active ? " cur" : "") }, r.label);
+    b.addEventListener("click", () => {
+      if (r.key === lakeKlineRange) return;
+      lakeKlineRange = r.key;
+      lakeKlineRenderBar(lakeKlineRange);
+      loadLakeKline(lakeKlineTs, lakeKlineRange);   // 切换即重取
+    });
+    bar.append(b);
+  }
 }
 
 async function loadLakeIndustries() {
