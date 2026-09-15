@@ -1135,6 +1135,40 @@ function lakeSetError(msg) {
   box.classList.remove("hidden");
 }
 
+// v6.0.4：数据端点 409 lake_backfill_in_progress（灌数进程持 DuckDB 独占写锁）→
+// 中性占位，**不**弹红色错误横幅——顶部琥珀色"⏳ 数据灌入中"块已说明原因。
+function lakeIsBackfillErr(e) {
+  return !!(e && e.status === 409 && e.body && e.body.error === "lake_backfill_in_progress");
+}
+
+// v6.0.4：灌数中状态块（琥珀色，与红色错误横幅 / "未初始化"空态三态互不串味）。
+// d = /status 响应；d.backfill_in_progress !== true → 隐藏块（防灌数结束后残留）。
+function lakeSetBackfill(d) {
+  const box = $("#lake-backfill");
+  if (!d || !d.backfill_in_progress) { box.classList.add("hidden"); return; }
+  $("#lake-backfill-meta").textContent =
+    "持锁 PID " + (d.lock_holder_pid ?? "未知") + " · 进度更新于 " + (d.updated_at || "—");
+  lakeRenderTasksTable($("#lake-backfill-tasks"), d.tasks || []);
+  box.classList.remove("hidden");
+}
+
+// tasks 摘要表渲染（区块C 正常态与 v6.0.4 灌数中块共用同一份，视觉一致）：
+// 表 / 层级 / 状态 / 进度(done/total+条) / 配额(今日 used/budget) / ETA(min)。
+function lakeRenderTasksTable(table, tasks) {
+  let th = "<thead><tr><th>表</th><th>层级</th><th>状态</th><th class='num'>进度</th><th class='num'>配额(今日)</th><th class='num'>ETA(min)</th></tr></thead><tbody>";
+  if (!tasks.length) th += '<tr><td colspan="6" class="placeholder">暂无后台补齐任务</td></tr>';
+  for (const t of tasks) {
+    const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+    th += `<tr><td>${esc(t.table)}</td><td>${esc(t.tier)}</td>` +
+      `<td><span class="badge ${esc(t.state || "idle")}">${esc(t.state || "idle")}</span></td>` +
+      `<td class="num lake-task-progress"><div class="progress-track" style="margin:0"><div class="progress-bar" style="width:${pct}%"></div></div>${t.done ?? 0}/${t.total ?? 0}</td>` +
+      `<td class="num">${t.quota_used_today ?? 0}/${t.quota_budget ?? "—"}</td>` +
+      `<td class="num">${t.eta_min ?? "—"}</td></tr>`;
+  }
+  th += "</tbody>";
+  table.innerHTML = th;
+}
+
 // 加载态：骨架屏（切股/搜索时）
 function lakeSkeleton(n = 4) {
   let h = '<div class="lake-loading-label">加载中…</div>';
@@ -1179,7 +1213,9 @@ async function initLakePage() {
       }
       resultsBox.classList.remove("hidden");
     } catch (e) {
-      lakeSetError(e.message);
+      // v6.0.4：灌数持锁（409 lake_backfill_in_progress）→ 中性处理，不弹红横幅
+      // （顶部琥珀色"⏳ 数据灌入中"块已说明原因）；其余错误保持红横幅。
+      if (!lakeIsBackfillErr(e)) lakeSetError(e.message);
       resultsBox.classList.add("hidden");
     }
   }
@@ -1211,6 +1247,7 @@ async function selectLakeStock(ts_code) {
     renderLakeStock(d);
   } catch (e) {
     if (e.status === 404) body.innerHTML = '<p class="placeholder">数据湖无此股（T1 未灌入）</p>';
+    else if (lakeIsBackfillErr(e)) body.innerHTML = '<p class="placeholder">⏳ 数据灌入中，个股查询暂不可用——稍后刷新</p>';
     else { lakeSetError(e.message); body.innerHTML = '<p class="placeholder">加载失败</p>'; }
   }
 }
@@ -1315,8 +1352,9 @@ async function loadLakeIndustries() {
     }
     if (list.some((it) => it.code === prev)) sel.value = prev;  // 保留已有选择（若仍存在）
   } catch (e) {
-    // 错误态：红横幅（与其他 lake 端点一致），下拉回退占位不阻塞浏览
-    lakeSetError(e.message);
+    // 错误态：红横幅（与其他 lake 端点一致），下拉回退占位不阻塞浏览；
+    // v6.0.4：灌数持锁 → 中性处理，不弹红横幅（琥珀色块已说明原因）
+    if (!lakeIsBackfillErr(e)) lakeSetError(e.message);
     sel.innerHTML = '<option value="">全部行业</option>';
   } finally {
     sel.disabled = false;
@@ -1336,8 +1374,14 @@ async function loadLakeMarket() {
     const d = await api("/api/lake/market?" + qs);
     renderLakeMarket(d);
   } catch (e) {
-    lakeSetError(e.message);
-    table.innerHTML = '<tr><td colspan="8" class="placeholder">加载失败</td></tr>';
+    // v6.0.4：灌数持锁 → 中性占位（不弹红横幅，顶部琥珀色块已说明原因）
+    if (lakeIsBackfillErr(e)) {
+      table.innerHTML = '<tr><td colspan="8" class="placeholder">⏳ 数据灌入中，全市场查询暂不可用——稍后刷新</td></tr>';
+      $("#lake-market-count").textContent = "";
+    } else {
+      lakeSetError(e.message);
+      table.innerHTML = '<tr><td colspan="8" class="placeholder">加载失败</td></tr>';
+    }
   }
 }
 
@@ -1394,7 +1438,15 @@ async function loadLakeStatus() {
     lakeInstalled = !!d.installed;
     if (!d.installed) { lakeSetError("duckdb 未安装（uv sync --extra lake）"); return; }
     lakeSetError("");   // 正常态：清错误横幅
-    covBox.textContent = `DuckDB ${d.duckdb_version} · 进度更新于 ${d.updated_at || "—"}`;
+    // v6.0.4 三态渲染（互不串味）：
+    //   ① backfill_in_progress=true → 琥珀色"⏳ 数据灌入中"块 + tasks 摘要；
+    //      coverage 来自 progress 文件降级，区块C 标注"灌数中·降级读取"。
+    //   ② initialized=false（真未初始化）→ 保持 v6.0.3 空态文案（"请先运行 backfill init"）。
+    //   ③ 正常 → coverage + tasks 表照旧。
+    lakeSetBackfill(d);
+    covBox.textContent = `DuckDB ${d.duckdb_version}` +
+      (d.backfill_in_progress ? " · ⏳ 灌数中（coverage 来自 progress 文件降级）" : "") +
+      ` · 进度更新于 ${d.updated_at || "—"}`;
     // coverage 行
     let ch = "";
     const cov = d.coverage || {};
@@ -1403,20 +1455,8 @@ async function loadLakeStatus() {
       ch += `<div>${esc(t)}：${c.codes ?? "—"} 只 · ${range} · ${c.rows ?? "—"} 行</div>`;
     }
     covBox.innerHTML = (covBox.textContent + "<br>" + (ch || '<span class="muted">（暂无覆盖数据）</span>'));
-    // tasks 表
-    let th = "<thead><tr><th>表</th><th>层级</th><th>状态</th><th class='num'>进度</th><th class='num'>配额(今日)</th><th class='num'>ETA(min)</th></tr></thead><tbody>";
-    const tasks = d.tasks || [];
-    if (!tasks.length) th += '<tr><td colspan="6" class="placeholder">暂无后台补齐任务</td></tr>';
-    for (const t of tasks) {
-      const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
-      th += `<tr><td>${esc(t.table)}</td><td>${esc(t.tier)}</td>` +
-        `<td><span class="badge ${esc(t.state || "idle")}">${esc(t.state || "idle")}</span></td>` +
-        `<td class="num lake-task-progress"><div class="progress-track" style="margin:0"><div class="progress-bar" style="width:${pct}%"></div></div>${t.done ?? 0}/${t.total ?? 0}</td>` +
-        `<td class="num">${t.quota_used_today ?? 0}/${t.quota_budget ?? "—"}</td>` +
-        `<td class="num">${t.eta_min ?? "—"}</td></tr>`;
-    }
-    th += "</tbody>";
-    table.innerHTML = th;
+    // tasks 表（灌数中态与正常态共用同一渲染；灌数中时顶部琥珀块另有摘要副本）
+    lakeRenderTasksTable(table, d.tasks || []);
   } catch (e) {
     // 错误态：5xx / duckdb 未装 → 红色横幅 + 降级占位（不白屏）
     lakeSetError(e.message);

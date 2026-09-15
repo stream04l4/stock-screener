@@ -38,6 +38,36 @@ def _is_invalid_db_error(exc: BaseException) -> bool:
     return any(m in str(exc) for m in _INVALID_DB_MARKERS)
 
 
+# v6.0.4：DuckDB 单文件独占写锁被**另一进程**持有（灌数/backfill 运行中）时，
+# duckdb.connect 抛 _duckdb.IOException，消息形如（实测，生产 p0 持锁期间抓取）：
+#   IO Error: Could not set lock on file "/…/lake.duckdb": Conflicting lock is held
+#   in /usr/bin/python3.10 (PID 1003318) by user ubuntu. See also …
+# 两个子串同时命中才判 locked（避免误伤其它 IO Error）。⚠️ 判定顺序：必须先于
+# _is_invalid_db_error——两者都是 IOException，但文案不重叠，且"锁被持有"意味着
+# 库文件本身合法（灌数进程正开着它），绝不能归一成 LakeInvalidFile。
+_LOCKED_DB_MARKERS = ("Could not set lock", "Conflicting lock")
+
+
+def _is_locked_db_error(exc: BaseException) -> bool:
+    """duckdb IO Error 消息匹配 → 单文件库被另一进程独占写锁持有（灌数中）。
+
+    复用 D-1 的"IO Error 文案匹配"模式（同一套 markers + str(exc) 判定），不重复
+    造轮子：D-1 归一"打不开的坏文件"，本函数归一"打不开的忙库"。
+    """
+    return all(m in str(exc) for m in _LOCKED_DB_MARKERS)
+
+
+def parse_lock_holder_pid(msg: Optional[str]) -> Optional[int]:
+    """从 duckdb 锁报错文案里尽力解析持锁进程 PID（``(PID <n>) by user …``）。
+
+    解析失败（文案格式变化 / 无数字 / msg 为 None）→ None（调用方降级，不猜、不抛）。
+    """
+    import re as _re
+
+    m = _re.search(r"\(PID\s+(\d+)\)", msg or "")
+    return int(m.group(1)) if m else None
+
+
 class LakeInvalidFile(LakeUnavailable):
     """库文件存在但**不是合法 DuckDB 库**（0 字节空文件 / 内容损坏，duckdb 打不开）。
 
@@ -54,6 +84,23 @@ class LakeInvalidFile(LakeUnavailable):
         self.db_path = db_path
 
 
+class LakeLocked(LakeUnavailable):
+    """库文件合法但被**另一进程**的独占写锁持有（v6.0.4：灌数/backfill 运行中）。
+
+    与 LakeInvalidFile 的关键区别：库本身是好的、正在被写入，**不是"未就绪"**——
+    Web /status 据此报 ``backfill_in_progress=true``（200），数据端点 409 +
+    ``lake_backfill_in_progress``（与 lake_not_initialized 区分开）。继承
+    LakeUnavailable 使既有 ``except LakeUnavailable`` 兜底路径仍友好降级。
+    """
+
+    def __init__(self, db_path: str, holder_pid: Optional[int] = None) -> None:
+        super().__init__(
+            f"数据湖被其他进程锁定（灌数进行中，持锁 PID={holder_pid if holder_pid is not None else '未知'}）："
+            f"{db_path}——稍后重试")
+        self.db_path = db_path
+        self.holder_pid = holder_pid
+
+
 def _check_invalid_db_file(db_path: str) -> None:
     """connect 前探测：文件存在且 **size==0** → LakeInvalidFile（不 connect）。
 
@@ -66,11 +113,19 @@ def _check_invalid_db_file(db_path: str) -> None:
 
 
 def _connect_or_raise_invalid(duckdb, db_path: str):
-    """duckdb.connect 的归一包装：IO Error "not a valid DuckDB database file" →
-    LakeInvalidFile（覆盖非 0 字节但内容损坏的文件）。其余异常原样上抛。"""
+    """duckdb.connect 的归一包装（v6.0.4 起同时覆盖"锁被持有"）：
+
+    - IO Error "Could not set lock … Conflicting lock is held (PID n)" →
+      :class:`LakeLocked`（**先判**——见 _LOCKED_DB_MARKERS 处注释；持锁 PID 尽力解析）。
+    - IO Error "not a valid DuckDB database file" → :class:`LakeInvalidFile`
+      （覆盖非 0 字节但内容损坏的文件）。
+    - 其余异常原样上抛。
+    """
     try:
         return duckdb.connect(db_path)
-    except Exception as exc:  # noqa: BLE001 - 仅归一"无效库文件"，其余透传
+    except Exception as exc:  # noqa: BLE001 - 仅归一两类已知 IO Error，其余透传
+        if _is_locked_db_error(exc):
+            raise LakeLocked(db_path, parse_lock_holder_pid(str(exc))) from exc
         if _is_invalid_db_error(exc):
             raise LakeInvalidFile(db_path) from exc
         raise
@@ -154,6 +209,8 @@ def connect_existing(db_path: Optional[str] = None):
     - 文件不存在/打不开 → duckdb 抛错，由调用方（web_api._con）转 503。
     - **D-1（v6.0.3 rework）**：0 字节/无效库文件 → :class:`LakeInvalidFile`
       （connect 前 size 探测 + connect IO Error 归一，双保险）。
+    - **v6.0.4**：库被另一进程独占写锁持有（灌数中）→ :class:`LakeLocked`
+      （connect IO Error 文案归一；持锁 PID 尽力解析进 holder_pid）。
     - 不触碰进程级单例 ``_conn``——与写路径完全隔离。
 
     :param db_path: 缺省 = default_db_path()；测试可传 tmp 库路径。
@@ -165,6 +222,44 @@ def connect_existing(db_path: Optional[str] = None):
     p = db_path or default_db_path()
     _check_invalid_db_file(p)
     return _connect_or_raise_invalid(duckdb, p)
+
+
+def probe_db_state(db_path: Optional[str] = None) -> str:
+    """三态探测（v6.0.4）：``"unavailable" | "locked" | "ok"``。
+
+    供 Web /status 区分"**锁被持有（灌数中）**"与"**真未初始化**"——两者在旧实现里
+    都被 ``_ensure_initialized`` 的 except 兜成 initialized=false + lake_not_initialized，
+    灌数期间（可能 1h+）页面持续误导显示"不可用"。判定顺序即优先级：
+
+    1. duckdb 未装 → ``"unavailable"``（不碰文件系统之外的任何东西）。
+    2. connect 抛 :class:`LakeLocked`（IO Error "Could not set lock … Conflicting
+       lock is held"）→ ``"locked"``。**先于** invalid 判定——锁被持有意味着库文件
+       合法且正被写入，绝不能报成坏文件。
+    3. connect 抛 :class:`LakeInvalidFile`（0 字节/损坏）或任何其它异常 →
+       ``"unavailable"``（含缺文件：duckdb.connect(不存在) 会 auto-create 空库，故
+       **先 os.path.exists 探测、绝不 connect**——与 web_api._con 的 B-1 约定一致）。
+    4. connect 成功 → close 后返回 ``"ok"``（schema 是否就绪由调用方再判，本函数
+       只回答"库文件能不能被本进程打开"）。
+
+    :param db_path: 缺省 = default_db_path()；测试可传 tmp 库路径。
+    """
+    if not duckdb_available():
+        return "unavailable"
+    import duckdb
+
+    p = db_path or default_db_path()
+    if not os.path.exists(p):
+        # 与 B-1 一致：不 connect（duckdb 会自动建空库文件，产生脏副作用）
+        return "unavailable"
+    try:
+        _check_invalid_db_file(p)  # size==0 → LakeInvalidFile → unavailable
+        con = _connect_or_raise_invalid(duckdb, p)
+    except LakeLocked:
+        return "locked"
+    except Exception:  # noqa: BLE001 - LakeInvalidFile / 其它 IO Error → unavailable
+        return "unavailable"
+    con.close()
+    return "ok"
 
 
 def reset_for_test() -> None:

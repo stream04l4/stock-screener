@@ -200,7 +200,13 @@ def test_driver_lake_unavailable_friendly(tmp_path, monkeypatch, capsys):
         raise LakeUnavailable("duckdb 未安装（uv sync --extra lake）")
 
     monkeypatch.setattr(mod, "_open_db", fake_open)
-    rc = mod.main(["init"])
+    # v6.0.4：显式 --db tmp 库。为什么：main() 对写命令（init/p0/history）整段持
+    # LakeLock(flock)（B-4），缺省 db → **生产** data/lake/lake.duckdb.write.lock——
+    # p0 灌数运行期间该 flock 被灌数进程持有，本用例会阻塞等锁直到超时（实测全量
+    # pytest 卡死在此）。断言目标（_open_db 抛 LakeUnavailable → rc=3 + 友好报错）
+    # 与库路径无关（fake_open 在任何路径都抛），故 tmp 库不改变测试语义，只把锁文件
+    # 移离生产目录（与其他 driver 用例 --db tmp 口径一致）。
+    rc = mod.main(["--db", str(tmp_path / "lake.duckdb"), "init"])
     assert rc == mod.EXIT_LAKE_UNAVAILABLE
     err = capsys.readouterr().err
     assert "数据湖不可用" in err and "uv sync --extra lake" in err

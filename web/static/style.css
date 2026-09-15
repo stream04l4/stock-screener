@@ -249,6 +249,12 @@ tr.clickable { cursor: pointer; }
   background: var(--bad-soft); color: #991b1b; border: 1px solid #fecaca;
   padding: 10px 14px; border-radius: 9px; margin-bottom: 14px; font-weight: 600;
 }
+/* v6.0.4 灌数中态：琥珀色（与红色 .lake-error、"未初始化"空态三态视觉区分，互不串味） */
+.lake-backfill {
+  background: #fffbeb; color: #92400e; border: 1px solid #fcd34d;
+  padding: 12px 14px; border-radius: 9px; margin-bottom: 14px;
+}
+.lake-backfill-head { font-size: 14.5px; font-weight: 700; }
 .lake-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; position: relative; }
 .lake-toolbar input[type="search"] { flex: 1; min-width: 220px; max-width: 420px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
 .lake-search-results {

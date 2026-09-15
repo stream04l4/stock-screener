@@ -174,6 +174,10 @@ global.esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 global.api = (p) => apiImpl(p);
 global.lakeSetError = (m) => errors.push(m);
+// v6.0.4：loadLakeIndustries 的 catch 分支新增 lakeIsBackfillErr(e) 判定（灌数持锁
+// → 不弹红横幅）——DOM stub 必须提供该全局；此处 stub 返回 false（等价于"非灌数错误"，
+// 态3 的 503 走原红横幅路径，断言不变）。
+global.lakeIsBackfillErr = (e) => !!(e && e.status === 409 && e.body && e.body.error === "lake_backfill_in_progress");
 
 (async () => {
   // ---- 态1：正常（2 个行业）----

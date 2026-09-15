@@ -26,6 +26,18 @@ SELECT 1），但数据端点查表报 "table not found" → 500，状态自相�
 - **/status** 例外：不抛 409，而是如实返回 200 + ``initialized=false`` + coverage
   全零（brief B-1 方案 b）——状态端点是"健康检查"，应反映真实状态而非报错。
   这样"库未就绪"在 status 可见、在数据端点一致降级，不再自相矛盾。
+
+**v6.0.4：区分"灌数持锁"与"真未初始化"**（TL 定位真 bug：p0 灌数进程持有 DuckDB
+单文件独占写锁期间，web_api 探测连不上库 → 误报 initialized=false +
+lake_not_initialized，页面持续误导显示"不可用"）：
+- conn 层 ``connect_existing`` 把 duckdb IO Error "Could not set lock … Conflicting
+  lock is held (PID n)" 归一为 :class:`lake.conn.LakeLocked`（复用 D-1 文案匹配模式）。
+- **数据端点**：locked → **409** + ``{"error":"lake_backfill_in_progress",
+  "hint":"灌数进行中，稍后重试"}``（顶层契约体，与 lake_not_initialized 区分开）。
+- **/status**：locked → **200** + ``initialized=true`` + ``backfill_in_progress=true``
+  + ``lock_holder_pid``（尽力解析，失败 None）+ coverage/tasks 降级读 progress 文件
+  （backfill_progress.json 不受 DuckDB 锁影响，正好是灌数进度）；真未初始化保持
+  v6.0.3 行为逐字节不变。
 """
 from __future__ import annotations
 
@@ -96,14 +108,55 @@ def _lake_not_initialized_handler(_request, exc: LakeNotInitialized):
                  "db_path": exc.db_path})
 
 
+# ---------------------------------------------------------------------------
+# v6.0.4：灌数持锁（DuckDB 单文件独占写锁被 backfill 进程持有）的一致降级
+#
+# 与 B-1 的 LakeNotInitialized 同构：自定义异常 + app 级 handler 渲染**顶层**
+# error/hint 契约体。区别只在语义——库是好的、正在被写入（initialized=true），
+# 不是"未就绪"；前端据此显示"⏳ 数据灌入中"而非"未初始化"。
+# ---------------------------------------------------------------------------
+BACKFILL_HINT = "灌数进行中，稍后重试"
+
+
+class LakeBackfillInProgress(HTTPException):
+    """库被另一进程独占写锁持有（v6.0.4：backfill/灌数运行中）。
+
+    数据端点命中 → 409 + {"error":"lake_backfill_in_progress","hint":"灌数进行中，
+    稍后重试"}（顶层契约体，由下方 handler 渲染）；/status 命中 → 不抛，改报
+    backfill_in_progress=true + lock_holder_pid（见 status）。
+
+    holder_pid：conn.parse_lock_holder_pid 尽力解析自 duckdb 锁报错文案
+    （"(PID <n>) by user …"），解析失败为 None——前端显示"未知"，不猜。
+    """
+
+    def __init__(self, db_path: Optional[str] = None,
+                 holder_pid: Optional[int] = None) -> None:
+        super().__init__(status_code=409, detail="数据湖灌数进行中")
+        self.db_path = db_path or ""
+        self.holder_pid = holder_pid
+
+
+def _lake_backfill_in_progress_handler(_request, exc: LakeBackfillInProgress):
+    """v6.0.4 契约体渲染：顶层 error/hint（brief v6.0.4 指定形状）。"""
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=409,
+        content={"error": "lake_backfill_in_progress", "hint": BACKFILL_HINT,
+                 "db_path": exc.db_path, "lock_holder_pid": exc.holder_pid})
+
+
 def install(app) -> None:
-    """把 B-1 异常 handler 注册到 FastAPI app（由 web/app.py 条件挂载块调用）。
+    """把 lake 异常 handler 注册到 FastAPI app（由 web/app.py 条件挂载块调用）。
 
     为什么放这里而不是 web_api 模块顶层：``APIRouter.exception_handler`` 在本版 FastAPI
     不存在，handler 只能挂在 app 上；而 app 只存在于 web/app.py。此函数是 lake → web 的
     唯一额外接线点（与 router 挂载同在 duckdb 可导入的条件块内），不破坏零 import 边界。
+    v6.0.4：同时注册 LakeBackfillInProgress handler（灌数持锁 → 409 新 error 值）。
     """
     app.add_exception_handler(LakeNotInitialized, _lake_not_initialized_handler)
+    app.add_exception_handler(
+        LakeBackfillInProgress, _lake_backfill_in_progress_handler)
 
 
 def _ensure_initialized(con) -> None:
@@ -134,6 +187,10 @@ def _con():
     - **D-1：0 字节/无效库文件**（conn.LakeInvalidFile，duckdb 打不开）→ 同样
       LakeNotInitialized(409)——"连 duckdb 都打不开 = schema 从未建立 = 未就绪"，
       不是服务不可用(503)。修复前此场景漏网：IO Error 落进下方通用 except → 503。
+    - **v6.0.4：库被灌数进程独占写锁持有**（conn.LakeLocked）→ 抛
+      LakeBackfillInProgress(409) + lake_backfill_in_progress——库是好的、正在被写入，
+      与"未初始化"语义不同，前端显示"⏳ 数据灌入中"。必须放在通用 except 之前
+      （同 D-1：否则会被转成 503 + detail，绕过 409 契约体）。
     - 就绪 → 返回连接（happy path 行为与 D-4 修复后完全一致：每请求独立短连接）。
     """
     from . import conn as _conn
@@ -146,6 +203,10 @@ def _con():
         raise LakeNotInitialized(db_path)
     try:
         con = _conn.connect_existing(db_path)
+    except _conn.LakeLocked as exc:  # noqa: BLE001
+        # v6.0.4：灌数持锁 → 409 lake_backfill_in_progress（先于 LakeInvalidFile/通用
+        # except——锁被持有 ≠ 坏文件，也 ≠ 服务不可用）
+        raise LakeBackfillInProgress(exc.db_path, exc.holder_pid) from exc
     except _conn.LakeInvalidFile as exc:  # noqa: BLE001
         # D-1：0 字节/无效库文件 = 未就绪（409），与缺文件/未 init_schema 一致。
         # 必须放在通用 except 之前——否则会被转成 503 + detail，绕过 409 契约体。
@@ -161,35 +222,47 @@ def _con():
 
 
 def _status_probe():
-    """/status 专用探测（B-1）：返回**就绪连接或 None**。
+    """/status 专用探测（B-1 + v6.0.4）：返回 ``(state, con, holder_pid)``。
 
-    与 _con 的区别：**不抛** LakeNotInitialized——状态端点是健康检查，应如实报告
-    "未初始化"（initialized=false + coverage 全零），而不是像数据端点那样报 409。
-    - duckdb 未装 / 缺文件 / 空文件 / 无 core 表 → None（调用方据此 initialized=false）。
-    - 就绪 → 返回短连接，**调用方负责 close**。
+    - ``("unavailable", None, None)`` → 库未就绪（duckdb 未装 / 缺文件 / 空文件 /
+      无 core 表）→ 调用方报 initialized=false（v6.0.3 行为不变）。
+    - ``("locked", None, pid_or_None)`` → **v6.0.4：库被灌数进程独占写锁持有**
+      （conn.LakeLocked）→ 调用方报 initialized=true + backfill_in_progress=true +
+      lock_holder_pid，coverage/tasks 降级读 progress 文件（不受 DuckDB 锁影响）。
+    - ``("ready", con, None)`` → 就绪；``con`` 为短连接（**调用方负责 close**）。
+
+    ⚠️ 为什么用显式 state 字符串而不是 (con, holder_pid) 二元组：locked 且 PID 解析
+    失败时 holder_pid=None，与"未就绪"的 (None, None) 无法区分——而 brief 要求
+    "解析失败降级 None"后仍必须报 backfill_in_progress=true（不能退回误报未初始化）。
+
+    与 _con 的区别：**不抛** LakeNotInitialized / LakeBackfillInProgress——状态端点是
+    健康检查，应如实报告真实状态，而不是像数据端点那样报 409。
     """
     from . import conn as _conn
 
     if not _conn.duckdb_available():
-        return None
+        return "unavailable", None, None
     db_path = _conn.default_db_path()
     if not os.path.exists(db_path):
-        return None
+        return "unavailable", None, None
     try:
         con = _conn.connect_existing(db_path)
-    except Exception:  # noqa: BLE001 - 打不开 → 视为未就绪（status 不抛 503）
-        return None
+    except _conn.LakeLocked as exc:  # noqa: BLE001
+        # v6.0.4：灌数持锁 → ("locked", None, holder_pid)；holder_pid 尽力解析，失败 None
+        return "locked", None, exc.holder_pid
+    except Exception:  # noqa: BLE001 - 打不开（含 D-1 无效文件）→ 视为未就绪（status 不抛 503）
+        return "unavailable", None, None
     try:
         n = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_schema='main' AND table_name=?", [_CORE_TABLE]).fetchone()[0]
     except Exception:  # noqa: BLE001
         con.close()
-        return None
+        return "unavailable", None, None
     if not n:
         con.close()
-        return None
-    return con
+        return "unavailable", None, None
+    return "ready", con, None
 
 
 def _rows_dicts(con, sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
@@ -344,17 +417,37 @@ def market(industry: Optional[str] = Query(default=None),
 # ---------------------------------------------------------------------------
 @router.get("/status")
 def status() -> Dict[str, Any]:
-    """补齐进度（§4 coverage + tasks）+ duckdb 安装状态 + **B-1 initialized**。
+    """补齐进度（§4 coverage + tasks）+ duckdb 安装状态 + **B-1 initialized**
+    + **v6.0.4 backfill_in_progress**。
 
     B-1：库未就绪（缺文件/空文件/未 init_schema）时**不抛 409**，如实返回
     ``initialized=false`` + coverage 全零 + tasks 空——状态端点是健康检查，
     应反映真实状态。数据端点则一致降级为 409 lake_not_initialized（见 _con）。
+
+    v6.0.4：库被灌数进程独占写锁持有时**不再误报未初始化**——返回
+    ``initialized=true`` + ``backfill_in_progress=true`` + ``lock_holder_pid``
+    （尽力解析，失败 None），coverage/tasks 降级读 progress 文件
+    （backfill_progress.json 是纯 JSON、不受 DuckDB 锁影响，正好是灌数进度）。
     """
     import duckdb
 
     from .backfill import load_progress
 
-    con = _status_probe()
+    state, con, holder_pid = _status_probe()
+    if state == "locked":
+        # v6.0.4：灌数持锁——库是好的（正在被写入），initialized=true；
+        # coverage/tasks 来自 progress 文件降级（DuckDB 连不上，但 JSON 可读）。
+        prog = load_progress()
+        return {
+            "installed": True,
+            "duckdb_version": getattr(duckdb, "__version__", "?"),
+            "initialized": True,
+            "backfill_in_progress": True,
+            "lock_holder_pid": holder_pid,
+            "coverage": prog.get("coverage", {}),
+            "tasks": prog.get("tasks", []),
+            "updated_at": prog.get("updated_at"),
+        }
     if con is None:
         # 库未就绪：coverage 全零、tasks 空（progress 文件即便存在也不代表库可用）
         return {

@@ -83,6 +83,15 @@
     <!-- 错误态：API 5xx / duckdb 未装 → 顶部红色横幅 + 三区块降级占位（不白屏、不阻塞其他 tab） -->
     <div id="lake-error" class="lake-error hidden"></div>
 
+    <!-- v6.0.4 灌数中态：/status.backfill_in_progress=true（DuckDB 独占写锁被 backfill
+         进程持有）→ 琥珀色状态块 + tasks 摘要（来自 backfill_progress.json，不受锁影响）。
+         与"未初始化"空态、红色错误横幅互不串味（三态视觉区分，见 app.js loadLakeStatus）。 -->
+    <div id="lake-backfill" class="lake-backfill hidden">
+      <div class="lake-backfill-head">⏳ 数据灌入中 <span id="lake-backfill-meta" class="muted small"></span></div>
+      <p class="muted small" style="margin:2px 0 8px;">DuckDB 库正被灌数进程独占写入，个股/全市场查询暂不可用；下方进度来自 backfill_progress.json（不受锁影响），完成后可刷新。</p>
+      <div class="tbl-wrap"><table class="data" id="lake-backfill-tasks"></table></div>
+    </div>
+
     <div class="lake-toolbar card">
       <input type="search" id="lake-search-input" placeholder="搜索代码 / 名称（如 601398 或 工行）" autocomplete="off">
       <button id="btn-lake-search" class="primary-btn">🔍 搜索</button>
