@@ -9,6 +9,10 @@
 - **幂等断点续传**：进度文件 ``data/lake/backfill_progress.json``，键
   ``(table, ts_code, period_or_date)``→done；落盘即标记；中断重跑先读 progress
   跳过 done 键 → **不重复耗配额**。写入 INSERT OR REPLACE（PK 表）幂等。
+- **v6.0.8 tasks 视图回填**：run() 开始处按 (table, tier) 分组统计 total、done
+  （从 ``self._done`` 集合计数——断点续传重启后视图立即反映真实进度）；
+  ``_update_task_view()``/收尾同步写 entry 的 total/done + eta_min（最近 N 个成功
+  任务平均耗时推算剩余分钟，无数据 None），并逐任务落盘（Web 3s 轮询可见）。
 
 ⚠️ 本模块**只做调度骨架 + 进度管理**，具体取数委托 ingest 层（复用客户端）。
 后台慢慢补——不在筛选热路径上。
@@ -17,10 +21,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
+import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 log = logging.getLogger("lake.backfill")
 
@@ -55,7 +62,8 @@ def save_progress(progress: Dict[str, Any], path: Optional[str] = None) -> None:
 
     p = path or _progress_path()
     progress["updated_at"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    os.makedirs(os.path.dirname(p), exist_ok=True)
+    # v6.0.8：dirname 为空（裸文件名路径）时 makedirs('') 会 ENOENT → 回退 "."
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".lake_prog_", suffix=".tmp", dir=os.path.dirname(p))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -127,6 +135,13 @@ class BackfillRunner:
         for t in self.progress.get("tasks", []):
             pass  # tasks 是聚合视图；done 明细见下
         self._load_done()
+        # v6.0.8：tasks 视图 total/done 回填 + ETA 所需状态。
+        # _view_groups：(table, tier) → {"total": int, "done_at_start": int}——
+        #   run() 开始处按本次队列分组统计；done 从 self._done 集合计数（断点续传
+        #   重启后视图立即反映真实进度，不依赖本次 run 增量）。
+        # _recent_durs：最近 N 个成功任务耗时（秒）环形缓冲 → eta_min 推算。
+        self._view_groups: Dict[Tuple[str, str], Dict[str, int]] = {}
+        self._recent_durs: Deque[float] = deque(maxlen=20)
 
     # ---------- done 键管理 ----------
     def _load_done(self) -> None:
@@ -183,10 +198,24 @@ class BackfillRunner:
 
         幂等保证：每个 task 先查 is_done → 跳过（**不耗配额**）；worker 成功后
         mark_done 落盘。中断重跑 → done 键已落盘 → 直接跳过，绝不重复调 BaoStock。
+
+        v6.0.8：run 开始处按 (table, tier) 分组统计 total/done_at_start（done 从
+        ``self._done`` 集合计数）→ tasks 视图立即回填真实进度（修复 Web 恒 0/0）。
         """
         ordered = sorted(tasks)  # Task order=True：priority 升序
         stats = {"total": len(ordered), "skipped_done": 0, "processed": 0,
                  "blocked_quota": False, "errors": []}
+        # v6.0.8：视图分组统计——done_at_start 只数**本次队列内**已 done 的任务：
+        # 断点续传重启后立即反映真实进度，同时避免同表旧期（如 valuation_daily
+        # 昨日 as_of）残留 done 键虚增计数。
+        self._view_groups = {}
+        for task in ordered:
+            g = self._view_groups.setdefault(
+                (task.table, f"P{task.priority}"),
+                {"total": 0, "done_at_start": 0, "done_in_run": 0})
+            g["total"] += 1
+            if self.is_done(task):
+                g["done_at_start"] += 1
         for task in ordered:
             if self.is_done(task):
                 stats["skipped_done"] += 1
@@ -199,21 +228,74 @@ class BackfillRunner:
                 self._update_task_view(task, "blocked_quota", used)
                 break
             try:
+                t0 = time.monotonic()
                 worker(task)
                 self.mark_done(task)
                 stats["processed"] += 1
+                # v6.0.8：耗时入环形缓冲（eta_min 推算）+ 分组 done 计数
+                self._recent_durs.append(time.monotonic() - t0)
+                g = self._view_groups.get((task.table, f"P{task.priority}"))
+                if g is not None:
+                    g["done_in_run"] += 1
                 self._update_task_view(task, "running", used)
             except Exception as exc:  # noqa: BLE001 - 单任务失败不中断整队列
                 log.error("backfill %s 失败: %s", task_key(task), exc)
                 stats["errors"].append(f"{task_key(task)}: {exc}")
                 self._update_task_view(task, "error", used)
+        # 收尾：v6.0.8 视图回填（含零处理 run——全跳过/预算到顶也要刷新 total/done）
+        self._refresh_task_view()
         # 收尾：写 coverage（各表行数/代码数/年份范围）
         self._refresh_coverage()
         save_progress(self.progress, self.progress_path)
         return stats
 
+    def _view_done_count(self, table: str, tier: str) -> int:
+        """v6.0.8：该 (table, tier) 已完成数 = run 开始已 done + 本次 run 新增。"""
+        g = self._view_groups.get((table, tier))
+        if g is None:
+            return 0
+        return g["done_at_start"] + g["done_in_run"]
+
+    def _eta_min(self) -> Optional[int]:
+        """v6.0.8：ETA（分钟）= 剩余任务数 × 最近 N 个成功任务平均耗时；
+        无成功样本 → None（前端显示 —）。取整向上，最小 1。"""
+        if not self._recent_durs:
+            return None
+        avg = sum(self._recent_durs) / len(self._recent_durs)
+        remaining = 0
+        for g in self._view_groups.values():
+            remaining += max(0, g["total"] - g["done_at_start"] - g["done_in_run"])
+        if remaining <= 0:
+            return None
+        eta = math.ceil(remaining * avg / 60.0)
+        return max(eta, 1)
+
+    def _refresh_task_view(self) -> None:
+        """v6.0.8：run 收尾统一回填 tasks 视图 total/done/eta_min。
+
+        逐组写入（含零处理 run）——修复"entry 创建后 total/done 从未赋值 →
+        Web 恒 0/0"。state/quota 仍由 :meth:`_update_task_view` 按事件更新，
+        本方法不覆盖 state。
+        """
+        for (table, tier), g in self._view_groups.items():
+            entry = next((t for t in self.progress["tasks"]
+                          if t.get("table") == table and t.get("tier") == tier), None)
+            if entry is None:
+                entry = {"table": table, "tier": tier, "total": 0, "done": 0,
+                         "quota_used_today": 0, "quota_budget": self.budget_per_day,
+                         "state": "idle", "eta_min": None, "last_error": ""}
+                self.progress["tasks"].append(entry)
+            entry["total"] = g["total"]
+            entry["done"] = self._view_done_count(table, tier)
+            entry["eta_min"] = self._eta_min()
+
     def _update_task_view(self, task: Task, state: str, quota_used: int) -> None:
-        """更新进度文件的 tasks 聚合视图（Web 读取格式，§4）。"""
+        """更新进度文件的 tasks 聚合视图（Web 读取格式，§4）。
+
+        v6.0.8：同步写入 ``total``/``done``（done = 该 table+tier 已完成任务数，
+        含本次 run 新增；run() 开始处已按分组统计）+ ``eta_min``（最近 N 个成功
+        任务平均耗时推算剩余分钟，无数据 None——前端显示 —）。
+        """
         tier = f"P{task.priority}"
         entry = next((t for t in self.progress["tasks"]
                       if t.get("table") == task.table and t.get("tier") == tier), None)
@@ -225,6 +307,16 @@ class BackfillRunner:
         entry["state"] = state
         entry["quota_used_today"] = quota_used
         entry["quota_budget"] = self.budget_per_day
+        # v6.0.8：total/done 回填（修复 Web 恒 0/0）+ eta_min
+        g = self._view_groups.get((task.table, tier))
+        if g is not None:
+            entry["total"] = g["total"]
+            entry["done"] = self._view_done_count(task.table, tier)
+        entry["eta_min"] = self._eta_min()
+        # v6.0.8：立即落盘——长跑灌数期间 Web 3s 轮询 /status，若只改内存、
+        # run 收尾才 save_progress，中途读到的仍是旧值（total/done 恒 0/0 的
+        # 第二层根因）。mark_done 每任务已落盘一次，此处同频不增额外开销。
+        save_progress(self.progress, self.progress_path)
 
     def _coverage_conn(self):
         """**B-2（v6.0.3）**：返回 coverage 统计所用的连接。
