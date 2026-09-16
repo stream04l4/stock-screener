@@ -8,6 +8,8 @@
 - **"停止"** = 优雅终止持锁进程（SIGTERM；BackfillRunner v6.0.9 注册 handler →
   任务间 break + state=stopped_by_signal + save_progress，rc=0）。**不升级 SIGKILL**
   （保守：DuckDB 语句原子性兜底，宁可让用户重试也不强杀可能正在写事务的进程）。
+  **v6.0.10：异步语义**——发信号即返回（waiting_task=true），不再同步阻塞等退出；
+  完成判定交给前端轮询 /status（backfill_in_progress=false=已停，stopping=true=收尾中）。
 - **运行状态检测复用 v6.0.4 三态机制**：:func:`lake.conn.probe_db_state` +
   :class:`LakeLocked.holder_pid`（内部 :func:`parse_lock_holder_pid`）+
   ``os.kill(pid, 0)`` 活性确认。flock 锁持锁进程死亡自动释放，无 stale lock 问题；
@@ -253,27 +255,40 @@ def start_sync(db_path: Optional[str] = None, sub: str = "history",
 # ---------------------------------------------------------------------------
 # 停止
 # ---------------------------------------------------------------------------
-def stop_sync(db_path: Optional[str] = None, timeout: int = 30) -> Dict[str, Any]:
+def stop_sync(db_path: Optional[str] = None) -> Dict[str, Any]:
     """优雅停止灌数（SIGTERM；BackfillRunner 任务间 break + 进度落盘，rc=0）。
 
-    :return: ``{"stopped": bool, "pid": int|None, "method": str|None, "reason": str?}``
-    - 未 running → ``stopped=False, reason="not_running"``（Web 层映射 409）。
+    **v6.0.10：异步语义**——发信号即返回，**不再同步阻塞等进程退出**。为什么：
+    SIGTERM 后 runner 要等"当前正在执行的任务跑完"才 break（BaoStock/腾讯重试
+    退避时单任务可能卡几分钟），旧实现轮询到 timeout=30s 才响应 → Web 请求挂死、
+    前端无反馈（Joel 实测"点了没反应"）。现改为：发信号 + 记录 pid 立即返回，
+    **完成判定交给前端轮询 /status**（backfill_in_progress=false = 已停；stopping
+    =true = 收尾中友好文案）。
+
+    :return: ``{"stopped": bool, "pid": int|None, "method": str|None,
+      "waiting_task": bool, "note": str?, "reason": str?}``
+    - 未 running → ``stopped=False, waiting_task=False, reason="not_running"``
+      （Web 层映射 409）。
     - holder pid 解析失败（None）→ **拒绝猜测**：``stopped=False,
-      reason="holder_pid_unknown"``（不 kill 未知进程）。
-    - 信号策略：先 ``os.killpg(pid, SIGTERM)``（本按钮 spawn 的进程 setsid 自成组，
-      pgid==pid，整组一次干净）；ProcessLookupError/PermissionError → 降级
-      ``os.kill(pid, SIGTERM)``——覆盖**非本按钮启动**的进程（如手动 shell 起的
-      history：python 不是进程组长，killpg ESRCH → 单发信号）。
-    - 轮询至进程退出（每 0.5s）或 timeout；超时 → ``stopped=False``（**不升级
-      SIGKILL**——保守，可能正在写事务；用户可再试或手动处理）。
+      waiting_task=False, reason="holder_pid_unknown"``（不 kill 未知进程）。
+    - 信号发送成功 → **立即** ``stopped=False, waiting_task=True`` + note
+      （"信号已发，正在等当前任务收尾"）——前端据此显示友好文案并轮询 /status。
+    - 信号发送失败（进程恰在窗口内退出等）→ ``stopped=False, waiting_task=False,
+      reason="signal failed: ..."``。
+
+    信号策略（不变）：先 ``os.killpg(pid, SIGTERM)``（本按钮 spawn 的进程 setsid
+    自成组，pgid==pid，整组一次干净）；ProcessLookupError/PermissionError → 降级
+    ``os.kill(pid, SIGTERM)``——覆盖**非本按钮启动**的进程。**不升级 SIGKILL**
+    （保守：DuckDB 语句原子性兜底）。
     """
     st = sync_status(db_path)   # 内部已 _reap_children（收尸后再判活性）
     if not st["running"]:
         return {"stopped": False, "pid": st["pid"], "method": None,
-                "reason": "not_running"}
+                "waiting_task": False, "reason": "not_running"}
     pid = st["pid"]
     if pid is None:
         return {"stopped": False, "pid": None, "method": None,
+                "waiting_task": False,
                 "reason": "holder_pid_unknown（锁文案未解析出 PID，拒绝猜测目标进程）"}
 
     method: Optional[str] = None
@@ -287,12 +302,11 @@ def stop_sync(db_path: Optional[str] = None, timeout: int = 30) -> Dict[str, Any
             method = "kill"
         except (ProcessLookupError, PermissionError) as exc:
             return {"stopped": False, "pid": pid, "method": None,
-                    "reason": f"signal failed: {exc}"}
+                    "waiting_task": False, "reason": f"signal failed: {exc}"}
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _pid_alive(pid):
-            return {"stopped": True, "pid": pid, "method": method}
-        time.sleep(0.5)
-    return {"stopped": False, "pid": pid, "method": method,
-            "reason": f"process still alive after {timeout}s（未升级 SIGKILL，请手动检查）"}
+    # v6.0.10：发信号即返回（不等退出）。进程退出与否由前端轮询 /status 判定——
+    # backfill_in_progress=false = 已停；stopping=true = 收尾中（progress 文件标记，
+    # BackfillRunner SIGTERM handler 落盘）。stopped 字段语义保留但恒 False（异步下
+    # 本调用不确认退出）；前端契约以 waiting_task + /status 为准。
+    return {"stopped": False, "pid": pid, "method": method, "waiting_task": True,
+            "note": "信号已发，正在等当前任务收尾（进度已保存，下次启动自动续传）"}

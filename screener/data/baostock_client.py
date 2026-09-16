@@ -197,9 +197,13 @@ class BaoStockClient:
         max_delay: float = 30.0,
         daily_quota: int = 49900,
         quota_path: Optional[Union[str, bool]] = None,
+        stop_checker: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.base_delay = base_delay
+        # v6.0.10：停止检查钩子（依赖注入，见 _query 注释）——lake driver 传入
+        # lake.backfill.stop_requested；None → 恒不中断（纯 screener 场景原行为）。
+        self._stop_checker: Optional[Callable[[], bool]] = stop_checker
         self.max_delay = max_delay
         self._local = threading.local()
         self.request_count = 0  # 实际发出的查询次数（含重试），用于缓存验证
@@ -238,8 +242,23 @@ class BaoStockClient:
         **kwargs: Any,
     ) -> Tuple[List[str], List[List[str]]]:
         """执行一次 baostock 查询，返回 (列名, 全量行)。失败指数退避重试。"""
+        # v6.0.10：全局停止检查（Web"停止同步"按钮 → SIGTERM handler 置位）。
+        # **依赖注入**（stop_checker 由调用方传入）：本模块是 screener 层，主路径
+        # 零 import lake 是硬边界（test_lake_zero_import AST 扫描，lazy import 也
+        # 会被命中）——lake driver 构造时注入 lake.backfill.stop_requested；非 lake
+        # 场景不传 → None → 行为零变化。用途：① 每轮 attempt 前检查 → 提前中断
+        # 当前重试；② 退避 sleep 拆 0.5s 块、逐块检查 → 信号在退避期间到达也立即
+        # 中断（BaoStock 网络不稳时单任务可能卡几分钟——Joel 实测"停止没反应"的
+        # 根因之一）。
+        _checker = self._stop_checker
+
+        def _stop_now() -> bool:
+            return bool(_checker is not None and _checker())
+
         last_err = "unknown"
         for attempt in range(1, self.max_attempts + 1):
+            if _stop_now():
+                raise BaoStockError("baostock 重试中收到停止信号，提前中断收尾")
             try:
                 # v5.2-p2（TL D1）：每次真正调用 query_fn **之前** acquire——
                 # 成功才放行；计数含重试（重试也是真实 API 调用）。超限 →
@@ -269,7 +288,15 @@ class BaoStockClient:
                 log.warning(
                     "retry %d/%d after %.1fs (%s)", attempt, self.max_attempts, delay, last_err
                 )
-                time.sleep(delay)
+                # v6.0.10：退避 sleep 拆 0.5s 块、逐块检查停止标志——信号在退避期间
+                # 到达立即中断（原行为 time.sleep(delay) 最长等满 max_delay=30s）。
+                slept = 0.0
+                while slept < delay:
+                    step = min(0.5, delay - slept)
+                    time.sleep(step)
+                    slept += step
+                    if _stop_now():
+                        raise BaoStockError("baostock 退避等待中收到停止信号，提前中断收尾")
         raise BaoStockError(f"baostock 查询失败（重试 {self.max_attempts} 次）: {last_err}")
 
     def call(self, query_fn: Callable[..., Any], *, label: str = "", **kwargs: Any) -> List[List[str]]:

@@ -627,6 +627,26 @@ def _iso_ts(v) -> Optional[str]:
     return s[:19]
 
 
+def _stopping_from_progress(prog: Dict[str, Any]) -> bool:
+    """v6.0.10：从 progress 文件判定"停止收尾中"（/status stopping 字段数据源）。
+
+    BackfillRunner 的 SIGTERM handler 在置 _stop_requested 时同步落盘
+    ``stopping_at`` 时间戳 + tasks[].state="stopping"（见 lake.backfill._mark_stopping）；
+    优雅停止收尾（_finish_stop）/新 run 开始时清除。跨进程可观测的唯一载体是库目录
+    下的 progress JSON（Web 与灌数子进程不共享内存）。
+
+    判定：``stopping_at`` 非空 **或** 任一 task entry state="stopping"（双保险——
+    handler 写文件时 tasks 视图可能尚无 entry，此时只有 stopping_at；旧版 runner
+    进程（v6.0.9）被信号打断时可能只留下 state 无 stopping_at）。
+    """
+    if prog.get("stopping_at"):
+        return True
+    for t in prog.get("tasks", []):
+        if isinstance(t, dict) and t.get("state") == "stopping":
+            return True
+    return False
+
+
 def _table_stats(con, table: str, code_col: Optional[str],
                  date_col: Optional[str]) -> Dict[str, Any]:
     """单表统计：rows / codes / date_min / date_max / last_sync_at（全运行时查询）。
@@ -805,8 +825,14 @@ def status() -> Dict[str, Any]:
     （backfill_progress.json 是纯 JSON、不受 DuckDB 锁影响，正好是灌数进度）。
 
     v6.0.5：**仅 ready 态**追加 tables（9 表逐表 state）/views/adj_factor_coverage_pct/
-    db/sync——locked 与 uninitialized 两态响应体保持 v6.0.4 逐字节不变（三态契约
-    test_lake_v604_lock 依赖"新字段只在 initialized+ok 态追加"这一纪律）。
+    db/sync——uninitialized 态响应体保持 v6.0.3/v6.0.4 逐字节不变（三态契约
+    test_lake_v604_lock 依赖"新字段只在对应态追加"这一纪律）。
+
+    v6.0.10：**locked 态**追加 ``stopping: bool``（停止收尾中——收到 SIGTERM、当前
+    任务收尾中；数据源=progress 文件 stopping_at/tasks[].state，见
+    :func:`_stopping_from_progress`）。前端据此显示"⏹ 停止中…（当前任务收尾中）"
+    而非无反应。uninitialized/ready 两态不追加（stopping 只在 backfill_in_progress
+    =true 时有意义；三态互不串味纪律延续 v6.0.4/v6.0.5）。
     """
     import duckdb
 
@@ -817,12 +843,15 @@ def status() -> Dict[str, Any]:
         # v6.0.4：灌数持锁——库是好的（正在被写入），initialized=true；
         # coverage/tasks 来自 progress 文件降级（DuckDB 连不上，但 JSON 可读）。
         # v6.0.5：本分支**不追加**新字段（brief：tables 数组可缺省，降级路径不变）。
+        # v6.0.10：追加 stopping（停止收尾中标志）——backfill_in_progress=true 时新增，
+        # 前端据此区分"正常运行中" vs "停止收尾中"（友好文案而非无反应）。
         prog = load_progress()
         return {
             "installed": True,
             "duckdb_version": getattr(duckdb, "__version__", "?"),
             "initialized": True,
             "backfill_in_progress": True,
+            "stopping": _stopping_from_progress(prog),
             "lock_holder_pid": holder_pid,
             "coverage": prog.get("coverage", {}),
             "tasks": prog.get("tasks", []),
@@ -908,10 +937,16 @@ def sync_start(codes: Optional[str] = Query(default=None)) -> Dict[str, Any]:
 def sync_stop() -> Dict[str, Any]:
     """优雅停止灌数（SIGTERM；进度已保存，下次启动自动续传）。
 
-    - 200 ``{stopped: true, pid, method}``：进程在 timeout 内干净退出。
+    **v6.0.10：异步**——发信号即返回 200 + ``waiting_task=true``（**不阻塞等进程
+    退出**）；完成判定由前端轮询 /status（backfill_in_progress=false = 已停，stopping
+    =true = 收尾中友好文案）。旧实现同步等到 timeout=30s 才响应 → 请求挂死、前端
+    "点了没反应"（Joel 实测缺陷）。
+
+    - 200 ``{stopped: false, pid, method, waiting_task: true, note}``：信号已发，
+      正在等当前任务收尾（前端锁定按钮 + 轮询 /status）。
     - **409** ``{error: "sync_not_running", hint}``（顶层契约体）：当前无灌数在跑。
-    - 200 ``{stopped: false, pid, method, reason}``：holder PID 解析失败（拒绝猜测
-      目标进程）/ 信号后超时未退出（**不升级 SIGKILL**，保守——请手动检查）。
+    - 200 ``{stopped: false, pid, method, waiting_task: false, reason}``：holder PID
+      解析失败（拒绝猜测目标进程）/ 信号发送失败。
     """
     from . import sync_control
 

@@ -130,10 +130,13 @@ def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
     load_t1 只落 BaoStock 侧列（name/is_st/soe_* 留 NULL）；随后用**一次**腾讯
     批量快照补 name/is_st（v5 口径：名称含 ST → is_st=1），不额外耗 BaoStock。
     """
+    from lake.backfill import stop_requested as _bk_stop
     from lake.ingest import baostock_ingest as bsi
     from screener.data.baostock_client import BaoStockClient
 
-    bs = BaoStockClient()  # 构造即挂 QuotaGuard（默认路径，跨进程共享计数）
+    # v6.0.10：注入停止检查钩子——SIGTERM 后重试循环提前中断（收尾加速；
+    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）
+    bs = BaoStockClient(stop_checker=_bk_stop)  # 构造即挂 QuotaGuard（默认路径，跨进程共享计数）
     try:
         basic_fields, basic_rows = bsi.fetch_stock_basic(bs)      # 1 次配额
         ind_fields, ind_rows = bsi.fetch_industry(bs)             # 1 次配额
@@ -417,7 +420,7 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     - done 键 ``period_or_date="full_history"``（固定字符串，不含日期）→ 断点续传
       **跨天有效**（旧 f"{start}~{end}" 因 end 缺省=今日 → 每天重跑全量失配）。
     """
-    from lake.backfill import BackfillRunner, Task
+    from lake.backfill import BackfillRunner, Task, stop_requested as _bk_stop
     from lake.ingest import baostock_ingest as bsi
     from lake.ingest.tencent_ingest import fetch_kline_full_history, load_t2
     from screener.data.baostock_client import BaoStockClient
@@ -430,7 +433,9 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     # B-2：coverage 走 runner 自身 db_path（与 run_p0 一致）
     runner = BackfillRunner(db_path=db_path)  # budget_per_day 门：到顶当日停（state=blocked_quota）
 
-    bs = BaoStockClient()     # QuotaGuard 内；adj_factor 1 次/股
+    # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
+    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）
+    bs = BaoStockClient(stop_checker=_bk_stop)     # QuotaGuard 内；adj_factor 1 次/股
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes),
                              "start_date": start_date, "end_date": end_date}

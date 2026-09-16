@@ -323,8 +323,11 @@ def test_classify_state_unit_four_branches():
 # C. locked / uninitialized 向后兼容（新字段只追加在 ready 态）
 # ===========================================================================
 def test_status_locked_backward_compat_no_new_fields(tmp_path, monkeypatch):
-    """locked 态响应体 = v6.0.4 键集**精确相等**：不得混入 tables/views/adj/db/sync
-    （brief：锁被持有时保持降级路径不变，tables 数组可缺省）。"""
+    """locked 态响应体 = v6.0.4 键集 + **v6.0.10 stopping**：不得混入 tables/views/
+    adj/db/sync（brief：锁被持有时保持降级路径不变，tables 数组可缺省）。
+
+    v6.0.10 起 locked 态恒带 ``stopping``（停止收尾中标志，前端友好文案数据源）——
+    这是 brief 明指的契约扩展，其余键集纪律不变。"""
     import lake.web_api as wapi
     from lake import conn as lconn
 
@@ -340,10 +343,11 @@ def test_status_locked_backward_compat_no_new_fields(tmp_path, monkeypatch):
 
     d = wapi.status()
     assert set(d.keys()) == {"installed", "duckdb_version", "initialized",
-                             "backfill_in_progress", "lock_holder_pid",
+                             "backfill_in_progress", "stopping", "lock_holder_pid",
                              "coverage", "tasks", "updated_at"}, \
-        f"locked 态键集必须与 v6.0.4 精确一致: {sorted(d.keys())}"
+        f"locked 态键集必须=v6.0.4+v6.0.10 stopping: {sorted(d.keys())}"
     assert d["backfill_in_progress"] is True and d["lock_holder_pid"] == 4321
+    assert d["stopping"] is False, f"progress 无停止标记时 stopping=false: {d}"
 
 
 def test_status_uninitialized_backward_compat_no_new_fields(tmp_path, monkeypatch):

@@ -337,6 +337,10 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-sync-label { font-size: 13px; font-weight: 600; color: #374151; }
 .lake-sync-control .primary-btn { white-space: nowrap; }
 #lake-sync-meta { font-size: 12.5px; word-break: break-all; }
+/* v6.0.10：按钮锁定态（启动中/停止收尾中）——disabled 置灰基础上再降透明度 +
+   去 hover 提亮，视觉明确"进行中不可点"（复用现有 --muted/CSS 变量，零新依赖） */
+#btn-lake-sync-toggle.sync-busy { opacity: .55; transition: opacity .15s ease; }
+#btn-lake-sync-toggle.sync-busy:hover { filter: none; }
 
 /* ---------- v6.0.6 个股全景·日K线蜡烛图（手绘 SVG，无图表库/CDN） ---------- */
 /* 区间切换按钮组：复用 .mini-btn 视觉语言，选中态用 accent 高亮 */

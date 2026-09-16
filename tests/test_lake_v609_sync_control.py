@@ -400,7 +400,11 @@ def test_stop_sync_holder_pid_unknown_refuses(tmp_path, monkeypatch):
 
 
 def test_stop_sync_killpg_setsid_process(tmp_path, monkeypatch):
-    """本按钮 spawn 的进程（setsid，pgid==pid）→ killpg 一次干净，method=killpg。"""
+    """本按钮 spawn 的进程（setsid，pgid==pid）→ killpg 一次干净，method=killpg。
+
+    v6.0.10 异步语义：stop_sync **发信号即返回**（waiting_task=True、不阻塞等退出）；
+    完成判定 = 轮询 sync_status 到 running=False（锁释放）。
+    """
     from lake import sync_control
 
     p = str(tmp_path / "stop1.duckdb")
@@ -410,19 +414,30 @@ def test_stop_sync_killpg_setsid_process(tmp_path, monkeypatch):
     started = sync_control.start_sync(db_path=p, sub="history")
     assert started["started"] is True, f"前置 spawn 应成功: {started}"
 
-    res = sync_control.stop_sync(db_path=p, timeout=15)
-    assert res["stopped"] is True, f"SIGTERM 后进程应退出: {res}"
+    t0 = time.monotonic()
+    res = sync_control.stop_sync(db_path=p)
+    # v6.0.10：立即返回（<2s——不等进程退出）+ waiting_task=True + method=killpg
+    assert time.monotonic() - t0 < 2.0, f"stop 必须异步立即返回: {res}"
+    assert res["waiting_task"] is True, f"信号已发应 waiting_task=True: {res}"
     assert res["pid"] == started["pid"]
     assert res["method"] == "killpg", f"setsid 进程应走 killpg: {res}"
-    # 停止后状态恢复未运行（锁释放）
-    time.sleep(0.3)
-    st = sync_control.sync_status(p)
-    assert st["running"] is False, f"停止后不得残留 running: {st}"
+    # 完成判定：轮询到进程退出（fake driver 默认 SIGTERM → 干净退出）
+    deadline = time.monotonic() + 15
+    st = None
+    while time.monotonic() < deadline:
+        st = sync_control.sync_status(p)
+        if not st["running"]:
+            break
+        time.sleep(0.2)
+    assert st and st["running"] is False, f"停止后不得残留 running: {st}"
 
 
 def test_stop_sync_degrades_to_kill_non_group_leader(tmp_path):
     """**非本按钮启动**的进程（无 setsid，pid 非组长）→ killpg ESRCH → 降级
-    os.kill(pid, SIGTERM)，method=kill——brief 明指的覆盖路径。"""
+    os.kill(pid, SIGTERM)，method=kill——brief 明指的覆盖路径。
+
+    v6.0.10 异步语义：发信号即返回 waiting_task=True；完成判定 = 轮询到锁释放。
+    """
     from lake import sync_control
 
     p = str(tmp_path / "stop2.duckdb")
@@ -440,9 +455,16 @@ def test_stop_sync_degrades_to_kill_non_group_leader(tmp_path):
             time.sleep(0.25)
         assert st and st["running"] is True, f"fake holder 应持锁: {st}"
 
-        res = sync_control.stop_sync(db_path=p, timeout=15)
-        assert res["stopped"] is True, f"降级 kill 后应退出: {res}"
+        res = sync_control.stop_sync(db_path=p)
+        assert res["waiting_task"] is True, f"信号已发应 waiting_task=True: {res}"
         assert res["method"] == "kill", f"非组长进程必须降级 os.kill: {res}"
+        # 完成判定：轮询到锁释放（fake driver 默认 SIGTERM → 干净退出）
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if not sync_control.sync_status(p)["running"]:
+                break
+            time.sleep(0.2)
+        assert holder.poll() is not None, f"降级 kill 后进程应退出: {res}"
     finally:
         if holder.poll() is None:
             holder.kill()
@@ -450,8 +472,9 @@ def test_stop_sync_degrades_to_kill_non_group_leader(tmp_path):
 
 
 def test_stop_sync_timeout_no_sigkill_escalation(tmp_path):
-    """SIGTERM 被忽略（trap）→ timeout 后 stopped=False + reason；**不升级 SIGKILL**
-    （保守：可能正在写事务）。"""
+    """SIGTERM 被忽略（trap）→ v6.0.10 异步语义下 stop_sync **立即返回**
+    waiting_task=True（不再同步等到 timeout）；进程仍活着 = **未升级 SIGKILL**
+    （保守：可能正在写事务）。完成与否由前端轮询 /status 判定。"""
     from lake import sync_control
 
     p = str(tmp_path / "stop3.duckdb")
@@ -471,11 +494,14 @@ def test_stop_sync_timeout_no_sigkill_escalation(tmp_path):
                               stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "TRAP_READY"
-        res = sync_control.stop_sync(db_path=p, timeout=3)
-        assert res["stopped"] is False, f"trap 进程不得报 stopped: {res}"
+        t0 = time.monotonic()
+        res = sync_control.stop_sync(db_path=p)
+        # v6.0.10：异步立即返回（不等 trap 进程退出）+ waiting_task=True
+        assert time.monotonic() - t0 < 2.0, f"stop 必须异步立即返回: {res}"
+        assert res["waiting_task"] is True, f"{res}"
         assert res["method"] in ("killpg", "kill")
-        assert "still alive" in res.get("reason", ""), f"reason 应说明超时: {res}"
-        # **未升级 SIGKILL**：进程仍活着（保守语义的直接证据）
+        # **未升级 SIGKILL**：稍等片刻进程仍活着（保守语义的直接证据）
+        time.sleep(1.0)
         assert holder.poll() is None, "不得升级 SIGKILL——trap 进程必须仍存活"
     finally:
         holder.kill()
@@ -707,19 +733,37 @@ def test_web_sync_start_success_200_shape(monkeypatch):
     assert d == {"started": True, "pid": 999, "log_path": "/tmp/s.log"}
 
 
-def test_web_sync_stop_timeout_200_not_stopped(monkeypatch):
-    """stop 超时未退出 → **200** stopped=False + reason（非冲突；前端 toast 提示，
-    不白屏、不误报成功）。"""
+def test_web_sync_stop_async_waiting_task_200(monkeypatch):
+    """v6.0.10：stop 异步语义——信号已发 → **200** + waiting_task=true + note
+    （不阻塞等退出；前端锁定按钮 + 轮询 /status 判完成）。"""
     import lake.web_api as wapi
     from lake import sync_control
 
     monkeypatch.setattr(
         sync_control, "stop_sync",
         lambda **k: {"stopped": False, "pid": 888, "method": "killpg",
-                     "reason": "process still alive after 30s（未升级 SIGKILL，请手动检查）"})
+                     "waiting_task": True,
+                     "note": "信号已发，正在等当前任务收尾（进度已保存，下次启动自动续传）"})
     d = wapi.sync_stop()
     assert d["stopped"] is False and d["pid"] == 888 and d["method"] == "killpg"
-    assert "still alive" in d["reason"]
+    assert d["waiting_task"] is True, f"异步 stop 必须 waiting_task=true: {d}"
+    assert "收尾" in d["note"], f"note 应说明正在收尾: {d}"
+
+
+def test_web_sync_stop_signal_failed_200_reason(monkeypatch):
+    """v6.0.10：信号未发出（holder pid 未知/发送失败）→ 200 + waiting_task=false
+    + reason（前端 toast 提示 + 释放按钮，不误报"已发信号"）。"""
+    import lake.web_api as wapi
+    from lake import sync_control
+
+    monkeypatch.setattr(
+        sync_control, "stop_sync",
+        lambda **k: {"stopped": False, "pid": None, "method": None,
+                     "waiting_task": False,
+                     "reason": "holder_pid_unknown（锁文案未解析出 PID，拒绝猜测目标进程）"})
+    d = wapi.sync_stop()
+    assert d["stopped"] is False and d["waiting_task"] is False
+    assert d["reason"].startswith("holder_pid_unknown")
 
 
 def test_http_sync_full_cycle_real_server(tmp_path):
@@ -758,21 +802,27 @@ def test_http_sync_full_cycle_real_server(tmp_path):
         assert bd.get("error") == "sync_already_running", f"{bd}"
         assert "hint" in bd and "detail" not in bd
 
-        # ③ POST stop → 200 stopped=true（SIGTERM；holder 无 setsid → 降级 kill）
+        # ③ POST stop → **200 + waiting_task=true**（v6.0.10 异步：发信号即返回，
+        #    SIGTERM；holder 无 setsid → 降级 kill）→ 轮询 /status 到锁释放
+        t0 = time.monotonic()
         s, b = _http(port, "POST", "/api/lake/sync/stop")
         assert s == 200, f"stop 应 200，实际 {s}: {b}"
         bd = json.loads(b)
-        assert bd.get("stopped") is True, f"{bd}"
+        assert time.monotonic() - t0 < 5.0, f"stop 必须异步立即返回: {bd}"
+        assert bd.get("waiting_task") is True, f"信号已发应 waiting_task=true: {bd}"
         assert bd.get("pid") == holder.pid
         assert bd.get("method") in ("killpg", "kill")
-        holder.wait(timeout=15)   # fake driver 默认 SIGTERM → 干净退出
 
-        # ④ 锁释放 → /status 无 backfill 键；再 stop → 409 sync_not_running
+        # ④ 轮询 /status 到锁释放（fake driver 默认 SIGTERM → 干净退出）；
+        #    locked 态恒带 stopping 键（v6.0.10 三态契约扩展；fake holder 无 runner
+        #    handler → progress 无标记 → stopping=false）
         d = None
-        for _ in range(40):
+        for _ in range(60):
             s, b = _http(port, "GET", "/api/lake/status")
             d = json.loads(b)
-            if "backfill_in_progress" not in d:
+            if d.get("backfill_in_progress"):
+                assert d.get("stopping") is False, f"无 runner 标记时 stopping=false: {d}"
+            else:
                 break
             time.sleep(0.25)
         assert "backfill_in_progress" not in d, f"停止后不得残留 backfill 键: {d}"
@@ -780,7 +830,7 @@ def test_http_sync_full_cycle_real_server(tmp_path):
         s, b = _http(port, "POST", "/api/lake/sync/stop")
         assert s == 409, f"未 running 时 stop 必须 409，实际 {s}: {b}"
         bd = json.loads(b)
-        assert bd.get("error") == "sync_not_running", f"{bd}"
+        assert bd.get("error") == "sync_not_running"
         assert "detail" not in bd
     finally:
         _stop_server(srv)
@@ -853,11 +903,16 @@ def test_runner_custom_db_without_explicit_progress_writes_local(tmp_path):
 # ===========================================================================
 def test_frontend_sync_control_contract():
     """index.html 有同步控制区 + app.js 接两个 POST 端点 + confirm 文案 +
-    backfill_in_progress 驱动按钮二态。"""
+    backfill_in_progress 驱动按钮二态。
+
+    v6.0.10：追加按钮锁定契约——停止点击即 disabled + "⏹ 停止中…" + 置灰类；
+    启动锁定 "▶ 启动中…"；收尾轮询读 stopping；90s 文案升级 + 5min 硬超时释放。"""
     html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"),
                 encoding="utf-8").read()
     js = open(os.path.join(REPO_ROOT, "web", "static", "app.js"),
               encoding="utf-8").read()
+    css = open(os.path.join(REPO_ROOT, "web", "static", "style.css"),
+               encoding="utf-8").read()
     assert 'id="lake-sync-control"' in html, "缺同步控制区 #lake-sync-control"
     assert 'id="btn-lake-sync-toggle"' in html, "缺按钮 #btn-lake-sync-toggle"
     assert "/api/lake/sync/start" in js, "app.js 未接 POST start"
@@ -867,6 +922,16 @@ def test_frontend_sync_control_contract():
     assert "停止后进度已保存，下次启动自动续传。确认停止？" in js
     assert "backfill_in_progress" in js
     assert "▶ 启动同步" in js and "停止同步" in js, "按钮二态文案缺失"
+    # v6.0.10 锁定契约（DOM 行为由 test_lake_v6010_stop_lock 的 node 契约测试覆盖）
+    assert 'btn.disabled = true' in js, "点击后必须 disabled（锁定）"
+    assert "⏹ 停止中…" in js, "停止锁定文案缺失"
+    assert "▶ 启动中…" in js, "启动锁定文案缺失"
+    assert "已停止，进度已保存" in js, "停止成功 toast 文案缺失"
+    assert "停止超时，进程可能仍在收尾，请刷新查看" in js, "硬超时 toast 文案缺失"
+    assert "当前任务收尾中，最长约几分钟" in js, "90s 文案升级缺失"
+    assert "d.stopping === true" in js, "未读 /status stopping 标志（收尾友好文案）"
+    assert "waiting_task" in js, "未处理 stop 异步响应 waiting_task"
+    assert "sync-busy" in js and "sync-busy" in css, "锁定置灰类缺失（js/css 脱节）"
 
 
 def test_install_registers_sync_conflict_handler():

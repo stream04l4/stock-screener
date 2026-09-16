@@ -273,6 +273,10 @@ def _run_history_offline(monkeypatch, tmp_path, db, codes, start, end,
     import screener.data.tencent as tmod
 
     class _FakeBS:
+        # v6.0.10：driver 构造传 stop_checker=（依赖注入）→ fake 需接受 kwargs
+        def __init__(self, *a, **k):
+            pass
+
         def close(self):
             pass
 

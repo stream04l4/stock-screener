@@ -141,6 +141,55 @@ def task_key(task: Task) -> Tuple[str, str, str]:
 
 
 # ---------------------------------------------------------------------------
+# v6.0.10：全局停止标志（"收尾等待"可观测 + 重试循环提前中断）
+# ---------------------------------------------------------------------------
+# Web"停止同步"按钮 → sync_control.stop_sync 发 SIGTERM → BackfillRunner handler
+# 置 _stop_requested **并**置本模块级标志。为什么需要模块级（handler 在灌数子进程、
+# Web 进程读不到它的内存）：
+# - **可观测**：handler 同步把 progress tasks[].state="stopping" + save_progress，
+#   Web /status 读 progress 文件即可区分"正常运行中" vs "停止收尾中"（跨进程共享
+#   的只有库目录下的 JSON 文件）；
+# - **加速收尾**（brief §3 可选项，实现成本低故做）：BaoStock/腾讯重试循环的退避
+#   sleep 前检查本标志 → 收到停止信号立即中断当前重试（不必等满指数退避），
+#   单任务从"卡几分钟"降到秒级收尾。
+# 生命周期：run() 开始处清零（防上一轮残留毒化新 run）；进程退出即消失（模块级，
+# 无持久状态）。
+_STOP_FLAG = False
+
+
+def set_stop_requested() -> None:
+    """置全局停止标志（SIGTERM handler / 测试用）。"""
+    global _STOP_FLAG
+    _STOP_FLAG = True
+
+
+def clear_stop_requested() -> None:
+    """清全局停止标志（run() 开始处调用，防上一轮残留）。"""
+    global _STOP_FLAG
+    _STOP_FLAG = False
+
+
+def stop_requested() -> bool:
+    """当前是否已请求停止。"""
+    return _STOP_FLAG
+
+
+class StopRequestedError(RuntimeError):
+    """v6.0.10：重试循环收到停止信号 → 提前中断（不等满退避）。
+
+    与网络失败同走 worker 的 except 分支（记 errors、**不 mark_done**）——下轮重跑
+    幂等续传；语义上"用户主动停止"不是数据错误，但复用既有失败路径最安全（不新造
+    控制流）。
+    """
+
+
+def _check_stop() -> None:
+    """重试循环 sleep 前调用：已请求停止 → 抛 StopRequestedError 提前中断。"""
+    if _STOP_FLAG:
+        raise StopRequestedError("收到停止信号，提前中断当前重试（收尾加速）")
+
+
+# ---------------------------------------------------------------------------
 # 调度器
 # ---------------------------------------------------------------------------
 class BackfillRunner:
@@ -197,6 +246,10 @@ class BackfillRunner:
         # v6.0.9：SIGTERM 优雅停止标志（Web"停止同步"按钮 → sync_control.stop_sync
         # killpg/kill SIGTERM）。run() 注册 handler 置位；主循环**任务间**检查 break。
         self._stop_requested = False
+        # v6.0.10：SIGTERM handler 置 _stop_requested 时同步落盘的"停止收尾中"标记
+        # （progress 顶层 stopping_at，Web /status 读 progress 文件得 stopping=true——
+        # 跨进程可观测的唯一载体是库目录下的 JSON 文件）。run() 开始处清除。
+        self.progress.setdefault("stopping_at", None)
 
     # ---------- done 键管理 ----------
     def _load_done(self) -> None:
@@ -267,9 +320,44 @@ class BackfillRunner:
         return prev
 
     def _on_stop_signal(self, signum, frame):  # noqa: ARG002 - signal handler 签名固定
-        """SIGTERM → 置停止标志（主循环任务间检查）。handler 保持最简：只置位。"""
+        """SIGTERM → 置停止标志（主循环任务间检查）。
+
+        v6.0.10：同时置**模块级**停止标志（BaoStock/腾讯重试循环的退避 sleep 前检查
+        → 提前中断当前重试，收尾从"等满指数退避几分钟"降到秒级）+ 落盘"停止收尾中"
+        标记（progress tasks[].state="stopping" + stopping_at + save_progress——Web
+        /status 据此报 stopping=true，前端显示友好文案而非"没反应"）。
+
+        handler 仍保持最简：不碰 DuckDB/网络（信号可能到达于任意指令之间）；只改内存
+        标志 + 一次纯 JSON 文件写（save_progress 是 tmp+rename 原子写，无事务风险）。
+        """
         self._stop_requested = True
+        set_stop_requested()   # v6.0.10：模块级标志（重试循环提前中断）
+        self._mark_stopping()
         log.info("收到 SIGTERM（signum=%s）→ 将在当前任务完成后优雅停止", signum)
+
+    def _mark_stopping(self) -> None:
+        """v6.0.10：落盘"停止收尾中"标记（handler 同步调用，Web /status 可观测）。
+
+        - progress 顶层 ``stopping_at`` = 当前 UTC 时间戳（非空=收尾中；run() 开始处
+          与 _finish_stop 收尾时清除）——/status 的 stopping 字段读它；
+        - tasks[].state="stopping"（**全部** entry，含尚未创建 entry 的组不在此列——
+          首个任务执行中被信号打断时 tasks 视图可能尚无 entry，此时只有 stopping_at
+          生效，/status 照样报 stopping=true）；
+        - save_progress 原子落盘（tmp+rename）。失败不抛（handler 上下文：任何异常
+          都会让进程直接死掉，比"标记没写上"严重得多——最坏情况退化为 v6.0.9 行为：
+          前端靠轮询 backfill_in_progress 判完成，只是少了友好文案）。
+        """
+        import datetime as _dt
+
+        try:
+            self.progress["stopping_at"] = _dt.datetime.now(
+                _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            for entry in self.progress.get("tasks", []):
+                if isinstance(entry, dict):
+                    entry["state"] = "stopping"
+            save_progress(self.progress, self.progress_path)
+        except Exception as exc:  # noqa: BLE001 - handler 上下文：落盘失败不致命
+            log.warning("停止标记落盘失败（不影响优雅停止本身）: %s", exc)
 
     def _restore_stop_handler(self) -> None:
         """run() 收尾恢复原 SIGTERM handler（不留副作用给后续代码/测试）。"""
@@ -291,6 +379,9 @@ class BackfillRunner:
         _update_task_view——"停止"是 run 级事件而非单任务事件；后续收尾的
         _refresh_task_view 不覆盖 state（v6.0.8 语义），最终文件即 stopped 态。
         done 明细不受影响（已落盘即有效，下次启动自动续传）。
+
+        v6.0.10：同时清除 ``stopping_at``（收尾完成 = 不再"停止中"；进程即将退出、
+        锁释放后 /status 回 ready 态，但文件是最后状态——不留残留标记给下一轮/读取方）。
         """
         done_total = sum(
             g["done_at_start"] + g["done_in_run"] for g in self._view_groups.values())
@@ -298,6 +389,7 @@ class BackfillRunner:
         for entry in self.progress.get("tasks", []):
             if isinstance(entry, dict):
                 entry["state"] = "stopped_by_signal"
+        self.progress["stopping_at"] = None   # v6.0.10：收尾完成，清除"停止中"标记
         save_progress(self.progress, self.progress_path)
         stats["stopped"] = True
         log.info("STOPPED by signal, progress saved (done=%d)", done_total)
@@ -331,6 +423,11 @@ class BackfillRunner:
     def _run_inner(self, tasks: List[Task], worker: Callable[[Task], None]) -> Dict[str, Any]:
         """run() 主体（v6.0.9：从 run() 拆出以便 try/finally 恢复 SIGTERM handler）。"""
         ordered = sorted(tasks)  # Task order=True：priority 升序
+        # v6.0.10：新 run 开始处清除上一轮残留——progress stopping_at（若上轮被强杀、
+        # _finish_stop 没跑到，文件可能残留"停止中"标记，/status 会误报 stopping=true）
+        # + 模块级停止标志（同进程多轮 run 的测试场景防串味）。
+        self.progress["stopping_at"] = None
+        clear_stop_requested()
         stats = {"total": len(ordered), "skipped_done": 0, "processed": 0,
                  "blocked_quota": False, "errors": []}
         # v6.0.8：视图分组统计——done_at_start 只数**本次队列内**已 done 的任务：

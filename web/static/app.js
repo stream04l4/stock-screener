@@ -1766,9 +1766,24 @@ function lakeRenderViews(d) {
 // v6.0.9 同步控制区（启动/停止全史补库）：按钮二态由 /status 的
 // backfill_in_progress / lock_holder_pid 驱动（v6.0.4 三态机制，不新增 GET 端点）。
 // 3s 轮询复用 loadLakeStatus（数据湖 tab 激活期间持续；离开 tab 停止）。
+// v6.0.10：按钮点击即**锁定**（disabled + 置灰），直到成功/失败才释放——
+//   停止：POST /sync/stop 异步返回 waiting_task=true 后进入"收尾轮询"（1s），
+//     等 /status backfill_in_progress=false → toast"已停止，进度已保存"+ 释放；
+//     >90s 未停 → 文案变"当前任务收尾中，最长约几分钟"；5min 硬超时 → toast + 释放。
+//   启动：POST /sync/start 返回前锁定（200→成功态 / 409→toast+释放）。
+//   任一进行中另一个也禁用（防 start/stop 竞态）。零新库，复用 toast/轮询/CSS 变量。
 // ---------------------------------------------------------------------------
-let lakeSyncPollTimer = null;        // 3s 轮询定时器（tab 激活期间）
+let lakeSyncPollTimer = null;        // status 轮询定时器（tab 激活期间；停止期 1s）
+let lakeSyncPollIv = null;           // v6.0.10：当前定时器间隔（状态切换时按需重建）
 let lakeSyncRunningSince = null;     // 本会话首次观察到 running 的时间戳（已耗时口径）
+let lakeSyncStarting = false;        // v6.0.10：启动进行中（POST /start 在途）
+let lakeSyncStopping = null;         // v6.0.10：{since, pid} | null（停止收尾中）
+let lakeSyncLastPid = null;          // v6.0.10：最近一次 /status 的 lock_holder_pid
+                                     // （stopping=true 时 meta 不显示 PID——点击侧从这取，
+                                     //  避免按钮显示"⏹ 停止中… (未知)"）
+
+const LAKE_STOP_SOFT_MS = 90 * 1000;    // >90s 未停 → 文案升级"当前任务收尾中"
+const LAKE_STOP_HARD_MS = 5 * 60 * 1000; // 5min 硬超时 → toast + 释放（不无限锁死）
 
 function lakeFmtElapsed(ms) {
   const m = Math.floor(ms / 60000);
@@ -1777,34 +1792,109 @@ function lakeFmtElapsed(ms) {
   return Math.floor(m / 60) + "小时" + (m % 60) + "分";
 }
 
+function _lakeSyncPollInterval() {
+  // v6.0.10：停止收尾期间提到 1s（更快感知 backfill_in_progress=false），其余 3s
+  return lakeSyncStopping ? 1000 : 3000;
+}
+
 function startLakeSyncPoll() {
-  if (lakeSyncPollTimer) return;
-  lakeSyncPollTimer = setInterval(loadLakeStatus, 3000);   // 复用现有 status 拉取
+  // v6.0.10：间隔按状态取（停止期 1s，其余 3s）。已有定时器且间隔不同 → 重建
+  // （停止开始/结束时切换快慢轮询）；同间隔不重建（避免重复触发漂移）。
+  const iv = _lakeSyncPollInterval();
+  if (lakeSyncPollTimer) {
+    if (lakeSyncPollIv !== iv) {
+      clearInterval(lakeSyncPollTimer);
+      lakeSyncPollTimer = setInterval(loadLakeStatus, iv);
+      lakeSyncPollIv = iv;
+    }
+    return;
+  }
+  lakeSyncPollIv = iv;
+  lakeSyncPollTimer = setInterval(loadLakeStatus, iv);   // 复用现有 status 拉取
 }
 
 function stopLakeSyncPoll() {
   if (lakeSyncPollTimer) { clearInterval(lakeSyncPollTimer); lakeSyncPollTimer = null; }
+  lakeSyncPollIv = null;
 }
 
-// d = /status 响应（null=错误态）。按钮二态：
-//   backfill_in_progress=false → [▶ 启动同步]；=true → [⏹ 停止同步 (pid)] + 运行中提示。
+// d = /status 响应（null=错误态）。按钮态优先级：
+//   锁定中（starting/stopping）> running → [⏹ 停止同步 (pid)] > idle → [▶ 启动同步]。
 function lakeRenderSyncControl(d) {
   const btn = $("#btn-lake-sync-toggle");
   const meta = $("#lake-sync-meta");
   if (!btn) return;
-  // 错误态（5xx/duckdb 未装）：禁用按钮不白屏（保留上次文案的占位）
-  if (!d) { btn.disabled = true; btn.innerHTML = '<span class="muted">状态不可用</span>'; meta.textContent = ""; return; }
+
+  // v6.0.10：锁定态（启动/停止进行中）——**不被轮询覆盖**（按钮保持禁用 + 置灰，
+  // 直到成功或失败才释放；错误态 d=null 也不解锁，靠硬超时兜底）。两按钮是同一个
+  // toggle，"任一进行中另一个也禁用"= 锁定期间本按钮恒 disabled。
+  if (lakeSyncStarting) {
+    btn.disabled = true;
+    btn.classList.add("sync-busy");
+    btn.innerHTML = "▶ 启动中…";
+    meta.textContent = "正在启动（确认进程拉起中）";
+    return;
+  }
+  if (lakeSyncStopping) {
+    const pid = lakeSyncStopping.pid != null ? lakeSyncStopping.pid : "未知";
+    const elapsed = Date.now() - lakeSyncStopping.since;
+    // v6.0.10：停止成功确认——backfill_in_progress=false（进程已退出、锁释放）→
+    // toast"已停止，进度已保存"+ 立即释放回 [▶ 启动同步]（**同步完成**，不依赖
+    // 异步 loadLakeStatus 的下一轮渲染；错误态 d=null 时不进此分支，靠硬超时兜底）。
+    if (d && d.installed && d.backfill_in_progress !== true) {
+      lakeSyncStopping = null;
+      btn.disabled = false;
+      btn.classList.remove("sync-busy");
+      toast("已停止，进度已保存");
+      lakeRenderSyncControl(d);   // 按真实状态重渲染（此刻必为 idle → 启动按钮）
+      return;
+    }
+    btn.disabled = true;
+    btn.classList.add("sync-busy");
+    // >90s 未停：文案升级（当前任务收尾中，最长约几分钟）；继续轮询直到成功或硬超时
+    if (elapsed > LAKE_STOP_SOFT_MS) {
+      btn.innerHTML = "⏹ 停止中…（当前任务收尾中，最长约几分钟）";
+    } else {
+      btn.innerHTML = `⏹ 停止中… (${pid})`;
+    }
+    meta.textContent = `PID ${pid} · 已等待 ${lakeFmtElapsed(elapsed)}`;
+    if (elapsed > LAKE_STOP_HARD_MS && d && d.installed) {
+      // 5min 硬超时：释放按钮 + toast（进程可能仍在收尾，刷新可查真实状态）——
+      // 同步按真实状态重渲染（running→恢复停止入口 / idle→启动按钮），不依赖异步轮询。
+      lakeSyncStopping = null;
+      btn.classList.remove("sync-busy");
+      toast("停止超时，进程可能仍在收尾，请刷新查看", false);
+      lakeRenderSyncControl(d);
+    }
+    return;
+  }
+
+  // 错误态（5xx/duckdb 未装）：禁用按钮不白屏（保留上次文案的占位）。
+  // v6.0.10：**锁定期间 d=null 不得覆盖锁定态**（网络抖动 ≠ 停止失败——保持
+  // disabled + "停止中…"，靠 5min 硬超时兜底释放；否则一次轮询失败就解锁，
+  // 用户会连点多次 stop，正是本次要修的体验问题）。
+  if (!d) {
+    if (lakeSyncStarting || lakeSyncStopping) return;   // 锁定态保持（不覆盖文案）
+    btn.disabled = true; btn.innerHTML = '<span class="muted">状态不可用</span>'; meta.textContent = ""; return;
+  }
   if (!d.installed) { btn.disabled = true; btn.innerHTML = '<span class="muted">数据湖未安装</span>'; meta.textContent = ""; return; }
 
   const running = d.backfill_in_progress === true;
+
   // 会话内观察到 false→true 跃迁才记"已耗时"起点（中途进页面不知真实启动时刻，
   // 改显示进度更新时间——不猜、不误导）
   if (running && !lakeSyncRunningSince) lakeSyncRunningSince = Date.now();
-  else if (!running) lakeSyncRunningSince = null;
+  else if (!running) { lakeSyncRunningSince = null; lakeSyncLastPid = null; }
 
   btn.disabled = false;
   if (running) {
     const pid = d.lock_holder_pid != null ? d.lock_holder_pid : "未知";
+    // v6.0.10：记住最近一次 holder pid（stopping=true 时 meta 不显示 PID，点击侧
+    // 停止按钮文案需要它——避免"⏹ 停止中… (未知)"）
+    if (d.lock_holder_pid != null) lakeSyncLastPid = d.lock_holder_pid;
+    // v6.0.10：stopping=true（SIGTERM 已发、当前任务收尾中）→ meta 提示友好文案，
+    // 按钮仍是停止入口（再点一次=重复发信号，runner 幂等忽略；锁定由点击侧负责）
+    const stopping = d.stopping === true;
     // 运行中提示：今日配额 x/5000（progress tasks 视图 quota，max 防御滞后）+ 耗时
     let qUsed = null, qBudget = null;
     for (const t of (d.tasks || [])) {
@@ -1812,7 +1902,7 @@ function lakeRenderSyncControl(d) {
       if (typeof t.quota_used_today === "number") qUsed = Math.max(qUsed ?? 0, t.quota_used_today);
       if (typeof t.quota_budget === "number") qBudget = Math.max(qBudget ?? 0, t.quota_budget);
     }
-    const parts = ["PID " + pid];
+    const parts = [stopping ? "⏹ 停止收尾中（当前任务完成后退出）" : "PID " + pid];
     if (qUsed != null) parts.push(`今日配额 ${qUsed}/${qBudget ?? "—"}`);
     if (lakeSyncRunningSince) parts.push("已耗时 " + lakeFmtElapsed(Date.now() - lakeSyncRunningSince));
     else if (d.updated_at) parts.push("进度更新于 " + String(d.updated_at).slice(5, 16));
@@ -1829,8 +1919,11 @@ function lakeRenderSyncControl(d) {
 async function lakeSyncStart() {
   const btn = $("#btn-lake-sync-toggle");
   if (!confirm("将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？")) return;
+  // v6.0.10：点击即锁定——POST /start 返回前按钮禁用 + "▶ 启动中…"（防连点/竞态）
+  lakeSyncStarting = true;
   btn.disabled = true;
-  btn.innerHTML = '<span class="muted">启动中…</span>';
+  btn.classList.add("sync-busy");
+  btn.innerHTML = "▶ 启动中…";
   try {
     const d = await api("/api/lake/sync/start", { method: "POST" });
     if (d.started) toast(`同步已启动（PID ${d.pid ?? "?"}）`);
@@ -1840,6 +1933,10 @@ async function lakeSyncStart() {
     if (e.status === 409 && e.body && e.body.hint) toast(e.body.hint, false);
     else toast("同步启动失败：" + e.message, false);
   } finally {
+    // v6.0.10：POST 返回即释放（200→成功态 / 409→toast+释放）——下一轮渲染按真实
+    // /status 恢复二态（started→running 显示停止按钮；失败→启动按钮）
+    lakeSyncStarting = false;
+    btn.classList.remove("sync-busy");
     loadLakeStatus();   // 立即刷新按钮态（不等下一轮 3s）
   }
 }
@@ -1847,17 +1944,40 @@ async function lakeSyncStart() {
 async function lakeSyncStop() {
   const btn = $("#btn-lake-sync-toggle");
   if (!confirm("停止后进度已保存，下次启动自动续传。确认停止？")) return;
+  // v6.0.10：点击瞬间锁定——disabled + "⏹ 停止中… (pid)" + 置灰（.sync-busy），
+  // 直到成功或失败才释放（防连点多次 stop、给即时反馈）。pid 优先从 meta 解析
+  // （正常运行态 meta="PID x · …"）；stopping=true 时 meta 不显示 PID → 回退
+  // 轮询记住的最近 lock_holder_pid（避免按钮显示"(未知)"）。
+  const pid = $("#lake-sync-meta")?.textContent.match(/PID\s+(\d+)/)?.[1]
+    ?? (lakeSyncLastPid != null ? String(lakeSyncLastPid) : null);
+  lakeSyncStopping = { since: Date.now(), pid: pid ? Number(pid) : null };
   btn.disabled = true;
-  btn.innerHTML = '<span class="muted">停止中…</span>';
+  btn.classList.add("sync-busy");
+  btn.innerHTML = `⏹ 停止中… (${pid ?? "未知"})`;
+  startLakeSyncPoll();   // v6.0.10：收尾期间提到 1s 轮询（复用 loadLakeStatus）
   try {
     const d = await api("/api/lake/sync/stop", { method: "POST" });
-    if (d.stopped) toast(`同步已停止（PID ${d.pid ?? "?"}），进度已保存`);
-    else toast("同步未能在超时内停止：" + (d.reason || "请手动检查"), false);
+    if (d.waiting_task) {
+      // 后端异步语义：信号已发、正在等当前任务收尾 → 保持锁定，轮询 /status 判完成
+      toast("停止信号已发送，等待当前任务收尾…");
+    } else if (d.reason) {
+      // 信号未发出（holder pid 未知/发送失败）→ 释放 + toast
+      lakeSyncStopping = null;
+      btn.classList.remove("sync-busy");
+      toast("同步停止失败：" + d.reason, false);
+    }
   } catch (e) {
-    if (e.status === 409 && e.body && e.body.hint) toast(e.body.hint, false);
-    else toast("同步停止失败：" + e.message, false);
+    if (e.status === 409 && e.body && e.body.hint) {
+      // 409 sync_not_running（状态刚变化）→ 释放 + toast
+      lakeSyncStopping = null;
+      btn.classList.remove("sync-busy");
+      toast(e.body.hint, false);
+    } else {
+      toast("同步停止失败：" + e.message, false);
+      // 网络错误：保持锁定继续轮询（后端可能已收到信号；硬超时兜底释放）
+    }
   } finally {
-    loadLakeStatus();
+    loadLakeStatus();   // 立即按真实状态渲染（锁定态下不覆盖按钮，见 lakeRenderSyncControl）
   }
 }
 

@@ -279,6 +279,8 @@ def test_web_status_locked_200_backfill_in_progress_tasks_from_progress_file(
     assert d["initialized"] is True, f"灌数持锁 ≠ 未初始化: {d}"
     assert d["backfill_in_progress"] is True
     assert d["lock_holder_pid"] == 4321
+    # v6.0.10：locked 态恒带 stopping（progress 无停止标记 → false）
+    assert d.get("stopping") is False, f"无 runner 停止标记时 stopping=false: {d}"
     # coverage/tasks 必须来自 progress 文件（降级读取，正是灌数进度）
     with open(prog, "r", encoding="utf-8") as f:
         expect = json.load(f)
@@ -489,6 +491,8 @@ def test_http_locked_status_200_and_data_endpoints_409_new_error(tmp_path):
         assert d["initialized"] is True
         assert d["backfill_in_progress"] is True
         assert d["lock_holder_pid"] == 777
+        # v6.0.10：locked 态恒带 stopping（fake holder 无 runner 标记 → false）
+        assert d.get("stopping") is False, f"无 runner 停止标记时 stopping=false: {d}"
         with open(prog, "r", encoding="utf-8") as f:
             expect = _json.load(f)
         assert d["tasks"] == expect["tasks"], "tasks 必须来自 progress 文件"

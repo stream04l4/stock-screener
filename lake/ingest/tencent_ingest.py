@@ -17,6 +17,11 @@ v6.0.7（history 全史补库运行时缺陷修复）：腾讯 fqkline 端点 **
 从最新往回分页翻到 IPO 边界（旧 ``fetch_kline_ohlcv(n=12000)`` 全市场取空）。
 **失败语义与 fetch_kline_ohlcv 不同**：单页重试耗尽 → 抛 RuntimeError（不静默
 返回 []——旧行为是 done 键毒化根因，见 v6.0.7 brief 缺陷 3）。
+
+v6.0.10（停止收尾加速）：重试循环每轮检查 :func:`lake.backfill.stop_requested`
+全局标志（Web"停止同步"按钮 → SIGTERM handler 置位）→ 收到停止信号**提前中断
+当前重试**（抛 StopRequestedError / 按既有失败语义返回 []），不必等满退避——
+单任务收尾从"卡几分钟"降到秒级。非 lake 场景标志恒 False，行为零变化。
 """
 from __future__ import annotations
 
@@ -24,9 +29,18 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..backfill import StopRequestedError, stop_requested as _bk_stop_requested
 from .common import DATA_VERSION, clean_date, now_ts, to_float, upsert
 
 log = logging.getLogger("lake.ingest.tencent")
+
+
+def _stop_requested() -> bool:
+    """v6.0.10：全局停止标志（lazy 兜底——backfill 不可用时恒 False，行为不变）。"""
+    try:
+        return _bk_stop_requested()
+    except Exception:  # noqa: BLE001 - 防御：标志不可用 → 不中断（原行为）
+        return False
 
 # 四指数（调研报告 §3 T7；腾讯格式，无点）
 INDEX_CODES = ["sh000001", "sh000300", "sz399001", "sh000922"]
@@ -58,6 +72,10 @@ def fetch_kline_ohlcv(client, ts_code: str, n: int) -> List[Dict[str, Any]]:
     timeout = float(getattr(client, "timeout", 15))
     max_attempts = int(getattr(client, "max_attempts", 3))
     for attempt in range(1, max_attempts + 1):
+        # v6.0.10：收到停止信号 → 提前中断（抛错不标 done，下轮续传；不返回 []——
+        # p0 worker 对空结果仍 mark_done，会把未取数误标完成）
+        if _stop_requested():
+            raise StopRequestedError("腾讯K线重试中收到停止信号，提前中断")
         try:
             resp = client.session.get(url, timeout=timeout)
             if resp.status_code != 200:
@@ -118,6 +136,10 @@ def _fetch_kline_page(client, tcode: str, start: Optional[str], end: Optional[st
     max_attempts = int(getattr(client, "max_attempts", 3))
     last_err = ""
     for attempt in range(1, max_attempts + 1):
+        # v6.0.10：收到停止信号 → 提前中断（StopRequestedError ⊂ RuntimeError，
+        # 与"单页重试耗尽"同走失败语义——worker 不 mark_done，下轮续传）
+        if _stop_requested():
+            raise StopRequestedError("腾讯K线全史重试中收到停止信号，提前中断")
         try:
             resp = client.session.get(url, timeout=timeout)
             if resp.status_code != 200:
