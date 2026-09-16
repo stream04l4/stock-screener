@@ -1,0 +1,24 @@
+{
+  "name": "stock-screener-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A股四维选股 Web 控制台 —— Vue3+Vite+Pinia SPA（D1：脚手架+统一刷新引擎+结果tab；dev-only :5173，生产 :9090 不动）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "echarts": "5.6.0",
+    "pinia": "^4.0.3",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "happy-dom": "^20.14.5",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}

@@ -21,3 +21,7 @@ output/
 # 团队流水线工作区产物（researcher/coder/tester 以 repo 为 cwd 时会把 stages/ 落到这里；
 # 正式交付物在 ~/.hermes/joint_project/<task>/stages/，此处仅为成员运行副产物，不入库）。
 /stages/
+
+# Web 前端（D1 框架化重构）：构建产物与依赖不入库；package-lock.json 提交
+web/dist/
+web/frontend/node_modules/
