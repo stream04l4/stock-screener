@@ -45,8 +45,25 @@ def code6(ts_code: str) -> str:
 #   必须用 delete_where + insert_many "先删后插"——DuckDB 的 INSERT OR REPLACE
 #   要求目标表有 UNIQUE/PK 约束，否则 BinderException）
 # ---------------------------------------------------------------------------
+class _WriteNull:
+    """哨兵：显式写 NULL（与"不写该列"区分）。不可序列化、单例语义。"""
+
+    __slots__ = ()
+
+
+def write_null() -> "_WriteNull":
+    """upsert 的 conflict_src 参数取值——**显式把 conflict_src 写成 NULL**。
+
+    v6.1 DEF-1：INSERT OR REPLACE 是整行替换——若"无分歧（None）"时不写该列，
+    旧行的陈旧 conflict_src 摘要会残留在新写入的行上（tester 复现的审计列错误）。
+    故 kline_daily 等每次写入都必须让 conflict_src **反映本次写入**：
+    有分歧→传摘要字符串；无分歧→传 ``write_null()``（显式 NULL，清掉旧值）。
+    """
+    return _WriteNull()
+
+
 def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]],
-           conflict_src: Optional[str] = None) -> int:
+           conflict_src: Optional[Any] = None) -> int:
     """批量 INSERT OR REPLACE。返回写入行数。**仅用于有 PK/UNIQUE 约束的表**。
 
     - 列名/值显式对应（不依赖顺序），None → NULL。
@@ -55,18 +72,26 @@ def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]
     - ⚠️ 无 PK 表调用本函数会抛 BinderException（"specify ON CONFLICT columns
       manually"）——请改用 delete_where + insert_many。
 
-    v6.1：``conflict_src`` 可选参数——跨源分歧摘要（写 ``conflict_src`` 列，≤256B；
-    None=不写该列→向后兼容，旧调用方零影响）。**仅当表 DDL 含 conflict_src 列时传**
-    （T1-T7 有、T8/T9 无——Q5）；对无此列的表传非 None 会抛 BinderException，
-    由调用方保证（load_t2/load_t7 等按 Q5 清单的表才传）。
+    v6.1：``conflict_src`` 可选参数——跨源分歧摘要（写 ``conflict_src`` 列，≤256B）。
+    **仅当表 DDL 含 conflict_src 列时传**（T1-T7 有、T8/T9 无——Q5）；对无此列的
+    表传非 None/哨兵会抛 BinderException，由调用方保证（load_t2/load_t7 等按 Q5
+    清单的表才传）。
+
+    v6.1 DEF-1：三态语义（向后兼容 + 审计列正确性）——
+    - ``None``（缺省）= **不写该列**：旧调用方零影响（T3/T4/T8/T9 等既有行为不变；
+      含 load_t2 的 legacy 单源路径与 v6.0.x 逐字节一致）。
+    - 字符串 = 写分歧摘要。
+    - :func:`write_null` 哨兵 = **显式写 NULL**：kline_daily 每次写入必传（无分歧
+      →NULL），REPLACE 后不残留上一次写入的陈旧值。
     """
     rows = [list(r) for r in rows]
     if not rows:
         return 0
     cols = list(columns)
-    if conflict_src is not None:
+    if conflict_src is not None:  # 字符串摘要 或 write_null() 哨兵（→NULL）
         cols = cols + ["conflict_src"]
-        rows = [r + [conflict_src] for r in rows]
+        val = None if isinstance(conflict_src, _WriteNull) else conflict_src
+        rows = [r + [val] for r in rows]
     cols_sql = ", ".join(f'"{c}"' for c in cols)
     placeholders = ", ".join(["?"] * len(cols))
     sql = f'INSERT OR REPLACE INTO {table} ({cols_sql}) VALUES ({placeholders})'

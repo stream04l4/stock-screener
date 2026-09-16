@@ -244,9 +244,11 @@ def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
         口径，v6.1 多源——原样入库不换算）。amount=None → NULL（腾讯不提供，不硬造）。
     :param adj_map: {date: af}——**事件日→af**（仅除权日有行）；本函数前向填充到每个交易日。
         None → adj_factor 全 NULL（hfq/qfq view 该段为 NULL，属预期）。
-    :param conflict_src: v6.1 跨源分歧摘要（≤256B；None=NULL——无分歧/单源）。
+    :param conflict_src: v6.1 跨源分歧摘要（≤256B）。**v6.1 DEF-1：kline_daily 每次
+        写入都显式落列**——有分歧=摘要；无分歧（None）→ 显式写 NULL（write_null 哨兵），
+        REPLACE 后不残留上一次写入的陈旧值（审计列必须反映本次写入）。
     """
-    from .common import forward_fill_af
+    from .common import forward_fill_af, write_null
 
     dates = [r["date"] for r in kline_rows]
     af_filled = forward_fill_af(dates, adj_map or {})
@@ -269,7 +271,10 @@ def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
     return upsert(con, "kline_daily", [
         "ts_code", "date", "open", "high", "low", "close", "volume",
         "amount", "pct_chg", "is_st", "preclose", "adj_factor",
-        "source", "fetched_at", "data_version"], rows, conflict_src=conflict_src)
+        # DEF-1：conflict_src 三态——摘要字符串原样；None→显式 NULL（write_null）。
+        # kline_daily 每次写入必落列，REPLACE 后不留上一次写入的陈旧残留。
+        "source", "fetched_at", "data_version"], rows,
+        conflict_src=conflict_src if conflict_src is not None else write_null())
 
 
 def load_t3(con, ts_code: str, snap: Dict[str, Any], date: str,

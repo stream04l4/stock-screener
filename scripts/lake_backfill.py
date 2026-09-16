@@ -11,8 +11,8 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
 - T4 dividend_events  ← em_dividend_ingest.load_dividends（cache/em_dividend_all.csv
                         静态导入全史，**零网络**）
 - T7 index_daily      ← tencent_ingest.fetch_kline_ohlcv + load_t7（4 指数 × N 天）
-- T2 kline_daily      ← tencent_ingest.fetch_kline_ohlcv + load_t2（逐股，
-                        BackfillRunner done 键幂等 → **中断续跑**；限速 ≥0.3s/股）
+- T2 kline_daily      ← v6.1 DEF-1 多源（source_pool：sina→tencent→tdx，窗口化近 N 天；
+                        adj sina/tdx 推导 + cross_check tdx；池空回退腾讯单源逐字节不变）
 - T3 valuation_daily  ← tencent_ingest.fetch_snapshot + load_t3（批量快照 50/批，
                         批间小睡；done 键同样幂等）
 - history             ← P2 全史后台补（v6.0.7：腾讯 K线分页翻到 IPO + BaoStock
@@ -360,12 +360,34 @@ def _universe_codes(con) -> List[str]:
 
 def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
            runner) -> Dict[str, Any]:
-    """T2：腾讯 raw K线逐股近 N 天（限速 ≥0.3s/股；done 键幂等中断续跑）。
+    """T2：K线逐股近 N 天增量（v6.1 DEF-1 修复：多源资源池，镜像 run_history worker）。
 
-    adj_factor 本步留 NULL（hfq/qfq view 该段 NULL 属预期）——P2 history 用
-    BaoStock adj_factor 前向填充补全。worker 回调委托 ingest 层函数。
+    **DEF-1 根因**：旧实现硬编码腾讯单源（fetch_kline_ohlcv + load_t2(adj_map=None)），
+    对已 history-done 的股执行 p0 会用 source=tencent/amount=NULL/adj_factor=NULL
+    覆盖多源写入的 sina 行，且 upsert 残留陈旧 conflict_src——违反 Q1 权威性不变式
+    （tencent=1 覆盖 sina=0）。现改为与 run_history 相同的多源逻辑（**窗口化**）：
+
+    - ``ohlcv_srcs = resolve_source("kline_daily","ohlcv_amount")``（config 序
+      sina→tencent→tdx）、``adj_srcs = resolve_source(...,"adj_factor")``（sina→tdx→baostock）；
+      按 Q1 优先级取第一个 available() 且成功的源（break）。
+    - **窗口化**：p0 是"近 N 天增量"，非全史重写——``window_start = (今日北京时间 -
+      (days+30) 自然日)``；对每个源 ``fetch_kline(code, start=window_start)``，取数后
+      **只 upsert 落在窗口内的行**（更早历史行丢弃，不重写旧数据）。sina adapter 忽略
+      start 恒返全史 → 取其尾部窗口即可（brief 明示可接受，不改 adapter）；tencent/tdx
+      原生支持窗口。
+    - adj_factor：主源自带推导值优先；否则按 adj_srcs 补取（同 history）。
+    - cross_check：采用 sina 主源时用 tdx 最近窗口轻量验证（close/amount/末因子，
+      阈值 config 集中）→ 分歧写 conflict_src（不阻断）；单源成功 → NULL。
+    - **限速红线保持**：sina ≥1s/股、tdx ≥0.5s/股（adapter 内 RateLimiter 已含，勿绕过）；
+      worker 末尾保留 time.sleep(0.3)。
+    - **取空/全源失败 → worker 抛错不 mark_done**（防 done 键毒化，同 history）。
+
+    legacy 兜底（零回归红线）：池全不可用（LAKE_MULTISOURCE=0 / config 源开关全关）
+    → 既有腾讯单源路径逐字节不变（离线单测 conftest autouse 置 0 走此路径、零网络）。
     """
     from lake.backfill import Task
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
     from lake.ingest.tencent_ingest import fetch_kline_ohlcv, load_t2
     from screener.data.tencent import TencentClient
 
@@ -375,11 +397,84 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes)}
 
+    # v6.1 DEF-1：多源池（门控同 run_history：LAKE_MULTISOURCE=0 / 源开关全关 → []）
+    ohlcv_srcs = sp.resolve_source("kline_daily", "ohlcv_amount")
+    adj_srcs = sp.resolve_source("kline_daily", "adj_factor")
+    t2_close_pct = crosscheck_threshold("t2_close_pct", 0.5)
+    t2_amount_pct = crosscheck_threshold("t2_amount_pct", 2.0)
+    t2_af_pct = crosscheck_threshold("t2_adj_factor_pct", 0.5)
+    # 增量窗口：近 (days+30) 自然日（p0 只覆盖该窗口，更早历史行不重写）
+    window_start = (_dt.date.today() - _dt.timedelta(days=days + 30)).isoformat()
+
     def worker(task: Task) -> None:
-        kl = fetch_kline_ohlcv(tclient, task.ts_code, n=days + 30)
-        if kl:
-            load_t2(con, task.ts_code, kl, adj_map=None)
-        time.sleep(0.3)  # brief 限速红线：≥0.3s/股
+        code = task.ts_code
+        if not ohlcv_srcs and not adj_srcs:
+            # ---- legacy 路径（池全不可用：离线单测/新源全降级）——v6.0.x 行为逐字节不变 ----
+            kl = fetch_kline_ohlcv(tclient, code, n=days + 30)
+            if kl:
+                load_t2(con, code, kl, adj_map=None)
+            time.sleep(0.3)  # brief 限速红线：≥0.3s/股
+            return
+
+        # ---- v6.1 DEF-1 多源路径（镜像 run_history，窗口化）----
+        kl: Optional[List[Dict[str, Any]]] = None
+        source = "tencent"
+        adj_map: Optional[Dict[str, float]] = None
+        for ad in ohlcv_srcs:
+            try:
+                res = ad.fetch_kline(code, start=window_start)  # 窗口（sina 忽略→全史取尾部）
+            except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源（fallback）
+                log.warning("T2 %s source=%s 取数失败，回退下一源: %s", code, ad.name, exc)
+                continue
+            if res and res.get("ohlcv"):
+                kl = res["ohlcv"]
+                source = ad.name
+                adj_map = res.get("adj_factor")
+                break
+        if not kl:
+            raise RuntimeError(f"T2 增量 K线所有源均失败 {code}（不标 done，下轮重试）")
+
+        # 窗口化：只 upsert 落在最近 (days+30) 自然日内的行（更早历史丢弃，不重写旧数据）
+        kl = [r for r in kl if str(r["date"]) >= window_start]
+        if not kl:
+            raise RuntimeError(f"T2 增量 K线窗口内无数据 {code}（不标 done，下轮重试）")
+
+        # adj_factor：主源自带推导值优先；否则按 adj 优先级补取（同 history）
+        if not adj_map:
+            for ad in adj_srcs:
+                try:
+                    m = ad.fetch_adj_factor(code, window_start, _today_beijing())
+                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
+                    log.warning("T2 %s adj source=%s 失败，回退下一源: %s", code, ad.name, exc)
+                    continue
+                if m:
+                    adj_map = m
+                    break
+
+        # cross_check：采用 sina 主源 → tdx 最近窗口轻量验证（close/amount/末因子）
+        conflict_src: Optional[str] = None
+        if source == "sina":
+            tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+            if tdx_ad is not None:
+                try:
+                    if tdx_ad.available():
+                        vres = tdx_ad.fetch_kline(code, start=window_start, end=None)
+                        vrows = (vres or {}).get("ohlcv") or []
+                        if vrows:
+                            conflict_src = sp.cross_check_kline(
+                                kl, "sina", vrows, "tdx",
+                                close_pct=t2_close_pct, amount_pct=t2_amount_pct)
+                            # 末因子交叉校验（af 误差累积进 hfq/qfq view，阈值从严）
+                            if adj_map and (vres or {}).get("adj_factor"):
+                                af_conf = sp.cross_check_adj_factor(
+                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
+                                conflict_src = _merge_conflict(conflict_src, af_conf)
+                except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
+                    log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
+
+        load_t2(con, code, kl, adj_map=adj_map, source=source,
+                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
+        time.sleep(0.3)  # brief 限速红线：≥0.3s/股（保留）
 
     stats.update(runner.run(tasks, worker))
     return {"table": "kline_daily", **stats}
