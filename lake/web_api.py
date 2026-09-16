@@ -161,6 +161,31 @@ def _lake_backfill_in_progress_handler(_request, exc: LakeBackfillInProgress):
                  "db_path": exc.db_path, "lock_holder_pid": exc.holder_pid})
 
 
+# ---------------------------------------------------------------------------
+# v6.0.9：同步控制（启动/停止灌数）冲突异常——与 B-1/v6.0.4 同构的顶层契约体
+#
+# POST /api/lake/sync/start 已 running → 409 sync_already_running；
+# POST /api/lake/sync/stop 未 running → 409 sync_not_running。
+# 与 v6.0.4 LakeBackfillInProgress 同模式（自定义异常 + app 级 handler 渲染顶层
+# error/hint，避免 FastAPI 把 detail 包进 "detail" 键破坏契约体形状）。
+# ---------------------------------------------------------------------------
+class LakeSyncConflict(HTTPException):
+    """同步控制冲突（start 已 running / stop 未 running）→ 409 + 顶层契约体。"""
+
+    def __init__(self, error: str, hint: str) -> None:
+        super().__init__(status_code=409, detail=hint)
+        self.error = error
+        self.hint = hint
+
+
+def _lake_sync_conflict_handler(_request, exc: LakeSyncConflict):
+    """v6.0.9 契约体渲染：顶层 error/hint（brief v6.0.9 指定形状，无 detail 键）。"""
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=409, content={"error": exc.error, "hint": exc.hint})
+
+
 def install(app) -> None:
     """把 lake 异常 handler 注册到 FastAPI app（由 web/app.py 条件挂载块调用）。
 
@@ -168,10 +193,12 @@ def install(app) -> None:
     不存在，handler 只能挂在 app 上；而 app 只存在于 web/app.py。此函数是 lake → web 的
     唯一额外接线点（与 router 挂载同在 duckdb 可导入的条件块内），不破坏零 import 边界。
     v6.0.4：同时注册 LakeBackfillInProgress handler（灌数持锁 → 409 新 error 值）。
+    v6.0.9：同时注册 LakeSyncConflict handler（同步控制 start/stop 冲突 → 409）。
     """
     app.add_exception_handler(LakeNotInitialized, _lake_not_initialized_handler)
     app.add_exception_handler(
         LakeBackfillInProgress, _lake_backfill_in_progress_handler)
+    app.add_exception_handler(LakeSyncConflict, _lake_sync_conflict_handler)
 
 
 def _ensure_initialized(con) -> None:
@@ -831,3 +858,65 @@ def status() -> Dict[str, Any]:
     }
     resp.update(details)  # v6.0.5 新字段只在 ready 态追加（旧字段逐字节不动）
     return resp
+
+
+# ---------------------------------------------------------------------------
+# v6.0.9：同步控制（启动/停止灌数）——Web"数据湖页"按钮后端
+#
+# 设计（TL 拍板）："启动" = scripts/lake_backfill.py history（P2 全史补库，
+# setsid 脱离长跑）；"停止" = 优雅终止持锁进程（SIGTERM → BackfillRunner 任务间
+# break + state=stopped_by_signal + save_progress，rc=0）。运行状态检测复用 v6.0.4
+# 三态机制（probe_db_state + LakeLocked.holder_pid + os.kill(pid,0)），**不新增
+# GET 端点**——前端用现有 /status 的 backfill_in_progress/lock_holder_pid 驱动按钮态。
+#
+# ⚠️ 生产库纪律：Web 服务进程对默认库（data/lake/lake.duckdb）操作 start/stop——
+# 这正是 Joel 要的"随时启动/停止"；E2E/单测一律显式 tmp 库，绝不触碰生产灌数进程。
+# ---------------------------------------------------------------------------
+@router.post("/sync/start")
+def sync_start(codes: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """启动全史数据补库（``lake_backfill.py history``，后台长跑）。
+
+    :param codes: 可选逗号分隔股票子集（透传 driver ``--codes``）——**E2E/冒烟限定
+        ≤3 只用**；Web 按钮不传 → 全集（Joel"启动数据更新"的默认语义）。
+    - 200 ``{started: true, pid, log_path}``：spawn 成功且 ~5s 内确认 running。
+    - **409** ``{error: "sync_already_running", hint, pid}``（顶层契约体）：已有灌数
+      在跑（v6.0.4 三态检测）——防双开，不 spawn。
+    - 200 ``{started: false, pid, log_path, reason}``：spawn 后进程提前退出/日志现
+      traceback（启动失败但非冲突；前端 toast 展示 reason，不白屏）。
+    """
+    from . import sync_control
+
+    # ⚠️ 直接函数调用（单测）时缺省值是 FieldInfo 对象而非 None——isinstance 归一化
+    # （与 /kline days、/market page_size 同口径；HTTP 路径恒为 str/None，行为不变）。
+    if not isinstance(codes, str):
+        codes = None
+    extra_args: Optional[List[str]] = None
+    if codes and codes.strip():
+        cs = [c.strip() for c in codes.split(",") if c.strip()]
+        if cs:
+            extra_args = ["--codes", ",".join(cs)]
+    res = sync_control.start_sync(extra_args=extra_args)   # 缺省库（生产默认）
+    if not res["started"] and res.get("reason") == "already_running":
+        raise LakeSyncConflict(
+            "sync_already_running",
+            f"已有灌数在运行（PID={res['pid'] if res['pid'] is not None else '未知'}），"
+            "请先停止再启动")
+    return {k: v for k, v in res.items() if v is not None}
+
+
+@router.post("/sync/stop")
+def sync_stop() -> Dict[str, Any]:
+    """优雅停止灌数（SIGTERM；进度已保存，下次启动自动续传）。
+
+    - 200 ``{stopped: true, pid, method}``：进程在 timeout 内干净退出。
+    - **409** ``{error: "sync_not_running", hint}``（顶层契约体）：当前无灌数在跑。
+    - 200 ``{stopped: false, pid, method, reason}``：holder PID 解析失败（拒绝猜测
+      目标进程）/ 信号后超时未退出（**不升级 SIGKILL**，保守——请手动检查）。
+    """
+    from . import sync_control
+
+    res = sync_control.stop_sync()
+    if not res["stopped"] and res.get("reason") == "not_running":
+        raise LakeSyncConflict(
+            "sync_not_running", "当前没有灌数在运行（状态可能刚更新，请刷新后重试）")
+    return {k: v for k, v in res.items() if v is not None}

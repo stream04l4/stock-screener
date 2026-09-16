@@ -23,7 +23,9 @@ import json
 import logging
 import math
 import os
+import signal
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -39,6 +41,45 @@ def _progress_path() -> str:
     from .conn import progress_path
 
     return progress_path()
+
+
+def _production_default_progress() -> str:
+    """真实生产默认 progress 路径（**不经** :func:`_progress_path`——不可被 monkeypatch）。
+
+    v6.0.9 派生判定专用：只有 ``_progress_path()`` 返回的就是这个真实生产路径时，
+    自定义 --db 才改派生到库目录；测试 patch 了 _progress_path（指向 tmp）→ 不派生，
+    patch 继续生效（v6.0.2 冒烟续跑 / v6.0.7 history 离线用例依赖它）。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "data", "lake", "backfill_progress.json")
+
+
+def progress_path_for_db(db_path: Optional[str]) -> Optional[str]:
+    """**v6.0.9（B-2 补全）**：progress 文件路径按库目录派生。
+
+    - ``db_path`` 非空且不是缺省库 → ``<db_dir>/backfill_progress.json``（自定义 --db
+      的进度与库同目录，不再落到生产 data/lake/）。
+    - ``db_path`` 为 None / 缺省库路径 → **返回 None**（调用方走 :func:`_progress_path`
+      = data/lake/backfill_progress.json——与原硬编码逐字节一致，且保留测试对
+      _progress_path 的 monkeypatch 注入能力）。
+
+    为什么放在 backfill 模块而非只在 driver：BackfillRunner(db_path=tmp) **不显式传
+    progress_path** 时（driver run_p0/run_history 正是这种构造）也必须落到 tmp 目录——
+    否则 E2E/冒烟的自定义库进度会写进生产 data/lake/backfill_progress.json。
+
+    ⚠️ 判定基准是 **_progress_path() 的实际返回值**：测试 patch 了 _progress_path →
+    返回 None（不派生，patch 生效）；只有真实生产默认路径 + 自定义 --db 才派生。
+    """
+    if not db_path:
+        return None
+    base = _progress_path()
+    if os.path.abspath(base) != _production_default_progress():
+        return None   # _progress_path 被 patch（测试注入）→ 不派生，保持原行为
+    d = os.path.dirname(os.path.abspath(db_path))
+    derived = os.path.join(d, "backfill_progress.json")
+    if os.path.abspath(derived) == base:
+        return None   # 缺省库：回退 _progress_path()（保持原行为 + 可 patch）
+    return derived
 
 
 def load_progress(path: Optional[str] = None) -> Dict[str, Any]:
@@ -128,7 +169,18 @@ class BackfillRunner:
         # B-2：runner 自身库路径（None=缺省库，coverage 走 get_conn 单例；自定义 --db 时
         # _refresh_coverage 改读该库）。progress 路径逻辑保持不变（见 docstring 说明）。
         self.db_path = db_path
-        self.progress_path = progress_path or _progress_path()
+        # v6.0.9（B-2 补全）：显式 progress_path 优先（测试注入/原行为不变）；未显式传
+        # 且自定义 --db → 按库目录派生（E2E/tmp 库进度不写生产 data/lake/）；缺省库 →
+        # _progress_path()（与原硬编码逐字节一致，保留 monkeypatch 注入能力）。
+        # ⚠️ 判定基准是 **_progress_path() 的实际返回值**而非字面默认值：测试对
+        # _progress_path 的 monkeypatch（v6.0.2 冒烟续跑 / v6.0.7 history 离线用例）
+        # 必须继续生效——只有"返回真实生产默认路径 + 自定义 --db"才派生。
+        base_progress = progress_path or _progress_path()
+        if (not progress_path and db_path
+                and os.path.abspath(base_progress) == _production_default_progress()):
+            base_progress = os.path.join(
+                os.path.dirname(os.path.abspath(db_path)), "backfill_progress.json")
+        self.progress_path = base_progress
         self.progress = load_progress(self.progress_path)
         # done 键集合（内存缓存，避免每任务重读文件）
         self._done: set = set()
@@ -142,6 +194,9 @@ class BackfillRunner:
         # _recent_durs：最近 N 个成功任务耗时（秒）环形缓冲 → eta_min 推算。
         self._view_groups: Dict[Tuple[str, str], Dict[str, int]] = {}
         self._recent_durs: Deque[float] = deque(maxlen=20)
+        # v6.0.9：SIGTERM 优雅停止标志（Web"停止同步"按钮 → sync_control.stop_sync
+        # killpg/kill SIGTERM）。run() 注册 handler 置位；主循环**任务间**检查 break。
+        self._stop_requested = False
 
     # ---------- done 键管理 ----------
     def _load_done(self) -> None:
@@ -189,6 +244,64 @@ class BackfillRunner:
         return used
 
     # ---------- 主循环 ----------
+    def _install_stop_handler(self) -> Optional[Any]:
+        """v6.0.9：注册 SIGTERM handler（仅主线程）→ 置 ``_stop_requested``。
+
+        - **只置标志、不做事**：handler 内不碰 runner 状态/文件——信号可能在 worker
+          执行中途到达，正在执行的任务让它跑完（不中断事务），主循环在**任务间**检查
+          标志 break；DuckDB 语句原子性兜底（已提交的不回滚、未提交的随语句结束）。
+        - **仅主线程安全场景**：driver 是单线程主循环（run() 在主线程调用）；非主线程
+          注册 signal handler 会抛 ValueError → 降级默认行为（SIGTERM 直接杀进程，
+          不 crash、不改变既有语义——brief："注册失败 → 降级默认行为"）。
+        - 返回原 handler（None=未注册/已保存 SIG_DFL），run() 收尾恢复。
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        try:
+            prev = signal.signal(signal.SIGTERM, self._on_stop_signal)
+        except (ValueError, OSError):  # noqa: BLE001 - 非主线程/平台不支持 → 降级默认
+            log.warning("SIGTERM handler 注册失败（%s）→ 降级默认行为",
+                        threading.current_thread().name)
+            return None
+        self._prev_term_handler = prev
+        return prev
+
+    def _on_stop_signal(self, signum, frame):  # noqa: ARG002 - signal handler 签名固定
+        """SIGTERM → 置停止标志（主循环任务间检查）。handler 保持最简：只置位。"""
+        self._stop_requested = True
+        log.info("收到 SIGTERM（signum=%s）→ 将在当前任务完成后优雅停止", signum)
+
+    def _restore_stop_handler(self) -> None:
+        """run() 收尾恢复原 SIGTERM handler（不留副作用给后续代码/测试）。"""
+        prev = getattr(self, "_prev_term_handler", None)
+        if prev is None:
+            return
+        try:
+            signal.signal(signal.SIGTERM, prev)
+        except (ValueError, OSError):  # noqa: BLE001 - 恢复失败不致命（进程即将退出）
+            pass
+        self._prev_term_handler = None
+
+    def _finish_stop(self, stats: Dict[str, Any]) -> None:
+        """v6.0.9：SIGTERM 优雅停止收尾——state=stopped_by_signal + save_progress + 日志。
+
+        先 :meth:`_refresh_task_view`（v6.0.8）确保 entry 存在且 total/done 回填
+        （信号在首个任务执行中到达时 tasks 视图可能尚无任何 entry），再对全部 entry
+        置 state="stopped_by_signal" + save_progress（brief 字面）。state 不走
+        _update_task_view——"停止"是 run 级事件而非单任务事件；后续收尾的
+        _refresh_task_view 不覆盖 state（v6.0.8 语义），最终文件即 stopped 态。
+        done 明细不受影响（已落盘即有效，下次启动自动续传）。
+        """
+        done_total = sum(
+            g["done_at_start"] + g["done_in_run"] for g in self._view_groups.values())
+        self._refresh_task_view()
+        for entry in self.progress.get("tasks", []):
+            if isinstance(entry, dict):
+                entry["state"] = "stopped_by_signal"
+        save_progress(self.progress, self.progress_path)
+        stats["stopped"] = True
+        log.info("STOPPED by signal, progress saved (done=%d)", done_total)
+
     def run(self, tasks: List[Task], worker: Callable[[Task], None]) -> Dict[str, Any]:
         """按优先级消费队列；幂等跳过 done；日预算到顶停。
 
@@ -201,7 +314,22 @@ class BackfillRunner:
 
         v6.0.8：run 开始处按 (table, tier) 分组统计 total/done_at_start（done 从
         ``self._done`` 集合计数）→ tasks 视图立即回填真实进度（修复 Web 恒 0/0）。
+
+        v6.0.9：**SIGTERM 优雅停止**（Web"停止同步"按钮 → sync_control.stop_sync
+        发 SIGTERM）。run() 注册 handler 置 ``_stop_requested``；主循环每任务边界
+        （worker 之前）检查 → break，写 state="stopped_by_signal" + save_progress +
+        stats["stopped"]=True（driver 正常收尾 rc=0）。正在执行的任务不中断——信号
+        到达时让它跑完（DuckDB 语句原子性兜底）。handler 在 run() 结束恢复原 handler；
+        非主线程/注册失败 → 降级默认行为（不 crash）。
         """
+        self._install_stop_handler()
+        try:
+            return self._run_inner(tasks, worker)
+        finally:
+            self._restore_stop_handler()
+
+    def _run_inner(self, tasks: List[Task], worker: Callable[[Task], None]) -> Dict[str, Any]:
+        """run() 主体（v6.0.9：从 run() 拆出以便 try/finally 恢复 SIGTERM handler）。"""
         ordered = sorted(tasks)  # Task order=True：priority 升序
         stats = {"total": len(ordered), "skipped_done": 0, "processed": 0,
                  "blocked_quota": False, "errors": []}
@@ -217,6 +345,14 @@ class BackfillRunner:
             if self.is_done(task):
                 g["done_at_start"] += 1
         for task in ordered:
+            # v6.0.9：任务边界检查停止标志（worker 之前）——正在执行的任务跑完，
+            # 下一个任务不再启动。放在 is_done 之前：停止后连"跳过"也不再发生，
+            # 立即进入收尾（进度已落盘的部分下次续传）。
+            if self._stop_requested:
+                log.info("SIGTERM 优雅停止：任务 %s 前 break（done 已落盘部分下次续传）",
+                         task_key(task))
+                self._finish_stop(stats)
+                break
             if self.is_done(task):
                 stats["skipped_done"] += 1
                 continue
@@ -242,6 +378,10 @@ class BackfillRunner:
                 log.error("backfill %s 失败: %s", task_key(task), exc)
                 stats["errors"].append(f"{task_key(task)}: {exc}")
                 self._update_task_view(task, "error", used)
+        # v6.0.9：信号在**最后一个任务执行期间**到达的边界——主循环已自然走完（没有
+        # 下一个任务边界可检查），此处补查停止标志 → 同样走优雅停止收尾。
+        if self._stop_requested:
+            self._finish_stop(stats)
         # 收尾：v6.0.8 视图回填（含零处理 run——全跳过/预算到顶也要刷新 total/done）
         self._refresh_task_view()
         # 收尾：写 coverage（各表行数/代码数/年份范围）

@@ -335,14 +335,14 @@ def _progress_for_db(db_path: str) -> Optional[str]:
 
     为什么缺省库不直接返回派生路径：派生值与 _progress_path() 相同，但显式传参会绕过
     测试对 _progress_path 的 patch（导致 Run1/Run2 读到不同进度文件、续跑失效）。
+
+    v6.0.9：判定逻辑收敛到 :func:`lake.backfill.progress_path_for_db`（BackfillRunner
+    构造器同用一份口径——自定义 --db 不显式传 progress_path 时 runner 也落到库目录）；
+    本函数保留为薄包装，driver 侧调用点与既有测试契约不变。
     """
     from lake import backfill as lb
 
-    d = os.path.dirname(os.path.abspath(db_path))
-    derived = os.path.join(d, "backfill_progress.json")
-    if os.path.abspath(derived) == os.path.abspath(lb._progress_path()):
-        return None  # 缺省库：回退 _progress_path()（保持原行为 + 可 patch）
-    return derived
+    return lb.progress_path_for_db(db_path)
 
 
 def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],

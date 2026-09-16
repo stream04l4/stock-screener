@@ -75,6 +75,8 @@ function switchTab(name) {
   if (name === "strategy") loadStrategy();
   if (name === "backtest") loadBacktest();
   if (name === "lake") onLakeTab();
+  // v6.0.9：同步控制按钮态 3s 轮询——仅数据湖 tab 激活期间运行（离开即停，不空转）
+  if (name === "lake") startLakeSyncPoll(); else stopLakeSyncPoll();
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,6 +1762,105 @@ function lakeRenderViews(d) {
   box.innerHTML = h;
 }
 
+// ---------------------------------------------------------------------------
+// v6.0.9 同步控制区（启动/停止全史补库）：按钮二态由 /status 的
+// backfill_in_progress / lock_holder_pid 驱动（v6.0.4 三态机制，不新增 GET 端点）。
+// 3s 轮询复用 loadLakeStatus（数据湖 tab 激活期间持续；离开 tab 停止）。
+// ---------------------------------------------------------------------------
+let lakeSyncPollTimer = null;        // 3s 轮询定时器（tab 激活期间）
+let lakeSyncRunningSince = null;     // 本会话首次观察到 running 的时间戳（已耗时口径）
+
+function lakeFmtElapsed(ms) {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "<1分钟";
+  if (m < 60) return m + "分钟";
+  return Math.floor(m / 60) + "小时" + (m % 60) + "分";
+}
+
+function startLakeSyncPoll() {
+  if (lakeSyncPollTimer) return;
+  lakeSyncPollTimer = setInterval(loadLakeStatus, 3000);   // 复用现有 status 拉取
+}
+
+function stopLakeSyncPoll() {
+  if (lakeSyncPollTimer) { clearInterval(lakeSyncPollTimer); lakeSyncPollTimer = null; }
+}
+
+// d = /status 响应（null=错误态）。按钮二态：
+//   backfill_in_progress=false → [▶ 启动同步]；=true → [⏹ 停止同步 (pid)] + 运行中提示。
+function lakeRenderSyncControl(d) {
+  const btn = $("#btn-lake-sync-toggle");
+  const meta = $("#lake-sync-meta");
+  if (!btn) return;
+  // 错误态（5xx/duckdb 未装）：禁用按钮不白屏（保留上次文案的占位）
+  if (!d) { btn.disabled = true; btn.innerHTML = '<span class="muted">状态不可用</span>'; meta.textContent = ""; return; }
+  if (!d.installed) { btn.disabled = true; btn.innerHTML = '<span class="muted">数据湖未安装</span>'; meta.textContent = ""; return; }
+
+  const running = d.backfill_in_progress === true;
+  // 会话内观察到 false→true 跃迁才记"已耗时"起点（中途进页面不知真实启动时刻，
+  // 改显示进度更新时间——不猜、不误导）
+  if (running && !lakeSyncRunningSince) lakeSyncRunningSince = Date.now();
+  else if (!running) lakeSyncRunningSince = null;
+
+  btn.disabled = false;
+  if (running) {
+    const pid = d.lock_holder_pid != null ? d.lock_holder_pid : "未知";
+    // 运行中提示：今日配额 x/5000（progress tasks 视图 quota，max 防御滞后）+ 耗时
+    let qUsed = null, qBudget = null;
+    for (const t of (d.tasks || [])) {
+      if (!t) continue;
+      if (typeof t.quota_used_today === "number") qUsed = Math.max(qUsed ?? 0, t.quota_used_today);
+      if (typeof t.quota_budget === "number") qBudget = Math.max(qBudget ?? 0, t.quota_budget);
+    }
+    const parts = ["PID " + pid];
+    if (qUsed != null) parts.push(`今日配额 ${qUsed}/${qBudget ?? "—"}`);
+    if (lakeSyncRunningSince) parts.push("已耗时 " + lakeFmtElapsed(Date.now() - lakeSyncRunningSince));
+    else if (d.updated_at) parts.push("进度更新于 " + String(d.updated_at).slice(5, 16));
+    meta.textContent = parts.join(" · ");
+    btn.innerHTML = `⏹ 停止同步 (${pid})`;
+    btn.onclick = lakeSyncStop;
+  } else {
+    meta.textContent = "";
+    btn.innerHTML = "▶ 启动同步";
+    btn.onclick = lakeSyncStart;
+  }
+}
+
+async function lakeSyncStart() {
+  const btn = $("#btn-lake-sync-toggle");
+  if (!confirm("将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？")) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="muted">启动中…</span>';
+  try {
+    const d = await api("/api/lake/sync/start", { method: "POST" });
+    if (d.started) toast(`同步已启动（PID ${d.pid ?? "?"}）`);
+    else toast("同步启动失败：" + (d.reason || "未知原因"), false);
+  } catch (e) {
+    // 409（已有灌数在跑，状态可能刚变化）→ toast 提示不白屏
+    if (e.status === 409 && e.body && e.body.hint) toast(e.body.hint, false);
+    else toast("同步启动失败：" + e.message, false);
+  } finally {
+    loadLakeStatus();   // 立即刷新按钮态（不等下一轮 3s）
+  }
+}
+
+async function lakeSyncStop() {
+  const btn = $("#btn-lake-sync-toggle");
+  if (!confirm("停止后进度已保存，下次启动自动续传。确认停止？")) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="muted">停止中…</span>';
+  try {
+    const d = await api("/api/lake/sync/stop", { method: "POST" });
+    if (d.stopped) toast(`同步已停止（PID ${d.pid ?? "?"}），进度已保存`);
+    else toast("同步未能在超时内停止：" + (d.reason || "请手动检查"), false);
+  } catch (e) {
+    if (e.status === 409 && e.body && e.body.hint) toast(e.body.hint, false);
+    else toast("同步停止失败：" + e.message, false);
+  } finally {
+    loadLakeStatus();
+  }
+}
+
 async function loadLakeStatus() {
   const table = $("#lake-tasks-table");
   try {
@@ -1778,6 +1879,7 @@ async function loadLakeStatus() {
     //   ② initialized=false（真未初始化）→ 空态文案（"请先运行 backfill init"）。
     //   ③ 正常 → v6.0.5 汇总条 + 9表清单 + 视图区 + tasks 表。
     lakeSetBackfill(d);
+    lakeRenderSyncControl(d);   // v6.0.9：同步控制按钮二态（3s 轮询驱动）
     lakeRenderSummary(d);
     lakeRenderTables(d);
     lakeRenderViews(d);
@@ -1786,6 +1888,7 @@ async function loadLakeStatus() {
   } catch (e) {
     // 错误态：5xx / duckdb 未装 → 红色横幅 + 降级占位（不白屏）
     lakeSetError(e.message);
+    lakeRenderSyncControl(null);   // v6.0.9：按钮禁用占位（不白屏）
     $("#lake-summary").innerHTML = '<span class="muted">—</span>';
     $("#lake-tables").innerHTML =
       '<tbody><tr><td colspan="7" class="placeholder">数据湖不可用</td></tr></tbody>';

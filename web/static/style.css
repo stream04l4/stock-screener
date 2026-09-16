@@ -327,6 +327,17 @@ tr.lake-row-muted .badge { opacity: .85; }
 /* tasks 表（保留 v6.0.4）：与上方表清单间留白 */
 .lake-tasks-wrap { margin-top: 2px; }
 
+/* ---------- v6.0.9 同步控制区（启动/停止全史补库按钮） ---------- */
+/* 放卡片头下方、汇总条上方：一行横排（标签 + 按钮 + 运行中提示），窄屏自动换行 */
+.lake-sync-control {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 10px;
+  background: #f8fafc; border: 1px solid var(--line); border-radius: 9px;
+}
+.lake-sync-label { font-size: 13px; font-weight: 600; color: #374151; }
+.lake-sync-control .primary-btn { white-space: nowrap; }
+#lake-sync-meta { font-size: 12.5px; word-break: break-all; }
+
 /* ---------- v6.0.6 个股全景·日K线蜡烛图（手绘 SVG，无图表库/CDN） ---------- */
 /* 区间切换按钮组：复用 .mini-btn 视觉语言，选中态用 accent 高亮 */
 .lake-kline-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; flex-wrap: wrap; }

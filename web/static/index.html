@@ -128,6 +128,12 @@
     <!-- 区块C：数据库状态 / 补齐进度（v6.0.5 重设计：汇总条 + 9表清单 + 视图区 + tasks） -->
     <div class="card" id="lake-status-card">
       <h3>数据湖状态 / 补齐进度 <button id="btn-lake-refresh-status" class="mini-btn" title="刷新">⟳</button></h3>
+      <!-- v6.0.9 同步控制区：启动/停止全史补库（按钮二态由 /status backfill_in_progress 驱动，3s 轮询） -->
+      <div id="lake-sync-control" class="lake-sync-control">
+        <span class="lake-sync-label">数据同步</span>
+        <button id="btn-lake-sync-toggle" class="primary-btn" disabled><span class="muted">检测中…</span></button>
+        <span id="lake-sync-meta" class="muted small"></span>
+      </div>
       <!-- v6.0.5 汇总条：N 表 + N 视图 · 库 X MB · DuckDB x.y.z · 最后同步 MM-DD HH:MM · [总体徽章] -->
       <div id="lake-summary" class="lake-summary"><span class="muted">加载中…</span></div>
       <!-- v6.0.5 表清单：9 行固定顺序（T1-T9）；零数据 P2/P3 表 muted 弱化 -->
