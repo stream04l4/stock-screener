@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import baostock as bs
@@ -31,6 +31,74 @@ log = logging.getLogger("screener.data.bs")
 
 # 北京时间自然日（BaoStock 官网限流口径=每 IP 每日；日期翻转即重置计数）
 _TZ_BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+# ---------------------------------------------------------------------------
+# v6.1（Q6 前置必修）：baostock socket 超时补丁
+# ---------------------------------------------------------------------------
+# baostock 0.9.30 ``util/socketutil.py`` 创建的 socket **无 timeout**——EU 链路
+# 抖动时 recv 永久 hang（实测 10/10 hang），login/query 都救不回来。修复方式：
+# monkey-patch ``SocketUtil.connect``，在其原逻辑执行后给
+# ``baostock.common.context.default_socket`` 补 settimeout(N)。researcher 已验证
+# 该路径生效（patch 后 gettimeout() 非 None）。
+#
+# **开关（brief 红线：必须有开关可关、默认开）**：
+# - 构造参数 ``socket_timeout: Optional[float]``——None=按环境变量缺省（开）；
+#   显式传值=用该值；传负数/0=禁用 patch（回退 baostock 原生无超时行为）。
+# - 环境变量 ``BS_SOCKET_TIMEOUT_MS``：毫秒整数，覆盖缺省 15000ms；设 0=禁用。
+#   为什么放环境变量而非 config.yaml：本模块是 screener 层，主路径零 import lake
+#   是硬边界（test_lake_zero_import），不能读 lake.config；screener 自身配置面
+#   （strategy.yaml）也不该为数据层基础设施加 accessor。env var 是最小侵入的开关。
+def _socket_timeout_default_ms() -> int:
+    try:
+        return int(os.environ.get("BS_SOCKET_TIMEOUT_MS", "15000"))
+    except ValueError:
+        return 15000
+
+
+_PATCHED = False          # 模块级幂等标记：同进程只 patch 一次
+_SOCKET_TIMEOUT_S: Optional[float] = None  # connect 时实际生效的超时（后构造的 client 覆盖）
+
+
+def _install_socket_timeout_patch() -> None:
+    """Patch ``SocketUtil.connect``：连接建立后给 default_socket settimeout。
+
+    - 幂等（_PATCHED 标记）：重复构造 client 不叠加包装；wrapper 在 **connect 时**
+      读模块级 ``_SOCKET_TIMEOUT_S``（后构造的 client 可覆盖，如 Q6 探测用 10s）。
+    - baostock 未装/结构变化 → 静默跳过（fail-open：退回原生行为，不阻断）。
+    - patch 内异常全部吞掉并 log——超时补丁失败不应影响数据查询主流程。
+    """
+    global _PATCHED
+    if _PATCHED:
+        return
+    try:
+        import baostock.common.context as bs_context
+        from baostock.util.socketutil import SocketUtil
+
+        orig_connect = SocketUtil.connect
+
+        def _connect_with_timeout(self):  # noqa: ANN001 - baostock 内部签名
+            orig_connect(self)
+            try:
+                tmo = _SOCKET_TIMEOUT_S
+                sock = getattr(bs_context, "default_socket", None)
+                if sock is not None and tmo is not None and tmo > 0:
+                    sock.settimeout(tmo)
+            except Exception as exc:  # noqa: BLE001 - 补丁失败不阻断（见模块注释）
+                log.warning("baostock socket timeout patch 生效失败: %s", exc)
+
+        SocketUtil.connect = _connect_with_timeout
+        _PATCHED = True
+        log.info("baostock socket timeout patch 已安装")
+    except Exception as exc:  # noqa: BLE001 - baostock 结构变化 → fail-open
+        log.warning("baostock socket timeout patch 安装失败（退回原生行为）: %s", exc)
+
+
+def reset_socket_patch_for_test() -> None:
+    """测试隔离：清 _PATCHED/超时标记（下次构造 client 重新 patch）。"""
+    global _PATCHED, _SOCKET_TIMEOUT_S
+    _PATCHED = False
+    _SOCKET_TIMEOUT_S = None
 
 
 def default_quota_path() -> str:
@@ -198,6 +266,7 @@ class BaoStockClient:
         daily_quota: int = 49900,
         quota_path: Optional[Union[str, bool]] = None,
         stop_checker: Optional[Callable[[], bool]] = None,
+        socket_timeout: Optional[float] = None,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.base_delay = base_delay
@@ -216,6 +285,17 @@ class BaoStockClient:
             self.quota_guard = QuotaGuard(daily_quota=daily_quota, path=quota_path)
         else:
             raise TypeError(f"quota_path 必须是字符串路径、None 或 False（当前 {quota_path!r}）")
+        # v6.1：socket 超时补丁（Q6 前置）。socket_timeout=None → 按 env/缺省 15s（默认开）；
+        # <=0 → 禁用 patch（回退原生无超时行为，开关可关）。patch 幂等（模块级标记），
+        # 多 client 只装一次。fail-open：baostock 结构变化时静默退回原生行为。
+        if socket_timeout is None:
+            self.socket_timeout = _socket_timeout_default_ms() / 1000.0
+        else:
+            self.socket_timeout = float(socket_timeout)
+        if self.socket_timeout > 0:
+            global _SOCKET_TIMEOUT_S
+            _SOCKET_TIMEOUT_S = self.socket_timeout
+            _install_socket_timeout_patch()
 
     # ---------- 登录态 ----------
     def _ensure_login(self) -> None:
@@ -308,6 +388,63 @@ class BaoStockClient:
     ) -> Tuple[List[str], List[List[str]]]:
         """同 :meth:`_query`，返回 (列名, 行)。"""
         return self._query(query_fn, label=label, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# v6.1（Q6）：BaoStock 恢复探测——灌数启动时探一次 query_all_stock 判活
+# ---------------------------------------------------------------------------
+def probe_baostock_alive(timeout_s: float = 10.0,
+                         wall_budget_s: Optional[float] = None) -> Dict[str, Any]:
+    """Q6 恢复探测：一次 ``query_all_stock`` 判定 BaoStock EU 链路是否存活。
+
+    :return: ``{"alive": bool, "elapsed_s": float|None, "detail": str}``——**绝不抛异常**
+        （探测失败/超时 = dead，由调用方写日志+progress 后按"死"处理）。
+    :param timeout_s: socket 层超时（brief：10s 判活）——经 v6.1 socket 超时补丁生效
+        （login/query 的 recv 都受此约束；无补丁时 EU hang 会永久卡死，正是本探测要防的）。
+    :param wall_budget_s: 墙钟硬预算（默认 3×timeout+10s）——baostock 协议层若吞掉
+        socket.timeout 进入内部循环时兜底：daemon 线程 join 超时即判 dead，绝不阻塞灌数启动。
+
+    设计取舍：
+    - ``max_attempts=1``：探测不重试（fail fast；重试会把"死"拖成分钟级）。
+    - ``quota_path=False``：探测**不消耗日预算**——它是存活检查而非数据取数，且若当日
+      预算已耗尽时探测会被 QuotaGuard 拒绝 → 误判 dead（语义错误）；1 次/启动对服务器
+      侧 5万/日/IP 限流是噪声级。数据路径的 QuotaGuard 纪律不受影响。
+    - 线程隔离：socket timeout 覆盖 recv，但 baostock 0.9.30 协议层行为不可全控
+      （send_msg 吞异常返回 None 后上层可能循环）→ daemon 线程 + join 硬预算双保险。
+    """
+    t_start = time.monotonic()
+    box: Dict[str, Any] = {"alive": False, "elapsed_s": None, "detail": ""}
+
+    def _do_probe() -> None:
+        t0 = time.monotonic()
+        client = BaoStockClient(max_attempts=1, base_delay=0.0,
+                                quota_path=False, socket_timeout=timeout_s)
+        try:
+            import baostock as bs
+
+            fields, rows = client.call_with_fields(
+                bs.query_all_stock, label="lake_probe_alive")
+            box["alive"] = True
+            box["detail"] = f"query_all_stock ok rows={len(rows)}"
+        except Exception as exc:  # noqa: BLE001 - 探测语义：任何异常=dead
+            box["alive"] = False
+            box["detail"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - close 失败不影响探测结论
+                pass
+            box["elapsed_s"] = round(time.monotonic() - t0, 2)
+
+    th = threading.Thread(target=_do_probe, name="bs-probe", daemon=True)
+    th.start()
+    budget = wall_budget_s if wall_budget_s is not None else timeout_s * 3 + 10
+    th.join(budget)
+    if th.is_alive():
+        # 硬预算耗尽：socket hang 未被协议层释放 → 判 dead（daemon 线程随进程退出，无泄漏）
+        box = {"alive": False, "elapsed_s": round(time.monotonic() - t_start, 2),
+               "detail": f"探测超过 {budget:.0f}s 硬预算（socket hang）→ 判 dead"}
+    return box
 
 
 # ---------------------------------------------------------------------------

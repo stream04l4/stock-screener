@@ -26,3 +26,22 @@ def _v52_isolate_raw_canonical(tmp_path, monkeypatch):
     yield
     rs.reset_raw_store()
     cs.reset_canonical_store()
+
+
+# ===========================================================================
+# v6.1 多源资源池：测试隔离门（autouse，默认关）
+# ---------------------------------------------------------------------------
+# v6.1 给 run_history/run_t7/run_p0 引入 source_pool.resolve_source()——它会懒加载
+# **真实** adapter 注册表并调 available()（EU 网络自检）。既有离线单测（v602/v603/
+# v607）全部 monkeypatch 腾讯/BaoStock 走 legacy 路径、契约是"零真实网络"——若多源
+# 池默认开启，resolve_source 会对真实 adapter 发 EU 自检请求 → 破坏离线契约 + 拖慢套件。
+#
+# 故本 autouse fixture 默认置 LAKE_MULTISOURCE=0：所有既有测试走 legacy 单源路径
+# （行为逐字节不变，零回归）。v6.1 多源专属用例（test_lake_v61_multisource）**显式**
+# monkeypatch.delenv("LAKE_MULTISOURCE") + 注入 mock adapter 注册表来开启多源。
+# ===========================================================================
+@pytest.fixture(autouse=True)
+def _v61_isolate_multisource(monkeypatch):
+    monkeypatch.setenv("LAKE_MULTISOURCE", "0")
+    yield
+

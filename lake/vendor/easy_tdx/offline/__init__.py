@@ -1,0 +1,37 @@
+"""离线数据读取模块 —— 从本地通达信安装目录读取数据文件。"""
+
+from .block import CustomerBlock, read_block_dat, read_customer_blocks
+from .daily_bar import find_daily_bar_file, read_daily_bars
+from .ex_daily_bar import ExDailyBar, read_ex_daily_bars
+from .finders import find_5min_bar_file, find_lc1_bar_file, find_lc5_bar_file
+from .gbbq import GbbqRecord, read_gbbq
+from .history_financial import read_history_financial
+from .min_bar import read_5min_bars, read_lc_min_bars
+from .paths import detect_tdx_home, resolve_vipdoc
+
+__all__ = [
+    # 路径
+    "detect_tdx_home",
+    "resolve_vipdoc",
+    # 日线
+    "read_daily_bars",
+    "find_daily_bar_file",
+    # 分钟线
+    "read_5min_bars",
+    "read_lc_min_bars",
+    "find_5min_bar_file",
+    "find_lc1_bar_file",
+    "find_lc5_bar_file",
+    # 扩展市场
+    "ExDailyBar",
+    "read_ex_daily_bars",
+    # 板块
+    "CustomerBlock",
+    "read_block_dat",
+    "read_customer_blocks",
+    # 股本变迁
+    "GbbqRecord",
+    "read_gbbq",
+    # 历史财务
+    "read_history_financial",
+]

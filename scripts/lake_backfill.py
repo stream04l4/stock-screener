@@ -122,6 +122,51 @@ def _quota_state() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# v6.1（Q6）：BaoStock 恢复探测——灌数启动时探一次，结果写日志+progress
+# ---------------------------------------------------------------------------
+def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """灌数启动的 Q6 BaoStock 存活探测（p0/history/reconcile 各调一次）。
+
+    - config ``baostock_probe_enabled=False`` → 跳过（按"死"处理，零网络——离线单测契约）。
+    - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 同样跳过（与 resolve_source 一致）。
+    - 探测本身 fail-fast：socket 10s 超时 + 墙钟硬预算（绝不阻塞灌数启动）；
+      结果 :func:`set_baostock_alive` 进程内共享 → baostock adapter available() 门控。
+    - 结果写日志 + progress 顶层 ``baostock_probe``（Web /status 可观测）。
+
+    **progress 路径按 db_path 派生**（v6.1 隔离修复）：自定义 --db（E2E/tmp 库）→
+    写到该库目录的 progress，**绝不污染生产 data/lake/backfill_progress.json**；
+    缺省库 → None → load/save_progress 走生产默认路径（原行为不变）。
+    """
+    from lake.config import lake_cfg
+
+    if os.environ.get("LAKE_MULTISOURCE") == "0":
+        return {"enabled": False, "alive": False, "detail": "multisource off (test isolation)"}
+    if not lake_cfg().get("baostock_probe_enabled", True):
+        return {"enabled": False, "alive": False, "detail": "probe disabled by config"}
+    from screener.data.baostock_client import probe_baostock_alive
+
+    res = probe_baostock_alive(timeout_s=10.0)
+    from lake.ingest.source_pool import set_baostock_alive
+
+    set_baostock_alive(res.get("alive", False), res.get("detail", ""))
+    log.info("Q6 BaoStock 恢复探测: alive=%s elapsed=%ss %s",
+             res.get("alive"), res.get("elapsed_s"), res.get("detail"))
+    # progress 落盘（Web /status 可观测）——失败不阻断灌数；路径按 db_path 派生（隔离）
+    try:
+        from lake.backfill import load_progress, save_progress
+
+        prog_path = _progress_for_db(db_path)  # None=缺省库→生产默认路径；自定义→库目录
+        prog = load_progress(prog_path)
+        prog["baostock_probe"] = {"at": _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"), "alive": bool(res.get("alive")),
+            "elapsed_s": res.get("elapsed_s"), "detail": res.get("detail", "")}
+        save_progress(prog, prog_path)
+    except Exception as exc:  # noqa: BLE001 - progress 写失败不影响灌数
+        log.warning("Q6 探测结果写 progress 失败（不阻断）: %s", exc)
+    return {"enabled": True, **res}
+
+
+# ---------------------------------------------------------------------------
 # T1 stock_master（BaoStock ~2 次 + 腾讯快照补 name/is_st）
 # ---------------------------------------------------------------------------
 def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
@@ -216,7 +261,9 @@ def run_t7(con, db_path: str, days: int, runner, force: bool = False) -> Dict[st
     done 键强制重取。零网络断言靠 fake client 计数（见 test_lake_v603）。
     """
     from lake.backfill import Task
-    from lake.ingest.tencent_ingest import INDEX_CODES, fetch_kline_ohlcv, load_t7
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
+    from lake.ingest.tencent_ingest import INDEX_CODES, load_t7
     from screener.data.tencent import TencentClient
 
     # n = 交易日数 + 缓冲（节假日/停牌不占行，多取一点保证覆盖 N 个交易日）
@@ -230,10 +277,49 @@ def run_t7(con, db_path: str, days: int, runner, force: bool = False) -> Dict[st
         runner._done = {k for k in runner._done if k[0] != "index_daily"}
         runner.progress["done"] = [list(k) for k in sorted(runner._done)]
 
+    t7_close_pct = crosscheck_threshold("t7_close_pct", 0.3)
+
     def worker(task: Task) -> None:
-        kl = fetch_kline_ohlcv(tclient, task.ts_code, n=days + 30)
+        # v6.1：T7 腾讯主源（现状稳定）+ tdx amount 补充 + close 交叉校验（0.3%）
+        ic = task.ts_code
+        srcs = sp.resolve_source("index_daily", "ohlcv")
+        kl, source = None, "tencent"
+        if srcs:
+            for ad in srcs:
+                try:
+                    rows = ad.fetch_index_kline(ic, n=days + 30)
+                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
+                    log.warning("T7 %s source=%s 取数失败，回退下一源: %s", ic, ad.name, exc)
+                    continue
+                if rows:
+                    kl, source = rows, ad.name
+                    break
+        else:
+            # 池全不可用（离线单测/降级）→ 既有直连路径（行为逐字节不变，零回归兜底）
+            from lake.ingest.tencent_ingest import fetch_kline_ohlcv
+
+            kl = fetch_kline_ohlcv(tclient, ic, n=days + 30)
+        # tdx amount 补充（腾讯指数行 amount 缺→NULL；tdx 提供则补上）
+        tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+        conflict = None
+        tdx_rows: List[Dict[str, Any]] = []
+        if kl and tdx_ad is not None:
+            try:
+                if tdx_ad.available():
+                    tdx_rows = tdx_ad.fetch_index_kline(ic, n=days + 30) or []
+            except Exception as exc:  # noqa: BLE001 - amount 补充失败不阻断（留 NULL）
+                log.warning("T7 %s tdx amount 补充失败（留 NULL）: %s", ic, exc)
+        if kl and tdx_rows:
+            tdx_map = {r["date"]: r for r in tdx_rows}
+            for r in kl:
+                tr = tdx_map.get(r["date"])
+                if tr is not None and r.get("amount") is None and tr.get("amount") is not None:
+                    r["amount"] = tr["amount"]  # 补缺口（不覆盖腾讯已有值）
+            # close 交叉校验：腾讯 vs tdx >0.3% → conflict_src（不阻断，取主源值）
+            conflict = sp.cross_check_kline(kl, source, tdx_rows, "tdx",
+                                            close_pct=t7_close_pct)
         if kl:
-            load_t7(con, task.ts_code, kl)
+            load_t7(con, ic, kl, source=source, conflict_src=conflict)
         time.sleep(0.3)  # 限速纪律（指数间小睡）
 
     stats = runner.run(tasks, worker)
@@ -328,7 +414,7 @@ def run_t3(con, db_path: str, codes: Optional[List[str]], runner,
     return {"table": "valuation_daily", **stats}
 
 
-def _progress_for_db(db_path: str) -> Optional[str]:
+def _progress_for_db(db_path: Optional[str]) -> Optional[str]:
     """**B-2（v6.0.3）**：progress 文件与库同目录派生；缺省库回退原路径。
 
     - 自定义 --db /tmp/x.db → /tmp/backfill_progress.json（不再落到生产 data/lake/）。
@@ -404,27 +490,44 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
 
 
 # ---------------------------------------------------------------------------
-# history（P2 全史后台补——本批次只构建不跑）
+# history（P2 全史后台补——v6.1 多源资源池）
 # ---------------------------------------------------------------------------
 def run_history(con, db_path: str, codes: Optional[List[str]],
                 start_date: str, end_date: str) -> Dict[str, Any]:
-    """P2 全史：腾讯 K线全史（分页翻到 IPO）+ BaoStock adj_factor 前向填充。
+    """P2 全史（v6.1 多源资源池，Q1 拍板序）。
 
-    走 BackfillRunner（budget_per_day 门 + done 键断点续传）。**本批次只构建
-    不跑**——TL 验收后由 TL 实际执行（后台长跑，日预算到顶当日停、次日续）。
+    走 BackfillRunner（budget_per_day 门 + done 键断点续传——**零改动**）。
+    TL 验收后由 TL 实际执行（后台长跑，日预算到顶当日停、次日续）。
 
-    v6.0.7 修复：
-    - 腾讯 n=12000 全市场取空（端点 n 上限=2000）→ 改 ``fetch_kline_full_history``
-      分页拉全史；单页重试耗尽/整轮取空 → worker 抛错（**不 mark_done**，下轮
-      重跑幂等）——杜绝"取空仍标 done"的 done 键毒化。
-    - done 键 ``period_or_date="full_history"``（固定字符串，不含日期）→ 断点续传
-      **跨天有效**（旧 f"{start}~{end}" 因 end 缺省=今日 → 每天重跑全量失配）。
+    **v6.1 worker 新逻辑**（brief §D；worker 粒度保持按股）：
+      ``for src in [sina, tencent, tdx]: fetch_kline+adj → cross_check(≥2源时)
+      → upsert(source=实际采用源, conflict_src=分歧摘要或NULL) → break``
+    - OHLCV/amount 主源=**新浪** akshare stock_zh_a_daily（全史一次拉全、含 amount、
+      volume=股），fallback=腾讯(分页 n≤2000)→tdx；
+    - adj_factor 主源=**新浪 hfq÷raw 推导**（raw+hfq 两次调用一次拿齐），
+      fallback=tdx hfq÷raw → BaoStock(Q6 探测存活时)；
+    - cross_check：采用新浪主源时，用 tdx 最近窗口（raw+hfq）做轻量验证
+      （close/amount/末因子，阈值 config 集中）→ 分歧写 conflict_src（不阻断）。
+      单源成功 → conflict_src=NULL。
+    - **池全不可用（离线单测/新源全降级）→ 回退既有路径**（腾讯全史 + BaoStock adj，
+      v6.0.7 行为逐字节不变——零回归兜底）。
+
+    v6.0.7 修复保留：done 键 ``period_or_date="full_history"``（固定字符串，跨天续传）；
+    取空/失败 → worker 抛错**不 mark_done**（杜绝 done 键毒化）。
+
+    **Q6**：启动时探一次 BaoStock（10s socket 超时判活；结果写日志+progress）——
+    存活则参与 adj fallback/交叉校验，死亡则自动跳过（不 crash、不阻塞）。
     """
     from lake.backfill import BackfillRunner, Task, stop_requested as _bk_stop
-    from lake.ingest import baostock_ingest as bsi
-    from lake.ingest.tencent_ingest import fetch_kline_full_history, load_t2
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
+    from lake.ingest.tencent_ingest import load_t2
     from screener.data.baostock_client import BaoStockClient
     from screener.data.tencent import TencentClient
+
+    # v6.1 Q6：灌数启动探一次 BaoStock（config 关/单测门控 → 跳过，零网络）；
+    # progress 落盘按 db_path 派生（自定义 --db → 库目录，不污染生产 progress）
+    probe_res = _run_bs_probe(db_path)
 
     codes = codes or _universe_codes(con)
     # v6.0.7：done 键稳定化——固定 "full_history"（不含日期），跨天断点续传有效
@@ -434,28 +537,280 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     runner = BackfillRunner(db_path=db_path)  # budget_per_day 门：到顶当日停（state=blocked_quota）
 
     # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
-    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）
+    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）。
+    # 多源模式下本源仅 legacy 回退路径使用（构造不登录、零网络；用不到则零成本）。
     bs = BaoStockClient(stop_checker=_bk_stop)     # QuotaGuard 内；adj_factor 1 次/股
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes),
                              "start_date": start_date, "end_date": end_date}
 
+    # 多源池（门控：单测 LAKE_MULTISOURCE=0 / config 源开关全关 → [] → legacy 路径）
+    ohlcv_srcs = sp.resolve_source("kline_daily", "ohlcv_amount")
+    adj_srcs = sp.resolve_source("kline_daily", "adj_factor")
+    t2_close_pct = crosscheck_threshold("t2_close_pct", 0.5)
+    t2_amount_pct = crosscheck_threshold("t2_amount_pct", 2.0)
+    t2_af_pct = crosscheck_threshold("t2_adj_factor_pct", 0.5)
+    # tdx 轻量验证窗口（最近 ~90 自然日≈60 交易日——成本可控的交叉校验，见假设记录）
+    verify_start = (_dt.date.today() - _dt.timedelta(days=90)).isoformat()
+
     def worker(task: Task) -> None:
-        # 腾讯全史 K线（v6.0.7：分页翻到 IPO；单页重试耗尽/整轮取空 → RuntimeError）
-        kl = fetch_kline_full_history(tclient, task.ts_code)
+        code = task.ts_code
+        if not ohlcv_srcs and not adj_srcs:
+            # ---- legacy 路径（池全不可用：离线单测/新源全降级）——v6.0.7 行为逐字节不变 ----
+            from lake.ingest import baostock_ingest as bsi
+            from lake.ingest.tencent_ingest import fetch_kline_full_history
+
+            kl = fetch_kline_full_history(tclient, code)
+            if not kl:
+                # 防御：fetch_kline_full_history 契约上取空即抛错，这里双保险——
+                # 绝不在无数据时 mark_done（旧 done 键毒化根因）
+                raise RuntimeError(f"腾讯K线全史为空 {code}（不标 done，下轮重试）")
+            fields, adj_rows = bsi.fetch_adjust_factor(bs, code, start_date, end_date)
+            adj_map = bsi.load_t2_adj_factor(con, code, adj_rows)
+            load_t2(con, code, kl, adj_map=adj_map)
+            time.sleep(0.3)
+            return
+
+        # ---- v6.1 多源路径：按 Q1 优先级取第一个成功源（break）----
+        kl: Optional[List[Dict[str, Any]]] = None
+        source = "tencent"
+        adj_map: Optional[Dict[str, float]] = None
+        for ad in ohlcv_srcs:
+            try:
+                res = ad.fetch_kline(code)  # 全史（start/end=None）
+            except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源（fallback）
+                log.warning("T2 %s source=%s 取数失败，回退下一源: %s", code, ad.name, exc)
+                continue
+            if res and res.get("ohlcv"):
+                kl = res["ohlcv"]
+                source = ad.name
+                adj_map = res.get("adj_factor")
+                break
         if not kl:
-            # 防御：fetch_kline_full_history 契约上取空即抛错，这里双保险——
-            # 绝不在无数据时 mark_done（旧 done 键毒化根因）
-            raise RuntimeError(f"腾讯K线全史为空 {task.ts_code}（不标 done，下轮重试）")
-        # BaoStock adj_factor 全史（仅除权日有行 → load_t2 前向填充；QuotaGuard 内）
-        fields, adj_rows = bsi.fetch_adjust_factor(bs, task.ts_code, start_date, end_date)
-        adj_map = bsi.load_t2_adj_factor(con, task.ts_code, adj_rows)
-        load_t2(con, task.ts_code, kl, adj_map=adj_map)
+            raise RuntimeError(f"T2 全史 K线所有源均失败 {code}（不标 done，下轮重试）")
+
+        # adj_factor：主源自带推导值（sina/tdx hfq÷raw）优先；否则按 adj 优先级补取
+        if not adj_map:
+            for ad in adj_srcs:
+                try:
+                    m = ad.fetch_adj_factor(code, start_date, end_date)
+                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
+                    log.warning("T2 %s adj source=%s 失败，回退下一源: %s", code, ad.name, exc)
+                    continue
+                if m:
+                    adj_map = m
+                    break
+
+        # cross_check（≥2源时）：采用新浪主源 → tdx 最近窗口轻量验证（close/amount/末因子）
+        conflict_src: Optional[str] = None
+        if source == "sina":
+            tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+            if tdx_ad is not None:
+                try:
+                    if tdx_ad.available():
+                        vres = tdx_ad.fetch_kline(code, start=verify_start, end=None)
+                        vrows = (vres or {}).get("ohlcv") or []
+                        if vrows:
+                            conflict_src = sp.cross_check_kline(
+                                kl, "sina", vrows, "tdx",
+                                close_pct=t2_close_pct, amount_pct=t2_amount_pct)
+                            # 末因子交叉校验（af 误差累积进 hfq/qfq view，阈值从严）
+                            if adj_map and (vres or {}).get("adj_factor"):
+                                af_conf = sp.cross_check_adj_factor(
+                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
+                                conflict_src = _merge_conflict(conflict_src, af_conf)
+                except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
+                    log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
+
+        load_t2(con, code, kl, adj_map=adj_map, source=source,
+                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
         time.sleep(0.3)
 
     stats.update(runner.run(tasks, worker))
     bs.close()
-    return {"sub": "history", **stats}
+    return {"sub": "history", **stats, "baostock_probe": probe_res,
+            "multisource": bool(ohlcv_srcs or adj_srcs),
+            "ohlcv_sources": [a.name for a in ohlcv_srcs],
+            "adj_sources": [a.name for a in adj_srcs]}
+
+
+def _merge_conflict(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """合并两段 conflict_src 摘要（≤256B；去重、截断）。"""
+    if not a:
+        return b
+    if not b:
+        return a
+    merged = f"{a};{b}"
+    return merged[:256]
+
+
+# ---------------------------------------------------------------------------
+# T5 fundamentals_quarterly（v6.1：adata F10 主源 + BaoStock 交叉校验）
+# ---------------------------------------------------------------------------
+def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
+    """T5 基本面（v6.1 多源，brief §D）。
+
+    - **adata F10 主源**（Q4：仅 fetch_f10；全报告期 PIT）→ load_t5 upsert。
+    - **BaoStock 探测存活时交叉校验**（最近 4 季；>1pp 记 conflict_src，不阻断）。
+      BaoStock 死（Q6 探测 False）→ 零调用、conflict_src=NULL（单源）。
+    - done 键 (fundamentals_quarterly, ts_code, "f10_full")——固定字符串跨天续传。
+    - adata 不可用/取空 → worker 抛错**不 mark_done**（下轮重试，防 done 键毒化）。
+    """
+    from lake.backfill import Task
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
+    from lake.ingest.adata_f10_adapter import load_t5
+
+    codes = codes or _universe_codes(con)
+    tasks = [Task(priority=2, table="fundamentals_quarterly", ts_code=c,
+                  period_or_date="f10_full", tier="P2") for c in codes]
+    stats: Dict[str, Any] = {"codes_requested": len(codes)}
+    t5_pp = crosscheck_threshold("t5_pp", 1.0)
+
+    def worker(task: Task) -> None:
+        code = task.ts_code
+        # adata F10 主源（Q4 硬编码边界：仅 fetch_f10）
+        ad = sp.get_adapter("adata_f10")
+        if ad is None or not lake_cfg().get("adata_f10_enabled", True) or not ad.available():
+            raise RuntimeError(f"T5 adata F10 不可用 {code}（不标 done，下轮重试）")
+        recs = ad.fetch_f10(code)
+        if not recs:
+            raise RuntimeError(f"T5 adata F10 取空 {code}（不标 done，下轮重试）")
+        # BaoStock 交叉校验（仅 Q6 探测存活时；>1pp 记 conflict_src）
+        conflict_src: Optional[str] = None
+        bs_ad = sp.get_adapter("baostock")
+        if bs_ad is not None and bs_ad.available():
+            try:
+                bs_recs = bs_ad.fetch_f10(code)  # 最近 4 季（配额内）
+                if bs_recs:
+                    conflict_src = sp.cross_check_f10(recs, "adata_f10",
+                                                      bs_recs, "baostock", pp=t5_pp)
+            except Exception as exc:  # noqa: BLE001 - 校验失败不阻断（取主源值）
+                log.warning("T5 %s BaoStock 交叉校验失败（不阻断）: %s", code, exc)
+        load_t5(con, code, recs, source="adata_f10", conflict_src=conflict_src)
+        time.sleep(0.3)
+
+    stats.update(runner.run(tasks, worker))
+    return {"table": "fundamentals_quarterly", **stats}
+
+
+# ---------------------------------------------------------------------------
+# reconcile（v6.1 --reconcile：仅跨源校验补 conflict_src，不重取主源数据）
+# ---------------------------------------------------------------------------
+def run_reconcile(con, db_path: str, codes: Optional[List[str]],
+                  start_date: str, end_date: str) -> Dict[str, Any]:
+    """--reconcile：对**已灌数据**补 conflict_src（brief §D）。
+
+    语义："仅跑跨源校验不重取"——
+    - **不重取/不覆盖主源 OHLCV/amount/adj_factor**（只读 DB 现有行）；
+    - 取**次源**（tdx，最近窗口）与 DB 行比对 → 超阈日期 ``UPDATE conflict_src``
+      （只写审计列，OHLCV 原值逐字节不动）；
+    - T2：kline_daily close(0.5%)/amount(2%) + 末因子 adj(0.5%)；T7：index_daily close(0.3%)。
+    - tdx 不可用 → 零更新（友好返回，不报错）。
+
+    :return: {table: {rows_compared, rows_conflicted, updated}} 汇总。
+    """
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
+
+    t2_close_pct = crosscheck_threshold("t2_close_pct", 0.5)
+    t2_amount_pct = crosscheck_threshold("t2_amount_pct", 2.0)
+    t2_af_pct = crosscheck_threshold("t2_adj_factor_pct", 0.5)
+    t7_close_pct = crosscheck_threshold("t7_close_pct", 0.3)
+
+    tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+    if tdx_ad is None or not tdx_ad.available():
+        return {"sub": "reconcile", "skipped": "tdx unavailable（零更新）"}
+
+    result: Dict[str, Any] = {"sub": "reconcile"}
+
+    # ---- T2 kline_daily ----
+    if codes:
+        t2_codes = [c for c in codes if "." in c]
+    else:
+        t2_codes = [r[0] for r in con.execute(
+            "SELECT DISTINCT ts_code FROM kline_daily ORDER BY ts_code").fetchall()]
+    t2_stat = {"rows_compared": 0, "rows_conflicted": 0, "updated": 0}
+    for code in t2_codes:
+        db_rows = con.execute(
+            "SELECT date, close, amount, adj_factor FROM kline_daily "
+            "WHERE ts_code=? ORDER BY date", [code]).fetchall()
+        if not db_rows:
+            continue
+        try:
+            vres = tdx_ad.fetch_kline(code)  # 全史（tdx 一次拿齐 raw+hfq）
+        except Exception as exc:  # noqa: BLE001 - 该股校验失败跳过（不阻断整轮）
+            log.warning("reconcile T2 %s tdx 取数失败，跳过: %s", code, exc)
+            continue
+        vrows = (vres or {}).get("ohlcv") or []
+        if not vrows:
+            continue
+        vmap = {r["date"]: r for r in vrows}
+        conflicted_dates: List[Tuple[str, str]] = []
+        for d, close, amount, af in db_rows:
+            vs = vmap.get(str(d))
+            if vs is None:
+                continue
+            t2_stat["rows_compared"] += 1
+            parts: List[str] = []
+            if close is not None and vs.get("close") is not None and close != 0:
+                if sp._rel_diff_pct(close, vs["close"]) > t2_close_pct:
+                    parts.append(f"close:sina:{sp._fmt_num(close)}|tdx:{sp._fmt_num(vs['close'])}")
+            if amount is not None and vs.get("amount") is not None and amount != 0:
+                if sp._rel_diff_pct(amount, vs["amount"]) > t2_amount_pct:
+                    parts.append(f"amount:sina:{sp._fmt_num(amount)}|tdx:{sp._fmt_num(vs['amount'])}")
+            if parts:
+                conflicted_dates.append((str(d), ";".join(parts)[:256]))
+        # 末因子 adj 校验（DB 最新非空 af vs tdx 推导末因子）
+        vadj = (vres or {}).get("adj_factor") or {}
+        if vadj:
+            last_af_row = con.execute(
+                "SELECT date, adj_factor FROM kline_daily WHERE ts_code=? AND adj_factor IS NOT NULL "
+                "ORDER BY date DESC LIMIT 1", [code]).fetchone()
+            if last_af_row and str(last_af_row[0]) in vadj:
+                db_af, tdx_af = float(last_af_row[1]), float(vadj[str(last_af_row[0])])
+                if db_af != 0 and sp._rel_diff_pct(db_af, tdx_af) > t2_af_pct:
+                    conflicted_dates.append(
+                        (str(last_af_row[0]),
+                         f"adj:sina:{sp._fmt_num(db_af)}|tdx:{sp._fmt_num(tdx_af)}"))
+        for d, summary in conflicted_dates:
+            t2_stat["rows_conflicted"] += 1
+            con.execute("UPDATE kline_daily SET conflict_src=? WHERE ts_code=? AND date=?",
+                        [summary, code, d])
+            t2_stat["updated"] += 1
+    result["kline_daily"] = t2_stat
+
+    # ---- T7 index_daily ----
+    from lake.ingest.tencent_ingest import INDEX_CODES
+
+    t7_stat = {"rows_compared": 0, "rows_conflicted": 0, "updated": 0}
+    for ic in INDEX_CODES:
+        db_rows = con.execute(
+            "SELECT date, close FROM index_daily WHERE index_code=? ORDER BY date",
+            [ic]).fetchall()
+        if not db_rows:
+            continue
+        try:
+            vrows = tdx_ad.fetch_index_kline(ic)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("reconcile T7 %s tdx 取数失败，跳过: %s", ic, exc)
+            continue
+        if not vrows:
+            continue
+        vmap = {r["date"]: r for r in vrows}
+        for d, close in db_rows:
+            vs = vmap.get(str(d))
+            if vs is None or close is None or vs.get("close") is None or close == 0:
+                continue
+            t7_stat["rows_compared"] += 1
+            if sp._rel_diff_pct(close, vs["close"]) > t7_close_pct:
+                summary = (f"close:tencent:{sp._fmt_num(close)}|tdx:{sp._fmt_num(vs['close'])}")[:256]
+                con.execute("UPDATE index_daily SET conflict_src=? WHERE index_code=? AND date=?",
+                            [summary, ic, d])
+                t7_stat["rows_conflicted"] += 1
+                t7_stat["updated"] += 1
+    result["index_daily"] = t7_stat
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -570,11 +925,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="B-3：强制重取 T7 四指数（清空 index_daily done 键，忽略幂等跳过）")
     sp.set_defaults(func=cmd_p0)
 
-    sp = sub.add_parser("history", help="P2 全史后台补（本批次只构建不跑）")
+    sp = sub.add_parser("history", help="P2 全史后台补（v6.1 多源资源池：sina 主源→tencent→tdx）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=全集）")
     sp.add_argument("--start-date", default="1990-01-01", help="全史起点（默认 1990-01-01）")
     sp.add_argument("--end-date", default=None, help="全史终点（缺省=今日北京时间）")
+    sp.add_argument("--t5", action="store_true",
+                    help="v6.1：同时灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）")
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser("reconcile",
+                        help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
+    sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=kline_daily 全集）")
+    sp.add_argument("--start-date", default="1990-01-01", help=argparse.SUPPRESS)
+    sp.add_argument("--end-date", default=None, help=argparse.SUPPRESS)
+    sp.set_defaults(func=cmd_reconcile)
 
     sp = sub.add_parser("status", help="各表 coverage + progress 文件摘要")
     sp.set_defaults(func=cmd_status)
@@ -612,7 +976,23 @@ def cmd_history(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     end_date = args.end_date or _today_beijing()
     summary = run_history(con, db_path, codes, args.start_date, end_date)
+    # v6.1：--t5 同时灌 T5（adata F10 主源；独立 done 键，失败不影响 history 主体）
+    if getattr(args, "t5", False):
+        from lake.backfill import BackfillRunner
+
+        runner = BackfillRunner(db_path=db_path)
+        summary["t5"] = run_t5(con, db_path, codes, runner)
     _print_summary("history", summary)
+    return EXIT_OK
+
+
+def cmd_reconcile(args, con, db_path: str) -> int:
+    codes = _parse_codes(args.codes)
+    end_date = args.end_date or _today_beijing()
+    # v6.1 Q6：reconcile 也探一次 BaoStock（一致性；结果写日志+progress，按 db_path 派生）
+    _run_bs_probe(db_path)
+    summary = run_reconcile(con, db_path, codes, args.start_date, end_date)
+    _print_summary("reconcile", summary)
     return EXIT_OK
 
 
@@ -623,9 +1003,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from lake.conn import LakeInvalidFile, LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
-    # B-4：写命令（init/p0/history）整段包在 LakeLock(flock) 内——connect + 写入 + close
+    # B-4：写命令（init/p0/history/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
-    write_cmd = args.cmd in ("init", "p0", "history")
+    write_cmd = args.cmd in ("init", "p0", "history", "reconcile")
 
     if not write_cmd:
         return _run_unlocked(args)

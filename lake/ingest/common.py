@@ -45,7 +45,8 @@ def code6(ts_code: str) -> str:
 #   必须用 delete_where + insert_many "先删后插"——DuckDB 的 INSERT OR REPLACE
 #   要求目标表有 UNIQUE/PK 约束，否则 BinderException）
 # ---------------------------------------------------------------------------
-def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> int:
+def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]],
+           conflict_src: Optional[str] = None) -> int:
     """批量 INSERT OR REPLACE。返回写入行数。**仅用于有 PK/UNIQUE 约束的表**。
 
     - 列名/值显式对应（不依赖顺序），None → NULL。
@@ -53,13 +54,22 @@ def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]
     - 单条失败立即抛错（不静默吞；调用方按 backfill 进度语义处理）。
     - ⚠️ 无 PK 表调用本函数会抛 BinderException（"specify ON CONFLICT columns
       manually"）——请改用 delete_where + insert_many。
+
+    v6.1：``conflict_src`` 可选参数——跨源分歧摘要（写 ``conflict_src`` 列，≤256B；
+    None=不写该列→向后兼容，旧调用方零影响）。**仅当表 DDL 含 conflict_src 列时传**
+    （T1-T7 有、T8/T9 无——Q5）；对无此列的表传非 None 会抛 BinderException，
+    由调用方保证（load_t2/load_t7 等按 Q5 清单的表才传）。
     """
     rows = [list(r) for r in rows]
     if not rows:
         return 0
-    cols = ", ".join(f'"{c}"' for c in columns)
-    placeholders = ", ".join(["?"] * len(columns))
-    sql = f'INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})'
+    cols = list(columns)
+    if conflict_src is not None:
+        cols = cols + ["conflict_src"]
+        rows = [r + [conflict_src] for r in rows]
+    cols_sql = ", ".join(f'"{c}"' for c in cols)
+    placeholders = ", ".join(["?"] * len(cols))
+    sql = f'INSERT OR REPLACE INTO {table} ({cols_sql}) VALUES ({placeholders})'
     con.executemany(sql, rows)
     return len(rows)
 

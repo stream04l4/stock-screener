@@ -17,3 +17,7 @@ output/
 # v5.2 Phase 1：raw/canonical 数据层（append-only 审计 + 派生 Schema；回滚=整删）。
 # ⚠️必须锚定仓库根 /data/——裸 data/ 会误伤 screener/data/ 源码目录。
 /data/
+
+# 团队流水线工作区产物（researcher/coder/tester 以 repo 为 cwd 时会把 stages/ 落到这里；
+# 正式交付物在 ~/.hermes/joint_project/<task>/stages/，此处仅为成员运行副产物，不入库）。
+/stages/

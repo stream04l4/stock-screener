@@ -234,12 +234,17 @@ def fetch_snapshot(client, ts_codes: Sequence[str]) -> Dict[str, Dict[str, Any]]
 # ---------------------------------------------------------------------------
 def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
             adj_map: Optional[Dict[str, float]] = None,
-            is_st: int = 0, source: str = "tencent") -> int:
-    """T2 upsert：OHLCV（volume ×100 转股，amount NULL）+ adj_factor（前向填充）。
+            is_st: int = 0, source: str = "tencent",
+            conflict_src: Optional[str] = None,
+            volume_is_shares: bool = False) -> int:
+    """T2 upsert：OHLCV + amount（若行提供）+ adj_factor（前向填充）。
 
-    :param kline_rows: fetch_kline_ohlcv 输出（升序）。
-    :param adj_map: {date: af}——**事件日→af**（BaoStock 仅除权日有行）；本函数前向填充到每个交易日。
+    :param kline_rows: K线行（升序）。volume 单位由 ``volume_is_shares`` 决定：
+        False=手（腾讯口径，×100 转股，Q8 既有行为）；True=股（新浪/tdx/BaoStock
+        口径，v6.1 多源——原样入库不换算）。amount=None → NULL（腾讯不提供，不硬造）。
+    :param adj_map: {date: af}——**事件日→af**（仅除权日有行）；本函数前向填充到每个交易日。
         None → adj_factor 全 NULL（hfq/qfq view 该段为 NULL，属预期）。
+    :param conflict_src: v6.1 跨源分歧摘要（≤256B；None=NULL——无分歧/单源）。
     """
     from .common import forward_fill_af
 
@@ -247,12 +252,14 @@ def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
     af_filled = forward_fill_af(dates, adj_map or {})
     rows = []
     for r in kline_rows:
-        vol_hand = r.get("volume")
+        vol = r.get("volume")
+        if vol is not None:
+            vol = vol if volume_is_shares else int(vol * 100)  # 手→股（Q8）/ 股原样
         rows.append([
             ts_code, r["date"],
             r.get("open"), r.get("high"), r.get("low"), r.get("close"),
-            int(vol_hand * 100) if vol_hand is not None else None,  # 手→股（Q8）
-            None,                    # amount：腾讯日K不提供 → NULL（不硬造，Q8）
+            vol,
+            r.get("amount"),          # amount：新浪/tdx/BaoStock 提供；腾讯 None→NULL
             None,                    # pct_chg：快照口径，K线行不含 → NULL
             int(is_st),
             None,                    # preclose：K线行不含 → NULL
@@ -262,7 +269,7 @@ def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
     return upsert(con, "kline_daily", [
         "ts_code", "date", "open", "high", "low", "close", "volume",
         "amount", "pct_chg", "is_st", "preclose", "adj_factor",
-        "source", "fetched_at", "data_version"], rows)
+        "source", "fetched_at", "data_version"], rows, conflict_src=conflict_src)
 
 
 def load_t3(con, ts_code: str, snap: Dict[str, Any], date: str,
@@ -287,8 +294,11 @@ def load_t3(con, ts_code: str, snap: Dict[str, Any], date: str,
 
 
 def load_t7(con, index_code: str, kline_rows: Sequence[Dict[str, Any]],
-            source: str = "tencent") -> int:
-    """T7 upsert：指数日K（amount 缺→NULL）。"""
+            source: str = "tencent", conflict_src: Optional[str] = None) -> int:
+    """T7 upsert：指数日K（amount 行提供则写、缺→NULL）。
+
+    :param conflict_src: v6.1 跨源分歧摘要（close 腾讯 vs tdx >0.3%；None=NULL）。
+    """
     rows = []
     for r in kline_rows:
         vol_hand = r.get("volume")
@@ -296,9 +306,9 @@ def load_t7(con, index_code: str, kline_rows: Sequence[Dict[str, Any]],
             index_code, r["date"],
             r.get("open"), r.get("high"), r.get("low"), r.get("close"),
             int(vol_hand * 100) if vol_hand is not None else None,
-            None,  # amount：指数行可能缺 → NULL（不硬造）
+            r.get("amount"),  # amount：行提供则写（tdx 补缺口）；缺→NULL（不硬造）
             source, now_ts(), DATA_VERSION,
         ])
     return upsert(con, "index_daily", [
         "index_code", "date", "open", "high", "low", "close", "volume",
-        "amount", "source", "fetched_at", "data_version"], rows)
+        "amount", "source", "fetched_at", "data_version"], rows, conflict_src=conflict_src)
