@@ -426,8 +426,26 @@ class BackfillRunner:
         # v6.0.10：新 run 开始处清除上一轮残留——progress stopping_at（若上轮被强杀、
         # _finish_stop 没跑到，文件可能残留"停止中"标记，/status 会误报 stopping=true）
         # + 模块级停止标志（同进程多轮 run 的测试场景防串味）。
+        # v6.0.10 DEF-1：清除必须**落盘**才对 /status 立即可见——/status 每请求重读
+        # progress 文件（web_api._stopping_from_progress），只改内存时下一次落盘要等
+        # 首个任务事件（mark_done/_update_task_view），长跑首任务窗口可达分钟级，整窗
+        # 误报 stopping=true。故先探测残留（清除前判定），清除 + 归位后补一次原子
+        # save_progress（与 handler/任务事件同频）。顺带归位残留 tasks[].state=
+        # "stopping"（_mark_stopping 写过的 state 同样会残留到首任务事件）：置回
+        # "pending"——新 run 开始、首个任务尚未执行，语义为"待处理"；随后首个任务
+        # 事件（running/error/blocked_quota）或收尾 _refresh_task_view 按实际推进覆盖。
+        # 正常 SIGTERM 停止路径不受影响：_mark_stopping 发生在**运行中**的 run 内
+        # （本方法早已跑完），_finish_stop 收尾时序不变；无残留时不落盘（零额外写）。
+        had_residual = (self.progress.get("stopping_at") is not None
+                        or any(isinstance(t, dict) and t.get("state") == "stopping"
+                               for t in self.progress.get("tasks", [])))
         self.progress["stopping_at"] = None
         clear_stop_requested()
+        if had_residual:
+            for entry in self.progress.get("tasks", []):
+                if isinstance(entry, dict) and entry.get("state") == "stopping":
+                    entry["state"] = "pending"
+            save_progress(self.progress, self.progress_path)
         stats = {"total": len(ordered), "skipped_done": 0, "processed": 0,
                  "blocked_quota": False, "errors": []}
         # v6.0.8：视图分组统计——done_at_start 只数**本次队列内**已 done 的任务：

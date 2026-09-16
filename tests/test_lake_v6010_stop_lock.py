@@ -442,6 +442,63 @@ def test_stopping_marker_cleared_on_new_run(tmp_path, monkeypatch):
     assert entry["state"] == "running", f"清除后 state 恢复正常: {entry}"
 
 
+def test_new_run_clears_residual_persisted_in_first_task_window(tmp_path, monkeypatch):
+    """**DEF-1 回归**：残留 stopping_at + tasks[].state="stopping"（上轮被强杀）→
+    新 run 开始处的清除+归位必须**落盘**——首个任务执行窗口内（任何任务事件落盘前），
+    直接读 progress 文件（/status 的 stopping 数据源，web_api._stopping_from_progress）
+    即应见 stopping_at=None 且无 state="stopping"。
+
+    旧实现只改内存、其后无 save_progress → 首任务窗口（长跑可达分钟级）文件持续残留
+    → /status 误报 stopping=true。判定点取**首个 worker 调用时刻**读文件——该时刻
+    run() 必已越过开始处的清除代码、且首个任务事件（mark_done/_update_task_view）
+    尚未发生，恰是 DEF-1 的误报窗口；确定性无竞态。回归时该时刻文件仍是残留态
+    （updated_at=None + stopping_at 非空 + state=stopping）→ 断言失败。"""
+    from lake import backfill as lb
+
+    prog = str(tmp_path / "prog_def1.json")
+    with open(prog, "w", encoding="utf-8") as f:
+        json.dump({"updated_at": None,
+                   "tasks": [{"table": "kline_history", "tier": "P2", "total": 3,
+                              "done": 1, "quota_used_today": 0, "quota_budget": 5000,
+                              "state": "stopping", "eta_min": None, "last_error": ""}],
+                   "coverage": {}, "stopping_at": "2026-09-16 07:00:00"}, f)
+    monkeypatch.setattr(lb.BackfillRunner, "_quota_state", lambda self: (False, 0))
+
+    tasks = [lb.Task(priority=2, table="kline_history", ts_code=f"sh.6{i:05d}",
+                     period_or_date="full_history", tier="P2") for i in range(3)]
+    first_task_file_state: dict | None = None
+
+    def worker(task):
+        nonlocal first_task_file_state
+        if first_task_file_state is None:
+            # 首任务执行中、首事件落盘前：/status 此刻读到的就是这份文件
+            with open(prog, encoding="utf-8") as f:
+                first_task_file_state = json.load(f)
+        time.sleep(1.5)   # 拉长首任务窗口（模拟长跑首任务，无事件落盘）
+
+    r = lb.BackfillRunner(budget_per_day=5000, progress_path=prog)
+    stats = r.run(tasks, worker)
+    assert stats["processed"] == 3
+
+    assert first_task_file_state is not None, "worker 未执行（前置错误）"
+    d = first_task_file_state
+    # ① 清除已落盘：updated_at 被 save_progress 刷新（预置文件为 None——窗口内除
+    #    run 开始处的清除外无任何写者，非空即证明清除落盘发生在首任务之前）
+    assert d.get("updated_at") is not None, \
+        f"首任务窗口内 progress 文件未被刷新——run 开始处的清除没有 save_progress " \
+        f"落盘（DEF-1 回归）: updated_at={d.get('updated_at')}"
+    # ② /status stopping 数据源：stopping_at=None 且无 state=stopping → stopping=false
+    assert d.get("stopping_at") is None, \
+        f"首任务窗口内文件残留 stopping_at（/status 将误报 stopping=true）: {d.get('stopping_at')}"
+    states = [t.get("state") for t in d.get("tasks", [])]
+    assert "stopping" not in states, \
+        f"首任务窗口内文件残留 state=stopping（/status 将误报 stopping=true）: {states}"
+    # ③ 归位语义：task state 置回 pending（随后首任务事件覆盖为 running；勿留 stopping）
+    entry = next(t for t in d["tasks"] if t.get("table") == "kline_history")
+    assert entry["state"] == "pending", \
+        f"归位后 state 应为 pending（新 run 开始、首任务尚未完成事件）: {entry}"
+
+
 # ===========================================================================
 # 4. 重试循环提前中断（收尾加速）——BaoStock / 腾讯
 # ===========================================================================
