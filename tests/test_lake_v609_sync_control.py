@@ -902,36 +902,37 @@ def test_runner_custom_db_without_explicit_progress_writes_local(tmp_path):
 # 7. 前端契约（防 JS/HTML 与后端端点脱节，v6.0.4 F 段同模式）
 # ===========================================================================
 def test_frontend_sync_control_contract():
-    """index.html 有同步控制区 + app.js 接两个 POST 端点 + confirm 文案 +
+    """Vue SyncControl.vue：同步控制区 + 两个 POST 端点 + confirm 文案 +
     backfill_in_progress 驱动按钮二态。
 
+    v6 FE-D3+：旧 vanilla index.html/app.js/style.css 已移除，契约断言改指 Vue
+    源码（SyncControl.vue + stores）+ app.css。
     v6.0.10：追加按钮锁定契约——停止点击即 disabled + "⏹ 停止中…" + 置灰类；
     启动锁定 "▶ 启动中…"；收尾轮询读 stopping；90s 文案升级 + 5min 硬超时释放。"""
-    html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"),
-                encoding="utf-8").read()
-    js = open(os.path.join(REPO_ROOT, "web", "static", "app.js"),
-              encoding="utf-8").read()
-    css = open(os.path.join(REPO_ROOT, "web", "static", "style.css"),
+    from conftest_helpers import vue_src_blob, vue_src
+    blob = vue_src_blob()
+    sc = vue_src("tabs/lake/SyncControl.vue")
+    css = open(os.path.join(REPO_ROOT, "web", "frontend", "src", "assets", "app.css"),
                encoding="utf-8").read()
-    assert 'id="lake-sync-control"' in html, "缺同步控制区 #lake-sync-control"
-    assert 'id="btn-lake-sync-toggle"' in html, "缺按钮 #btn-lake-sync-toggle"
-    assert "/api/lake/sync/start" in js, "app.js 未接 POST start"
-    assert "/api/lake/sync/stop" in js, "app.js 未接 POST stop"
-    assert 'method: "POST"' in js
-    assert "将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？" in js
-    assert "停止后进度已保存，下次启动自动续传。确认停止？" in js
-    assert "backfill_in_progress" in js
-    assert "▶ 启动同步" in js and "停止同步" in js, "按钮二态文案缺失"
-    # v6.0.10 锁定契约（DOM 行为由 test_lake_v6010_stop_lock 的 node 契约测试覆盖）
-    assert 'btn.disabled = true' in js, "点击后必须 disabled（锁定）"
-    assert "⏹ 停止中…" in js, "停止锁定文案缺失"
-    assert "▶ 启动中…" in js, "启动锁定文案缺失"
-    assert "已停止，进度已保存" in js, "停止成功 toast 文案缺失"
-    assert "停止超时，进程可能仍在收尾，请刷新查看" in js, "硬超时 toast 文案缺失"
-    assert "当前任务收尾中，最长约几分钟" in js, "90s 文案升级缺失"
-    assert "d.stopping === true" in js, "未读 /status stopping 标志（收尾友好文案）"
-    assert "waiting_task" in js, "未处理 stop 异步响应 waiting_task"
-    assert "sync-busy" in js and "sync-busy" in css, "锁定置灰类缺失（js/css 脱节）"
+    assert "lake-sync-control" in sc, "缺同步控制区 .lake-sync-control"
+    assert 'id="btn-lake-sync-toggle"' in sc, "缺按钮 #btn-lake-sync-toggle"
+    assert "/api/lake/sync/start" in blob, "Vue 未接 POST start"
+    assert "/api/lake/sync/stop" in blob, "Vue 未接 POST stop"
+    assert 'method: "POST"' in blob
+    assert "将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？" in blob
+    assert "停止后进度已保存，下次启动自动续传。确认停止？" in blob
+    assert "backfill_in_progress" in blob
+    assert "▶ 启动同步" in sc and "停止同步" in sc, "按钮二态文案缺失"
+    # v6.0.10 锁定契约（DOM 行为由 vitest SyncControl.test.js + tester E2E 覆盖）
+    assert "disabled: true" in sc, "点击后必须 disabled（锁定，computed btn.disabled）"
+    assert "⏹ 停止中…" in blob, "停止锁定文案缺失"
+    assert "▶ 启动中…" in blob, "启动锁定文案缺失"
+    assert "已停止，进度已保存" in blob, "停止成功 toast 文案缺失"
+    assert "停止超时，进程可能仍在收尾，请刷新查看" in blob, "硬超时 toast 文案缺失"
+    assert "当前任务收尾中，最长约几分钟" in blob, "90s 文案升级缺失"
+    assert "d.stopping === true" in sc, "未读 /status stopping 标志（收尾友好文案）"
+    assert "waiting_task" in blob, "未处理 stop 异步响应 waiting_task"
+    assert "sync-busy" in sc and "sync-busy" in css, "锁定置灰类缺失（vue/css 脱节）"
 
 
 def test_install_registers_sync_conflict_handler():

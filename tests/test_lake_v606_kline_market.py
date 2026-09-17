@@ -312,40 +312,43 @@ def test_kline_locked_409_backfill_in_progress(tmp_path, monkeypatch):
 # 前端契约（离线断言 DOM/JS/CSS，防前后端字段脱节）
 # ===========================================================================
 def test_frontend_v606_dom_contract():
-    """index.html/app.js/style.css：蜡烛图 DOM + JS 渲染函数 + A股配色变量。
+    """Vue 组件：蜡烛图 DOM + ECharts 渲染函数 + A股配色变量。
 
-    - index.html：个股全景卡片结构不变（K线区由 app.js 在 #lake-stock-body 内动态
-      注入，故断言锚点 = #lake-stock-card/#lake-stock-body）。
-    - app.js：/api/lake/kline 消费 + 渲染函数 + 区间按钮组 + 空态文案逐字。
-    - style.css：--lake-up/--lake-down CSS 变量（红涨绿跌）+ .lk-up/.lk-down。
+    v6 FE-D3+：旧 vanilla index.html/app.js/style.css 已移除，契约断言改指 Vue
+    源码（StockPanoramaCard/LakeKlineChart/klineOption）+ app.css。
+    - StockPanoramaCard：个股全景卡片锚点 #lake-stock-card/#lake-stock-body。
+    - LakeKlineChart：/api/lake/kline 消费 + ECharts candlestick + 区间按钮组 + 空态文案逐字。
+    - app.css：--lake-up/--lake-down CSS 变量（红涨绿跌）+ .lk-up/.lk-down。
     """
-    html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"),
-                encoding="utf-8").read()
-    js = open(os.path.join(REPO_ROOT, "web", "static", "app.js"),
-              encoding="utf-8").read()
-    css = open(os.path.join(REPO_ROOT, "web", "static", "style.css"),
+    from conftest_helpers import vue_src_blob, vue_src
+    blob = vue_src_blob()
+    card = vue_src("tabs/lake/StockPanoramaCard.vue")
+    chart = vue_src("tabs/lake/LakeKlineChart.vue")
+    ko = vue_src("tabs/lake/klineOption.js")
+    css = open(os.path.join(REPO_ROOT, "web", "frontend", "src", "assets", "app.css"),
                encoding="utf-8").read()
 
-    # index.html：全景卡片锚点仍在（K线区注入其内）
+    # 全景卡片锚点仍在（K线区注入其内）
     for sel in ('id="lake-stock-card"', 'id="lake-stock-body"'):
-        assert sel in html, f"index.html 缺 {sel}"
+        assert sel in card, f"StockPanoramaCard.vue 缺 {sel}"
 
-    # app.js：kline 端点消费 + 渲染/加载函数 + 区间组 + 空态文案
-    assert "/api/lake/kline/" in js, "app.js 未消费 /api/lake/kline 端点"
-    for fn in ("lakeKlineRenderChart", "loadLakeKline", "lakeKlineRenderBar"):
-        assert f"function {fn}(" in js, f"app.js 缺 {fn}"
+    # Vue：kline 端点消费 + ECharts 渲染/加载函数 + 区间组 + 空态文案
+    assert "/api/lake/kline/" in blob, "Vue 未消费 /api/lake/kline 端点"
+    assert "loadLakeKline" in blob, "缺 loadLakeKline（数据加载）"
+    for fn in ("buildKlineOption", "mapKlineData"):
+        assert fn in ko, f"klineOption.js 缺 {fn}（ECharts 渲染）"
     for label in ('{ key: "60"', '{ key: "120"', '{ key: "250"', '{ key: "all"'):
-        assert label in js, f"区间按钮组缺 {label}"
-    assert "该股暂无K线数据" in js, "空态文案必须逐字（brief）"
-    assert "id=\"lake-kline-bar\"" in js and "id=\"lake-kline-chart\"" in js
-    # 红涨绿跌判定逻辑存在（close≥open → up）
-    assert "Number(r.close) >= Number(r.open)" in js, "缺 A股红涨绿跌判定"
+        assert label in chart, f"区间按钮组缺 {label}"
+    assert "该股暂无K线数据" in blob, "空态文案必须逐字（brief）"
+    assert 'class="lake-kline-bar"' in chart and 'id="lake-kline-chart"' in chart
+    # 红涨绿跌判定逻辑存在（close≥open → up；ECharts data=[open,close,low,high]）
+    assert "const up = c >= o;" in ko, "缺 A股红涨绿跌判定"
 
-    # style.css：CSS 变量 + 蜡烛配色 class（前后端/CSS 不脱节）
+    # app.css：CSS 变量 + 蜡烛配色 class（Vue/CSS 不脱节）
     assert "--lake-up:" in css and "--lake-down:" in css, \
-        "style.css 缺 --lake-up/--lake-down 变量"
+        "app.css 缺 --lake-up/--lake-down 变量"
     for cls in (".lk-up", ".lk-down", ".lake-kline-tip", ".lake-kline-range"):
-        assert cls in css, f"style.css 缺 {cls}"
+        assert cls in css, f"app.css 缺 {cls}"
     # 红涨绿跌：--lake-up 必须是红色系（#dc2626），--lake-down 绿色系（#16a34a）
     up_line = next(l for l in css.splitlines() if l.strip().startswith("--lake-up"))
     down_line = next(l for l in css.splitlines() if l.strip().startswith("--lake-down"))

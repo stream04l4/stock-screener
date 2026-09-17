@@ -445,31 +445,32 @@ def test_http_status_ready_new_fields_end_to_end(tmp_path):
 # E. 前端契约（离线断言 DOM/JS/CSS，防前后端字段脱节）
 # ===========================================================================
 def test_frontend_v605_dom_contract():
-    """index.html 区块 C：新 DOM 三件套齐全、旧 #lake-coverage 已移除；
-    app.js 渲染函数 + 四色徽章 class + state_detail 消费；style.css 对应样式。"""
-    html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"),
-                encoding="utf-8").read()
-    js = open(os.path.join(REPO_ROOT, "web", "static", "app.js"),
-              encoding="utf-8").read()
-    css = open(os.path.join(REPO_ROOT, "web", "static", "style.css"),
+    """Vue 组件（LakeStatusCard/LakeTab）：区块 C DOM 锚点齐全、徽章 class +
+    state_detail 消费；app.css 对应样式。
+
+    v6 FE-D3+：旧 vanilla index.html/app.js/style.css 已移除，契约断言改指 Vue
+    源码（id 锚点/字段消费/徽章 class）+ app.css（徽章/muted 样式）。"""
+    from conftest_helpers import vue_src_blob, vue_src
+    card = vue_src("tabs/lake/LakeStatusCard.vue")
+    lt = vue_src("tabs/LakeTab.vue")
+    blob = vue_src_blob()
+    css = open(os.path.join(REPO_ROOT, "web", "frontend", "src", "assets", "app.css"),
                encoding="utf-8").read()
 
-    # index.html：新 DOM（汇总条/表清单/视图区）+ 保留 tasks 表与灌数中块
+    # 区块 C DOM 锚点（LakeStatusCard）+ 灌数中块（LakeTab）
     for sel in ('id="lake-summary"', 'id="lake-tables"', 'id="lake-views"',
-                'id="lake-tasks-table"', 'id="lake-backfill"'):
-        assert sel in html, f"index.html 缺 {sel}"
-    assert 'id="lake-coverage"' not in html, "旧 #lake-coverage 应已移除（v6.0.5 重设计）"
+                'id="lake-tasks-table"'):
+        assert sel in card, f"LakeStatusCard.vue 缺 {sel}"
+    assert 'id="lake-backfill"' in lt, "LakeTab.vue 缺灌数中块 #lake-backfill"
 
-    # app.js：渲染函数 + 徽章 class + 新字段消费
-    for fn in ("lakeRenderSummary", "lakeRenderTables", "lakeRenderViews"):
-        assert f"function {fn}(" in js, f"app.js 缺 {fn}"
+    # 徽章 class（组件 + CSS 不脱节）+ 新字段消费
     for cls in ("lake-st-fresh", "lake-st-lagging", "lake-st-pending", "lake-st-empty"):
-        assert cls in js and cls in css, f"徽章 class {cls} 前后端/CSS 脱节"
+        assert cls in card and cls in css, f"徽章 class {cls} Vue/CSS 脱节"
     for field in ("state_detail", "adj_factor_coverage_pct", "size_mb",
                   "quota_used_today", "last_sync_at"):
-        assert field in js, f"app.js 未消费新字段 {field}"
-    assert "lake-row-muted" in js and "lake-row-muted" in css, \
-        "零数据表 muted 弱化 class 前后端/CSS 脱节"
+        assert field in blob, f"Vue 未消费新字段 {field}"
+    assert "lake-row-muted" in card and "lake-row-muted" in css, \
+        "零数据表 muted 弱化 class Vue/CSS 脱节"
     # v6.0.4 三态契约不回退（AC3）：灌数中块/未初始化文案/error 识别仍在
-    assert "backfill_in_progress" in js and "lock_holder_pid" in js
-    assert "lake_backfill_in_progress" in js and "数据灌入中" in html
+    assert "backfill_in_progress" in blob and "lock_holder_pid" in blob
+    assert "lake_backfill_in_progress" in blob and "数据灌入中" in lt

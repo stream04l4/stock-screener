@@ -663,14 +663,17 @@ def test_real_cross_process_lock_full_cycle(tmp_path):
 # F. 前端三态文案契约（防 JS/HTML 与后端字段脱节）
 # ===========================================================================
 def test_frontend_contract_backfill_block_and_error_value():
-    """index.html 有 #lake-backfill 状态块；app.js 读 backfill_in_progress /
-    lock_holder_pid 并识别 lake_backfill_in_progress error 值。"""
-    html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"),
-                encoding="utf-8").read()
-    js = open(os.path.join(REPO_ROOT, "web", "static", "app.js"),
+    """Vue 源码有 #lake-backfill 状态块；读 backfill_in_progress / lock_holder_pid
+    并识别 lake_backfill_in_progress error 值。
+
+    v6 FE-D3+：旧 vanilla index.html/app.js 已移除，契约断言改指 Vue 组件源码
+    （LakeTab.vue 灌数中块 + api/client.js error 识别）。"""
+    lt = open(os.path.join(REPO_ROOT, "web", "frontend", "src", "tabs", "LakeTab.vue"),
               encoding="utf-8").read()
-    assert 'id="lake-backfill"' in html, "index.html 缺灌数中状态块 #lake-backfill"
-    assert "数据灌入中" in js and "数据灌入中" in html
-    assert "backfill_in_progress" in js
-    assert "lock_holder_pid" in js
-    assert "lake_backfill_in_progress" in js, "app.js 未识别新 error 值（三态会串味）"
+    from conftest_helpers import vue_src_blob
+    blob = vue_src_blob()
+    assert 'id="lake-backfill"' in lt, "LakeTab.vue 缺灌数中状态块 #lake-backfill"
+    assert "数据灌入中" in lt
+    assert "backfill_in_progress" in blob
+    assert "lock_holder_pid" in blob
+    assert "lake_backfill_in_progress" in blob, "Vue 未识别新 error 值（三态会串味）"

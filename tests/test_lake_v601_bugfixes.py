@@ -14,8 +14,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 
 import pytest
 
@@ -143,100 +141,13 @@ def test_d3_industries_endpoint_empty(monkeypatch):
         con.close()
 
 
-# ---------------------------------------------------------------------------
-# D-3（前端侧）：node 最小 DOM stub 真实执行 loadLakeIndustries 三态
-# ---------------------------------------------------------------------------
-_NODE_DOM_TEST = r"""
-"use strict";
-// 从 app.js 提取 loadLakeIndustries 函数源码（到下一个顶层 async function 为止）
-const fs = require("fs");
-const src = fs.readFileSync(process.argv[2], "utf8");
-const start = src.indexOf("async function loadLakeIndustries()");
-if (start < 0) { console.error("FAIL: loadLakeIndustries not found in app.js"); process.exit(2); }
-const end = src.indexOf("\nasync function", start + 1);
-const fnSrc = src.slice(start, end > 0 ? end : undefined);
-
-// ---- 最小 DOM stub（只覆盖本函数用到的 API）----
-function makeSelect() {
-  return { value: "", disabled: false, _html: "",
-    set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html; } };
-}
-function makeHint() {
-  const h = { textContent: "", _hidden: true,
-    classList: { hidden: true,
-      add(c) { if (c === "hidden") this.hidden = true; },
-      remove(c) { if (c === "hidden") this.hidden = false; } } };
-  return h;
-}
-let sel, hint, apiImpl, errors = [];
-global.$ = (s) => s === "#lake-industry-filter" ? sel : s === "#lake-industry-hint" ? hint : null;
-global.esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
-  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-global.api = (p) => apiImpl(p);
-global.lakeSetError = (m) => errors.push(m);
-// v6.0.4：loadLakeIndustries 的 catch 分支新增 lakeIsBackfillErr(e) 判定（灌数持锁
-// → 不弹红横幅）——DOM stub 必须提供该全局；此处 stub 返回 false（等价于"非灌数错误"，
-// 态3 的 503 走原红横幅路径，断言不变）。
-global.lakeIsBackfillErr = (e) => !!(e && e.status === 409 && e.body && e.body.error === "lake_backfill_in_progress");
-
-(async () => {
-  // ---- 态1：正常（2 个行业）----
-  sel = makeSelect(); hint = makeHint();
-  apiImpl = async () => ({ industries: [
-    { code: "C39", name: "计算机、通信和其他电子设备制造业" },
-    { code: "J66", name: "货币金融服务" } ] });
-  await eval(fnSrc + "; loadLakeIndustries()");
-  let opts = [...sel._html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)].map(m => [m[1], m[2]]);
-  if (opts.length !== 3 || opts[0][0] !== "" || opts[0][1] !== "全部行业") { console.error("FAIL state1 options:", JSON.stringify(opts)); process.exit(1); }
-  if (opts[1][0] !== "C39" || !opts[1][1].startsWith("C39 ")) { console.error("FAIL state1 C39:", JSON.stringify(opts[1])); process.exit(1); }
-  if (opts[2][0] !== "J66" || opts[2][1] !== "J66 货币金融服务") { console.error("FAIL state1 J66:", JSON.stringify(opts[2])); process.exit(1); }
-  if (!hint.classList.hidden) { console.error("FAIL state1: hint should stay hidden"); process.exit(1); }
-
-  // ---- 态2：空库（保持占位 + 空态文案）----
-  sel = makeSelect(); hint = makeHint();
-  apiImpl = async () => ({ industries: [] });
-  await eval(fnSrc + "; loadLakeIndustries()");
-  opts = [...sel._html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)].map(m => [m[1], m[2]]);
-  if (opts.length !== 1 || opts[0][1] !== "全部行业") { console.error("FAIL state2 options:", JSON.stringify(opts)); process.exit(1); }
-  if (hint.classList.hidden || hint.textContent !== "（暂无行业数据）") { console.error("FAIL state2 hint:", hint.textContent, hint.classList.hidden); process.exit(1); }
-
-  // ---- 态3：错误（503 降级：红横幅 + 回退占位，select 不永久禁用）----
-  sel = makeSelect(); hint = makeHint();
-  apiImpl = async () => { const e = new Error("数据湖不可用：duckdb 未安装"); e.status = 503; throw e; };
-  await eval(fnSrc + "; loadLakeIndustries()");
-  opts = [...sel._html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)].map(m => [m[1], m[2]]);
-  if (opts.length !== 1 || opts[0][1] !== "全部行业") { console.error("FAIL state3 options:", JSON.stringify(opts)); process.exit(1); }
-  if (errors.length !== 1) { console.error("FAIL state3: error banner not raised:", errors); process.exit(1); }
-  if (sel.disabled) { console.error("FAIL state3: select left disabled"); process.exit(1); }
-
-  // ---- 态4：保留已有选择（prev 仍存在时）----
-  sel = makeSelect(); sel.value = "J66"; hint = makeHint();
-  apiImpl = async () => ({ industries: [
-    { code: "C39", name: "电子设备" }, { code: "J66", name: "货币金融服务" } ] });
-  await eval(fnSrc + "; loadLakeIndustries()");
-  if (sel.value !== "J66") { console.error("FAIL state4: prev selection lost:", sel.value); process.exit(1); }
-
-  console.log("DOM_OK state1=populated state2=empty-hint state3=error-fallback state4=keep-prev");
-})().catch((e) => { console.error("FAIL uncaught:", e.message); process.exit(1); });
-"""
-
-
-def test_d3_frontend_dropdown_states():
-    """node 真实执行 app.js::loadLakeIndustries（DOM stub）：正常/空/错误/保留选择。"""
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node 不可用（前端 DOM 断言跳过；端点侧用例仍覆盖 D-3 API）")
-    script = "/tmp/_lake_d3_dom_test.js"
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(_NODE_DOM_TEST)
-    app_js = os.path.join(REPO_ROOT, "web", "static", "app.js")
-    r = subprocess.run([node, script, app_js], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"node DOM 测试失败:\nstdout={r.stdout}\nstderr={r.stderr}"
-    assert "DOM_OK" in r.stdout
-
-
 def test_d3_index_html_has_hint_anchor():
-    """index.html 区块B 存在空态文案锚点（#lake-industry-hint，muted small hidden）。"""
-    html = open(os.path.join(REPO_ROOT, "web", "static", "index.html"), encoding="utf-8").read()
-    assert 'id="lake-industry-filter"' in html
-    assert 'id="lake-industry-hint" class="muted small hidden"' in html
+    """Vue 源码（MarketTable.vue）存在行业下拉 + 空态文案锚点。
+
+    v6 FE-D3+：旧 vanilla index.html/app.js 已移除，契约断言改指 Vue 组件源码
+    （#lake-industry-hint 空态 span 仍在，三态行为由 vitest + tester E2E 覆盖）。"""
+    src = open(os.path.join(REPO_ROOT, "web", "frontend", "src", "tabs", "lake",
+                            "MarketTable.vue"), encoding="utf-8").read()
+    assert 'id="lake-industry-filter"' in src
+    assert 'id="lake-industry-hint"' in src
+    assert "（暂无行业数据）" in src

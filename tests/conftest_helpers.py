@@ -49,3 +49,34 @@ def trading_dates(n: int, end: date) -> List[str]:
         else:
             d -= timedelta(days=1)
     return list(reversed(out))
+
+
+# ===========================================================================
+# v6 FE-D3+：Vue 前端源码树 blob（契约断言用；旧 web/static vanilla 栈已移除）
+# ===========================================================================
+import glob as _glob  # noqa: E402
+
+_VUE_BLOB_CACHE = None
+
+
+def vue_src_blob() -> str:
+    """web/frontend/src 全量源码拼接（缓存）。防前后端字段脱节的契约断言统一用它。"""
+    global _VUE_BLOB_CACHE
+    if _VUE_BLOB_CACHE is None:
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "web", "frontend", "src")
+        parts = []
+        for p in _glob.glob(os.path.join(root, "**"), recursive=True):
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as fh:
+                    parts.append(fh.read())
+        _VUE_BLOB_CACHE = "\n".join(parts)
+    return _VUE_BLOB_CACHE
+
+
+def vue_src(path: str) -> str:
+    """读单个 Vue 源文件（相对 web/frontend/src）。"""
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "web", "frontend", "src")
+    with open(os.path.join(root, path), encoding="utf-8") as fh:
+        return fh.read()

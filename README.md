@@ -286,9 +286,10 @@ stock-screener/
 │       ├── akshare_src.py      # v5.2：akshare 校验源客户端（仅校验用途，breaker+限速）
 │       └── em.py               # 东财 datacenter-web 客户端（v5 已停用，代码保留）
 ├── tests/                      # 388 个离线单测 + fixtures（真实样例数据）
-├── web/                        # Web 前端（FastAPI + 静态 SPA，端口 9090）
+├── web/                        # Web 前端（FastAPI + Vue3 SPA，端口 9090）
 │   ├── app.py                  # FastAPI 应用（API + 子进程任务管理 + 策略校验 + data_health badge）
-│   └── static/                 # index.html / style.css / app.js（vanilla JS，无构建）
+│   ├── frontend/               # Vue3 + Vite + Pinia 源码（统一刷新引擎 queryRegistry）
+│   └── dist/                   # `npm run build` 产物（不入库，app.py serve /assets + index.html）
 ├── cache/                      # 原始数据缓存（自动生成）
 ├── data/                       # v5.2：raw/（append-only 原始响应）+ canonical/（统一 Schema + v5.3 version_log.csv），已 gitignore
 ├── output/                     # result_*.csv / report_*.md（自动生成，报告含数据源健康度段）

@@ -44,7 +44,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
 BAK_PATH = CONFIG_PATH.with_suffix(".yaml.bak")
 LOGS_DIR = PROJECT_ROOT / "logs"
-STATIC_DIR = WEB_DIR / "static"
+DIST_DIR = WEB_DIR / "dist"   # v6 FE-D3+：Vue3+Vite 构建产物（`npm run build` @ web/frontend → ../dist，不入库）
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1378,14 +1378,17 @@ if _lake_router is None:
 
 
 # ---------------------------------------------------------------------------
-# 静态前端（最后挂载，避免吞掉 /api/*）
+# 静态前端（最后挂载，避免吞掉 /api/*）——v6 FE-D3+：serve Vite 构建产物 dist/
+# （dist/index.html 引用 /assets/<hash>.js|css；无 vue-router → 单页无需 SPA fallback）
 # ---------------------------------------------------------------------------
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if DIST_DIR.exists():
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(str(STATIC_DIR / "index.html"))
+        return FileResponse(str(DIST_DIR / "index.html"))
 
 
 if __name__ == "__main__":
