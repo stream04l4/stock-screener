@@ -295,14 +295,64 @@ def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - name/is_st 补齐失败不阻断 T1 主体
         log.warning("T1 腾讯快照补 name/is_st 失败（不影响 BaoStock 侧列）: %s", exc)
 
+    # v6.1.1 FIX-2：industry_csric2 自愈回填（BaoStock 挂时 csric2 全空 → 从
+    # industry_name 提取 [A-Z]\d{1,3} 前缀；幂等、零网络；失败不阻断 T1 主体）
+    try:
+        industry_backfilled = backfill_industry_csric2(con)
+    except Exception as exc:  # noqa: BLE001 - 回填失败不阻断（下轮 T1/手动 UPDATE 再补）
+        log.warning("T1 industry_csric2 自愈回填失败（不影响 T1 主体）: %s", exc)
+        industry_backfilled = 0
+
     return {
         "table": "stock_master",
         "rows_written": n,
         "name_isst_enriched": enriched,
+        "industry_csric2_backfilled": industry_backfilled,
         "baostock_calls_this_step": 2,
         "note": "BaoStock 侧列=list_date/delist_date/board/industry；"
                 "name/is_st 由腾讯快照补；soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
     }
+
+
+# ---------------------------------------------------------------------------
+# v6.1.1 FIX-2：industry_csric2 自愈回填（独立函数——REG-1 行业测试直接调用，零网络）
+# ---------------------------------------------------------------------------
+def backfill_industry_csric2(con) -> int:
+    """v6.1.1 FIX-2：industry_csric2 自愈回填（从 industry_name 提取 CSRC 行业代码前缀）。
+
+    背景：P0 灌 T1 时 BaoStock 挂 → ``industry_csric2`` 全空（生产实测 0/5556），
+    只有 ``industry_name`` 有值（83 个 distinct，**全部**带 ``[A-Z]\\d{1,3}`` 代码前缀，
+    如 "C39计算机、通信和其他电子设备制造业"）。行业下拉（/api/lake/industries 按
+    csric2 分组）与 market 筛选（``m.industry_csric2 = ?``）因此空转。本函数无损回填：
+
+    - ``regexp_extract(industry_name, '^([A-Z][0-9]{1,3})', 1)`` 提取前缀；
+    - **提取不到前缀的行保持 NULL**——⚠️ DuckDB ``regexp_extract`` 无匹配时返回
+      **空串 ''（不是 NULL）**（实测），故 WHERE 必须显式排除空串，否则会把
+      "无前缀"行回填成 ''（industries API 的 ``<> ''`` 过滤虽能挡住，但库内脏值
+      违反"提取不到保持 NULL"契约）；
+    - 幂等：已非空的行不碰（BaoStock 恢复后 fetch_industry 给出真 csric2 时，
+      load_t1 的 upsert 整行覆盖回填值——无冲突，回填值本就是 name 里的真代码）。
+
+    :return: 实际回填行数（UPDATE 前 COUNT 同条件口径；零网络、纯 SQL）。
+    """
+    # 回填候选 = csric2 空 + name 非空 + name 有合法前缀（与 UPDATE 条件逐字一致）
+    n_candidates = con.execute(
+        "SELECT COUNT(*) FROM stock_master WHERE "
+        "(industry_csric2 IS NULL OR industry_csric2 = '') "
+        "AND industry_name IS NOT NULL "
+        "AND regexp_extract(industry_name, '^([A-Z][0-9]{1,3})', 1) <> ''"
+    ).fetchone()[0]
+    if not n_candidates:
+        return 0
+    con.execute(
+        "UPDATE stock_master SET industry_csric2 = "
+        "regexp_extract(industry_name, '^([A-Z][0-9]{1,3})', 1) WHERE "
+        "(industry_csric2 IS NULL OR industry_csric2 = '') "
+        "AND industry_name IS NOT NULL "
+        "AND regexp_extract(industry_name, '^([A-Z][0-9]{1,3})', 1) <> ''"
+    )
+    log.info("FIX-2 industry_csric2 自愈回填: %d 行（从 industry_name 提取前缀）", n_candidates)
+    return int(n_candidates)
 
 
 # ---------------------------------------------------------------------------

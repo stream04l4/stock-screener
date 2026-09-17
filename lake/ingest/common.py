@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import datetime as _dt
+import secrets
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+from weakref import WeakKeyDictionary
 
 # 溯源：数据湖 schema 版本（v6 首版）
 DATA_VERSION = "v6.0"
@@ -81,8 +83,36 @@ def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]
     - ``None``（缺省）= **不写该列**：旧调用方零影响（T3/T4/T8/T9 等既有行为不变；
       含 load_t2 的 legacy 单源路径与 v6.0.x 逐字节一致）。
     - 字符串 = 写分歧摘要。
-    - :func:`write_null` 哨兵 = **显式写 NULL**：kline_daily 每次写入必传（无分歧
+    :func:`write_null` 哨兵 = **显式写 NULL**：kline_daily 每次写入必传（无分歧
       →NULL），REPLACE 后不残留上一次写入的陈旧值。
+
+    v6.1.1 FIX-1：**临时表批量冲突**（灌数提速，语义与逐行路径逐字节等价）。
+
+    为什么改：``executemany(INSERT OR REPLACE ... VALUES)`` 对百万行大表是**逐行
+    冲突检测**——kline_daily 768 万行时单股全史（4815 行）实测 29.0s，占单股耗时
+    ~85%（TL 诊断 A/B/C 对照）。改为：
+
+      1. ``DESCRIBE {table}`` 取列类型（按 (con, table) 缓存——同连接重复 upsert
+         同一表零额外查询）；
+      2. 建 TEMP 表 ``_up_tmp_<随机后缀>``（**仅含本次写入的 cols**，类型取自
+         DESCRIBE；无 PK——冲突检测统一交给目标表的 REPLACE，temp 只是批量缓冲）；
+      3. ``executemany(INSERT INTO _up_tmp ...)`` 普通插入（无冲突检测，快）；
+      4. ``INSERT OR REPLACE INTO {table} (cols) SELECT * FROM _up_tmp``——整批一次
+         冲突合并（实测 4.1s vs 29.0s，~7×）；
+      5. ``DROP TABLE _up_tmp``（try/finally——异常路径也清理，不留 temp 残留）。
+
+    **等价性保证**（tests/test_lake_v611_upsert_temp.py 全表哈希对照）：
+    - 同 PK 覆盖 / 无冲突行插入：REPLACE ... SELECT 与逐行 REPLACE 语义一致；
+    - conflict_src 三态不变：拼列逻辑保持在下方原位（拼进 cols/rows 后才走新路径）——
+      None=不写列（temp 表无该列，REPLACE 保留旧值）、字符串=摘要、write_null()=显式 NULL；
+    - **批内重复 PK = last-wins**：逐行 executemany 是后行覆盖前行；而 REPLACE ...
+      SELECT 对源内重复键的结果不确定（实测取首行）。真实调用方单批不产生重复 PK
+      （load_t2 按 date 升序唯一、T1/T3/T5/T7 天然唯一），但为**逐字节等价**仍做
+      Python 侧去重：按目标表 PK 列（duckdb_constraints 取）保留每键**最后一行**。
+    - 返回行数 = 传入行数（与现状一致；批内重复键时 = 去重前行数——调用方口径不变）。
+
+    临时表名带随机后缀（``secrets.token_hex(6)``）防并发撞名——灌数是单进程，
+    属防御性处理。temp 表随连接关闭自动消失，DROP 只是及时释放。
     """
     rows = [list(r) for r in rows]
     if not rows:
@@ -92,11 +122,83 @@ def upsert(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]
         cols = cols + ["conflict_src"]
         val = None if isinstance(conflict_src, _WriteNull) else conflict_src
         rows = [r + [val] for r in rows]
-    cols_sql = ", ".join(f'"{c}"' for c in cols)
-    placeholders = ", ".join(["?"] * len(cols))
-    sql = f'INSERT OR REPLACE INTO {table} ({cols_sql}) VALUES ({placeholders})'
-    con.executemany(sql, rows)
+
+    # ---- v6.1.1 FIX-1：临时表批量冲突（语义等价，见 docstring）----
+    # 批内重复 PK → last-wins（= 逐行 executemany 顺序覆盖；REPLACE...SELECT 对源内
+    # 重复键不确定，必须先去重）。PK 列取目标表约束（与本次写入 cols 求交——
+    # conflict_src 等非 PK 列不参与去重键）。
+    pk_cols = _table_pk_cols(con, table)
+    if pk_cols and all(c in cols for c in pk_cols):
+        pos = [cols.index(c) for c in pk_cols]
+        seen: Dict[Any, List[Any]] = {}
+        for r in rows:  # dict 赋值覆盖 → 每 PK 键保留最后一行（last-wins）
+            seen[tuple(r[i] for i in pos)] = r
+        deduped = list(seen.values())
+    else:
+        # 无 PK 约束 / 写入列不含完整 PK：不去重。前者=调用方误用（本函数契约=PK
+        # 表），交给目标表抛 BinderException（与现状一致）；后者在 INSERT 阶段即被
+        # NOT NULL/PK 约束拒绝（实测两路径同错，错误语义不变）。
+        deduped = rows
+
+    types = _table_col_types(con, table)
+    tmp = f"_up_tmp_{secrets.token_hex(6)}"
+    cols_sql = ", ".join(f'"{c}" {types[c]}' for c in cols)
+    con.execute(f"CREATE TEMP TABLE {tmp} ({cols_sql})")
+    try:
+        ins_cols = ", ".join(f'"{c}"' for c in cols)
+        placeholders = ", ".join(["?"] * len(cols))
+        con.executemany(f"INSERT INTO {tmp} ({ins_cols}) VALUES ({placeholders})", deduped)
+        # 整批一次冲突合并：列名显式对应（SELECT * 顺序 = temp DDL 顺序 = cols 顺序）
+        con.execute(
+            f'INSERT OR REPLACE INTO {table} ({ins_cols}) SELECT * FROM {tmp}')
+    finally:
+        # 异常路径也清理（REG-1c：upsert 中途失败不得残留 _up_tmp*）
+        try:
+            con.execute(f"DROP TABLE {tmp}")
+        except Exception:  # noqa: BLE001 - DROP 失败不掩盖原始异常
+            pass
     return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# upsert 辅助：DESCRIBE 类型 / PK 列（按 (con, table) 缓存——同连接重复 upsert
+# 同一表零额外查询；WeakKeyDictionary 随连接回收自动清，不泄漏）
+# ---------------------------------------------------------------------------
+_DESC_CACHE: "WeakKeyDictionary[Any, Dict[str, Dict[str, str]]]" = WeakKeyDictionary()
+
+
+def _table_col_types(con, table: str) -> Dict[str, str]:
+    """DESCRIBE {table} → {列名: 类型串}（缓存到连接对象上，按表名）。
+
+    为什么用 DESCRIBE 而不是 information_schema：一次查询同时拿到**全部列**的
+    顺序+类型（temp DDL 需要本次写入 cols 的类型子集）；DESCRIBE 输出稳定
+    （列名/类型/null/PK/default/key 六元组，见 lake.ddl 建表实测）。
+    """
+    cache = _DESC_CACHE.get(con)
+    if cache is None:
+        cache = {}
+        _DESC_CACHE[con] = cache
+    t = cache.get(table)
+    if t is None:
+        t = {r[0]: r[1] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+        cache[table] = t
+    return t
+
+
+def _table_pk_cols(con, table: str) -> List[str]:
+    """目标表 PK 列名列表（无 PK → []）。
+
+    取 ``duckdb_constraints()`` 的 PRIMARY KEY 行 + ``constraint_column_indexes``
+    （0-based 位置）映射回 DESCRIBE 列序。用于 upsert 批内重复键 last-wins 去重。
+    """
+    row = con.execute(
+        "SELECT constraint_column_indexes FROM duckdb_constraints() "
+        "WHERE table_name=? AND constraint_type='PRIMARY KEY'", [table]).fetchone()
+    if row is None:
+        return []
+    desc_cols = [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()]
+    idxs = row[0] or []
+    return [desc_cols[i] for i in idxs]
 
 
 def insert_many(con, table: str, columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> int:
