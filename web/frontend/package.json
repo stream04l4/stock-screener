@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "A股四维选股 Web 控制台 —— Vue3+Vite+Pinia SPA（D1：脚手架+统一刷新引擎+结果tab；dev-only :5173，生产 :9090 不动）",
+  "description": "A股四维选股 Web 控制台 —— Vue3+Vite+Pinia SPA（D2：+运行tab taskStore/SSE全局化 +回测tab ECharts +策略tab D-W02状态机；dev-only :5173，生产 :9090 不动）",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.9",
+    "@vue/test-utils": "^2.5.1",
     "happy-dom": "^20.14.5",
     "vite": "^8.3.0",
     "vitest": "^5.0.1"

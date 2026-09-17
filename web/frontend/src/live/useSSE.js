@@ -5,7 +5,7 @@
 // - 连续失败计数：每次 onerror +1；onopen 成功归零。达到 maxFails（默认 3）→ close() +
 //   调 opts.onDowngrade（调用方降级，如回退 3s 轮询 /status——保留 v1 兜底语义）。
 // - 生命周期：setup 时立即 open；onUnmounted 自动 close。
-import { onUnmounted, ref } from "vue";
+import { getCurrentInstance, onUnmounted, ref } from "vue";
 
 export function useSSE(url, onEvent, opts = {}) {
   const failCount = ref(0);
@@ -43,7 +43,9 @@ export function useSSE(url, onEvent, opts = {}) {
   }
 
   open();
-  onUnmounted(close);
+  // D2：store（taskStore）等非组件上下文调用时跳过 unmount 钩子——close() 由调用方显式管理
+  // （生命周期 = SPA 会话）。组件上下文行为与 D1 完全一致。
+  if (getCurrentInstance()) onUnmounted(close);
 
   return { failCount, alive, close };
 }
