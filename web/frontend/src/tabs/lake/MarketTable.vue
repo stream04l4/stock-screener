@@ -49,6 +49,14 @@ function onIndustries() {
 const d = computed(() => marketQ.data.value || null);
 const rows = computed(() => (d.value && d.value.rows) || []);
 const loading = computed(() => marketQ.loading.value && !d.value);
+// v6.1.2 P3：跳页输入框（数字 + 回车/Go；clamp [1, pages]，与 page ref 同 key 机制走 useLiveQuery 重取）
+const jumpVal = ref("");
+function doJump() {
+  const n = parseInt(jumpVal.value, 10);
+  if (isNaN(n)) return;   // 非数字 → 不动（不猜、不清空已有页）
+  const pages = d.value ? Math.max(1, d.value.pages) : 1;
+  page.value = Math.min(pages, Math.max(1, n));   // clamp [1, pages]
+}
 
 // ---- 错误态（409 backfill 中性 / 其余红横幅）----
 // 表格内占位文案：backfill → 灌数中；其余错误且有数据 → null（旧值照常展示，SWR 语义）
@@ -118,13 +126,18 @@ function go(p) { if (p >= 1) page.value = p; }
       </table>
     </div>
 
-    <!-- 分页（vanilla renderLakeMarket pager：« ‹ N/M › »） -->
+    <!-- 分页（vanilla renderLakeMarket pager：« ‹ N/M › »；v6.1.2 P3 +跳页输入框） -->
     <div class="pager" id="lake-market-pager">
       <button :disabled="!d || d.page <= 1" @click="go(1)">«</button>
       <button :disabled="!d || d.page <= 1" @click="go((d ? d.page : 1) - 1)">‹</button>
       <span>{{ d ? `${d.page} / ${Math.max(1, d.pages)}` : "—" }}</span>
       <button :disabled="!d || d.page >= d.pages" @click="go((d ? d.page : 1) + 1)">›</button>
       <button :disabled="!d || d.page >= d.pages" @click="go(d ? Math.max(1, d.pages) : 1)">»</button>
+      <!-- v6.1.2 P3：跳页（数字 input + 回车/Go；clamp [1,pages]，同 page ref key 机制重取） -->
+      <input type="number" id="lake-market-jump" class="lake-jump-input" min="1"
+             :max="d ? Math.max(1, d.pages) : undefined" v-model="jumpVal"
+             placeholder="跳页" @keydown.enter="doJump()" />
+      <button id="btn-lake-market-jump" class="mini-btn" @click="doJump()">Go</button>
     </div>
   </div>
 </template>

@@ -149,6 +149,12 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 }
 .pager button:disabled { opacity: .4; cursor: default; }
 .pager button.cur { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* v6.1.2 P3：跳页输入框（数字 + 回车/Go；与 pager 按钮同排） */
+.lake-jump-input {
+  width: 74px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 13px; text-align: center;
+}
+.lake-jump-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 
 /* ---------- 策略页 ---------- */
 .strategy-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
@@ -258,6 +264,9 @@ tr.clickable { cursor: pointer; }
   padding: 12px 14px; border-radius: 9px; margin-bottom: 14px;
 }
 .lake-backfill-head { font-size: 14.5px; font-weight: 700; }
+/* v6.1.2 P2-A：琥珀块总进度行（done/total 合计 + 进度条 + 预计剩余） */
+.lake-backfill-total { display: flex; align-items: center; gap: 8px; margin: 8px 0 10px; }
+.lake-backfill-total-track { flex: 1; max-width: 420px; height: 9px; margin: 0; }
 .lake-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; position: relative; }
 .lake-toolbar input[type="search"] { flex: 1; min-width: 220px; max-width: 420px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
 .lake-search-results {
@@ -349,6 +358,9 @@ tr.lake-row-muted .badge { opacity: .85; }
   border-radius: 6px; cursor: pointer; padding: 2px 10px; font-size: 12px; }
 .lake-kline-range:hover { color: var(--accent); border-color: var(--accent); }
 .lake-kline-range.cur { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* v6.1.2 P1-A：复权三态切换（区间按钮组旁）——分隔符 + 降级提示小字 */
+.lake-kline-sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+.lake-kline-adjust-note { margin: -2px 0 6px; font-size: 12px; color: #92400e; }
 /* 图容器：宽度自适应卡片（viewBox + preserveAspectRatio 缩放），窄屏不破版；
    position:relative 是 tooltip（absolute）的定位基准 */
 .lake-kline-wrap { width: 100%; margin-bottom: 4px; position: relative; }

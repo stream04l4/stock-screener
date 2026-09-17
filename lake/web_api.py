@@ -376,6 +376,34 @@ def stock_detail(ts_code: str) -> Dict[str, Any]:
                          "FROM factor_snapshot WHERE ts_code=?) ORDER BY factor_name",
                          [ts_code, ts_code])
 
+        # v6.1.2 P2-B：近 5 年分红小表（T4 dividend_events）。
+        # - ex_date 降序、**PIT 纪律** ex_date<=CURRENT_DATE（T4 除权日可含未来，必须滤掉）；
+        #   窗口 = 近 5 个自然年（ex_date >= CURRENT_DATE - INTERVAL 5 YEAR）。
+        # - dividend_yield_pct = cash_dps / 当日收盘价 ×100（**若可算**——dps 与 close 均非空
+        #   且 close>0；否则 null，不猜、不用近似价）；close 取 kline_daily 同日收盘。
+        # - 上限 12 行；空 → []（本键恒在 ready 态出现——stock_detail 仅 ready 可达，
+        #   locked/uninitialized 在上游 _con() 已抛 409，与 source_pool 同规）。
+        div_rows = _rows_dicts(
+            con,
+            "SELECT d.ex_date, d.cash_dps, k.close AS ex_close "
+            "FROM dividend_events d "
+            "LEFT JOIN kline_daily k ON k.ts_code=d.ts_code AND k.date=d.ex_date "
+            "WHERE d.ts_code=? AND d.ex_date<=CURRENT_DATE "
+            "AND d.ex_date>=(CURRENT_DATE - INTERVAL 5 YEAR) "
+            "ORDER BY d.ex_date DESC LIMIT 12", [ts_code])
+        dividends_recent: List[Dict[str, Any]] = []
+        for r in div_rows:
+            dps = r.get("cash_dps")
+            close = r.get("ex_close")
+            yld = None
+            if dps is not None and close is not None and close > 0:
+                yld = round(100.0 * dps / close, 4)   # 股息率 %（保留 4 位，前端展示 2 位）
+            dividends_recent.append({
+                "ex_date": _iso_date(r["ex_date"]),
+                "cash_dps": dps,
+                "dividend_yield_pct": yld,
+            })
+
         return {
             "ts_code": ts_code,
             "base": base,                 # 区块A 基础卡 + 估值行（panorama 全列）
@@ -383,24 +411,100 @@ def stock_detail(ts_code: str) -> Dict[str, Any]:
             "holders_top10": t6,          # 缺 → []（前端"暂无数据（后台补齐中）"）
             "factors": {r["factor_name"]: r["value"] for r in t8},  # T8 全因子
             "factors_as_of": t8[0]["as_of_date"] if t8 else None,
+            "dividends_recent": dividends_recent,   # v6.1.2 P2-B：近5年分红（仅 ready 态）
         }
 
 
 # ---------------------------------------------------------------------------
-# GET /kline/{ts_code}（v6.0.6：个股全景日线图数据源）
+# GET /kline/{ts_code}（v6.0.6：个股全景日线图数据源；v6.1.2 P1-A +复权切换）
 # ---------------------------------------------------------------------------
+# v6.1.2 P1-A：复权切换（原始 none / 前复权 qfq / 后复权 hfq）。
+# 数据源 = kline_daily.adj_factor（v6.1 新浪推导核心资产，此前前端完全未用）。
+# 公式与 lake.ddl 的 kline_daily_hfq / kline_daily_qfq view **逐式一致**：
+#   hfq = raw × adj_factor；qfq = raw × (adj_factor / max(adj_factor))。
+# 为何在 Python 计算而非直接 SELECT view：brief 要求降级纪律——"adj_factor 全 NULL
+# → 返回 raw rows + adjust_note；部分 NULL → 只用可得行 + note"。view 对无因子行产出
+# NULL OHLC，需二次查询/逐行过滤才能区分"无因子行"与"真空股"；改为**一次取回
+# raw+adj_factor** 后在内存判定：全 NULL 时直接复用同一批 raw 行（零二次查询），
+# 部分 NULL 只保留有因子行——降级语义精确可控，且 adjust=none 路径键集逐字节不变。
+_ADJUST_NOTE = "复权因子补齐中，暂显示原始价"
+_VALID_ADJUST = ("none", "qfq", "hfq")
+
+
+def _mul(v, k):
+    """v × k（任一为 None → None；保持 DOUBLE 原精度不四舍五入——前端 toFixed(2) 展示）。"""
+    if v is None or k is None:
+        return None
+    return v * k
+
+
+def _adjust_kline_rows(rows, adjust):
+    """对 raw rows（含 adj_factor）做复权 → ``(out_rows, note_or_None)``。
+
+    :param rows: list[dict]，每行含 date/open/high/low/close/volume/adj_factor（date 升序）。
+    :param adjust: ``"qfq"`` | ``"hfq"``（``"none"`` 由调用方直接返回 raw，不进本函数）。
+    :return: (out_rows, note)。out_rows **已去掉 adj_factor 列**、保持 date 升序；
+        note 为降级提示文案或 None。
+
+    降级纪律（brief v6.1.2 P1-A）：
+    - **全 NULL**（该股 adj_factor 未灌完）→ 返回 raw rows（去 adj_factor）+ _ADJUST_NOTE；
+    - **部分 NULL** → **只用可得行**（adj_factor 非 NULL 的行，已复权）+ _ADJUST_NOTE；
+    - **全部非 NULL** → 返回复权行，**无 note**（无降级、无缺失，不提示）。
+    qfq 归一因子 = 窗口内 max(adj_factor)（使最新一根 close=真实成交价，A股惯例：
+    最新价=真实价）。adj_factor 应单调不减故 max=最新；防御性用 max 而非末值。
+    """
+    if not rows:
+        return [], None
+    have = [r for r in rows if r.get("adj_factor") is not None]
+    if not have:
+        # 全 NULL → raw 行（去 adj_factor）+ note（brief：返回 raw rows + adjust_note）
+        out = [{k: v for k, v in r.items() if k != "adj_factor"} for r in rows]
+        return out, _ADJUST_NOTE
+    max_af = max(r["adj_factor"] for r in have)
+    # 防御：max_af 非正（数据异常）→ 无法归一，按全 NULL 降级回 raw + note
+    if not max_af or max_af <= 0:
+        out = [{k: v for k, v in r.items() if k != "adj_factor"} for r in rows]
+        return out, _ADJUST_NOTE
+    # 部分 NULL（有因子行 < 全部行）→ 降级提示；全非 NULL → 无 note
+    partial_note = _ADJUST_NOTE if len(have) < len(rows) else None
+    out = []
+    for r in rows:
+        af = r.get("adj_factor")
+        if af is None:
+            continue   # 部分 NULL → 只用可得行（跳过无因子行，brief）
+        k = (af / max_af) if adjust == "qfq" else af
+        out.append({
+            "date": r["date"],
+            "open": _mul(r.get("open"), k),
+            "high": _mul(r.get("high"), k),
+            "low": _mul(r.get("low"), k),
+            "close": _mul(r.get("close"), k),
+            "volume": r.get("volume"),
+        })
+    return out, partial_note
+
+
 @router.get("/kline/{ts_code}")
-def stock_kline(ts_code: str, days: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    """个股日K线 OHLCV（前端 SVG 蜡烛图数据源）。
+def stock_kline(ts_code: str, days: Optional[str] = Query(default=None),
+                adjust: str = Query(default="none")) -> Dict[str, Any]:
+    """个股日K线 OHLCV（前端 ECharts 蜡烛图数据源）+ **v6.1.2 P1-A 复权切换**。
 
     :param ts_code: sh/sz/bj.6位数字（非法 → 400，与 /stock/{ts_code} 一致）。
     :param days: 缺省 ``"250"``；clamp [30, 9999]（越界取边界值）；``"all"`` →
         全量。非法/非数字且非 all → 回退 250（与 market page_size 同口径：
         静默降级，不改变既有错误语义）。
+    :param adjust: **v6.1.2 P1-A** ``none`` | ``qfq`` | ``hfq``（缺省 none）。
+        非法值 → **400**（brief：非法值→400，与 ts_code 同口径显式报错，不静默回退——
+        复权态是策略刚需，错配会误导价格，必须显式拒绝）。
 
     响应契约（brief v6.0.6）：``{ts_code, name, rows:[{date,open,high,low,close,
     volume}], count}``——rows **date 升序**；空股（无 K线）→ ``rows=[] count=0``
     （200，不报错）。
+
+    **三态契约红线（v6.1.2）**：``adjust=none`` 时响应键集与现状**逐字节不变**
+    （rows 不含 adj_factor、顶层无 adjust_note）——test_lake_v606 精确断言
+    ``set(d.keys())=={ts_code,name,rows,count}`` + 每行 6 列，不得破坏。
+    ``adjust_note`` **只在 ready 态且降级时**追加（adj_factor 全/部分 NULL）。
 
     连接纪律：D-4 每请求短连接（with 保证异常路径也 close）；库未就绪/locked 走
     v6.0.3/v6.0.4 既有异常路径（_con → LakeNotInitialized / LakeBackfillInProgress
@@ -411,6 +515,14 @@ def stock_kline(ts_code: str, days: Optional[str] = Query(default=None)) -> Dict
     """
     if not _valid_ts_code(ts_code):
         raise HTTPException(status_code=400, detail=f"非法代码: {ts_code}")
+    # adjust 解析：非法 → 400。⚠️ 直接函数调用（单测）时缺省值是 FastAPI Query() 返回的
+    # FieldInfo 对象而非 "none"——isinstance 归一化为 "none"（HTTP 路径恒为 str，行为不变）。
+    if not isinstance(adjust, str):
+        adjust = "none"
+    adjust = adjust.strip().lower()
+    if adjust not in _VALID_ADJUST:
+        raise HTTPException(status_code=400,
+                            detail=f"非法复权参数: {adjust}（须 none|qfq|hfq）")
     # days 解析：all → None（不加 LIMIT）；数字 clamp [30,9999]；其余回退 250。
     # ⚠️ 直接函数调用（单测）时 days 默认值是 FastAPI Query() 返回的 FieldInfo
     # 对象而非 None——isinstance 归一化，HTTP 路径（str）行为不变。
@@ -430,21 +542,32 @@ def stock_kline(ts_code: str, days: Optional[str] = Query(default=None)) -> Dict
     with _con() as con:
         name_row = _rows_dicts(con, "SELECT name FROM stock_master WHERE ts_code=?",
                                [ts_code])
-        sql = ("SELECT date, open, high, low, close, volume FROM kline_daily "
+        # v6.1.2：多取 adj_factor 列（复权计算用；adjust=none 时下方 pop 掉，键集不变）
+        sql = ("SELECT date, open, high, low, close, volume, adj_factor FROM kline_daily "
                "WHERE ts_code=? ORDER BY date ASC")
         params: List[Any] = [ts_code]
         if limit is not None:
             # 取**最近** N 根（date 升序尾部）：内层降序 LIMIT 后外层再升序。
-            sql = ("SELECT date, open, high, low, close, volume FROM "
-                   "(SELECT date, open, high, low, close, volume FROM kline_daily "
+            sql = ("SELECT date, open, high, low, close, volume, adj_factor FROM "
+                   "(SELECT date, open, high, low, close, volume, adj_factor FROM kline_daily "
                    f"WHERE ts_code=? ORDER BY date DESC LIMIT {limit}) "
                    "ORDER BY date ASC")
         rows = _rows_dicts(con, sql, params)
         for r in rows:  # DATE → 'YYYY-MM-DD'（与全 API 日期口径一致）
             r["date"] = _iso_date(r["date"])
-        return {"ts_code": ts_code,
-                "name": name_row[0]["name"] if name_row else None,
-                "rows": rows, "count": len(rows)}
+        name = name_row[0]["name"] if name_row else None
+        if adjust == "none":
+            # **契约红线**：键集与 v6.1.1 逐字节不变（去 adj_factor、无 adjust_note）
+            for r in rows:
+                r.pop("adj_factor", None)
+            return {"ts_code": ts_code, "name": name,
+                    "rows": rows, "count": len(rows)}
+        out_rows, note = _adjust_kline_rows(rows, adjust)
+        resp: Dict[str, Any] = {"ts_code": ts_code, "name": name,
+                                "rows": out_rows, "count": len(out_rows)}
+        if note is not None:
+            resp["adjust_note"] = note   # 仅 ready 态降级时追加（三态红线：新字段只 ready 加）
+        return resp
 
 
 # ---------------------------------------------------------------------------

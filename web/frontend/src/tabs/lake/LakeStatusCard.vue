@@ -139,8 +139,9 @@ const tables = computed(() => (d.value && d.value.tables) || []);
           </div>
         </div>
 
-        <!-- tasks 表（灌数中态与正常态共用） -->
-        <div class="tbl-wrap lake-tasks-wrap">
+        <!-- tasks 表（正常态显示；v6.1.2 P1-B：灌数中态**不渲染**——琥珀块 #lake-backfill-tasks
+             已展示同一份 tasks，避免底部再渲染一遍造成双份冗余。非灌数态照常显示。） -->
+        <div v-if="!d.backfill_in_progress" class="tbl-wrap lake-tasks-wrap">
           <table class="data" id="lake-tasks-table">
             <thead><tr>
               <th>表</th><th>层级</th><th>状态</th><th class="num">进度</th>

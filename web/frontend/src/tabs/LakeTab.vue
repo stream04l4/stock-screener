@@ -23,6 +23,32 @@ import LakeStatusCard from "./lake/LakeStatusCard.vue";
 const lake = useLakeStore();
 const stockCode = ref("");      // 当前选中股（""=未选 → 全景卡占位）
 
+// v6.1.2 P2-A：琥珀块总进度（纯前端，数据=lake.backfillView.tasks）。
+// 所有 tasks 的 done 合计/total 合计 + 进度条 + 预计剩余（取各任务 eta_min 最大值，
+// 换算"约 N 小时 M 分"；无 eta → "—"）。
+const bfTasks = computed(() => (lake.backfillView && lake.backfillView.tasks) || []);
+const totalProgress = computed(() => {
+  const ts = bfTasks.value;
+  let done = 0, total = 0, maxEta = null;
+  for (const t of ts) {
+    if (!t) continue;
+    if (typeof t.done === "number") done += t.done;
+    if (typeof t.total === "number") total += t.total;
+    if (typeof t.eta_min === "number" && isFinite(t.eta_min)) {
+      maxEta = maxEta == null ? t.eta_min : Math.max(maxEta, t.eta_min);
+    }
+  }
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  let etaText = "—";   // 无 eta → "—"（brief）
+  if (maxEta != null) {
+    const m = Math.max(0, Math.round(maxEta));
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    etaText = h > 0 ? `约 ${h} 小时 ${mm} 分` : `约 ${mm} 分`;
+  }
+  return { done, total, pct, etaText };
+});
+
 onActivated(() => lake.activate());
 onDeactivated(() => lake.deactivate());
 
@@ -58,6 +84,15 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
         <span class="muted small">
           持锁 PID {{ (lake.backfillView.lock_holder_pid ?? "未知") + " · 进度更新于 " + (lake.backfillView.updated_at || "—") }}
         </span>
+      </div>
+      <!-- v6.1.2 P2-A：总进度行（所有 tasks done/total 合计 + 进度条 + 预计剩余 max eta_min） -->
+      <div class="lake-backfill-total" id="lake-backfill-total">
+        <span class="muted small">总进度</span>
+        <div class="progress-track lake-backfill-total-track">
+          <span class="progress-bar" :style="{ width: totalProgress.pct + '%' }"></span>
+        </div>
+        <span class="mono small">{{ totalProgress.done }}/{{ totalProgress.total }}</span>
+        <span class="muted small">预计剩余 {{ totalProgress.etaText }}</span>
       </div>
       <div class="tbl-wrap">
         <table class="data" id="lake-backfill-tasks">

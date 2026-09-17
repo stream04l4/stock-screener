@@ -22,17 +22,25 @@ const stockQ = useLiveQuery(
   { ttl: 60000 }
 );
 
-// K线（缓存键 ts_code+range——报告 §2.1；切股/切区间 → key 变 → 重取）
+// K线（缓存键 ts_code+range+adjust——v6.1.2 P1-A 复权态入 key；切股/切区间/切复权 → key 变 → 重取）
 const range = ref("250");   // 默认 250（brief/vanilla lakeKlineRange）
+// v6.1.2 P1-A：复权三态切换，**默认前复权 qfq**（A股惯例、最新价=真实价）。
+const adjust = ref("qfq");   // none | qfq | hfq
 const klineQ = useLiveQuery(
-  () => (props.code ? `lake:kline:${props.code}:${range.value}` : null),
-  () => api(`/api/lake/kline/${props.code}?days=${encodeURIComponent(range.value)}`),
+  () => (props.code ? `lake:kline:${props.code}:${range.value}:${adjust.value}` : null),
+  () => api(`/api/lake/kline/${props.code}?days=${encodeURIComponent(range.value)}`
+            + `&adjust=${encodeURIComponent(adjust.value)}`),
   { ttl: 60000 }
 );
 
 const d = computed(() => stockQ.data.value || null);
 const base = computed(() => (d.value && d.value.base) || {});
 const kRows = computed(() => (klineQ.data.value && klineQ.data.value.rows) || []);
+// v6.1.2 P1-A：复权降级提示（adj_factor 全/部分 NULL → 后端带 adjust_note，图表上方小字）
+const adjustNote = computed(() => (klineQ.data.value && klineQ.data.value.adjust_note) || "");
+// v6.1.2 P1-A：标题复权态文案（原始 / 前复权 / 后复权）
+const ADJUST_LABEL = { none: "原始价", qfq: "前复权", hfq: "后复权" };
+const adjustLabel = computed(() => ADJUST_LABEL[adjust.value] || "原始价");
 
 // 404/灌数中占位（vanilla selectLakeStock catch 分支文案原样）
 const stockState = computed(() => {
@@ -49,6 +57,8 @@ const stockState = computed(() => {
 const factors = computed(() => Object.entries((d.value && d.value.factors) || {}));
 const f = computed(() => (d.value && d.value.fundamental_latest) || null);
 const holders = computed(() => (d.value && d.value.holders_top10) || []);
+// v6.1.2 P2-B：近 5 年分红小表（/stock dividends_recent；仅 ready 态出现，空 → []）
+const dividends = computed(() => (d.value && d.value.dividends_recent) || []);
 
 // 错误分流（vanilla selectLakeStock catch）：404/backfill → 卡片内占位；其余 → 红横幅
 watch(stockQ.error, (e) => {
@@ -75,17 +85,24 @@ watch(stockQ.error, (e) => {
     <p v-else-if="stockState" class="placeholder">{{ stockState }}</p>
 
     <template v-else>
-      <!-- 日K线区（ECharts candlestick；区间按钮 60/120/250/all → days 重取） -->
-      <div class="lake-section-title">日K线（T2 · 原始价）</div>
+      <!-- 日K线区（ECharts candlestick；区间按钮 60/120/250/all → days 重取；
+           v6.1.2 P1-A：复权三态切换 原始/前复权/后复权，默认前复权） -->
+      <div class="lake-section-title">日K线（T2 · {{ adjustLabel }}）</div>
       <LakeKlineChart :rows="kRows" :ts-code="code" :range="range"
+                      :adjust="adjust" :adjust-note="adjustNote"
                       :loading="klineQ.loading.value" :error="klineQ.error.value"
-                      @range-change="(r) => (range = r)" />
+                      @range-change="(r) => (range = r)"
+                      @adjust-change="(a) => (adjust = a)" />
 
       <!-- 基础卡（名称/行业/板块/is_st/soe_flag+soe_basis） -->
       <div class="lake-base-grid">
         <div class="lake-kv"><div class="k">名称</div><div class="v">{{ base.name || "—" }}</div></div>
         <div class="lake-kv"><div class="k">行业</div>
-          <div class="v">{{ [base.industry_csric2, base.industry_name].filter(Boolean).join(" ") || "—" }}</div></div>
+          <!-- v6.1.2 P0：只显示 industry_name（已含 CSRC 代码前缀，如"C39计算机…"）。
+               v6.1.1 回填后 industry_csric2 有值且 industry_name 本身带代码前缀 →
+               旧写法 join 出 "C39 C39计算机…" 重复。MarketTable 行业列(L110)与 /search
+               下拉(sr-ind)均只用 industry_name，无此问题（TL 复查确认）。 -->
+          <div class="v">{{ base.industry_name || "—" }}</div></div>
         <div class="lake-kv"><div class="k">板块</div><div class="v">{{ base.board || "—" }}</div></div>
         <div class="lake-kv"><div class="k">ST</div><div class="v">{{ base.is_st ? "是" : "否" }}</div></div>
         <div class="lake-kv"><div class="k">央国企</div>
@@ -112,11 +129,25 @@ watch(stockQ.error, (e) => {
         </div>
       </div>
 
-      <!-- 最近分红 -->
+      <!-- 最近分红（最新一次 kv + v6.1.2 P2-B 近5年小表） -->
       <div class="lake-section-title">最近分红</div>
       <div class="lake-base-grid">
         <div class="lake-kv"><div class="k">除权日</div><div class="v">{{ base.last_ex_date || "—" }}</div></div>
         <div class="lake-kv"><div class="k">每股分红(元)</div><div class="v">{{ lakeFmt(base.last_cash_dps, "num") }}</div></div>
+      </div>
+      <!-- v6.1.2 P2-B：近 5 年分红小表（除权日/每股分红/股息率；空态"近 5 年无分红记录"） -->
+      <p v-if="!dividends.length" class="muted small">近 5 年无分红记录</p>
+      <div v-else class="tbl-wrap">
+        <table class="data" id="lake-dividends-table">
+          <thead><tr><th>除权日</th><th class="num">每股分红(元)</th><th class="num">股息率%</th></tr></thead>
+          <tbody>
+            <tr v-for="(r, i) in dividends" :key="i">
+              <td class="mono small">{{ r.ex_date || "—" }}</td>
+              <td class="num">{{ lakeFmt(r.cash_dps, "num") }}</td>
+              <td class="num">{{ lakeFmt(r.dividend_yield_pct, "pct") }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <!-- T5 最近季 -->
