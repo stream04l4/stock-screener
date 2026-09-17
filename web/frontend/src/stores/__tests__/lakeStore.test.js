@@ -265,3 +265,65 @@ describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
     lake._stopTimerForTest();
   });
 });
+
+describe("lakeStore：DEFECT-D3-2 非激活 running→idle 定时器收敛（brief 9：idle 停）", () => {
+  it("切走后灌数结束 → 下一轮 10s 读到 idle → interval 降为 0（不再空转 /status）", async () => {
+    const s = mockFetch(statusBody({ backfill_in_progress: true, lock_holder_pid: 7 }));
+    const lake = useLakeStore();
+    lake.activate();
+    await flush();
+    expect(lake.backfillRunning).toBe(true);
+
+    lake.deactivate();                      // 用户切到其它页签（灌数仍在跑）
+    expect(lake._timerIv).toBe(10000);      // 非激活但 running → 10s 跨页签感知
+
+    s.status = statusBody();                // 灌数完成
+    await vi.advanceTimersByTimeAsync(10000); // 下一轮 10s 轮询读到 idle
+    expect(lake.status.backfill_in_progress).toBe(false);
+    expect(lake._prevBf).toBe(false);
+    expect(lake._timerIv).toBe(0);          // **DEFECT-D3-2**：跃迁被观察到 → 停（修复前恒 10s）
+
+    const n = s.statusCalls;
+    await vi.advanceTimersByTimeAsync(60000); // 之后 1 分钟零请求（不空转）
+    expect(s.statusCalls).toBe(n);
+    lake._stopTimerForTest();
+  });
+
+  it("回归：激活期 3s 节奏不被 fetchStatus 内新增 recompute 破坏（幂等）", async () => {
+    const s = mockFetch(statusBody({ backfill_in_progress: true, lock_holder_pid: 7 }));
+    const lake = useLakeStore();
+    lake.activate();
+    await flush();
+    expect(lake._timerIv).toBe(3000);       // 激活优先于 running 分支（3s）
+    const before = s.statusCalls;
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(s.statusCalls - before).toBe(3); // 恰 3 轮/9s（每轮 recompute 同间隔幂等，无漂移）
+    lake._stopTimerForTest();
+  });
+
+  it("B9.2 回归（定时器驱动）：running→idle toast + invalidate 各恰一次，随后停轮询", async () => {
+    const s = mockFetch(statusBody({ backfill_in_progress: true, lock_holder_pid: 7 }));
+    const lake = useLakeStore();
+    lake.activate();
+    await flush();
+
+    // 订阅一个湖 key（模拟 MarketTable 在场）→ invalidate 触发重拉可计数
+    let fetches = 0;
+    subscribe("lake:market:1:total_mv::", () => { fetches += 1; return Promise.resolve({ rows: [] }); }, { ttl: 0 });
+    await flush();
+    expect(fetches).toBe(1);
+
+    lake.deactivate();
+    s.status = statusBody();                // 灌数完成（下一轮 10s 读到 idle）
+    await vi.advanceTimersByTimeAsync(10000);
+    await flush();
+    expect(toastMsg()).toBe("✓ 数据灌入完成");   // toast 恰一次（跃迁判定在 _prevBf，与定时器无关）
+    expect(fetches).toBe(2);                       // invalidate('lake:*') → 重拉恰一次
+    expect(lake._timerIv).toBe(0);                 // 且轮询已停
+
+    await vi.advanceTimersByTimeAsync(30000);      // 无重复跃迁 → 不再 invalidate/重拉
+    await flush();
+    expect(fetches).toBe(2);
+    lake._stopTimerForTest();
+  });
+});

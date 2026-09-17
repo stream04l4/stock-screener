@@ -215,13 +215,15 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
             adapters[name] = {"available": False, "probed_at": now_s,
                               "latency_ms": int((time.monotonic() - t0) * 1000)}
 
-    # 落点：progress 同目录（B-2 派生纪律；缺省库→生产 data/lake/）
-    from lake import conn as lconn
-
-    prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径
-    base = prog_path or lconn.progress_path()
-    health_path = os.path.join(os.path.dirname(os.path.abspath(base)),
-                               "source_health.json")
+    # 落点：progress 同目录（B-2 派生纪律；缺省库→生产 data/lake/）。
+    # **DEFECT-D3-3**：fallback 统一经 ``lb._progress_path()``（lake.backfill），**不再**
+    # 直接调 ``lconn.progress_path()``——后者不可被测试 monkeypatch，多源用例 patch 了
+    # _progress_path→tmp 时健康文件仍会落生产 data/lake/（红线违反）。口径：
+    #   - 缺省库：_progress_for_db(None)=None → lb._progress_path()=data/lake/（行为不变）；
+    #   - 测试 patch _progress_path→tmp：base=tmp（与 progress 同目录，patch 生效）；
+    #   - **未 patch + 自定义 --db**：base 仍是真实生产默认 → B-2 派生到库目录
+    #     （health 与 progress 同目录；绝不污染生产 data/lake/）。
+    health_path = _source_health_path_for_db(db_path)
     try:
         import tempfile
 
@@ -603,6 +605,27 @@ def _progress_for_db(db_path: Optional[str]) -> Optional[str]:
     from lake import backfill as lb
 
     return lb.progress_path_for_db(db_path)
+
+
+def _source_health_path_for_db(db_path: Optional[str]) -> str:
+    """**DEFECT-D3-3（B-2 统一口径）**：source_health.json 落点 = progress 同目录。
+
+    口径与 :func:`_progress_for_db` / ``BackfillRunner`` 完全一致（健康文件必须与
+    progress 文件同目录，测试 patch ``lake.backfill._progress_path``→tmp 时两者一起
+    落 tmp，绝不污染生产 data/lake/）：
+
+    - 缺省库（db_path=None/默认路径）且未 patch → ``data/lake/source_health.json``
+      （= 原行为逐字节不变——生产 driver 唯一真实场景）；
+    - 测试 patch _progress_path→tmp → tmp 目录（patch 生效，与 progress 同目录）；
+    - **未 patch + 自定义 --db** → B-2 派生到库目录（progress 也落库目录，两者一致）。
+
+    ⚠️ 不直接调 ``lake.conn.progress_path()``——它不可被 monkeypatch，正是 DEFECT-D3-3
+    的根因（多源用例 patch 了 _progress_path→tmp，fallback 却打到生产路径）。
+    """
+    from lake import backfill as lb
+
+    base = _progress_for_db(db_path) or lb._progress_path()
+    return os.path.join(os.path.dirname(os.path.abspath(base)), "source_health.json")
 
 
 def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],

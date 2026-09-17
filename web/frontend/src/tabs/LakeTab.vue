@@ -37,7 +37,9 @@ function onSelect(code) {
   });
 }
 
-// 红横幅文案（vanilla lakeSetError："数据湖不可用：msg"）
+// 红横幅文案（vanilla lakeSetError："数据湖不可用：msg"）。
+// **单一事实源（DEFECT-D3-1）**：lake.lastError 只存**裸 msg**（子组件 @error 直传、
+// fetchStatus 的 duckdb 未安装/e.message 亦为裸值）——前缀**只在此处加一次**。
 const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.lastError : ""));
 </script>
 
@@ -81,14 +83,14 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
 
     <!-- 搜索（防抖 250ms + 下拉；409 backfill → 中性处理不弹红横幅） -->
     <div class="lake-toolbar card">
-      <LakeSearchBar @select="onSelect" @error="(m) => (lake.lastError = '数据湖不可用：' + m)" />
+      <LakeSearchBar @select="onSelect" @error="(m) => (lake.lastError = m)" />
     </div>
 
     <!-- 个股全景（未选股 → 占位；搜索/行点击联动） -->
-    <StockPanoramaCard ref="stockCardEl" :code="stockCode" @error="(m) => (lake.lastError = '数据湖不可用：' + m)" />
+    <StockPanoramaCard ref="stockCardEl" :code="stockCode" @error="(m) => (lake.lastError = m)" />
 
     <!-- 全市场浏览（服务端分页+筛选；行点击→全景卡+scrollIntoView） -->
-    <MarketTable @select="onSelect" @error="(m) => (lake.lastError = '数据湖不可用：' + m)" />
+    <MarketTable @select="onSelect" @error="(m) => (lake.lastError = m)" />
 
     <!-- 数据库状态 / 补齐进度（SyncControl + SummaryBar + SourcePoolPanel + 9表 + 视图 + tasks） -->
     <LakeStatusCard />

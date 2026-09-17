@@ -97,6 +97,12 @@ export const useLakeStore = defineStore("lake", {
         }
         this._prevBf = nowBf;
         this._checkStopCompletion(d);   // v6.0.10：停止成功确认 / 硬超时（仅成功拉取时判定）
+        // **DEFECT-D3-2**：本轮读到的新 backfillRunning 立即生效——非激活且 running→idle
+        // 跃迁被观察到后把 10s interval 降为 0（brief 契约「idle 且非激活 → 停，不空转」）。
+        // _recomputeTimer 有同间隔幂等保护（_timerIv===iv 直接 return），重复调用安全；
+        // 既有节奏不变：stopping 1s / 激活 3s / 非激活 running 10s。跃迁判定在 _prevBf，
+        // 与定时器无关（B9.2 toast+invalidate 各恰一次不受影响）。
+        this._recomputeTimer();
       } catch (e) {
         // 错误态（5xx/网络）：status=null → 红横幅 + 各区块降级占位。
         // ⚠️ v6.0.10：**锁定期间 d=null 不得覆盖锁定态**——syncState/stoppingSince 不动，
