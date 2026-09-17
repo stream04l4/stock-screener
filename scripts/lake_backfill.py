@@ -167,6 +167,82 @@ def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# v6.1 D3：资源池健康探测——灌数 driver 启动时探各 adapter available() 记 latency，
+# 落 data/lake/source_health.json（Web /status.source_pool.adapters 只读消费）
+# ---------------------------------------------------------------------------
+def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """灌数 driver 启动的 adapter 健康探测（报告 §4：source_health.json 写入方）。
+
+    - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 跳过，零网络（与 _run_bs_probe /
+      resolve_source 同口径；conftest autouse 默认置位 → 离线单测不触网）。
+    - 探测对象 = AUTHORITY 的 5 个外部源（sina/tencent/baostock/tdx/adata_f10）；
+      ``local`` 是本地推导（静态 csv/factors 派生），无网络可达性概念，不进健康度。
+    - 各 adapter ``available()`` 记 latency_ms：首次调用触发 EU 自检（网络探测），
+      失败→False 自动跳过该源（不 crash、不阻塞灌数启动——单源异常只记 false）。
+      baostock adapter 的 available() = Q6 探测结果（零网络）——**history/reconcile
+      路径须先跑 _run_bs_probe 再调本函数**，否则按"未探测=死"保守记录。
+    - adapter 未注册（依赖库未装/import 失败）→ 记 available=false（该源在本环境
+      恒不可用——resolve_source 同样跳过它；不猜 null）。
+    - 落点 = progress 同目录的 ``source_health.json``（B-2 纪律：自定义 --db → 库
+      目录，绝不污染生产 data/lake/；缺省库 → 生产默认路径）。原子写（tmp+rename）；
+      写失败不阻断灌数（与 _run_bs_probe 的 progress 写纪律一致）。
+
+    :return: ``{"enabled": bool, "path": str|None, "adapters": {...}}``（summary 用）。
+    """
+    from lake.ingest.source_pool import AUTHORITY, get_adapter
+
+    if os.environ.get("LAKE_MULTISOURCE") == "0":
+        return {"enabled": False, "path": None,
+                "detail": "multisource off (test isolation)"}
+    names = [n for n in ("sina", "tencent", "baostock", "tdx", "adata_f10")
+             if n in AUTHORITY]
+    now_s = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    adapters: Dict[str, Any] = {}
+    for name in names:
+        t0 = time.monotonic()
+        try:
+            ad = get_adapter(name)
+            if ad is None:
+                # 依赖库未装/import 失败 → 本环境恒不可用（resolve_source 同语义跳过）
+                adapters[name] = {"available": False, "probed_at": now_s,
+                                  "latency_ms": None}
+                continue
+            ok = bool(ad.available())
+            adapters[name] = {"available": ok, "probed_at": now_s,
+                              "latency_ms": int((time.monotonic() - t0) * 1000)}
+        except Exception as exc:  # noqa: BLE001 - 单源探测异常→false（不 crash、不阻塞）
+            log.warning("adapter %s available() 探测异常 → 记 false: %s", name, exc)
+            adapters[name] = {"available": False, "probed_at": now_s,
+                              "latency_ms": int((time.monotonic() - t0) * 1000)}
+
+    # 落点：progress 同目录（B-2 派生纪律；缺省库→生产 data/lake/）
+    from lake import conn as lconn
+
+    prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径
+    base = prog_path or lconn.progress_path()
+    health_path = os.path.join(os.path.dirname(os.path.abspath(base)),
+                               "source_health.json")
+    try:
+        import tempfile
+
+        os.makedirs(os.path.dirname(health_path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".lake_sh_", suffix=".tmp",
+                                   dir=os.path.dirname(health_path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(adapters, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, health_path)
+    except Exception as exc:  # noqa: BLE001 - 健康度写失败不阻断灌数（Web 显"未知"）
+        log.warning("source_health.json 写入失败（不阻断）: %s", exc)
+        health_path = None
+    log.info("资源池健康探测: %s",
+             {n: a["available"] for n, a in adapters.items()})
+    return {"enabled": True, "path": health_path, "adapters": adapters}
+
+
+# ---------------------------------------------------------------------------
 # T1 stock_master（BaoStock ~2 次 + 腾讯快照补 name/is_st）
 # ---------------------------------------------------------------------------
 def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
@@ -549,6 +625,12 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     runner = BackfillRunner(db_path=db_path)
     steps: Dict[str, Any] = {}
 
+    # v6.1 D3：p0 启动也探资源池健康（Web /status.source_pool.adapters 数据源；
+    # LAKE_MULTISOURCE=0 → 跳过零网络）。baostock adapter available() 读 Q6 进程内
+    # 状态——p0 本身不跑 _run_bs_probe，未探测时按"死"保守记录（与 baostock_alive
+    # 的保守语义一致；history/reconcile 路径先探 Q6 再探健康度）。
+    health_res = _probe_all_adapters(db_path)
+
     if not skip_t1:
         print("[p0] T1 stock_master（BaoStock ~2 次，QuotaGuard 内）...")
         steps["t1"] = run_t1(con, db_path, quota_before)
@@ -581,6 +663,8 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
             "after": quota_after,
             "consumed": max(0, quota_after - quota_before),
         },
+        # v6.1 D3：资源池健康探测结果（summary 可观测；落盘在 _probe_all_adapters 内）
+        "source_health": health_res,
     }
 
 
@@ -623,6 +707,9 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     # v6.1 Q6：灌数启动探一次 BaoStock（config 关/单测门控 → 跳过，零网络）；
     # progress 落盘按 db_path 派生（自定义 --db → 库目录，不污染生产 progress）
     probe_res = _run_bs_probe(db_path)
+    # v6.1 D3：资源池健康探测（Q6 之后——baostock adapter available() 读 Q6 结果；
+    # LAKE_MULTISOURCE=0 → 跳过零网络）。落 source_health.json，Web /status 消费。
+    health_res = _probe_all_adapters(db_path)
 
     codes = codes or _universe_codes(con)
     # v6.0.7：done 键稳定化——固定 "full_history"（不含日期），跨天断点续传有效
@@ -724,6 +811,7 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     stats.update(runner.run(tasks, worker))
     bs.close()
     return {"sub": "history", **stats, "baostock_probe": probe_res,
+            "source_health": health_res,
             "multisource": bool(ohlcv_srcs or adj_srcs),
             "ohlcv_sources": [a.name for a in ohlcv_srcs],
             "adj_sources": [a.name for a in adj_srcs]}

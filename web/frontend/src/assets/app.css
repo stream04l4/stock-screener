@@ -377,6 +377,34 @@ tr.lake-row-muted .badge { opacity: .85; }
 /* 空态/错误态占位（与页面既有 .placeholder 一致，不白屏） */
 .lake-kline-empty { padding: 46px 0; text-align: center; color: var(--muted); font-size: 13px; }
 
+/* ---------- v6.1 D3：多源资源池面板（SourcePoolPanel；数据=/status.source_pool） ---------- */
+.lake-spp { margin: 0 0 12px; padding: 10px 12px; background: #f8fafc; border: 1px solid var(--line); border-radius: 9px; }
+.lake-spp-off { padding: 14px 0; text-align: center; color: var(--muted); font-size: 13px; }
+.lake-spp-block { margin-bottom: 12px; }
+.lake-spp-block:last-child { margin-bottom: 0; }
+.lake-spp-title { font-size: 12.5px; font-weight: 600; color: #374151; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 区块1：by_source 横向堆叠条（固定色板在组件内；行 = 表名 + 条 + 总行数） */
+.lake-spp-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.lake-spp-row-label { width: 130px; flex: none; font-size: 12px; color: #475569; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lake-spp-bar { flex: 1; height: 12px; display: flex; border-radius: 4px; overflow: hidden; background: #edf1f7; min-width: 80px; }
+.lake-spp-bar i { display: block; height: 100%; }
+.lake-spp-row-total { width: 90px; flex: none; text-align: right; font-size: 12px; font-family: var(--mono); color: #475569; }
+/* 区块2：adapters 网格（✓/✗/未知—） */
+.lake-spp-adapters { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.lake-spp-adapter { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.lake-spp-adapter-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12.5px; }
+.lake-spp-avail { font-weight: 700; font-family: var(--mono); }
+.lake-spp-avail.ok { color: #16a34a; }
+.lake-spp-avail.bad { color: #dc2626; }
+/* stale → "探测数据过期"角标（复用 lake-st-lagging 琥珀色） */
+.lake-spp-stale { font-size: 11px; padding: 1px 8px; }
+/* 区块3：conflict_rows */
+.lake-spp-conflict { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 区块4：baostock_probe */
+.lake-spp-bs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 市场表工具栏 count（与 .tbl-toolbar .count 同视觉） */
+.lake-toolbar .count { font-size: 12px; color: var(--muted); margin-left: auto; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }

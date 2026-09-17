@@ -55,6 +55,7 @@ test_lake_v604_lock 不得破坏）。state 判定全部运行时计算、零硬
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import math
 import os
@@ -610,6 +611,158 @@ _VIEW_META = [
     ("stock_panorama", "个股全景视图", "T1⋈T3 拼装"),
 ]
 
+# ---------------------------------------------------------------------------
+# v6.1：source_pool（多源资源池可观测性）——/status ready 态追加顶层字段
+#
+# 规格（research_report_frontend §4，TL brief D3-A）：
+# - ``by_source``：**9 表键恒定**（无数据=``{}``，形状稳定），SQL =
+#   ``SELECT source, COUNT(*) FROM <t> GROUP BY source``（T1-T9 全有 source 列）。
+# - ``conflict_rows``：仅 T1-T7 有 conflict_src 列（T8/T9 无该列，不出现在对象里）；
+#   total = 七表之和。
+# - ``adapters``：读 ``data/lake/source_health.json``（灌数 driver 启动时
+#   ``_probe_all_adapters()`` 写入；Web 只读）。文件缺失/损坏 → 全 null + stale=true。
+# - ``baostock_probe``：直接透出 progress 顶层既有键（零新增写入代码）；无此键 → null。
+# - ``stale``：source_health.json 缺失或 max(probed_at) 距今 >7 天 → true。
+#
+# **兼容红线**：locked/uninitialized 态响应键集一个字节不动（test_lake_v605_status
+# 精确断言 set(d.keys())）——本段只在 ready 态经 ``resp.update()`` 追加。
+# ---------------------------------------------------------------------------
+_SOURCE_TABLES = [t[0] for t in _TABLE_META]          # 9 表固定顺序（T1-T9）
+_CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 conflict_src 列）
+_ADAPTER_NAMES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
+_STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
+
+
+def _source_health_path() -> str:
+    """source_health.json 路径（与 progress 同目录 data/lake/；测试可 monkeypatch）。"""
+    from . import conn as _conn
+
+    return os.path.join(os.path.dirname(_conn.progress_path()), "source_health.json")
+
+
+def _read_source_health():
+    """读 source_health.json → (adapters dict, stale bool)。
+
+    文件缺失/损坏/非 dict → ``{name: {available: None, probed_at: None,
+    latency_ms: None} for name in _ADAPTER_NAMES}`` + stale=True（"从未探测"语义）。
+    """
+    empty = {n: {"available": None, "probed_at": None, "latency_ms": None}
+             for n in _ADAPTER_NAMES}
+    try:
+        with open(_source_health_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return dict(empty), True
+    if not isinstance(data, dict):
+        return dict(empty), True
+    adapters: Dict[str, Any] = {}
+    for n in _ADAPTER_NAMES:
+        a = data.get(n)
+        if isinstance(a, dict):
+            adapters[n] = {"available": a.get("available"),
+                           "probed_at": a.get("probed_at"),
+                           "latency_ms": a.get("latency_ms")}
+        else:
+            adapters[n] = dict(empty[n])
+    # stale：max(probed_at) 距今 >7 天（解析失败/缺失 → 按过期处理，保守提示）
+    max_ts: Optional[datetime.datetime] = None
+    for a in data.values():
+        if not isinstance(a, dict):
+            continue
+        s = str(a.get("probed_at") or "")[:19].replace("T", " ")
+        try:
+            ts = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+    stale = True
+    if max_ts is not None:
+        age_days = (datetime.datetime.now() - max_ts).total_seconds() / 86400.0
+        stale = age_days > _STALE_DAYS
+    return adapters, stale
+
+
+def _build_source_pool(con, prog: Dict[str, Any]) -> Dict[str, Any]:
+    """ready 态 source_pool 组装（全部只读 SELECT + 文件读，不写 data/lake/）。
+
+    by_source/conflict_rows 走 :func:`_source_pool_cache`（TTL 60s，键=db mtime）——
+    3s 轮询不重复跑 9×GROUP BY + 7×COUNT。任何单表查询异常 → 该表降级 ``{}``/0
+    （防御：某表缺列不拖垮整个 /status；正常库不会触发）。
+    """
+    db_path = _source_pool_db_path()
+    by_source, conflict_rows = _source_pool_cache(con, db_path)
+
+    adapters, stale = _read_source_health()
+    bs_probe = prog.get("baostock_probe")   # 直接透出 progress 既有键；无 → None
+    return {
+        "by_source": by_source,
+        "conflict_rows": conflict_rows,
+        "adapters": adapters,
+        "baostock_probe": bs_probe if isinstance(bs_probe, dict) else None,
+        "stale": stale,
+    }
+
+
+def _source_pool_db_path() -> str:
+    from . import conn as _conn
+
+    return _conn.default_db_path()
+
+
+# TTL 缓存（web 进程内）：键 = (db mtime, db size)——库被灌数更新（mtime 变）即失效；
+# 60s 内同键复用，3s 轮询不重复跑聚合查询。只读语义，无锁竞争问题（单值原子替换）。
+_SP_CACHE: Dict[str, Any] = {"key": None, "at": 0.0, "by_source": None,
+                             "conflict_rows": None}
+_SP_TTL_S = 60.0
+
+
+def _source_pool_cache(con, db_path: str) -> tuple:
+    """(by_source, conflict_rows) 带 TTL 缓存的聚合查询（见模块级注释）。"""
+    import time as _time
+
+    try:
+        st = os.stat(db_path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    now = _time.monotonic()
+    if (_SP_CACHE["key"] == key and _SP_CACHE["by_source"] is not None
+            and now - _SP_CACHE["at"] < _SP_TTL_S):
+        return _SP_CACHE["by_source"], _SP_CACHE["conflict_rows"]
+
+    by_source: Dict[str, Dict[str, int]] = {}
+    for t in _SOURCE_TABLES:
+        m: Dict[str, int] = {}
+        try:
+            for src, n in con.execute(
+                    f"SELECT source, COUNT(*) FROM {t} GROUP BY source").fetchall():
+                m[str(src) if src is not None else "unknown"] = int(n or 0)
+        except Exception:  # noqa: BLE001 - 防御性降级（正常库不触发）
+            m = {}
+        by_source[t] = m   # 9 表键恒定：无数据 = {}
+
+    conflict_rows: Dict[str, int] = {}
+    total = 0
+    for t in _CONFLICT_TABLES:
+        try:
+            n = con.execute(
+                f"SELECT COUNT(*) FROM {t} WHERE conflict_src IS NOT NULL").fetchone()[0]
+        except Exception:  # noqa: BLE001
+            n = 0
+        n = int(n or 0)
+        conflict_rows[t] = n
+        total += n
+    conflict_rows["total"] = total
+
+    _SP_CACHE.update(key=key, at=now, by_source=by_source, conflict_rows=conflict_rows)
+    return by_source, conflict_rows
+
+
+def _source_pool_cache_reset() -> None:
+    """测试隔离：清 TTL 缓存（生产代码不得调用）。"""
+    _SP_CACHE.update(key=None, at=0.0, by_source=None, conflict_rows=None)
+
 
 def _iso_date(v) -> Optional[str]:
     """date/datetime/str → 'YYYY-MM-DD'（None 透传）。"""
@@ -833,6 +986,10 @@ def status() -> Dict[str, Any]:
     :func:`_stopping_from_progress`）。前端据此显示"⏹ 停止中…（当前任务收尾中）"
     而非无反应。uninitialized/ready 两态不追加（stopping 只在 backfill_in_progress
     =true 时有意义；三态互不串味纪律延续 v6.0.4/v6.0.5）。
+
+    v6.1：**仅 ready 态**追加 ``source_pool``（by_source 9表恒定 / conflict_rows
+    T1-T7+total / adapters / baostock_probe / stale，见 :func:`_build_source_pool`）
+    ——locked/uninitialized 键集一个字节不动（三态契约红线）。
     """
     import duckdb
 
@@ -874,6 +1031,8 @@ def status() -> Dict[str, Any]:
         con.execute("SELECT 1").fetchone()
         # v6.0.5：9 表逐表统计 + state 判定（同一短连接内完成，全部只读 SELECT）
         details = _build_status_details(con, load_progress())
+        # v6.1：source_pool（仅 ready 态；by_source/conflict 走 TTL 缓存，全部只读）
+        source_pool = _build_source_pool(con, load_progress())
     finally:
         con.close()
     prog = load_progress()
@@ -886,6 +1045,7 @@ def status() -> Dict[str, Any]:
         "updated_at": prog.get("updated_at"),
     }
     resp.update(details)  # v6.0.5 新字段只在 ready 态追加（旧字段逐字节不动）
+    resp["source_pool"] = source_pool  # v6.1 新字段只在 ready 态追加（三态红线）
     return resp
 
 

@@ -815,6 +815,14 @@ function renderStrategyCards(cards, json, editing) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v6.1 D3（Joel 拍板）：[object Object] 修复——dict/list 值落到 FIELD_TYPE 未注册
+// 字段（如 dividend.payout_band_pct / backtest.* / datasource.*）时，兜底 String(v)
+// 会渲染成 "[object Object]"。改为**可读摘要**（两处同步：vanilla + Vue strategyMeta）：
+// - list → join(", ")；>50 项截断显示前 50 + "…共N项"；
+// - dict → {k:v, ...} 紧凑 JSON（JSON.stringify，深度 >2 层截断为 "…"）；
+// - 标量保持 String(v) 不变。
+// ---------------------------------------------------------------------------
 function displayValue(section, field, v) {
   const t = FIELD_TYPE[field];
   if (t === "list") return Array.isArray(v) ? v.join(", ") : String(v);
@@ -826,7 +834,39 @@ function displayValue(section, field, v) {
     return Object.entries(v || {}).map(([dim, m]) =>
       dim + "{" + Object.entries(m).map(([k, x]) => `${k}:${x}`).join(",") + "}").join("  ");
   }
+  return readableValue(v);
+}
+
+// 可读摘要（v6.1 D3）：dict/list → 紧凑可读文本；标量 → String(v)。
+function readableValue(v) {
+  if (Array.isArray(v)) {
+    if (!v.length) return "[]";
+    // 元素：字符串/数字原样（join(", ") 语义）；对象/数组 → JSON.stringify（防 [object Object]）
+    const head = v.slice(0, 50).map((x) =>
+      x !== null && typeof x === "object" ? JSON.stringify(x) : String(x)).join(", ");
+    return v.length > 50 ? `[${head}, …共${v.length}项]` : `[${head}]`;
+  }
+  if (v !== null && typeof v === "object") {
+    return compactJson(v, 2);   // compactJson: "{}" / "{k:v,…}" / "…"（自带头尾括号）
+  }
   return String(v);
+}
+
+// 紧凑 JSON（深度 >maxDepth 层 → "…"；JSON.stringify 语义：字符串带引号、null/数字原样）。
+function compactJson(v, maxDepth) {
+  if (Array.isArray(v)) {
+    if (maxDepth <= 0) return "…";
+    const parts = v.map((x) => compactJson(x, maxDepth - 1));
+    return "[" + parts.join(",") + "]";
+  }
+  if (v !== null && typeof v === "object") {
+    if (maxDepth <= 0) return "…";
+    const keys = Object.keys(v);
+    if (!keys.length) return "{}";
+    const parts = keys.map((k) => `${JSON.stringify(k)}:${compactJson(v[k], maxDepth - 1)}`);
+    return "{" + parts.join(",") + "}";   // 自带头尾括号（空对象上面已返回 "{}"）
+  }
+  return JSON.stringify(v);
 }
 
 function editControl(section, field, value) {

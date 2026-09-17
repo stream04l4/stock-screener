@@ -127,3 +127,56 @@ describe("displayValue · 按 FIELD_TYPE 分支（移植 app.js L818-830）", ()
     expect(displayValue("scoring", "top_n", 50)).toBe("50");
   });
 });
+
+describe("displayValue · [object Object] 修复（v6.1 D3，Joel 拍板）", () => {
+  // 根因：dict/list 值落到 FIELD_TYPE 未注册字段 → 旧兜底 String(v) = "[object Object]"
+  it("dict 值（未注册字段）→ 紧凑 JSON 摘要，不再是 [object Object]", () => {
+    const v = displayValue("dividend", "payout_band_pct", { min: 30, max: 80 });
+    expect(v).not.toContain("[object Object]");
+    expect(v).toBe('{"min":30,"max":80}');
+  });
+
+  it("list 值（未注册字段）→ join(', ')，不再是 [object Object]", () => {
+    const v = displayValue("backtest", "benchmarks", ["sh.000300", "sh.000905"]);
+    expect(v).not.toContain("[object Object]");
+    expect(v).toBe("[sh.000300, sh.000905]");   // 字符串/数字元素原样（join ", " 语义）
+  });
+
+  it("list >50 项 → 前 50 + '…共N项' 截断", () => {
+    const items = Array.from({ length: 60 }, (_, i) => `s${i}`);
+    const v = displayValue("x", "y", items);
+    expect(v).toContain("s49");
+    expect(v).not.toContain("s50,");
+    expect(v).toContain("…共60项");
+  });
+
+  it("list 含对象元素 → 对象元素 JSON.stringify（防 [object Object]）", () => {
+    const v = displayValue("x", "y", ["a", { b: 1 }]);
+    expect(v).toBe("[a, {\"b\":1}]");
+  });
+
+  it("深嵌套 dict → 深度 >2 层截断为 '…'", () => {
+    const v = displayValue("x", "y", { a: { b: { c: 1 } }, d: [1, { e: 2 }] });
+    expect(v).not.toContain("[object Object]");
+    // 第 1 层 key、第 2 层值展开；第 3 层（b.c / e）→ "…"（裸省略号，非 JSON 字符串）
+    expect(v).toBe('{"a":{"b":…},"d":[1,…]}');
+  });
+
+  it("空值/边界：null → 'null'、{} → '{}'、[] → '[]'", () => {
+    expect(displayValue("x", "y", null)).toBe("null");
+    expect(displayValue("x", "y", {})).toBe("{}");
+    expect(displayValue("x", "y", [])).toBe("[]");
+  });
+
+  it("标量保持 String(v)（int/float/str 行为不变）", () => {
+    expect(displayValue("scoring", "top_n", 50)).toBe("50");
+    expect(displayValue("technical", "min_return_pct", 3.5)).toBe("3.5");
+    expect(displayValue("data", "cache_dir", "cache/")).toBe("cache/");
+  });
+
+  it("已注册类型分支不受影响（list/bool/weights_dict/sub_weights_dict 原语义）", () => {
+    expect(displayValue("universe", "a_share_prefixes", ["sh.60", "sz.00"])).toBe("sh.60, sz.00");
+    expect(displayValue("hard_filter", "st_enabled", true)).toBe("true");
+    expect(displayValue("scoring", "weights", { technical: 1 })).toBe("技术面 1");
+  });
+});
