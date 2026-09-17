@@ -41,6 +41,15 @@ async function refresh(key) {
     .catch((err) => {
       entry.lastError = err;
       if (entry.inFlight === p) entry.inFlight = null;
+      // DEFECT-1 修复：失败路径也必须 notify(entry)。
+      // 否则 useLiveQuery.sync() 只被成功分支的 notify 触发 → 已挂载订阅者的
+      // data/error/loading 三 ref 冻结在挂载初值：首次加载失败时 error 恒 null、
+      // loading 恒 true（UI 永久卡"加载中…"）；已有数据时后台刷新失败则静默保留旧值、
+      // 无任何失败反馈。notify 后 sync() 语义自然满足契约：
+      //   - 首载失败 → data=undefined、error=Error、loading=false（组件渲染"加载失败: …"）
+      //   - SWR 后台刷新失败 → data 保留旧值、error 透出、loading 不翻转（旧值照常展示）
+      // 时序与成功分支一致：先清 inFlight 再 notify（避免订阅者同步重入时去重锚点未清）。
+      notify(entry);
       throw err;
     });
   entry.inFlight = p;
