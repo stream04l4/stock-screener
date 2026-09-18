@@ -401,13 +401,19 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-spp-bar { flex: 1; height: 12px; display: flex; border-radius: 4px; overflow: hidden; background: #edf1f7; min-width: 80px; }
 .lake-spp-bar i { display: block; height: 100%; }
 .lake-spp-row-total { width: 90px; flex: none; text-align: right; font-size: 12px; font-family: var(--mono); color: #475569; }
-/* 区块2：adapters 网格（✓/✗/未知—） */
-.lake-spp-adapters { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
-.lake-spp-adapter { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+/* 区块2（v6.1.3）：数据源状态卡（每源一张；SOURCE_COLORS 左边框在组件内联着色） */
+.lake-spp-adapters { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+.lake-spp-adapter { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px; }
 .lake-spp-adapter-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12.5px; }
 .lake-spp-avail { font-weight: 700; font-family: var(--mono); }
 .lake-spp-avail.ok { color: #16a34a; }
 .lake-spp-avail.bad { color: #dc2626; }
+.lake-spp-conn { display: flex; align-items: baseline; gap: 4px; font-size: 12.5px; }
+/* 数据类型 chips（provides；role 后缀小字 muted） */
+.lake-spp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.lake-spp-chip { display: inline-block; font-size: 11.5px; line-height: 1.5; padding: 1px 8px; border-radius: 999px; background: #eef2f7; color: #334155; border: 1px solid var(--line); }
+/* enabled=false → "已禁用"灰 badge（替代 ✓/✗） */
+.lake-spp-disabled { font-size: 11px; padding: 1px 8px; }
 /* stale → "探测数据过期"角标（复用 lake-st-lagging 琥珀色） */
 .lake-spp-stale { font-size: 11px; padding: 1px 8px; }
 /* 区块3：conflict_rows */

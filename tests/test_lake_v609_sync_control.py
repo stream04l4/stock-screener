@@ -919,7 +919,7 @@ def test_frontend_sync_control_contract():
     assert "/api/lake/sync/start" in blob, "Vue 未接 POST start"
     assert "/api/lake/sync/stop" in blob, "Vue 未接 POST stop"
     assert 'method: "POST"' in blob
-    assert "将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？" in blob
+    assert "将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？" in blob
     assert "停止后进度已保存，下次启动自动续传。确认停止？" in blob
     assert "backfill_in_progress" in blob
     assert "▶ 启动同步" in sc and "停止同步" in sc, "按钮二态文案缺失"

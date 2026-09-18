@@ -72,10 +72,10 @@ describe("SourcePoolPanel：adapters 三态", () => {
     const byName = {};
     for (const c of cards) byName[c.find("b").text()] = c;
     expect(byName.sina.find(".lake-spp-avail").classes()).toContain("ok");
-    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓");
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
     expect(byName.tencent.find(".lake-spp-avail").classes()).toContain("bad");
-    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗");
-    expect(byName.baostock.find(".lake-spp-avail").text().trim()).toBe("—");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
+    expect(byName.baostock.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
   });
 
   it("probed_at + latency_ms 展示（≥1000ms → s 单位）", () => {
@@ -151,5 +151,170 @@ describe("SourcePoolPanel：backfill 降级", () => {
     const w = mountPanel({ pool: null, backfill: false });
     expect(w.find(".lake-spp-off").exists()).toBe(true);
     expect(w.findAll(".lake-spp-row").length).toBe(0);
+  });
+});
+
+// ===========================================================================
+// v6.1.3：区块2"数据源状态"（每源一张卡；pool.sources 驱动）+ 配额列已删守卫
+// ===========================================================================
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+function vueSrc(rel) {
+  return readFileSync(resolve(__dirname, rel), "utf-8");
+}
+
+// v6.1.3 形态：pool.sources（后端数组，固定 5 源 + provides/quota/rate_limit/enabled）
+function makeSourcesPool(over = {}) {
+  const base = makePool();   // 保留 by_source/conflict/baostock_probe/stale（区块1/3/4 不变）
+  return {
+    ...base,
+    sources: [
+      { name: "sina", enabled: true, available: true, probed_at: "2026-09-17T08:00:00",
+        latency_ms: 320, authority: 0,
+        provides: [
+          { table: "kline_daily", table_cn: "T2 日K线", field_group: "ohlcv_amount", role: "主源" },
+          { table: "kline_daily", table_cn: "T2 日K线", field_group: "adj_factor", role: "主源(推导)" },
+        ], quota: null, rate_limit: "≥1s/股" },
+      { name: "tencent", enabled: true, available: false, probed_at: "2026-09-17T08:00:01",
+        latency_ms: null, authority: 1,
+        provides: [
+          { table: "stock_master", table_cn: "T1 股票主档", field_group: "master", role: "主源" },
+          { table: "valuation_daily", table_cn: "T3 估值日线", field_group: "valuation", role: "主源" },
+        ], quota: null, rate_limit: null },
+      { name: "baostock", enabled: true, available: null, probed_at: null,
+        latency_ms: null, authority: 2,
+        provides: [
+          { table: "kline_daily", table_cn: "T2 日K线", field_group: "adj_factor", role: "fallback(探测存活时)" },
+        ], quota: { used_today: 1234, budget: 5000 }, rate_limit: null },
+      { name: "tdx", enabled: false, available: true, probed_at: "2026-09-17T08:00:02",
+        latency_ms: 210, authority: 3,
+        provides: [
+          { table: "index_daily", table_cn: "T7 指数日线", field_group: "amount", role: "主源" },
+        ], quota: null, rate_limit: "≥0.5s/股" },
+      { name: "adata_f10", enabled: true, available: true, probed_at: "2026-09-17T08:00:03",
+        latency_ms: 88, authority: 3,
+        provides: [
+          { table: "fundamentals_quarterly", table_cn: "T5 季度基本面", field_group: "f10", role: "主源" },
+        ], quota: null, rate_limit: "≥1s/股" },
+    ],
+    ...over,
+  };
+}
+
+function cardsBy(w) {
+  const byName = {};
+  for (const c of w.findAll(".lake-spp-adapter")) byName[c.find("b").text()] = c;
+  return byName;
+}
+
+describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => {
+  it("区块标题='数据源状态（连通性·数据类型·配额 · 灌数启动时探测）'，5 源各一张卡", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("数据源状态"));
+    expect(block.exists()).toBe(true);
+    expect(block.find(".lake-spp-title").text()).toContain("连通性·数据类型·配额");
+    expect(w.findAll(".lake-spp-adapter").length).toBe(5);
+  });
+
+  it("卡内四行：连通性（✓可达/✗不可达/—未探测 + latency）+ 探测时间", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
+    expect(byName.sina.text()).toContain("latency 320ms");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
+    expect(byName.baostock.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
+    // 行4 探测时间（probed_at / 未探测）
+    expect(byName.sina.text()).toContain("探测：2026-09-17T08:00:00");
+    expect(byName.baostock.text()).toContain("探测：未探测");
+  });
+
+  it("数据类型 chips（table_cn·字段组 + role 后缀小字 muted）", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    // sina：2 个 chip（OHLCV+amount 主源 / 复权因子 主源(推导)）
+    const sinaChips = byName.sina.findAll(".lake-spp-chip");
+    expect(sinaChips.length).toBe(2);
+    expect(sinaChips[0].text()).toContain("T2 日K线·OHLCV+amount");
+    expect(sinaChips[0].text()).toContain("主源");
+    expect(sinaChips[1].text()).toContain("复权因子");
+    expect(sinaChips[1].text()).toContain("主源(推导)");
+    // tencent：T1 股票主档·主档（master→"主档"）+ T3 估值日线·估值
+    const txText = byName.tencent.findAll(".lake-spp-chip").map((c) => c.text()).join("|");
+    expect(txText).toContain("T1 股票主档·主档");
+    expect(txText).toContain("T3 估值日线·估值");
+    // role 后缀是小字 muted（span.muted.small）
+    const roleSpan = sinaChips[0].find("span.muted");
+    expect(roleSpan.exists()).toBe(true);
+    expect(roleSpan.text().trim()).toBe("主源");
+  });
+
+  it("配额行：baostock='今日 1234/5000'；sina='≥1s/股'；tencent（无 quota 无 rate_limit）='无官方配额'", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    expect(byName.baostock.text()).toContain("配额：今日 1234/5000");
+    expect(byName.sina.text()).toContain("配额：≥1s/股");
+    expect(byName.tencent.text()).toContain("配额：无官方配额");
+  });
+
+  it("enabled=false → '已禁用'灰 badge 替代 ✓/✗（连通性行不渲染）", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    const tdx = byName.tdx;
+    expect(tdx.find(".lake-spp-disabled").text()).toBe("已禁用");
+    expect(tdx.find(".lake-spp-conn").exists()).toBe(false);   // 连通性行被 badge 替代
+    // 其余 enabled=true 源无"已禁用"badge
+    expect(byName.sina.find(".lake-spp-disabled").exists()).toBe(false);
+  });
+
+  it("baostock quota.used_today=null → '今日 —/5000'（从未灌数）", () => {
+    const pool = makeSourcesPool();
+    pool.sources[2].quota = { used_today: null, budget: 5000 };
+    const w = mountPanel({ pool });
+    expect(cardsBy(w).baostock.text()).toContain("配额：今日 —/5000");
+  });
+
+  it("SOURCE_COLORS 左边框着色（sina 蓝 #2563eb / tdx 青 #06b6d4）", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    expect(byName.sina.attributes("style")).toContain("#2563eb");
+    expect(byName.tdx.attributes("style")).toContain("#06b6d4");
+  });
+
+  it("stale=true → 数据源状态区块出现'探测数据过期'角标（与 by_source 区共 2 处）", () => {
+    const w = mountPanel({ pool: makeSourcesPool({ stale: true }) });
+    expect(w.findAll(".lake-spp-stale").length).toBe(2);
+  });
+
+  it("旧形态（无 sources 键，仅 adapters）→ 回退渲染 5 卡 + '无官方配额'占位", () => {
+    const w = mountPanel({ pool: makePool() });   // makePool 只有 adapters，无 sources
+    expect(w.findAll(".lake-spp-adapter").length).toBe(5);
+    const byName = cardsBy(w);
+    expect(byName.sina.text()).toContain("✓ 可达");
+    expect(byName.sina.text()).toContain("配额：无官方配额");   // rate_limit=null → 占位
+  });
+});
+
+describe("v6.1.3：配额(今日)列已删（源码契约守卫）", () => {
+  it("LakeTab.vue / LakeStatusCard.vue 不含'配额(今日)'th/td，SyncControl.vue 不含'今日配额'", () => {
+    const lakeTab = vueSrc("../../LakeTab.vue");
+    const card = vueSrc("../LakeStatusCard.vue");
+    const sc = vueSrc("../SyncControl.vue");
+    expect(lakeTab).not.toContain("配额(今日)");
+    expect(card).not.toContain("配额(今日)");
+    // tasks 表 quota td 一并移除（不再渲染 t.quota_used_today）
+    expect(lakeTab).not.toContain("quota_used_today");
+    expect(card).not.toContain("quota_used_today");
+    // SyncControl 头部"今日配额 x/budget"片段已删（保留已耗时/进度更新时间）
+    expect(sc).not.toContain("今日配额");
+    expect(sc).toContain("进度更新于");   // 保留项仍在
+  });
+
+  it("lakeStore.js confirm 文案='BaoStock 每日配额 5000'（更准确：配额是 BaoStock 的）", () => {
+    const store = vueSrc("../../../stores/lakeStore.js");
+    expect(store).toContain(
+      "将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？");
   });
 });

@@ -54,14 +54,18 @@ describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", ()
     expect(w.find("#lake-sync-meta").text()).toContain("进度更新于 09-17T08:00");
   });
 
-  it("running + 今日配额（tasks max）→ meta '今日配额 x/budget'", async () => {
+  it("running + tasks 含 quota → meta **不含**'今日配额'（v6.1.3：配额归数据源状态卡）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({
       backfill_in_progress: true, lock_holder_pid: 1,
       tasks: [{ quota_used_today: 300, quota_budget: 5000 }, { quota_used_today: 900, quota_budget: 5000 }],
     });
     await tick();
-    expect(w.find("#lake-sync-meta").text()).toContain("今日配额 900/5000");   // max（防御滞后视图）
+    const meta = w.find("#lake-sync-meta").text();
+    // v6.1.3：SyncControl 头部不再展示"今日配额 x/budget"（配额是 BaoStock 的，
+    // 归 SourcePoolPanel 数据源状态卡）——只留 PID + 已耗时/进度更新时间。
+    expect(meta).not.toContain("今日配额");
+    expect(meta).toContain("PID 1");
   });
 
   it("running + stopping=true（SIGTERM 已发）→ meta '⏹ 停止收尾中（当前任务完成后退出）'，按钮仍是停止入口", async () => {

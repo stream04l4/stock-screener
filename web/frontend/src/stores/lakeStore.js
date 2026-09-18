@@ -138,7 +138,7 @@ export const useLakeStore = defineStore("lake", {
     // 同步控制动作（v6.0.9/v6.0.10；移植 lakeSyncStart/lakeSyncStop）
     // ------------------------------------------------------------------
     async startSync() {
-      if (!window.confirm("将启动全史数据补库（后台长跑，每日配额 5000 到顶自停）。确认启动？")) return;
+      if (!window.confirm("将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？")) return;
       // v6.0.10：点击即锁定——POST /start 返回前按钮禁用+"▶ 启动中…"（防连点/竞态）
       this.syncState = "starting";
       try {

@@ -47,6 +47,57 @@ AUTHORITY: Dict[str, int] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# v6.1.3：SOURCE_CAPABILITIES —— 各源可提供的数据类型（静态能力表，非用户可配）
+#
+# 与 adapter 注册表同层的**展示元数据**（/status.source_pool.sources[].provides
+# 的数据源；前端"数据源状态"卡渲染 chips）。为什么放这里而非 web_api：能力
+# 是数据源池的固有属性，与 AUTHORITY 同源同生命周期——web_api 只读透出。
+# table_cn 口径 = web_api._TABLE_META name_cn 的简写（T2 日K线 / T3 估值日线…），
+# 与前端 SourcePoolPanel.TABLE_LABELS 对齐；role 含"主源/fallback/交叉校验"及
+# 推导方式备注（hfq÷raw）。**T4 分红=本地静态缓存（零网络）不属任何在线源，
+# 本表不列 T4**（brief 红线）。
+# ---------------------------------------------------------------------------
+SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
+    "sina": [
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "ohlcv_amount", "role": "主源"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "adj_factor", "role": "主源(推导)"},   # hfq÷raw 推导
+    ],
+    "tencent": [
+        {"table": "stock_master", "table_cn": "T1 股票主档",
+         "field_group": "master", "role": "主源"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "ohlcv_amount", "role": "fallback"},
+        {"table": "valuation_daily", "table_cn": "T3 估值日线",
+         "field_group": "valuation", "role": "主源"},
+        {"table": "index_daily", "table_cn": "T7 指数日线",
+         "field_group": "ohlcv", "role": "主源"},
+    ],
+    "baostock": [
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "adj_factor", "role": "fallback(探测存活时)"},
+        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
+         "field_group": "f10", "role": "交叉校验"},
+    ],
+    "tdx": [
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "ohlcv_amount", "role": "fallback"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "adj_factor", "role": "fallback(推导)"},   # hfq÷raw 推导
+        {"table": "index_daily", "table_cn": "T7 指数日线",
+         "field_group": "ohlcv", "role": "fallback"},
+        {"table": "index_daily", "table_cn": "T7 指数日线",
+         "field_group": "amount", "role": "主源"},
+    ],
+    "adata_f10": [
+        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
+         "field_group": "f10", "role": "主源"},
+    ],
+}
+
+
 @runtime_checkable
 class SourceAdapter(Protocol):
     """源适配器统一接口（粒度=按(表,字段组)取数，避免 N×M 函数爆炸——报告 §5.1）。"""

@@ -4,8 +4,11 @@
 // 四区块（报告 §3 T-数据湖）：
 //   1) 采用源分布：每表 by_source **横向堆叠条**（固定色板 sina蓝/tencent橙/baostock紫/
 //      tdx青/adata_f10粉/local灰；legacy 未知 source → 灰）+ 数字；
-//   2) 资源池健康度：5 adapter 网格（available ✓/✗/未知— + probed_at + latency_ms，
-//      stale=true → "探测数据过期"角标）；
+//   2) 数据源状态（v6.1.3，原"资源池健康度"升级）：每源一张卡（5 色 SOURCE_COLORS
+//      左边框/标题着色），卡内四行——连通性（✓可达/✗不可达/—未探测 + latency；
+//      enabled=false → "已禁用"灰 badge 替代 ✓/✗）/ 数据类型（provides chips，role
+//      后缀小字 muted）/ 配额（baostock 今日 used/budget；其余 rate_limit 文案或
+//      "无官方配额"）/ 探测时间（stale=true → "探测数据过期"角标）。
 //   3) conflict_src：total + 非零表逐行（T8/T9 无该列，后端不出现在对象里）；
 //   4) BaoStock 恢复探测：alive badge + at/elapsed/detail。
 // **backfill_in_progress 时整块"灌数中暂不可用"**（库被独占写锁持有期间 source_pool
@@ -49,11 +52,44 @@ const rows = computed(() => {
   });
 });
 
-// 区块2：adapters 网格（✓/✗/未知—）
-const adapters = computed(() => (props.pool && props.pool.adapters) || {});
+// 区块2（v6.1.3）：数据源状态卡。优先用 pool.sources（后端 v6.1.3 数组，固定 5 源
+// 顺序 + provides/quota/rate_limit/enabled）；旧形态（无 sources 键）回退 adapters
+// 网格语义（provides/quota/rate_limit 空 → 前端显示占位文案），保证向前兼容。
+const sources = computed(() => {
+  const pool = props.pool || {};
+  if (Array.isArray(pool.sources) && pool.sources.length) return pool.sources;
+  // 回退：adapters → 最小形态（available/probed_at/latency_ms 复用，enabled=true）
+  const ad = pool.adapters || {};
+  return Object.entries(ad).map(([name, a]) => ({
+    name, enabled: true,
+    available: (a && a.available) ?? null,
+    probed_at: (a && a.probed_at) ?? null,
+    latency_ms: (a && a.latency_ms) ?? null,
+    authority: null, provides: [], quota: null, rate_limit: null,
+  }));
+});
+
+// 连通性三态（✓可达/✗不可达/—未探测；复用 availMark 口径）
 function availMark(a) {
-  if (!a || a.available === null || a.available === undefined) return "—";
-  return a.available ? "✓" : "✗";
+  if (a === null || a === undefined) return "—";
+  return a ? "✓" : "✗";
+}
+function connWord(a) {
+  if (a === null || a === undefined) return "未探测";
+  return a ? "可达" : "不可达";
+}
+// 字段组 → chip 短名（brief："T2 日K线·OHLCV+amount(主源)" 形式；模板内联使用）
+const FIELD_GROUP_CN = {
+  ohlcv_amount: "OHLCV+amount", adj_factor: "复权因子", master: "主档",
+  valuation: "估值", f10: "F10基本面", ohlcv: "OHLCV", amount: "amount",
+};
+// 配额行：quota 非 null → 今日 used/budget；否则 rate_limit 文案或"无官方配额"
+function quotaText(s) {
+  if (s.quota && typeof s.quota === "object") {
+    const u = s.quota.used_today == null ? "—" : s.quota.used_today;
+    return `今日 ${u}/${s.quota.budget ?? "—"}`;
+  }
+  return s.rate_limit || "无官方配额";
 }
 
 // 区块3：conflict_rows total + 非零表逐行（T8/T9 不在对象里；total 单独取）
@@ -97,22 +133,41 @@ function fmtLatency(ms) {
         </div>
       </div>
 
-      <!-- 区块2：资源池健康度（5 adapter 网格） -->
+      <!-- 区块2（v6.1.3）：数据源状态（每源一张卡；SOURCE_COLORS 左边框/标题着色）。
+           四行：连通性（✓可达/✗不可达/—未探测 + latency；enabled=false→"已禁用"灰 badge
+           替代 ✓/✗）/ 数据类型（provides chips，role 后缀小字 muted）/ 配额 / 探测时间 -->
       <div class="lake-spp-block">
         <div class="lake-spp-title">
-          资源池健康度（adapters · 灌数启动时探测）
+          数据源状态（连通性·数据类型·配额 · 灌数启动时探测）
           <span v-if="stale" class="badge lake-st-lagging lake-spp-stale">探测数据过期</span>
         </div>
         <div class="lake-spp-adapters">
-          <div v-for="(a, name) in adapters" :key="name" class="lake-spp-adapter">
+          <div v-for="s in sources" :key="s.name" class="lake-spp-adapter"
+               :style="{ borderLeft: '3px solid ' + (SOURCE_COLORS[s.name] || UNKNOWN_COLOR) }">
             <div class="lake-spp-adapter-head">
-              <b>{{ name }}</b>
-              <span class="lake-spp-avail" :class="{ ok: a.available === true, bad: a.available === false }">
-                {{ availMark(a) }}
-              </span>
+              <b :style="{ color: SOURCE_COLORS[s.name] || '#475569' }">{{ s.name }}</b>
+              <span v-if="s.enabled === false" class="badge lake-st-empty lake-spp-disabled">已禁用</span>
             </div>
-            <div class="muted small mono">{{ a.probed_at || "未探测" }}</div>
-            <div class="muted small mono">latency {{ fmtLatency(a.latency_ms) }}</div>
+            <!-- 行1 连通性（enabled=false → 上方 badge 替代 ✓/✗） -->
+            <div v-if="s.enabled !== false" class="lake-spp-conn">
+              <span class="lake-spp-avail" :class="{ ok: s.available === true, bad: s.available === false }">
+                {{ availMark(s.available) }} {{ connWord(s.available) }}
+              </span>
+              <span class="muted small mono"> · latency {{ fmtLatency(s.latency_ms) }}</span>
+            </div>
+            <!-- 行2 数据类型（provides chips；role 后缀小字 muted） -->
+            <div class="lake-spp-chips">
+              <template v-if="(s.provides || []).length">
+                <span v-for="(p, i) in s.provides" :key="i" class="chip lake-spp-chip">
+                  {{ p.table_cn }}·{{ FIELD_GROUP_CN[p.field_group] || p.field_group }}<span class="muted small"> {{ p.role }}</span>
+                </span>
+              </template>
+              <span v-else class="muted small">—</span>
+            </div>
+            <!-- 行3 配额（baostock 今日 used/budget；其余 rate_limit 或"无官方配额"） -->
+            <div class="muted small mono">配额：{{ quotaText(s) }}</div>
+            <!-- 行4 探测时间 -->
+            <div class="muted small mono">探测：{{ s.probed_at || "未探测" }}</div>
           </div>
         </div>
       </div>

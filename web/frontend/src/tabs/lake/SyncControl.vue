@@ -16,19 +16,13 @@ import { useLakeStore, fmtElapsed, STOP_SOFT_MS } from "../../stores/lakeStore.j
 const lake = useLakeStore();
 
 // 运行中 meta 拼接（移植 vanilla running 分支）：stopping=true → 友好文案；
-// 今日配额 x/budget（tasks max 防御滞后视图）+ 已耗时/进度更新时间。
+// 已耗时/进度更新时间。v6.1.3：头部配额片段（今日 used/budget）移除——配额是
+// BaoStock 的，归 SourcePoolPanel 数据源状态卡展示；此处只留 PID/stopping + 耗时口径。
 const runningMeta = computed(() => {
   const d = lake.status;
   if (!d || !d.installed) return "";
   const stopping = d.stopping === true;
-  let qUsed = null, qBudget = null;
-  for (const t of d.tasks || []) {
-    if (!t) continue;
-    if (typeof t.quota_used_today === "number") qUsed = Math.max(qUsed ?? 0, t.quota_used_today);
-    if (typeof t.quota_budget === "number") qBudget = Math.max(qBudget ?? 0, t.quota_budget);
-  }
   const parts = [stopping ? "⏹ 停止收尾中（当前任务完成后退出）" : "PID " + (d.lock_holder_pid != null ? d.lock_holder_pid : "未知")];
-  if (qUsed != null) parts.push(`今日配额 ${qUsed}/${qBudget ?? "—"}`);
   if (lake.runningSince) parts.push("已耗时 " + fmtElapsed(Date.now() - lake.runningSince));
   else if (d.updated_at) parts.push("进度更新于 " + String(d.updated_at).slice(5, 16));
   return parts.join(" · ");

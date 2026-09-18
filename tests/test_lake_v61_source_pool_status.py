@@ -5,7 +5,8 @@
 - **ready 态**追加顶层 ``source_pool``：by_source（9表键恒定，无数据={}）/
   conflict_rows（T1-T7 + total=七表之和）/ adapters（读 source_health.json）/
   baostock_probe（progress 既有键透出，无→null）/ stale（文件缺失或 max(probed_at)
-  距今>7天 → true）。
+  距今>7天 → true）。v6.1.3：ready 态再追加 sources（各源连通性+数据类型+配额；
+  test_lake_v613_source_pool 专测，本文件 A 段键集断言同步含 sources）。
 - **兼容红线**：locked/uninitialized 态响应键集一个字节不动（本文件含显式回归断言；
   test_lake_v605_status C 段同纪律保留必过）。
 - source_health.json 写入方 = 灌数 driver ``_probe_all_adapters()``（LAKE_MULTISOURCE=0
@@ -110,8 +111,11 @@ def _write_source_health(tmp_path, adapters: dict, name="source_health.json"):
 def test_ready_source_pool_shape_by_source_nine_fixed(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     sp = d["source_pool"]
+    # v6.1.3：ready 态 source_pool 追加 sources（各源连通性+数据类型+配额；
+    # 仅 ready 态——locked/uninitialized 无 source_pool 键，见 C 段）。
     assert set(sp.keys()) == {"by_source", "conflict_rows", "adapters",
-                              "baostock_probe", "stale"}, f"source_pool 键集: {sorted(sp)}"
+                              "baostock_probe", "stale", "sources"}, \
+        f"source_pool 键集: {sorted(sp)}"
     # by_source：9 表键恒定（无数据={}，形状稳定）
     assert list(sp["by_source"].keys()) == NINE_TABLES, \
         f"by_source 必须 9 表固定顺序: {list(sp['by_source'].keys())}"

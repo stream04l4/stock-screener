@@ -806,12 +806,94 @@ def _read_source_health():
     return adapters, stale
 
 
+def _quota_from_progress(prog: Dict[str, Any]) -> Optional[int]:
+    """BaoStock 日配额派生 used_today（progress tasks quota_used_today max）。
+
+    现有算法原样复用——多 task 视图可能滞后，取 max 防低估；无 tasks/非 int → None。
+    budget 由调用方从 config ``baostock_daily_budget`` 取（本函数只算 used，单一职责）。
+    """
+    used = None
+    for t in prog.get("tasks", []):
+        if not isinstance(t, dict):
+            continue
+        u = t.get("quota_used_today")
+        if isinstance(u, int):
+            used = max(used or 0, u)
+    return used
+
+
+def _rate_limit_text(name: str, cfg: Dict[str, Any]) -> Optional[str]:
+    """限速纪律文案（config ``{name}_min_interval_s`` 派生；未配置 → None）。
+
+    1.0 → "≥1s/股"（整数去小数点）；0.5 → "≥0.5s/股"。tencent/baostock 无
+    min_interval 配置 → None（前端显示"无官方配额"）。
+    """
+    v = cfg.get(f"{name}_min_interval_s")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        s = str(int(v)) if float(v).is_integer() else str(v)
+        return f"≥{s}s/股"
+    return None
+
+
+def _build_sources(prog: Dict[str, Any], adapters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """v6.1.3：``source_pool.sources`` 数组（**仅 ready 态**，随 source_pool 同规）。
+
+    每源一项，固定顺序 = :data:`_ADAPTER_NAMES`（与前端 SOURCE_COLORS 对齐）：
+    - ``enabled``：config 开关（``{name}_enabled``；未配置开关的源=tencent/baostock
+      → True——它们没有独立开关，由探测/配额纪律约束）；
+    - ``available/probed_at/latency_ms``：**复用现有 adapters[name]**（None=未探测，
+      语义与 v6.1 adapters 字段一致，零新增探测）；
+    - ``authority``：Q1 权威性数值（source_pool.AUTHORITY 静态常量——不 import
+      adapter 实例，避免 web 进程触发重依赖懒加载/网络自检）；
+    - ``provides``：静态能力表 SOURCE_CAPABILITIES（该源可提供的数据类型+role；
+      T4=本地静态缓存不属在线源，不列）；
+    - ``quota``：**仅 baostock 非 null**（有硬配额的唯一源）——used_today 取
+      progress tasks max（现有算法），budget 取 config ``baostock_daily_budget``；
+      其余源 null；
+    - ``rate_limit``：min_interval_s 派生文案（sina/tdx/adata_f10 有；
+      tencent/baostock → None）。
+
+    全部只读（config 文件 + progress dict + 静态常量），零网络、零库查询。
+    """
+    from .config import lake_cfg
+    from .ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES
+
+    cfg = lake_cfg()
+    used_today = _quota_from_progress(prog)
+    out: List[Dict[str, Any]] = []
+    for name in _ADAPTER_NAMES:
+        a = adapters.get(name) or {}
+        entry: Dict[str, Any] = {
+            "name": name,
+            "enabled": bool(cfg.get(f"{name}_enabled", True)),
+            "available": a.get("available"),
+            "probed_at": a.get("probed_at"),
+            "latency_ms": a.get("latency_ms"),
+            "authority": AUTHORITY.get(name),
+            "provides": [dict(p) for p in SOURCE_CAPABILITIES.get(name, [])],
+            "quota": None,
+            "rate_limit": _rate_limit_text(name, cfg),
+        }
+        if name == "baostock":
+            # 唯一有硬配额的源：budget=config（默认 5000，Q2）；used_today 可能
+            # 为 None（从未灌数/无 tasks）→ 前端按"今日 —/budget"渲染。
+            entry["quota"] = {
+                "used_today": used_today,
+                "budget": int(cfg.get("baostock_daily_budget", 5000)),
+            }
+        out.append(entry)
+    return out
+
+
 def _build_source_pool(con, prog: Dict[str, Any]) -> Dict[str, Any]:
     """ready 态 source_pool 组装（全部只读 SELECT + 文件读，不写 data/lake/）。
 
     by_source/conflict_rows 走 :func:`_source_pool_cache`（TTL 60s，键=db mtime）——
     3s 轮询不重复跑 9×GROUP BY + 7×COUNT。任何单表查询异常 → 该表降级 ``{}``/0
     （防御：某表缺列不拖垮整个 /status；正常库不会触发）。
+
+    v6.1.3：追加 ``sources``（各源连通性+数据类型+配额，见 :func:`_build_sources`）——
+    与 source_pool 同规**仅 ready 态**出现（三态契约红线不变）。
     """
     db_path = _source_pool_db_path()
     by_source, conflict_rows = _source_pool_cache(con, db_path)
@@ -824,6 +906,8 @@ def _build_source_pool(con, prog: Dict[str, Any]) -> Dict[str, Any]:
         "adapters": adapters,
         "baostock_probe": bs_probe if isinstance(bs_probe, dict) else None,
         "stale": stale,
+        # v6.1.3：sources（静态能力表 + 既有探测结果，零网络；仅 ready 态）
+        "sources": _build_sources(prog, adapters),
     }
 
 
@@ -1113,6 +1197,12 @@ def status() -> Dict[str, Any]:
     v6.1：**仅 ready 态**追加 ``source_pool``（by_source 9表恒定 / conflict_rows
     T1-T7+total / adapters / baostock_probe / stale，见 :func:`_build_source_pool`）
     ——locked/uninitialized 键集一个字节不动（三态契约红线）。
+
+    v6.1.3：``source_pool`` 内追加 ``sources`` 数组（各源连通性+数据类型 provides
+    +配额 quota+限速 rate_limit，见 :func:`_build_sources`）——随 source_pool 同规
+    **仅 ready 态**出现；locked/uninitialized 响应体仍逐字节不动（三态契约红线延续）。
+    ``sync.quota_used_today/quota_budget`` **保留不删**（v605 断言依赖 + API 契约；
+    v6.1.3 只是前端不再展示配额列）。
 
     **coverage 键三态保留 = v6.0.4 契约，不得移除**：uninitialized/locked/ready 三态
     响应体均含 ``coverage`` 键（uninitialized 全零 / locked 降级读 progress / ready 实算）——

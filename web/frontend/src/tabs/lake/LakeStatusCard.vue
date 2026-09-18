@@ -145,10 +145,10 @@ const tables = computed(() => (d.value && d.value.tables) || []);
           <table class="data" id="lake-tasks-table">
             <thead><tr>
               <th>表</th><th>层级</th><th>状态</th><th class="num">进度</th>
-              <th class="num">配额(今日)</th><th class="num">ETA(min)</th>
+              <th class="num">ETA(min)</th>
             </tr></thead>
             <tbody>
-              <tr v-if="!d.tasks || !d.tasks.length"><td colspan="6" class="placeholder">暂无后台补齐任务</td></tr>
+              <tr v-if="!d.tasks || !d.tasks.length"><td colspan="5" class="placeholder">暂无后台补齐任务</td></tr>
               <tr v-for="(t, i) in d.tasks || []" :key="i">
                 <td>{{ t.table }}</td><td>{{ t.tier }}</td>
                 <td><span class="badge" :class="t.state || 'idle'">{{ t.state || "idle" }}</span></td>
@@ -156,7 +156,6 @@ const tables = computed(() => (d.value && d.value.tables) || []);
                   <div class="progress-track" style="margin:0"><div class="progress-bar" :style="{ width: taskPct(t) + '%' }"></div></div>
                   {{ (t.done ?? 0) + "/" + (t.total ?? 0) }}
                 </td>
-                <td class="num">{{ (t.quota_used_today ?? 0) + "/" + (t.quota_budget ?? "—") }}</td>
                 <td class="num">{{ t.eta_min ?? "—" }}</td>
               </tr>
             </tbody>
