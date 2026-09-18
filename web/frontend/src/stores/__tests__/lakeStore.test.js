@@ -162,7 +162,7 @@ describe("lakeStore：running→idle 跃迁（Joel 核心诉求）", () => {
 });
 
 describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
-  it("startSync：点击即锁定 → POST 返回后释放 + toast（200 started）", async () => {
+  it("startSync：点击即锁定 → POST 返回后释放 + toast（200 started；v6.1.6 全量文案）", async () => {
     const s = mockFetch();
     const lake = useLakeStore();
     await flush();
@@ -170,43 +170,12 @@ describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
     expect(lake.syncState).toBe("starting");   // 点击即锁定（POST 在途）
     await p; await flush();
     expect(lake.syncState).toBe("idle");       // POST 返回即释放
-    expect(toastMsg()).toBe("✓ 同步已启动（PID 4321）");
+    expect(toastMsg()).toBe("✓ 全量数据补齐已启动（PID 4321）");   // v6.1.6：full 文案
     expect(s.startCalls).toBe(1);
     lake._stopTimerForTest();
   });
 
-  it("startSync('incremental')：URL 带 ?mode=incremental + toast'增量同步已启动'（v6.1.4 O2）", async () => {
-    const s = mockFetch();
-    let lastStartUrl = "";
-    // 在 mockFetch 路由基础上包一层记录 start URL（其余行为不变）
-    globalThis.fetch = vi.fn(async (url) => {
-      const u = String(url);
-      if (u.startsWith("/api/lake/sync/start")) { s.startCalls += 1; lastStartUrl = u; }
-      return fetchImpl(u);
-    });
-    // 复用 mockFetch 的路由语义（status/start/stop）——fetchImpl 捕获原实现不可行，
-    // 直接按同一契约重写路由（s.status/s.startRes/s.stopRes 共享状态）。
-    async function fetchImpl(u) {
-      if (u.startsWith("/api/lake/status")) return jsonRes(200, s.status || statusBody());
-      if (u.startsWith("/api/lake/sync/start")) return s.startRes;
-      if (u.startsWith("/api/lake/sync/stop")) return s.stopRes;
-      return jsonRes(404, {});
-    }
-    const lake = useLakeStore();
-    await flush();
-    await lake.startSync("incremental");
-    await flush();
-    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=incremental");
-    expect(toastMsg()).toBe("✓ 增量同步已启动（PID 4321）");
-    // history 缺省：URL 显式带 ?mode=history（后端 default 兜底，前端恒传 mode）
-    lastStartUrl = "";
-    await lake.startSync();
-    await flush();
-    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=history");
-    lake._stopTimerForTest();
-  });
-
-  it("startSync('t5')：URL 带 ?mode=t5 + toast'T5 基本面灌数已启动'（v6.1.5 F4）", async () => {
+  it("startSync 无参 → POST /api/lake/sync/start **不带 ?mode=**（v6.1.6：后端缺省=full）", async () => {
     const s = mockFetch();
     let lastStartUrl = "";
     globalThis.fetch = vi.fn(async (url) => {
@@ -222,10 +191,32 @@ describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
     });
     const lake = useLakeStore();
     await flush();
-    await lake.startSync("t5");
+    await lake.startSync();   // v6.1.6：无参（旧 mode 参数删除——UI 不再暴露）
     await flush();
-    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=t5");
-    expect(toastMsg()).toBe("✓ T5 基本面灌数已启动（PID 4321）");
+    expect(lastStartUrl).toBe("/api/lake/sync/start");   // 无 ?mode=（后端缺省 full）
+    expect(toastMsg()).toBe("✓ 全量数据补齐已启动（PID 4321）");
+    lake._stopTimerForTest();
+  });
+
+  it("startSync 传多余参数也不透传 mode（v6.1.6：action 签名收敛，防御性）", async () => {
+    const s = mockFetch();
+    let lastStartUrl = "";
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.startsWith("/api/lake/sync/start")) { s.startCalls += 1; lastStartUrl = u; }
+      async function fetchImpl(v) {
+        if (v.startsWith("/api/lake/status")) return jsonRes(200, s.status || statusBody());
+        if (v.startsWith("/api/lake/sync/start")) return s.startRes;
+        if (v.startsWith("/api/lake/sync/stop")) return s.stopRes;
+        return jsonRes(404, {});
+      }
+      return fetchImpl(u);
+    });
+    const lake = useLakeStore();
+    await flush();
+    await lake.startSync("t5");   // 旧调用形态（deprecated）——参数被忽略，不透传
+    await flush();
+    expect(lastStartUrl).toBe("/api/lake/sync/start");   // 仍无 ?mode=
     lake._stopTimerForTest();
   });
 

@@ -19,6 +19,20 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                         adj_factor；done 键固定 "full_history" 跨天续传；取空/失败
                         抛错不 mark_done），走 BackfillRunner（budget_per_day 门）。
                         **本批次只构建不跑**——TL 验收后由 TL 实际执行。
+- full                ← v6.1.6 单按钮全量补齐（Joel 拍板：一个按钮负责启动停止，
+                        启动了就是要把所有历史及现状数据全部补上）。**一个 backfill
+                        进程内顺序执行三阶段**，同一把 DuckDB 独占锁贯穿全程
+                        （main() 的 LakeLock 包住整个 full——天然无竞争）：
+                          phase1 history（T2 全史 + adj_factor，幂等 done 键全跳过；
+                                  --t5 不在此处——T5 是独立阶段 3）
+                          phase2 P3 增量（kline_daily→valuation_daily→index_daily，
+                                  run_incremental 原样复用）
+                          phase3 T5 fundamentals_quarterly（run_t5 原样复用：
+                                  adata F10 主源 + BaoStock 探测存活时交叉校验，
+                                  限速 adata_f10_min_interval_s）
+                        每阶段开始/结束打 sync.log 段标（===== phase: X =====）；
+                        任一阶段异常 → last_error + 该任务 state=error，**继续下一
+                        阶段**（单表故障不拖死全量；hang1 R3 停滞看门狗照旧兜底）。
 
 纪律（v6.0.2）：
 - BaoStock 一律走 QuotaGuard（baostock_ingest 现有路径），不得裸调；日预算到顶
@@ -28,7 +42,7 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
 - **D-1（v6.0.3 rework）**：--db 指向 0 字节/无效库文件（duckdb 打不开）→
   LakeInvalidFile 友好报错退出（exit 3），同样不崩裸 traceback。
 
-子命令：init / p0 / history / status（见 --help）。
+子命令：init / p0 / history / full / incremental / reconcile / status（见 --help）。
 """
 from __future__ import annotations
 
@@ -1478,6 +1492,202 @@ def cmd_incremental(args, con, db_path: str) -> int:
     _print_summary("incremental", summary)
     return EXIT_OK
 
+
+# ---------------------------------------------------------------------------
+# full（v6.1.6：单按钮全量补齐——一个 backfill 进程顺序跑完所有阶段）
+# ---------------------------------------------------------------------------
+# v6.1.6 brief §A：Joel 拍板"三个按钮没必要，一个按钮负责启动停止——只要启动了
+# 就是需要把所有历史及现状数据全部都补上"。full = 同一进程内**顺序**执行三阶段，
+# 同一把 DuckDB 独占锁贯穿全程（main() 的 LakeLock 包住整个 full → 天然无竞争）：
+#   phase1 history（T2 全史 + adj_factor；幂等——done 键全跳过；--t5 不在此处）
+#   phase2 P3 增量（kline_daily→valuation_daily→index_daily，run_incremental 原样复用）
+#   phase3 T5 fundamentals_quarterly（run_t5 原样复用：adata F10 主源 + BaoStock
+#          探测存活时交叉校验；限速 adata_f10_min_interval_s 在 adapter 内）
+#
+# 阶段间契约（brief 逐字）：
+# - 每阶段开始/结束打 sync.log 段标（===== phase: X =====）——Web spawn 时 stdout
+#   append 到 sync.log，log.info 即落该文件；
+# - progress tasks 各自 done/state 正常推进（各阶段走 BackfillRunner 既有视图）；
+# - **任一阶段异常 → last_error + 该任务 state=error，继续下一阶段**（单表故障
+#   不拖死全量）。为什么 try/except 包在 run_full 而非各 run_* 内部：run_history/
+#   run_incremental/run_t5 的既有异常语义（HangWatchdogError 穿透、T3 全空中止等）
+#   逐字节不动，full 只在编排层兜底——零回归。
+# - hang1 R3 停滞看门狗照旧兜底：run_history 内 arm()（主线程调用，full 也在主
+#   线程顺序执行各阶段 → 满足 signal.signal 限制）；R3 abort 抛 HangWatchdogError
+#   （BaseException）→ full 的 except Exception **不捕获**它 → 穿透到 main → rc=1
+#   干净退出（done 键已落盘，下次续传无损）。
+_FULL_PHASES = (
+    ("history", "T2 全史"),
+    ("p3", "P3 增量"),
+    ("t5", "T5 基本面"),
+)
+
+
+def _full_phase_tables(phase: str) -> List[str]:
+    """该阶段关联的 progress tasks 表名（error 时标 state=error + last_error 用）。"""
+    return {
+        "history": ["kline_history"],
+        "p3": ["kline_daily", "valuation_daily", "index_daily"],
+        "t5": ["fundamentals_quarterly"],
+    }[phase]
+
+
+def _full_ensure_entry(prog: Dict[str, Any], table: str, tier: str) -> Dict[str, Any]:
+    """取该表 tasks entry；不存在则建（phase 级异常可能在 runner 建 entry 前就抛——
+    此时须补建 entry 才能标 error，否则 Web /status 看不到故障）。"""
+    e = next((t for t in prog.get("tasks", []) if t.get("table") == table), None)
+    if e is None:
+        e = {"table": table, "tier": tier, "total": 0, "done": 0,
+             "quota_used_today": 0, "quota_budget": 0,
+             "state": "pending", "eta_min": None, "last_error": ""}
+        prog.setdefault("tasks", []).append(e)
+    return e
+
+
+def _full_set_phase_entries_error(phase: str, db_path: str, exc: BaseException) -> None:
+    """progress 该阶段 tasks entry 置 state=error + last_error（幂等，可重复调用）。
+
+    对阶段关联的**每张表** upsert entry 再标 error——收尾 _refresh_incremental_task_view
+    会覆盖 T2/T3/T5 entry 的 state，故 full 收尾须重标（见 run_full）；且 phase 级异常
+    可能在 runner 建 entry 前就抛 → 这里补建。
+    """
+    from lake.backfill import load_progress, save_progress
+
+    prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径；自定义→库目录
+    prog = load_progress(prog_path)
+    tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2"}
+    for table in _full_phase_tables(phase):
+        e = _full_ensure_entry(prog, table, tiers.get(table, "P3"))
+        e["state"] = "error"
+        e["last_error"] = f"phase {phase} failed: {exc}"[:500]
+    save_progress(prog, prog_path)
+
+
+def _full_mark_phase_error(phase: str, db_path: str, exc: BaseException) -> None:
+    """阶段异常 → progress 该阶段任务 state=error + last_error（brief 逐字）。
+
+    只改**本阶段**的 tasks entry（不碰其它阶段——单表故障不拖死全量）；写失败
+    不抛（编排层兜底本身不能成为新故障点，段标日志已记录原因）。
+    """
+    from lake.backfill import load_progress, save_progress
+
+    try:
+        prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径；自定义→库目录
+        prog = load_progress(prog_path)
+        now_s = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2"}
+        for table in _full_phase_tables(phase):
+            e = _full_ensure_entry(prog, table, tiers.get(table, "P3"))
+            e["state"] = "error"
+            e["last_error"] = f"phase {phase} failed: {exc}"[:500]
+        prog["phase_errors"] = prog.get("phase_errors", []) + [
+            {"phase": phase, "at": now_s, "error": str(exc)[:500]}]
+        save_progress(prog, prog_path)
+    except Exception as wexc:  # noqa: BLE001 - progress 写失败不阻断（日志已有）
+        log.warning("full phase=%s error 标记落盘失败（不阻断，段标日志已记录）: %s",
+                    phase, wexc)
+
+
+def run_full(con, db_path: str, codes: Optional[List[str]],
+             start_date: str, end_date: str, days: int) -> Dict[str, Any]:
+    """v6.1.6 full 模式：单进程顺序执行 history → P3 增量 → T5（brief §A）。
+
+    :param con: driver 主连接（LakeLock 内；三阶段共用——同锁天然无竞争）。
+    :param codes: 股票子集（None=stock_master 全集；透传各阶段）。
+    :param start_date/end_date: history 全史窗口（与 cmd_history 同口径）。
+    :param days: P3 T7 指数窗口交易日数（run_incremental 的 days，默认 250）。
+
+    :return: ``{"sub": "full", "phases": {phase: stats|error}, ...}``——summary 打印。
+        各阶段异常**不抛**（记 phases[phase]["error"] + progress state=error），
+        唯一例外 HangWatchdogError（R3 看门狗 abort，BaseException 穿透 → rc=1）。
+    """
+    from lake.backfill import BackfillRunner
+
+    summary: Dict[str, Any] = {"sub": "full", "db_path": db_path,
+                               "start_date": start_date, "end_date": end_date,
+                               "days": days, "phases": {}}
+    failed: Dict[str, Any] = {}   # phase → 异常/错误摘要（收尾视图刷新后重标 error 用）
+    for phase, label in _FULL_PHASES:
+        log.info("===== phase: %s =====（%s 开始）", phase, label)
+        print(f"===== phase: {phase} =====（{label} 开始）")
+        t0 = time.monotonic()
+        try:
+            if phase == "history":
+                # 阶段 1：T2 全史 + adj_factor（幂等——done 键全跳过；--t5 不在此处，
+                # T5 是独立阶段 3）。run_history 原样复用（Q6/健康探测在其内部）。
+                stats = run_history(con, db_path, codes, start_date, end_date)
+            elif phase == "p3":
+                # 阶段 2：P3 增量（kline_daily→valuation_daily→index_daily，
+                # 现有 incremental 逻辑原样复用——含收尾 tasks 视图刷新）。
+                stats = run_incremental(con, db_path, codes, days)
+            else:   # t5
+                # 阶段 3：T5 fundamentals_quarterly（现有 --t5 逻辑抽出复用：
+                # adata F10 主源 + BaoStock 探测存活时交叉校验，限速在 adapter）。
+                stats = run_t5(con, db_path, codes, BackfillRunner(db_path=db_path))
+            summary["phases"][phase] = {"ok": True, "elapsed_s": round(time.monotonic() - t0, 1),
+                                        **stats}
+            # brief"任一阶段异常 → last_error + 该任务 state=error"：runner 吞单任务
+            # 异常（记 stats["errors"]、entry.state=error 但**不写 last_error**——
+            # _update_task_view 无此字段）→ 编排层补标 last_error（可观测"错在哪"）。
+            # p3 阶段 run_incremental 返回嵌套 {t2:{errors}, t3:{...}, t7:{...}}，
+            # history/t5 是扁平 stats["errors"]——两种形状都收集。
+            errs: List[str] = list(stats.get("errors") or [])
+            for _sub in ("t2", "t3", "t7"):
+                if isinstance(stats.get(_sub), dict):
+                    errs += list(stats[_sub].get("errors") or [])
+            if errs:
+                failed[phase] = (f"{len(errs)} task(s) failed; first: {errs[0]}"
+                                 [:500])
+                # summary 口径与异常分支一致：有任务失败 → ok=False + error（all_ok
+                # 如实反映"全量是否干净跑完"；progress 里各表 state=error 是权威态）。
+                summary["phases"][phase]["ok"] = False
+                summary["phases"][phase]["error"] = failed[phase]
+                _full_mark_phase_error(phase, db_path, failed[phase])
+            log.info("===== phase: %s =====（%s 结束，%.1fs）",
+                     phase, label, time.monotonic() - t0)
+            print(f"===== phase: {phase} =====（{label} 结束，"
+                  f"{round(time.monotonic() - t0, 1)}s）")
+        except Exception as exc:  # noqa: BLE001 - 单阶段故障不拖死全量（brief 逐字）
+            # ⚠️ HangWatchdogError 是 BaseException（R3 abort）——本 except **不捕获**，
+            # 穿透到 main → rc=1（干净退出 + done 键续传无损），与 cmd_history 同语义。
+            log.error("===== phase: %s =====（%s 异常，继续下一阶段）: %s",
+                      phase, label, exc)
+            print(f"===== phase: {phase} =====（{label} 异常，继续下一阶段）: {exc}")
+            summary["phases"][phase] = {"ok": False, "error": str(exc)[:500],
+                                        "elapsed_s": round(time.monotonic() - t0, 1)}
+            failed[phase] = exc
+            _full_mark_phase_error(phase, db_path, exc)
+    # 收尾：tasks 视图按全集口径归位（incremental 收尾已刷过；这里兜底——若 p3 阶段
+    # 异常没跑到 _refresh_incremental_task_view，kline_history/T5/T6 entry 仍如实）。
+    try:
+        _refresh_incremental_task_view(BackfillRunner(db_path=db_path), con,
+                                       _today_beijing())
+    except Exception as exc:  # noqa: BLE001 - 视图刷新失败不阻断（summary 已含各阶段结果）
+        log.warning("full 收尾 tasks 视图刷新失败（不阻断）: %s", exc)
+    # ⚠️ _refresh_incremental_task_view 会**无条件覆盖** fundamentals_quarterly/T2/T3
+    # entry 的 state（done==total→done / 否则 pending）——上面刚标的 phase error 会被
+    # 冲掉。视图刷新后对失败阶段**重标** error（幂等；brief"该任务 state=error"以最终
+    # 落盘为准，Web /status 3s 轮询读到的必须是 error 而非 pending）。
+    for phase, exc in failed.items():
+        try:
+            _full_set_phase_entries_error(phase, db_path, exc)
+        except Exception as wexc:  # noqa: BLE001 - 重标失败不阻断（日志已记录）
+            log.warning("full 收尾 %s error 重标失败（不阻断）: %s", phase, wexc)
+    summary["all_ok"] = all(p.get("ok") for p in summary["phases"].values())
+    return summary
+
+
+def cmd_full(args, con, db_path: str) -> int:
+    """full 子命令入口（v6.1.6：单按钮全量补齐）。"""
+    codes = _parse_codes(args.codes)
+    end_date = args.end_date or _today_beijing()
+    summary = run_full(con, db_path, codes, args.start_date, end_date, args.days)
+    _print_summary("full", summary)
+    # 单阶段故障不拖死全量（各阶段 error 已记 progress）→ 进程 rc=0；R3 看门狗
+    # abort（HangWatchdogError）在 run_full 内穿透 → main 层异常路径 rc=1。
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # status（coverage + progress 摘要）
 # ---------------------------------------------------------------------------
@@ -1620,6 +1830,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="T7 指数窗口交易日数（默认 250；取数 n=days+30 自然日缓冲）")
     sp.set_defaults(func=cmd_incremental)
 
+    sp = sub.add_parser(
+        "full",
+        help="v6.1.6：单按钮全量补齐——一个进程顺序跑完 history→P3 增量→T5（同一把锁贯穿全程；"
+             "任一阶段异常记 error 后继续下一阶段）")
+    sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=全集）")
+    sp.add_argument("--start-date", default="1990-01-01", help="全史起点（默认 1990-01-01）")
+    sp.add_argument("--end-date", default=None, help="全史终点（缺省=今日北京时间）")
+    sp.add_argument("--days", type=int, default=250,
+                    help="P3 T7 指数窗口交易日数（默认 250）")
+    sp.set_defaults(func=cmd_full)
+
     sp = sub.add_parser("reconcile",
                         help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=kline_daily 全集）")
@@ -1717,9 +1938,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from lake.conn import LakeInvalidFile, LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
-    # B-4：写命令（init/p0/history/incremental/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
+    # B-4：写命令（init/p0/history/full/incremental/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
-    write_cmd = args.cmd in ("init", "p0", "history", "incremental", "reconcile")
+    # full（v6.1.6）：同一把锁贯穿三阶段全程（brief §A"天然无竞争"）。
+    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile")
 
     if not write_cmd:
         return _run_unlocked(args)

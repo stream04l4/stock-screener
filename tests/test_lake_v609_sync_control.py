@@ -724,7 +724,8 @@ def test_web_sync_stop_not_running_409_contract(monkeypatch):
 def test_web_sync_start_success_200_shape(monkeypatch):
     """start 成功 → 200 {started, pid, log_path}（None 值字段被过滤，不出现 null）。
 
-    v6.1.4 O2：响应追加 ``mode`` 回显（缺省 history；新字段只追加，旧字段不变）。
+    v6.1.4 O2：响应追加 ``mode`` 回显（新字段只追加，旧字段不变）。
+    v6.1.6：缺省 mode=full（单按钮全量）——回显 'full'。
     """
     import lake.web_api as wapi
     from lake import sync_control
@@ -734,7 +735,7 @@ def test_web_sync_start_success_200_shape(monkeypatch):
         lambda **k: {"started": True, "pid": 999, "log_path": "/tmp/s.log"})
     d = wapi.sync_start()
     assert d == {"started": True, "pid": 999, "log_path": "/tmp/s.log",
-                 "mode": "history"}
+                 "mode": "full"}
 
 
 def test_web_sync_stop_async_waiting_task_200(monkeypatch):
@@ -923,10 +924,12 @@ def test_frontend_sync_control_contract():
     assert "/api/lake/sync/start" in blob, "Vue 未接 POST start"
     assert "/api/lake/sync/stop" in blob, "Vue 未接 POST stop"
     assert 'method: "POST"' in blob
-    assert "将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？" in blob
+    assert "将启动全量数据补齐（历史+增量+基本面，后台长跑，幂等可中断续传）。确认启动？" in blob, \
+        "v6.1.6 单按钮 confirm 文案缺失（旧'全史数据补库/BaoStock 每日配额'文案已随三按钮合并删除）"
     assert "停止后进度已保存，下次启动自动续传。确认停止？" in blob
     assert "backfill_in_progress" in blob
-    assert "▶ 启动同步" in sc and "停止同步" in sc, "按钮二态文案缺失"
+    # v6.1.6：单按钮二态——idle【▶ 启动数据补齐】/ running【■ 停止数据补齐】(danger)
+    assert "▶ 启动数据补齐" in sc and "■ 停止数据补齐" in sc, "v6.1.6 单按钮二态文案缺失"
     # v6.0.10 锁定契约（DOM 行为由 vitest SyncControl.test.js + tester E2E 覆盖）
     assert "disabled: true" in sc, "点击后必须 disabled（锁定，computed btn.disabled）"
     assert "⏹ 停止中…" in blob, "停止锁定文案缺失"

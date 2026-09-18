@@ -1064,6 +1064,49 @@ def _stopping_from_progress(prog: Dict[str, Any]) -> bool:
     return False
 
 
+def _current_phase(db_path: Optional[str] = None) -> Optional[str]:
+    """v6.1.6：从 sync.log 段标推导当前灌数阶段（/status ``phase`` 字段数据源）。
+
+    full 模式（driver run_full）每阶段开始/结束打段标到 stdout（Web spawn 时
+    append 落 sync.log）：``===== phase: history =====（T2 全史 开始）`` /
+    ``……结束，Xs）`` / ``……异常，继续下一阶段）``。本函数扫日志尾部（64KB 足够——
+    阶段标记之间至多隔几十行进度输出）按序回放：见"开始"→ 记当前 phase；见同一
+    phase 的"结束/异常"→ 清空。返回 ``history|p3|t5`` 或 None（无 full 段标 /
+    非 full 模式进程 / 日志缺失——此时前端不显示 phase 小字，三态契约其余字段不动）。
+
+    为什么读日志而非 progress 文件：progress 的 tasks 视图是**按表**聚合的
+    （kline_history/kline_daily/…），没有"阶段"概念；段标是 full 编排层的原生
+    信号，零 schema 变更（brief：phase 只加在 backfill_in_progress=true 时）。
+    读失败一律 None（fail-open——phase 是展示性字段，不得影响 /status 主契约）。
+    """
+    import re
+
+    try:
+        from .sync_control import _sync_log_path
+
+        path = _sync_log_path(db_path)
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 日志缺失/不可读 → None（不猜）
+        return None
+    cur: Optional[str] = None
+    for line in tail.splitlines():
+        m = re.search(r"===== phase: (\w+) =====", line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name not in ("history", "p3", "t5"):
+            continue   # 未知段标忽略（不猜）
+        if "开始" in line:
+            cur = name
+        elif "结束" in line or "异常" in line:
+            cur = None
+    return cur
+
+
 def _table_stats(con, table: str, code_col: Optional[str],
                  date_col: Optional[str]) -> Dict[str, Any]:
     """单表统计：rows / codes / date_min / date_max / last_sync_at（全运行时查询）。
@@ -1277,8 +1320,11 @@ def status() -> Dict[str, Any]:
         # v6.0.5：本分支**不追加**新字段（brief：tables 数组可缺省，降级路径不变）。
         # v6.0.10：追加 stopping（停止收尾中标志）——backfill_in_progress=true 时新增，
         # 前端据此区分"正常运行中" vs "停止收尾中"（友好文案而非无反应）。
+        # v6.1.6：追加 phase（当前灌数阶段 history/p3/t5；仅 backfill_in_progress=true
+        # 分支——三态契约红线延续：uninitialized/ready 响应体一个字节不动，phase 只在
+        # running 时追加。非 full 模式进程无段标 → None 被过滤不出现该键）。
         prog = load_progress()
-        return {
+        resp = {
             "installed": True,
             "duckdb_version": getattr(duckdb, "__version__", "?"),
             "initialized": True,
@@ -1289,6 +1335,10 @@ def status() -> Dict[str, Any]:
             "tasks": prog.get("tasks", []),
             "updated_at": prog.get("updated_at"),
         }
+        phase = _current_phase()
+        if phase is not None:
+            resp["phase"] = phase
+        return resp
     if con is None:
         # 库未就绪：coverage 全零、tasks 空（progress 文件即便存在也不代表库可用）
         return {
@@ -1507,17 +1557,24 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @router.post("/sync/start")
 def sync_start(codes: Optional[str] = Query(default=None),
-               mode: str = Query(default="history")) -> Dict[str, Any]:
-    """启动数据补库（后台长跑；v6.1.4 O2：mode 选灌数阶段）。
+               mode: str = Query(default="full")) -> Dict[str, Any]:
+    """启动数据补齐（后台长跑；**v6.1.6：缺省 mode=full 单按钮全量**）。
 
     :param codes: 可选逗号分隔股票子集（透传 driver ``--codes``）——**E2E/冒烟限定
         ≤3 只用**；Web 按钮不传 → 全集（Joel"启动数据更新"的默认语义）。
-    :param mode: 灌数模式——``history``（缺省，P2 全史补库，行为与 v6.0.9 逐字节一致）|
-        ``incremental``（v6.1.4 O2，P3 每日增量：kline_daily 最近缺口 / valuation_daily
-        最新快照 / index_daily 近 N 日）| **``t5``（v6.1.5 F4，基本面一键启动）**→
-        子进程 ``history --t5``（kline_history 部分幂等全跳过、只灌 T5；T6 无源不动）。
-        三者**互斥**（同一 backfill scope + DuckDB 独占写锁）——已 running → 409 现状不变。
-        非法 mode → 400。
+    :param mode: 灌数模式——
+        - **``full``（v6.1.6 缺省）**：单进程顺序跑完 history→P3 增量→T5（同一把
+          DuckDB 独占锁贯穿全程；任一阶段异常记 error 后继续下一阶段）。Web 唯一
+          按钮【▶ 启动数据补齐】即此模式——Joel 拍板"只要启动了就是需要把所有历史
+          及现状数据全部都补上"。
+        - ``history``（**deprecated，测试/排障用，UI 不再暴露**）：仅 P2 全史补库
+          （v6.0.9 语义；其能力已被 full 阶段 1 覆盖且幂等）。
+        - ``incremental``（**deprecated，测试/排障用，UI 不再暴露**）：仅 P3 每日增量
+          （v6.1.4 O2 语义；full 阶段 2 原样复用）。
+        - ``t5``（**deprecated，测试/排障用，UI 不再暴露**）：driver ``history --t5``
+          （v6.1.5 F4 语义；kline_history 幂等全跳过、只灌 T5）。
+        各模式**互斥**（同一 backfill scope + DuckDB 独占写锁）——已 running → 409
+        现状不变。非法 mode → 400。
     - 200 ``{started: true, pid, log_path, mode}``：spawn 成功且 ~5s 内确认 running。
     - **409** ``{error: "sync_already_running", hint, pid}``（顶层契约体）：已有灌数
       在跑（v6.0.4 三态检测）——防双开，不 spawn。
@@ -1531,22 +1588,22 @@ def sync_start(codes: Optional[str] = Query(default=None),
     if not isinstance(codes, str):
         codes = None
     if not isinstance(mode, str) or not mode.strip():
-        mode = "history"   # FieldInfo（直接调用缺省）→ 默认全史
+        mode = "full"   # v6.1.6：FieldInfo（直接调用缺省）→ 默认全量
     mode = mode.strip()
-    if mode not in ("history", "incremental", "t5"):
+    if mode not in ("full", "history", "incremental", "t5"):
         raise HTTPException(
-            status_code=400, detail=f"非法 mode: {mode!r}（history|incremental|t5）")
+            status_code=400, detail=f"非法 mode: {mode!r}（full|history|incremental|t5）")
     extra_args: Optional[List[str]] = None
     if codes and codes.strip():
         cs = [c.strip() for c in codes.split(",") if c.strip()]
         if cs:
             extra_args = ["--codes", ",".join(cs)]
-    # history 缺省 → sub="history"（start_sync 既有默认，行为逐字节不变）；
-    # incremental → driver `incremental` 子命令（v6.1.4 O2）；
-    # **t5（v6.1.5 F4）**→ driver `history --t5`：kline_history 已灌部分幂等全跳过、
-    # 只灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）。sub 恒 "history"
-    # （T5 是 history 子命令的 --t5 开关，非独立子命令），互斥/409/锁语义与现有一致。
-    sub = mode if mode in ("history", "incremental") else "history"
+    # v6.1.6：full → driver `full` 子命令（单进程顺序三阶段，同一把锁贯穿全程）。
+    # deprecated modes（history/incremental/t5）行为逐字节不变——测试/排障通道保留：
+    # history → sub="history"；incremental → sub="incremental"；
+    # t5 → driver `history --t5`（T5 是 history 子命令的 --t5 开关，非独立子命令），
+    # 互斥/409/锁语义与现有一致。
+    sub = mode if mode in ("full", "history", "incremental") else "history"
     if mode == "t5":
         extra_args = (extra_args or []) + ["--t5"]
     res = sync_control.start_sync(sub=sub, extra_args=extra_args)   # 缺省库（生产默认）

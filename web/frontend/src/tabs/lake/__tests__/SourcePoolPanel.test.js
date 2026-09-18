@@ -312,9 +312,12 @@ describe("v6.1.3：配额(今日)列已删（源码契约守卫）", () => {
     expect(sc).toContain("进度更新于");   // 保留项仍在
   });
 
-  it("lakeStore.js confirm 文案='BaoStock 每日配额 5000'（更准确：配额是 BaoStock 的）", () => {
+  it("lakeStore.js confirm 文案=v6.1.6 全量补齐（历史+增量+基本面，幂等可中断续传）", () => {
     const store = vueSrc("../../../stores/lakeStore.js");
+    // v6.1.6：三按钮合并为单按钮——confirm 文案改为全量补齐（旧"全史数据补库/BaoStock
+    // 每日配额 5000"文案随 mode 参数一并删除）。
     expect(store).toContain(
-      "将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？");
+      "将启动全量数据补齐（历史+增量+基本面，后台长跑，幂等可中断续传）。确认启动？");
+    expect(store).not.toContain("BaoStock 每日配额 5000 到顶自停");
   });
 });

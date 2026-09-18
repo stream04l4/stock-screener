@@ -137,23 +137,18 @@ export const useLakeStore = defineStore("lake", {
     // ------------------------------------------------------------------
     // 同步控制动作（v6.0.9/v6.0.10；移植 lakeSyncStart/lakeSyncStop）
     // ------------------------------------------------------------------
-    async startSync(mode = "history") {
-      // v6.1.4 O2：mode=history（全史补库，缺省）| incremental（P3 每日增量）。
-      // v6.1.5 F4：mode=t5（基本面一键启动 → 后端 history --t5，只灌 T5）。
-      // 确认文案按 mode 区分；后端 ?mode= 透传 driver 子命令（互斥：running→409 现状不变）。
-      const confirmMsg = mode === "incremental"
-        ? "将启动 P3 每日增量同步（kline_daily 最近缺口 / valuation_daily 最新快照 / index_daily 近 N 日，后台长跑）。确认启动？"
-        : mode === "t5"
-          ? "将启动 T5 基本面灌数（history --t5：kline_history 已灌部分幂等跳过、只灌 fundamentals_quarterly，adata F10 主源 + BaoStock 存活时交叉校验；后台长跑）。确认启动？"
-          : "将启动全史数据补库（后台长跑，BaoStock 每日配额 5000 到顶自停）。确认启动？";
+    async startSync() {
+      // v6.1.6：三按钮合并为单按钮——startSync 无参 = full（全量补齐：历史+增量+基本面，
+      // 后端 /sync/start 缺省 mode=full → driver `full` 子命令顺序跑完三阶段）。
+      // deprecated modes（history/incremental/t5）仅测试/排障用，UI 不再暴露；
+      // 本 action 不接受 mode 参数（旧 startIncremental/startT5 已删除——brief"以删除为主"）。
+      const confirmMsg = "将启动全量数据补齐（历史+增量+基本面，后台长跑，幂等可中断续传）。确认启动？";
       if (!window.confirm(confirmMsg)) return;
       // v6.0.10：点击即锁定——POST /start 返回前按钮禁用+"▶ 启动中…"（防连点/竞态）
       this.syncState = "starting";
       try {
-        const d = await api("/api/lake/sync/start?mode=" + encodeURIComponent(mode),
-                            { method: "POST" });
-        if (d.started) useToastStore().toast(
-          (mode === "incremental" ? "增量同步已启动" : mode === "t5" ? "T5 基本面灌数已启动" : "同步已启动") + `（PID ${d.pid ?? "?"}）`);
+        const d = await api("/api/lake/sync/start", { method: "POST" });
+        if (d.started) useToastStore().toast(`全量数据补齐已启动（PID ${d.pid ?? "?"}）`);
         else useToastStore().toast("同步启动失败：" + (d.reason || "未知原因"), false);
       } catch (e) {
         // 409（已有灌数在跑，状态可能刚变化）→ toast 提示不白屏

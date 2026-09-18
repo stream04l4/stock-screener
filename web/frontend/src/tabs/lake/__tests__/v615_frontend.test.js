@@ -1,4 +1,5 @@
 // v6.1.5 前端用例（F1 legacy 源名中文映射 / F2 local 色对比度 / F4 T5 一键启动按钮）。
+// v6.1.6：F4 段改写为单按钮断言（三按钮合并——旧 T5/增量按钮删除）。
 // mock 模式与 v614_frontend.test.js 同源（api client + useLiveQuery 打桩，零网络）。
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mount } from "@vue/test-utils";
@@ -155,7 +156,8 @@ describe("F2：SourcePoolPanel 图例 local 色点 = #64748b", () => {
 });
 
 // ===========================================================================
-// F4：SyncControl 第三个按钮【▶ 启动基本面(T5)】（状态机复用，running 时三按钮全禁）
+// F4：T5 一键启动（v6.1.5）→ **v6.1.6 三按钮合并为单 toggle**（本段改写：
+// 旧"第三个 T5 按钮"断言删除，改验单按钮 + phase 小字——brief §B"以删除为主"）
 // ===========================================================================
 function statusBody(over = {}) {
   return {
@@ -175,54 +177,64 @@ async function tick() { await import("@vue/test-utils").then((m) => m.flushPromi
 
 beforeEach(() => { pinia = createPinia(); setActivePinia(pinia); });
 
-describe("F4：SyncControl T5 按钮（第三个，状态机复用增量按钮）", () => {
-  it("idle → 三按钮均可点（全史/增量/T5），T5 文案 '▶ 启动基本面(T5)'", async () => {
+describe("F4→v6.1.6：SyncControl 单按钮（T5/增量并入全量 toggle）", () => {
+  it("idle → 唯一按钮 '▶ 启动数据补齐'；旧 T5/增量按钮 DOM 消失（三按钮合并）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody();
     await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动全史补库");
-    expect(w.find("#btn-lake-sync-incremental").text()).toBe("▶ 启动增量同步");
-    const t5 = w.find("#btn-lake-sync-t5");
-    expect(t5.exists()).toBe(true);
-    expect(t5.text()).toBe("▶ 启动基本面(T5)");
-    expect(t5.attributes("disabled")).toBeUndefined();   // idle 可点
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动数据补齐");
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeUndefined();
+    // v6.1.6：T5/增量独立按钮删除（T5 由 full 阶段 3 覆盖；UI 不再暴露）
+    expect(w.find("#btn-lake-sync-t5").exists()).toBe(false);
+    expect(w.find("#btn-lake-sync-incremental").exists()).toBe(false);
     w.unmount();
   });
 
-  it("running → T5 按钮禁用（brief：running 时三按钮全禁）", async () => {
+  it("running → '■ 停止数据补齐' + sync-danger（红色危险样式）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 5 });
     await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("⏹ 停止同步 (5)");
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeDefined();   // T5 也禁
+    const btn = w.find("#btn-lake-sync-toggle");
+    expect(btn.text()).toBe("■ 停止数据补齐");
+    expect(btn.classes()).toContain("sync-danger");
     w.unmount();
   });
 
-  it("starting/stopping/错误态 → T5 按钮禁用（锁定态三按钮全禁）", async () => {
+  it("running + phase → 小字 '正在灌：…'（history/p3/t5 映射；无 phase 键不渲染）", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t5" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T5 基本面");
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9 });
+    await tick();
+    expect(w.find("#lake-sync-phase").exists()).toBe(false);   // 非 full 进程无段标
+    w.unmount();
+  });
+
+  it("starting/stopping/错误态 → 单按钮禁用（锁定态语义不变）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody();
     await tick();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeUndefined();   // idle 可点
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeUndefined();   // idle 可点
     lake.syncState = "starting";
     await tick();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeDefined();
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeDefined();
     lake.syncState = "stopping";
     lake.stoppingSince = Date.now() - 1000;
     await tick();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeDefined();
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeDefined();
     lake.syncState = "idle";
     lake.status = null;   // 错误态
     await tick();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeDefined();
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeDefined();
     w.unmount();
   });
 
-  it("!installed → T5 按钮禁用（数据湖未安装占位）", async () => {
+  it("!installed → 单按钮禁用（数据湖未安装占位）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({ installed: false });
     await tick();
-    expect(w.find("#btn-lake-sync-t5").attributes("disabled")).toBeDefined();
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeDefined();
     w.unmount();
   });
 });

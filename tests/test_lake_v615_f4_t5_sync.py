@@ -72,17 +72,17 @@ def test_f4_sync_start_mode_t5_running_409_unchanged(monkeypatch):
 
 
 def test_f4_sync_start_bad_mode_still_400(monkeypatch):
-    """非法 mode（'full'）→ 400（白名单扩为 history|incremental|t5，其余仍拒——不 spawn）。"""
+    """非法 mode → 400（v6.1.6 白名单扩为 full|history|incremental|t5，其余仍拒）。"""
     import lake.sync_control as sc
 
     monkeypatch.setattr(sc, "start_sync", lambda **k: pytest.fail("非法 mode 不得 spawn"))
     with pytest.raises(wapi.HTTPException) as ei:
-        wapi.sync_start(mode="full")
+        wapi.sync_start(mode="p0")
     assert ei.value.status_code == 400
 
 
 def test_f4_sync_start_history_incremental_unchanged(monkeypatch):
-    """回归：history/incremental 行为不变（t5 加入不得破坏既有两 mode）。"""
+    """回归：history/incremental 行为不变（t5/full 加入不得破坏既有 mode）。"""
     import lake.sync_control as sc
 
     captured = {}
@@ -92,7 +92,29 @@ def test_f4_sync_start_history_incremental_unchanged(monkeypatch):
     assert "--t5" not in (captured.get("extra_args") or [])   # incremental 不带 --t5
 
     captured.clear()
-    d = wapi.sync_start()   # 缺省 → history（FieldInfo 归一化）
+    d = wapi.sync_start(mode="history")   # v6.1.6：缺省已改 full，history 走显式传参
     assert captured.get("sub") == "history"
     assert "--t5" not in (captured.get("extra_args") or [])
     assert d["mode"] == "history"
+
+
+def test_f4_sync_start_default_full_v616(monkeypatch):
+    """v6.1.6：/sync/start 缺省 mode=full → start_sync(sub='full')；响应回显 full。"""
+    import lake.sync_control as sc
+
+    captured = {}
+    monkeypatch.setattr(sc, "start_sync", _fake_start(captured))
+    d = wapi.sync_start()   # FieldInfo 直调缺省 → 归一化 full
+    assert captured.get("sub") == "full"
+    assert d["mode"] == "full" and d["started"] is True
+
+
+def test_f4_sync_start_full_with_codes(monkeypatch):
+    """v6.1.6：codes + full 组合 → extra_args=[--codes, ...]（顺序稳定）。"""
+    import lake.sync_control as sc
+
+    captured = {}
+    monkeypatch.setattr(sc, "start_sync", _fake_start(captured))
+    wapi.sync_start(codes="sh.601398,sz.000001")   # 缺省 mode=full
+    assert captured.get("sub") == "full"
+    assert captured.get("extra_args") == ["--codes", "sh.601398,sz.000001"]

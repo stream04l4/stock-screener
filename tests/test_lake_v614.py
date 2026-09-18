@@ -476,8 +476,8 @@ def test_o2_sync_start_mode_incremental_passthrough(monkeypatch):
     assert d["mode"] == "incremental" and d["started"] is True
 
 
-def test_o2_sync_start_mode_default_history(monkeypatch):
-    """缺省 mode=history（FieldInfo 直调归一化）→ sub='history'（v6.0.9 行为不变）。"""
+def test_o2_sync_start_mode_default_full_v616(monkeypatch):
+    """v6.1.6：缺省 mode=full（FieldInfo 直调归一化）→ sub='full'（单按钮全量）。"""
     import lake.sync_control as sc
 
     captured = {}
@@ -487,8 +487,25 @@ def test_o2_sync_start_mode_default_history(monkeypatch):
         return {"started": True, "pid": 1234, "log_path": "/tmp/x.log"}
 
     monkeypatch.setattr(sc, "start_sync", fake_start)
-    d = wapi.sync_start()   # 直调缺省 → mode=FieldInfo → 归一化 history
+    d = wapi.sync_start()   # 直调缺省 → mode=FieldInfo → 归一化 full（v6.1.6）
+    assert captured.get("sub") == "full"
+    assert d["mode"] == "full"
+
+
+def test_o2_sync_start_mode_history_deprecated_still_works(monkeypatch):
+    """v6.1.6：deprecated mode=history 行为逐字节不变（测试/排障通道保留）。"""
+    import lake.sync_control as sc
+
+    captured = {}
+
+    def fake_start(**kw):
+        captured.update(kw)
+        return {"started": True, "pid": 1234, "log_path": "/tmp/x.log"}
+
+    monkeypatch.setattr(sc, "start_sync", fake_start)
+    d = wapi.sync_start(mode="history")
     assert captured.get("sub") == "history"
+    assert "--t5" not in (captured.get("extra_args") or [])
     assert d["mode"] == "history"
 
 
@@ -509,11 +526,12 @@ def test_o2_sync_start_mode_with_codes(monkeypatch):
 
 
 def test_o2_sync_start_bad_mode_400(monkeypatch):
+    """v6.1.6：白名单扩为 full|history|incremental|t5——其余值（如 'p0'）仍 400。"""
     import lake.sync_control as sc
 
     monkeypatch.setattr(sc, "start_sync", lambda **k: pytest.fail("非法 mode 不得 spawn"))
     with pytest.raises(wapi.HTTPException) as ei:
-        wapi.sync_start(mode="full")
+        wapi.sync_start(mode="p0")
     assert ei.value.status_code == 400
 
 

@@ -71,6 +71,9 @@ h3 { margin: 0 0 10px; font-size: 15px; }
 }
 .primary-btn:hover { filter: brightness(1.08); }
 .primary-btn:disabled { background: #9db4e8; cursor: not-allowed; }
+/* v6.1.6：单按钮 running 态【■ 停止数据补齐】红色危险样式（--bad 色板，与 .run-badge-failed 同源） */
+.sync-danger { background: var(--bad); }
+.sync-danger:hover { filter: brightness(1.08); }
 .ghost-btn {
   background: transparent; color: var(--muted); border: 1px solid var(--line);
   padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;

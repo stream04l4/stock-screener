@@ -1,7 +1,9 @@
-// SyncControl 单测（brief D3：v6.0.10 状态机**移植回归**——按钮态/文案与 vanilla 对齐）。
-// 覆盖：idle→[▶ 启动同步] / running→[⏹ 停止同步 (pid)]+meta（配额/已耗时/进度更新）/
-//       stopping=true 友好文案 / starting 锁定 / stopping 锁定（>90s 文案升级）/
-//       错误态 status=null → "状态不可用"禁用 / !installed → "数据湖未安装"。
+// SyncControl 单测（v6.1.6：三按钮合并为**单 toggle**——idle【▶ 启动数据补齐】/
+// running【■ 停止数据补齐】(danger)；状态机 v6.0.10 移植回归保留）。
+// 覆盖：idle 单按钮可点 / running 停止按钮+danger 样式 / starting/stopping 锁定态 /
+//       错误态 status=null → "状态不可用"禁用 / !installed → "数据湖未安装" /
+//       **phase 小字**（#lake-sync-phase："正在灌：T2 全史/T3 估值增量/T5 基本面"，
+//       仅 running+status.phase 存在时渲染；无 phase 键不渲染——三态契约）。
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { setActivePinia, createPinia } from "pinia";
@@ -31,100 +33,81 @@ async function tick() { await flushPromises(); }
 beforeEach(() => { vi.useFakeTimers(); pinia = createPinia(); setActivePinia(pinia); });
 afterEach(() => { vi.useRealTimers(); });
 
-describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", () => {
-  it("idle → [▶ 启动全史补库] + [▶ 启动增量同步] 均可点、meta 空（v6.1.4 O2：双按钮）", async () => {
+describe("SyncControl v6.1.6：单按钮 toggle（三按钮合并）", () => {
+  it("idle → 唯一按钮 [▶ 启动数据补齐] 可点；旧三按钮消失；phase 小字不渲染", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody();
     await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动全史补库");
+    // v6.1.6：单 toggle 按钮（idle 态）
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动数据补齐");
     expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeUndefined();
-    // v6.1.4 O2：增量按钮（P3）——idle 时可点
-    expect(w.find("#btn-lake-sync-incremental").text()).toBe("▶ 启动增量同步");
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeUndefined();
+    expect(w.find("#btn-lake-sync-toggle").classes()).not.toContain("sync-danger");
+    // v6.1.6：旧三按钮合并——增量/T5 按钮 DOM 消失（brief"以删除为主"）
+    expect(w.find("#btn-lake-sync-incremental").exists()).toBe(false);
+    expect(w.find("#btn-lake-sync-t5").exists()).toBe(false);
+    // 页面上只剩一个同步按钮
+    expect(w.findAll("button").length).toBe(1);
+    // idle（未 running）→ phase 小字不渲染（v-if=false → 元素不存在）
+    expect(w.find("#lake-sync-phase").exists()).toBe(false);
     expect(w.find("#lake-sync-meta").text()).toBe("");
   });
 
-  it("running → 两按钮都禁（brief：running 时两按钮都禁）+ [⏹ 停止同步 (pid)]", async () => {
+  it("running → [■ 停止数据补齐] + sync-danger 红色危险样式", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 5 });
     await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("⏹ 停止同步 (5)");
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
+    const btn = w.find("#btn-lake-sync-toggle");
+    expect(btn.text()).toBe("■ 停止数据补齐");
+    expect(btn.attributes("disabled")).toBeUndefined();
+    // v6.1.6：running 态红色危险样式（--bad 色板）
+    expect(btn.classes()).toContain("sync-danger");
+    // meta 仍含 PID（v6.0.10 状态机不变）
+    expect(w.find("#lake-sync-meta").text()).toContain("PID 5");
   });
 
-  it("starting/stopping/错误态 → 增量按钮禁用（锁定态两按钮都禁）", async () => {
+  it("running + phase=history → 小字 '正在灌：T2 全史'；p3/t5 同理", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "history" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T2 全史");
+
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "p3" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T3 估值增量");
+
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t5" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T5 基本面");
+  });
+
+  it("running 但无 phase 键（非 full 进程/全结束）→ 小字不渲染（三态契约其余字段不动）", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9 });
+    await tick();
+    expect(w.find("#lake-sync-phase").exists()).toBe(false);
+    // 其余 running 展示不受影响
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("■ 停止数据补齐");
+  });
+
+  it("starting → [▶ 启动中…] disabled + sync-busy；stopping → [⏹ 停止中… (pid)] disabled", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody();
     await tick();
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeUndefined();
+    expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeUndefined();
+
     lake.syncState = "starting";
     await tick();
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
-    lake.syncState = "stopping";
-    lake.stoppingSince = Date.now() - 1000;
-    await tick();
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
-    lake.syncState = "idle";
-    lake.status = null;   // 错误态
-    await tick();
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
-  });
-
-  it("running → [⏹ 停止同步 (pid)] + meta 'PID x · 进度更新于 …'（会话未观察跃迁）", async () => {
-    const { lake, w } = mountSC();
-    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 4242 });
-    await tick();
-    const btn = w.find("#btn-lake-sync-toggle");
-    expect(btn.text()).toBe("⏹ 停止同步 (4242)");
-    expect(btn.attributes("disabled")).toBeUndefined();
-    // v6.1.4 O2：running 时增量按钮禁用（两个"启动"都不可点——history/incremental 互斥）
-    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
-    // runningSince=null（测试直接置 status，未走 fetchStatus 跃迁观察）→ 显示进度更新时间
-    expect(w.find("#lake-sync-meta").text()).toContain("PID 4242");
-    // vanilla 口径：String(updated_at).slice(5,16) → "09-17T08:00"（T 保留，与 app.js 一致）
-    expect(w.find("#lake-sync-meta").text()).toContain("进度更新于 09-17T08:00");
-  });
-
-  it("running + tasks 含 quota → meta **不含**'今日配额'（v6.1.3：配额归数据源状态卡）", async () => {
-    const { lake, w } = mountSC();
-    lake.status = statusBody({
-      backfill_in_progress: true, lock_holder_pid: 1,
-      tasks: [{ quota_used_today: 300, quota_budget: 5000 }, { quota_used_today: 900, quota_budget: 5000 }],
-    });
-    await tick();
-    const meta = w.find("#lake-sync-meta").text();
-    // v6.1.3：SyncControl 头部不再展示"今日配额 x/budget"（配额是 BaoStock 的，
-    // 归 SourcePoolPanel 数据源状态卡）——只留 PID + 已耗时/进度更新时间。
-    expect(meta).not.toContain("今日配额");
-    expect(meta).toContain("PID 1");
-  });
-
-  it("running + stopping=true（SIGTERM 已发）→ meta '⏹ 停止收尾中（当前任务完成后退出）'，按钮仍是停止入口", async () => {
-    const { lake, w } = mountSC();
-    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 7, stopping: true });
-    await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("⏹ 停止同步 (7)");
-    expect(w.find("#lake-sync-meta").text()).toContain("⏹ 停止收尾中（当前任务完成后退出）");
-  });
-
-  it("starting → [▶ 启动中…] disabled + sync-busy + meta '正在启动（确认进程拉起中）'", async () => {
-    const { lake, w } = mountSC();
-    lake.syncState = "starting";
-    await tick();
-    const btn = w.find("#btn-lake-sync-toggle");
+    let btn = w.find("#btn-lake-sync-toggle");
     expect(btn.text()).toBe("▶ 启动中…");
     expect(btn.attributes("disabled")).toBeDefined();
     expect(btn.classes()).toContain("sync-busy");
     expect(w.find("#lake-sync-meta").text()).toBe("正在启动（确认进程拉起中）");
-  });
 
-  it("stopping → [⏹ 停止中… (pid)] disabled + meta 'PID x · 已等待 …'", async () => {
-    const { lake, w } = mountSC();
     lake.syncState = "stopping";
     lake.stoppingSince = Date.now() - 5000;   // 已等待 5s（<1分钟）
     lake.stoppingPid = 888;
     await tick();
-    const btn = w.find("#btn-lake-sync-toggle");
+    btn = w.find("#btn-lake-sync-toggle");
     expect(btn.text()).toBe("⏹ 停止中… (888)");
     expect(btn.attributes("disabled")).toBeDefined();
     expect(w.find("#lake-sync-meta").text()).toContain("PID 888 · 已等待 <1分钟");
@@ -137,6 +120,26 @@ describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", ()
     lake.stoppingPid = null;   // pid 未知 → "(未知)"（<90s 分支）；>90s 分支不带 pid
     await tick();
     expect(w.find("#btn-lake-sync-toggle").text()).toBe("⏹ 停止中…（当前任务收尾中，最长约几分钟）");
+  });
+
+  it("running + stopping=true → meta '⏹ 停止收尾中（当前任务完成后退出）'，按钮仍是停止入口", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 7, stopping: true });
+    await tick();
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("■ 停止数据补齐");
+    expect(w.find("#lake-sync-meta").text()).toContain("⏹ 停止收尾中（当前任务完成后退出）");
+  });
+
+  it("running + tasks 含 quota → meta **不含**'今日配额'（v6.1.3：配额归数据源状态卡）", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({
+      backfill_in_progress: true, lock_holder_pid: 1,
+      tasks: [{ quota_used_today: 300, quota_budget: 5000 }, { quota_used_today: 900, quota_budget: 5000 }],
+    });
+    await tick();
+    const meta = w.find("#lake-sync-meta").text();
+    expect(meta).not.toContain("今日配额");
+    expect(meta).toContain("PID 1");
   });
 
   it("错误态 status=null → [状态不可用] disabled（不白屏；锁定态除外见 store 测试）", async () => {
@@ -166,5 +169,29 @@ describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", ()
     await tick();
     expect(w.find("#lake-sync-meta").text()).toContain("已耗时 5分钟");
     expect(w.find("#lake-sync-meta").text()).not.toContain("进度更新于");
+  });
+
+  it("点击 idle 按钮 → store.startSync() 无参调用（=full 全量）", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody();
+    await tick();
+    // happy-dom 无 window.confirm → 直接赋值 stub（afterEach 恢复由 vitest 环境隔离）
+    globalThis.window.confirm = () => true;
+    let startedWith;
+    const origStart = lake.startSync;
+    lake.startSync = function (...args) { startedWith = args; return Promise.resolve(); };
+    await w.find("#btn-lake-sync-toggle").trigger("click");
+    expect(startedWith).toEqual([]);   // v6.1.6：startSync 无参（后端缺省=full）
+    lake.startSync = origStart;
+  });
+
+  it("点击 running 按钮 → store.stopSync() 被调用", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 5 });
+    await tick();
+    let stopped = false;
+    lake.stopSync = function () { stopped = true; };
+    await w.find("#btn-lake-sync-toggle").trigger("click");
+    expect(stopped).toBe(true);
   });
 });
