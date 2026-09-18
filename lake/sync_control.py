@@ -26,14 +26,89 @@
 from __future__ import annotations
 
 import builtins
+import logging
 import os
 import signal
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+log = logging.getLogger("lake.sync_control")
 
 __all__ = ["sync_status", "start_sync", "stop_sync"]
+
+
+# ---------------------------------------------------------------------------
+# DEFECT-HANG-1（R5）：backfill 生命周期与 web 解耦（cgroup 迁移）
+# ---------------------------------------------------------------------------
+# 根因（09-16/09-17 两次事故同因）：web unit（stock-screener-web.service）**未设
+# KillMode** → systemd 默认 ``control-group``——stop/restart 时对该 unit cgroup 内
+# **全部进程**发 SIGKILL。backfill 由 uvicorn（web 进程）spawn，虽已 setsid 脱离
+# session/进程组，但 **cgroup 仍在 web unit 内** → web 一重启就被连带杀掉（长跑任务
+# 丢一个工作日窗口）。setsid/nohup 只解决"终端挂断/SIGHUP"，不解决 cgroup kill scope。
+#
+# 方案 = spawn 后把子进程迁入 **web unit 的兄弟 cgroup scope**
+# （``<app.slice>/stock-screener-backfill.scope``）——移出 web 的 kill scope，web
+# restart 不再波及；而 Web API 管理**零改动**：stop_sync 经 duckdb 锁文案拿 holder_pid
+# + ``killpg(pid)``（子进程仍 setsid 自成组，pgid==pid），start/status 探测全走锁+活性，
+# 均与 cgroup 无关。相比"独立 systemd user service"方案：无需改 unit/daemon-reload、
+# 无第二套 spawn 路径、E2E 测试零影响（fail-open 降级为旧行为）。
+_BACKFILL_SCOPE = "stock-screener-backfill.scope"
+_MIGRATED_PIDS: Set[int] = set()   # 已迁入独立 scope 的 backfill pid（退出时清理用）
+
+
+def _backfill_scope_path() -> Optional[str]:
+    """backfill 专用 cgroup scope 路径（当前进程 cgroup 父目录下的兄弟节点）。
+
+    读 ``/proc/self/cgroup`` 的 v2 unified 行（``0::<path>``）→ 取 dirname 作父。
+    非 Linux / 无 v2 层级 / 解析失败 → None（调用方 fail-open，不迁移）。
+    """
+    try:
+        with builtins.open("/proc/self/cgroup", encoding="ascii") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":   # cgroup v2 unified 层级
+                    cur = parts[2].rstrip("/")
+                    parent = os.path.dirname(cur) or "/"
+                    return f"/sys/fs/cgroup{parent}/{_BACKFILL_SCOPE}"
+    except OSError:
+        pass
+    return None
+
+
+def _detach_to_own_cgroup(pid: int) -> bool:
+    """R5：把 backfill 子进程迁入独立 cgroup scope（web restart 不再连带杀它）。
+
+    **fail-open**：任何失败（非 Linux / 无写权限 / 子进程已退出 ESRCH）→ False，
+    不影响 spawn 成功判定（降级为 R5 之前的"随 web 生命周期"行为，不 crash、不阻断）。
+    迁移 = 向 scope 的 ``cgroup.procs`` 写 pid（内核把整个 thread group 移入；子进程
+    是 setsid 会话组长，全部线程随之移动）。
+    """
+    scope = _backfill_scope_path()
+    if not scope:
+        return False
+    try:
+        os.makedirs(scope, exist_ok=True)
+        with builtins.open(os.path.join(scope, "cgroup.procs"), "w", encoding="ascii") as f:
+            f.write(f"{pid}\n")
+    except OSError as exc:
+        log.warning("R5 cgroup 迁移失败（降级为随 web 生命周期）: %s", exc)
+        return False
+    _MIGRATED_PIDS.add(pid)
+    log.info("R5: backfill pid=%d 迁入独立 cgroup %s（web restart 不再波及）", pid, scope)
+    return True
+
+
+def _cleanup_backfill_scope() -> None:
+    """backfill 退出后清理空 scope（rmdir；非空/不存在/权限 → 静默跳过）。"""
+    scope = _backfill_scope_path()
+    if not scope:
+        return
+    try:
+        os.rmdir(scope)   # 仅当空目录成功——子进程已退则必空
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +194,10 @@ def _reap_children() -> None:
         try:
             if _CHILDREN[pid].poll() is not None:
                 del _CHILDREN[pid]
+                # DEFECT-HANG-1（R5）：backfill 退出 → 清理其独立 cgroup scope（空目录）。
+                if pid in _MIGRATED_PIDS:
+                    _MIGRATED_PIDS.discard(pid)
+                    _cleanup_backfill_scope()
         except Exception:  # noqa: BLE001 - 收尸失败不影响主流程
             pass
 
@@ -225,6 +304,9 @@ def start_sync(db_path: Optional[str] = None, sub: str = "history",
 
     pid = proc.pid
     _CHILDREN[pid] = proc   # 注册表持有引用：请求结束后仍可 poll() 收尸（防僵尸）
+    # DEFECT-HANG-1（R5）：迁入独立 cgroup scope——web restart 不再连带杀长跑 backfill。
+    # fail-open：迁移失败只降级为旧行为（随 web 生命周期），不影响 spawn 成功判定。
+    _detach_to_own_cgroup(pid)
     deadline = time.monotonic() + 5.0
     confirmed = False
     reason: Optional[str] = None

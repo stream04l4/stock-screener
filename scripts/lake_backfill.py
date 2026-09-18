@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -141,6 +142,14 @@ def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
 
     if os.environ.get("LAKE_MULTISOURCE") == "0":
         return {"enabled": False, "alive": False, "detail": "multisource off (test isolation)"}
+    # DEFECT-HANG-1（repro 纪律）：env LAKE_DISABLE_BAOSTOCK=1 → 跳过 BaoStock 探测
+    # （baostock_alive 恒 False → adapter available()=False → 各池排除 baostock，零连接）。
+    # 用途：生产 backfill 正在跑（BaoStock 串行占用）时，repro/并行作业必须避免**第二个**
+    # BaoStock 连接源（>~4 并发连接触发服务端黑名单，见团队纪律）。sina/tencent/tdx 不受
+    # 影响——HANG-1 卡死点恰在这三源网络路径（ESTAB→Tencent:443 + CLOSE-WAIT），R1 证据完整。
+    if os.environ.get("LAKE_DISABLE_BAOSTOCK") == "1":
+        return {"enabled": False, "alive": False,
+                "detail": "baostock disabled (LAKE_DISABLE_BAOSTOCK=1)"}
     if not lake_cfg().get("baostock_probe_enabled", True):
         return {"enabled": False, "alive": False, "detail": "probe disabled by config"}
     from screener.data.baostock_client import probe_baostock_alive
@@ -770,9 +779,10 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     **Q6**：启动时探一次 BaoStock（10s socket 超时判活；结果写日志+progress）——
     存活则参与 adj fallback/交叉校验，死亡则自动跳过（不 crash、不阻塞）。
     """
-    from lake.backfill import BackfillRunner, Task, stop_requested as _bk_stop
+    from lake.backfill import BackfillRunner, Task, save_progress, stop_requested as _bk_stop
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
+    from lake.ingest.common import HangWatchdogError, ProgressWatchdog
     from lake.ingest.tencent_ingest import load_t2
     from screener.data.baostock_client import BaoStockClient
     from screener.data.tencent import TencentClient
@@ -881,7 +891,38 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                 conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
         time.sleep(0.3)
 
-    stats.update(runner.run(tasks, worker))
+    # DEFECT-HANG-1（R3）：进度停滞看门狗——progress 文件 mtime 连续 hang_stall_minutes
+    # （config，缺省 10min）无推进 → 主线程 SIGINT abort（抛 HangWatchdogError）。
+    # 为什么需要：HANG-1 的卡死是"进程活着但零产出数小时"（线程池/连接池 stateful 死锁），
+    # 单任务 R2 超时救不了跨任务的池级死锁；看门狗在 runner 层兜底——干净退出（flock/
+    # DuckDB lock 随进程释放、done 键已落盘）让下次 relaunch 从 stable done keys 续传。
+    # arm() 必须在主线程调用（signal.signal 限制）——run_history 由 driver cmd_history
+    # 在主线程执行，满足。<=0 → 禁用（config 可调）。
+    _stall_min = float(lake_cfg().get("hang_stall_minutes", 10.0))
+    _wd: Optional[ProgressWatchdog] = None
+    if _stall_min > 0:
+        _wd = ProgressWatchdog(runner.progress_path, _stall_min).arm()
+    try:
+        stats.update(runner.run(tasks, worker))
+    except HangWatchdogError as exc:
+        # R3 abort：记 last_error + state=hang_watchdog + 落盘（Web/TL 可观测"为何停"），
+        # 干净退出 rc=1。done 键已在每次 mark_done 原子落盘 → 下次续传无损。
+        log.error("R3 看门狗触发，history 干净退出（续传无损）: %s", exc)
+        _stats_hang = dict(stats)
+        _stats_hang["hang_watchdog"] = True
+        _stats_hang["last_error"] = f"hang_watchdog: {exc}"
+        for _entry in runner.progress.get("tasks", []):
+            if isinstance(_entry, dict) and _entry.get("table") == "kline_history":
+                _entry["state"] = "hang_watchdog"
+                _entry["last_error"] = f"progress 停滞 >{_stall_min:.0f}min → 看门狗 abort"
+        runner.progress["stopping_at"] = None
+        save_progress(runner.progress, runner.progress_path)
+        bs.close()   # R4：baostock send_msg 紧循环守卫已装（CLOSE-WAIT 立即返回，不 spin）
+        return _stats_hang
+    finally:
+        if _wd is not None:
+            _wd.stop()   # 恢复原 SIGINT handler + 停看门狗线程（正常收尾/异常都执行）
+
     bs.close()
     return {"sub": "history", **stats, "baostock_probe": probe_res,
             "source_health": health_res,
@@ -1239,6 +1280,11 @@ def cmd_history(args, con, db_path: str) -> int:
         runner = BackfillRunner(db_path=db_path)
         summary["t5"] = run_t5(con, db_path, codes, runner)
     _print_summary("history", summary)
+    # DEFECT-HANG-1（R3）：看门狗 abort → 非零退出码（区别于"正常跑完/优雅停止"的 rc=0）。
+    # Web start_sync 把"5s 内提前退出"判为启动失败——但 R3 abort 发生在长跑后（非启动期），
+    # 不受该判定影响；rc=1 让 TL/运维脚本能区分"卡死自愈退出"与"正常完成"。
+    if summary.get("hang_watchdog"):
+        return EXIT_RUNTIME
     return EXIT_OK
 
 
@@ -1252,8 +1298,30 @@ def cmd_reconcile(args, con, db_path: str) -> int:
     return EXIT_OK
 
 
+def _install_fault_hook() -> None:
+    """DEFECT-HANG-1：faulthandler 诊断钩子（SIGUSR1 → 全线程栈转储到 stderr/sync.log）。
+
+    为什么加：HANG-1 的冻结签名是"全部线程 futex_wait、io/CPU 全平"——纯 Python 层
+    锁死锁/挂起，无 ptrace 权限（yama ptrace_scope=2）时 py-spy/gdb/strace 都 attach
+    不了。faulthandler.register(SIGUSR1) 是**无需 ptrace** 的线程栈转储通道：
+    ``kill -SIGUSR1 <pid>`` → 所有线程 Python 栈写到 stderr（Web spawn 时落 sync.log）→
+    直接定位死锁在哪个 lock/调用点。对正常运行零副作用（只注册信号，不占 CPU；
+    SIGUSR1 默认行为本就是 kill，注册后变成转储——比被杀好）。仅主线程可注册
+    （signal.signal 限制）→ 非主线程静默跳过。
+    """
+    import faulthandler
+    import signal as _sig
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            faulthandler.register(_sig.SIGUSR1, all_threads=True)
+    except (ValueError, OSError, RuntimeError):  # noqa: BLE001 - 注册失败不阻断灌数
+        pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    _install_fault_hook()   # DEFECT-HANG-1：SIGUSR1 全线程栈转储（诊断钩子）
     parser = build_parser()
     args = parser.parse_args(argv)
 

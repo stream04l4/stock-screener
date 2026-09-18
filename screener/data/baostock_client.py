@@ -96,9 +96,96 @@ def _install_socket_timeout_patch() -> None:
 
 def reset_socket_patch_for_test() -> None:
     """测试隔离：清 _PATCHED/超时标记（下次构造 client 重新 patch）。"""
-    global _PATCHED, _SOCKET_TIMEOUT_S
+    global _PATCHED, _SOCKET_TIMEOUT_S, _SEND_MSG_PATCHED
     _PATCHED = False
     _SOCKET_TIMEOUT_S = None
+    _SEND_MSG_PATCHED = False
+
+
+# ---------------------------------------------------------------------------
+# DEFECT-HANG-1（R2/R4）：baostock send_msg 紧循环补丁（09-16 shutdown-spin 根因）
+# ---------------------------------------------------------------------------
+# baostock ``util/socketutil.py::send_msg`` 的读响应循环是**裸 while True**：
+#   receive = b""
+#   while True:
+#       recv = default_socket.recv(8192)
+#       receive += recv
+#       if receive[-13:] == b"<![CDATA[]]>\n": break
+# 当**对端已关连接（CLOSE-WAIT）**时，``recv`` **立即返回 b""**（不是阻塞、不超时）→
+# ``receive`` 恒为 b"" → ``b""[-13:]`` 永不匹配分隔符 → **无限紧循环 100% CPU**。
+# 这正是 09-16 pid 2146668 的 shutdown-spin 签名（strace ~327k recvfrom/8s on
+# CLOSE-WAIT socket、~100% CPU、零 I/O）。且该路径可达**主线程**：run_history 收尾
+# ``bs.close()``→``bs.logout()``→send_msg——summary 已打印后进程仍不退出（持 DuckDB
+# lock + flock → web 数据端点 409）。
+#
+# 为什么 socket-timeout patch 救不了它：CLOSE-WAIT 下 recv 是**立即返回空**，不是
+# "等超时"——settimeout 只对阻塞中的 recv 生效。必须在循环里显式识别 ``recv==b""``
+# （对端已关）并退出。
+#
+# 修复 = monkey-patch send_msg：① ``recv==b""`` → break（返回 None，上层按失败重试/
+#   回退——login/logout/query 全走此语义，零新控制流）；② 迭代硬上限兜底任何"慢滴答
+#   但永不给分隔符"的半死连接。健康路径逐字节不变（正常响应 1-3 次 recv 即读到分隔符
+#   break）。fail-open：baostock 未装/结构变化 → 静默退回原生行为，不阻断。
+_SEND_MSG_PATCHED = False
+_SEND_MSG_MAX_ITERS = 1000   # 单条消息迭代上限（正常 1-3 次；1000×8KB=8MB≫任何单响应）
+
+
+def _install_send_msg_patch() -> None:
+    """Patch ``baostock.util.socketutil.send_msg``：CLOSE-WAIT 紧循环守卫（见上注释）。"""
+    global _SEND_MSG_PATCHED
+    if _SEND_MSG_PATCHED:
+        return
+    try:
+        import zlib as _zlib
+
+        import baostock.common.context as bs_context
+        import baostock.common.contants as bs_cons
+        from baostock.util import socketutil as bs_sock
+
+        def _send_msg_guarded(msg):
+            """原生 send_msg 的守卫版：recv==b""（对端关连接）→ 立即退出，不紧循环。"""
+            try:
+                if hasattr(bs_context, "default_socket"):
+                    default_socket = getattr(bs_context, "default_socket")
+                    if default_socket is not None:
+                        msg = msg + "\n"   # 消息结尾分隔符（不压缩时）
+                        default_socket.send(bytes(msg, encoding="utf-8"))
+                        receive = b""
+                        for _ in range(_SEND_MSG_MAX_ITERS):
+                            recv = default_socket.recv(8192)
+                            if not recv:    # DEFECT-HANG-1：对端已关连接 → 退出（不紧循环）
+                                break
+                            receive += recv
+                            if receive[-13:] == b"<![CDATA[]]>\n":   # 压缩时结尾分隔符
+                                break
+                        else:
+                            # 迭代上限耗尽仍未读到完整消息（半死连接慢滴答）→ 按失败
+                            log.warning("baostock send_msg 迭代上限 %d 次耗尽 → 按失败处理",
+                                        _SEND_MSG_MAX_ITERS)
+                            return None
+                        if not receive:     # recv==b"" 提前退出（连接已关）→ 失败
+                            return None
+                        head_bytes = receive[0:bs_cons.MESSAGE_HEADER_LENGTH]
+                        head_str = bytes.decode(head_bytes)
+                        head_arr = head_str.split(bs_cons.MESSAGE_SPLIT)
+                        if head_arr[1] in bs_cons.COMPRESSED_MESSAGE_TYPE_TUPLE:
+                            head_inner_length = int(head_arr[2])
+                            body_str = bytes.decode(_zlib.decompress(
+                                receive[bs_cons.MESSAGE_HEADER_LENGTH:
+                                       bs_cons.MESSAGE_HEADER_LENGTH + head_inner_length]))
+                            return head_str + body_str
+                        return bytes.decode(receive)   # 不压缩
+                    return None
+                print("you don't login.")
+            except Exception as ex:   # noqa: BLE001 - 与原生一致：异常打印后返回 None
+                print(ex)
+                print("接收数据异常，请稍后再试。")
+
+        bs_sock.send_msg = _send_msg_guarded
+        _SEND_MSG_PATCHED = True
+        log.info("baostock send_msg 紧循环守卫已安装（DEFECT-HANG-1）")
+    except Exception as exc:   # noqa: BLE001 - baostock 结构变化 → fail-open
+        log.warning("baostock send_msg patch 安装失败（退回原生行为）: %s", exc)
 
 
 def default_quota_path() -> str:
@@ -296,6 +383,10 @@ class BaoStockClient:
             global _SOCKET_TIMEOUT_S
             _SOCKET_TIMEOUT_S = self.socket_timeout
             _install_socket_timeout_patch()
+        # DEFECT-HANG-1（R2/R4）：send_msg 紧循环守卫与 socket-timeout patch 同源
+        # （baostock 协议层缺陷），**独立安装**——即使 socket_timeout<=0 禁用前者，
+        # CLOSE-WAIT 紧循环守卫仍必须生效（09-16 shutdown-spin 根因，与超时开关无关）。
+        _install_send_msg_patch()
 
     # ---------- 登录态 ----------
     def _ensure_login(self) -> None:

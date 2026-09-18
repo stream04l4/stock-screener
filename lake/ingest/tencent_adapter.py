@@ -53,7 +53,11 @@ class TencentKlineAdapter:
             if self._avail is not None:
                 return self._avail
         try:
-            rows = _ti.fetch_kline_ohlcv(self._get_client(), "sh.601398", n=5)
+            from .common import fetch_with_timeout
+
+            # DEFECT-HANG-1（R2）：自检 K线同走 session.get(timeout=15)——单次 socket 超时
+            # 非整请求墙钟上限。套 fetch_with_timeout（全 fetch 路径 ≤30s，含自检）。
+            rows = fetch_with_timeout(_ti.fetch_kline_ohlcv, self._get_client(), "sh.601398", n=5)
             ok = len(rows) > 0
         except Exception as exc:  # noqa: BLE001 - EU 不可达 → False（跳过该源）
             log.warning("tencent available() 自检失败 → 跳过腾讯源: %s", exc)
@@ -79,7 +83,13 @@ class TencentKlineAdapter:
         """
         client = self._get_client()
         if start is None and end is None:
-            rows = _ti.fetch_kline_full_history(client, ts_code)  # 失败抛 RuntimeError
+            # DEFECT-HANG-1（R2）：session.get(timeout=15) 是**单次 socket 操作**超时，
+            # 非整请求墙钟上限——半死服务端慢速滴答/keepalive 可无限拖长（生产实测挂
+            # ~70min）。套 fetch_with_timeout 墙钟硬上限：超时抛 FetchTimeoutError
+            # （⊂ RuntimeError，worker 回退下一源），挂死线程 daemon 随进程退出回收。
+            from .common import fetch_with_timeout
+
+            rows = fetch_with_timeout(_ti.fetch_kline_full_history, client, ts_code)
         else:
             # 近 N 天窗口（end-start 自然日 → 交易日数估算 ×2/3 + 缓冲）
             import datetime as _dt
@@ -87,7 +97,9 @@ class TencentKlineAdapter:
             d0 = _dt.date.fromisoformat(start or "1990-01-01")
             d1 = _dt.date.fromisoformat(end or _dt.date.today().isoformat())
             n = max(30, int((d1 - d0).days * 0.72) + 60)
-            rows = _ti.fetch_kline_ohlcv(client, ts_code, n=n)
+            from .common import fetch_with_timeout
+
+            rows = fetch_with_timeout(_ti.fetch_kline_ohlcv, client, ts_code, n=n)
             if not rows:
                 raise RuntimeError(f"腾讯 K线取空 {ts_code}（回退下一源）")
         ohlcv = [{
@@ -117,7 +129,11 @@ class TencentKlineAdapter:
             return []
         prefix = "sh" if index_code.startswith("sh") else "sz"
         ts_code = f"{prefix}.{index_code[2:]}"  # sh000001 → sh.000001（fetch 内部转 tcode）
-        rows = fetch_kline_ohlcv(self._get_client(), ts_code, n=n)
+        # DEFECT-HANG-1（R2）：指数 K线同走 session.get(timeout=15)——单次 socket 超时非整请求
+        # 墙钟上限。套 fetch_with_timeout（与 fetch_kline 两路径同口径，全 fetch 路径 ≤30s）。
+        from .common import fetch_with_timeout
+
+        rows = fetch_with_timeout(fetch_kline_ohlcv, self._get_client(), ts_code, n=n)
         return [{
             "date": r["date"],
             "open": r.get("open"), "high": r.get("high"),

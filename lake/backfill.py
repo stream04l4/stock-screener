@@ -329,11 +329,32 @@ class BackfillRunner:
 
         handler 仍保持最简：不碰 DuckDB/网络（信号可能到达于任意指令之间）；只改内存
         标志 + 一次纯 JSON 文件写（save_progress 是 tmp+rename 原子写，无事务风险）。
+
+        DEFECT-HANG-1（R4）：启动"快速退出兜底"线程——若主线程 15s 内未走完收尾
+        （worker 卡在无法打断的 C 层阻塞 / 异常路径漏了 break），daemon 线程 os._exit(0)
+        强制退出。为什么安全：SIGTERM 到达时**没有进行中的 DuckDB 写事务**（flock +
+        单连接，语句原子性兜底）；进度文件已在每次 mark_done/_update_task_view 落盘，
+        done 键完整 → 下次续传无损。os._exit 跳过 atexit/DuckDB close——flock 与文件
+        fd 由 OS 在进程退出时自动释放（R4：≤20s 退出 + fuser clean）。
         """
         self._stop_requested = True
         set_stop_requested()   # v6.0.10：模块级标志（重试循环提前中断）
         self._mark_stopping()
         log.info("收到 SIGTERM（signum=%s）→ 将在当前任务完成后优雅停止", signum)
+        # DEFECT-HANG-1（R4）：快速退出兜底（见 docstring）
+        import threading as _th
+
+        def _fast_exit_guard() -> None:
+            import os as _os
+            import time as _time
+
+            _time.sleep(15.0)   # 给主循环收尾留足窗口（任务边界 break + summary 落盘）
+            log.warning("SIGTERM 后 15s 主线程仍未退出 → os._exit(0) 强制收尾"
+                        "（flock/进度文件随进程退出释放，done 键已落盘可续传）")
+            _os._exit(0)
+
+        g = _th.Thread(target=_fast_exit_guard, name="sigterm-fast-exit", daemon=True)
+        g.start()
 
     def _mark_stopping(self) -> None:
         """v6.0.10：落盘"停止收尾中"标记（handler 同步调用，Web /status 可观测）。
@@ -490,6 +511,11 @@ class BackfillRunner:
                     g["done_in_run"] += 1
                 self._update_task_view(task, "running", used)
             except Exception as exc:  # noqa: BLE001 - 单任务失败不中断整队列
+                # DEFECT-HANG-1（R3）：HangWatchdogError 是 **BaseException**（见
+                # common.HangWatchdogError docstring）——本 ``except Exception`` 天然
+                # 不捕获它，SIGINT abort 信号会穿透此处直达 run_history 的收尾分支。
+                # （勿"顺手"把它改成 except BaseException/加 re-raise：那会让看门狗
+                #  abort 被当普通任务失败吞掉。）
                 log.error("backfill %s 失败: %s", task_key(task), exc)
                 stats["errors"].append(f"{task_key(task)}: {exc}")
                 self._update_task_view(task, "error", used)

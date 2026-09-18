@@ -64,12 +64,18 @@ class EasyTdxAdapter:
 
     # ---------- client 管理（MacClient 持久连接 + 断线重连） ----------
     def _get_client(self):
-        """懒建 MacClient（from_best_host 选最优 EU 可达 host）。失败抛异常。"""
+        """懒建 MacClient（from_best_host 选最优 EU 可达 host）。失败抛异常。
+
+        **DEFECT-HANG-1（R2）**：from_best_host 内部 ping_all 并发探测多 host
+        （每 host socket timeout 有界，但整段墙钟无上限）→ 套 fetch_with_timeout。
+        """
         if self._client is None:
             _ensure_vendor_path()
             from easy_tdx.mac.client import MacClient
 
-            self._client = MacClient.from_best_host(ping_timeout=4)
+            from .common import fetch_with_timeout
+
+            self._client = fetch_with_timeout(MacClient.from_best_host, ping_timeout=4)
         return self._client
 
     def _reset_client(self) -> None:
@@ -95,8 +101,12 @@ class EasyTdxAdapter:
             _ensure_vendor_path()
             from easy_tdx.mac.enums import Period
 
+            from .common import fetch_with_timeout
+
             client = self._get_client()
-            df = client.get_stock_kline(1, "601398", Period.DAILY, start=0, count=3)
+            # DEFECT-HANG-1（R2）：自检 K线也走 tdx socket——套墙钟硬上限（全 fetch 路径 ≤30s）。
+            df = fetch_with_timeout(
+                client.get_stock_kline, 1, "601398", Period.DAILY, start=0, count=3)
             ok = df is not None and len(df) > 0
         except Exception as exc:  # noqa: BLE001 - EU 不可达/未装 → False（跳过该源）
             log.warning("tdx available() 自检失败 → 跳过 tdx 源: %s", exc)
@@ -161,12 +171,19 @@ class EasyTdxAdapter:
         _ensure_vendor_path()
         from easy_tdx.mac.enums import Adjust, Period
 
+        from .common import fetch_with_timeout
+
         self._limiter.wait()
         try:
             client = self._get_client()
             if start is None and end is None:
-                raw_df = client.get_stock_kline(market, code6, Period.DAILY,
-                                                start=0, count=_FULL_HISTORY_COUNT)
+                # DEFECT-HANG-1（R2）：tdx socket read 有 timeout，但**整段全史分页**
+                # （~30 页 × 重连退避）墙钟无上限 + MacClient._execute 断线重试可累计
+                # 分钟级。套 fetch_with_timeout：超时抛 FetchTimeoutError → 下方 except
+                # 重置 client 后转 RuntimeError（回退下一源）。
+                raw_df = fetch_with_timeout(
+                    client.get_stock_kline, market, code6, Period.DAILY,
+                    start=0, count=_FULL_HISTORY_COUNT)
             else:
                 # 窗口：按自然日估算交易日数 + 缓冲，取最近 N 根后过滤
                 import datetime as _dt
@@ -174,9 +191,10 @@ class EasyTdxAdapter:
                 d0 = _dt.date.fromisoformat(start or "1990-01-01")
                 d1 = _dt.date.fromisoformat(end or _dt.date.today().isoformat())
                 n = max(30, int((d1 - d0).days * 0.72) + 60)
-                raw_df = client.get_stock_kline(market, code6, Period.DAILY,
-                                                start=0, count=n)
-        except Exception as exc:  # noqa: BLE001 - 连接/协议失败 → 重置后抛（回退下一源）
+                raw_df = fetch_with_timeout(
+                    client.get_stock_kline, market, code6, Period.DAILY,
+                    start=0, count=n)
+        except Exception as exc:  # noqa: BLE001 - 连接/协议失败/超时 → 重置后抛（回退下一源）
             self._reset_client()
             raise RuntimeError(f"tdx K线取数失败 {ts_code}: {exc}") from exc
 
@@ -193,11 +211,11 @@ class EasyTdxAdapter:
         self._limiter.wait()
         try:
             client = self._get_client()
-            hfq_df = client.get_stock_kline(market, code6, Period.DAILY,
-                                            start=0, count=_FULL_HISTORY_COUNT,
-                                            adjust=Adjust.HFQ)
+            hfq_df = fetch_with_timeout(
+                client.get_stock_kline, market, code6, Period.DAILY,
+                start=0, count=_FULL_HISTORY_COUNT, adjust=Adjust.HFQ)
             adj_map = self._derive_adj_factor(ohlcv, self._df_to_rows(hfq_df))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - hfq 失败/超时不阻断 raw
             log.warning("tdx hfq K线失败 %s → adj_factor=None: %s", ts_code, exc)
             self._reset_client()
         return {"ohlcv": ohlcv, "adj_factor": adj_map}
@@ -250,7 +268,11 @@ class EasyTdxAdapter:
         self._limiter.wait()
         try:
             client = self._get_client()
-            df = client.get_stock_kline(market, code6, Period.DAILY, start=0, count=n)
+            # DEFECT-HANG-1（R2）：指数 K线同走 tdx socket——套墙钟硬上限（全 fetch 路径 ≤30s）。
+            from .common import fetch_with_timeout
+
+            df = fetch_with_timeout(
+                client.get_stock_kline, market, code6, Period.DAILY, start=0, count=n)
             return self._df_to_rows(df)
         except Exception as exc:  # noqa: BLE001 - 指数取数失败 → []（amount 留 NULL，不阻断）
             log.warning("tdx 指数 K线失败 %s: %s", index_code, exc)

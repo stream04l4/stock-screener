@@ -72,10 +72,17 @@ class SinaKlineAdapter:
         :param count_recent: 仅取最近 N 根（available() 自检用，省流量）；None=全史。
         :return: pandas DataFrame（列 date/open/high/low/close/volume/amount...）；
             失败/空 → None。
+
+        **DEFECT-HANG-1（R2）**：akshare 内部是**裸 ``requests.get(url)`` 无 timeout**
+        （源码级确认）——sina 主源路径一次 stall = 整进程永久冻结（HANG-1 卡死签名）。
+        套 :func:`fetch_with_timeout` 墙钟硬上限（缺省 30s）：超时抛 FetchTimeoutError
+        （⊂ RuntimeError，worker 回退下一源），挂死线程 daemon 随进程退出回收。
         """
         import akshare as ak
 
-        df = ak.stock_zh_a_daily(symbol=symbol6, adjust=adjust)
+        from .common import fetch_with_timeout
+
+        df = fetch_with_timeout(ak.stock_zh_a_daily, symbol=symbol6, adjust=adjust)
         if df is None or len(df) == 0:
             return None
         if count_recent is not None and len(df) > count_recent:

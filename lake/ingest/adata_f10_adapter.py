@@ -77,10 +77,18 @@ class AdataF10Adapter:
     # ---------- 底层：adata get_core_index（唯一封装的接口——Q4） ----------
     @staticmethod
     def _core_index(code6: str):
-        """调 adata ``stock.finance.get_core_index``。失败抛异常（调用方处理）。"""
+        """调 adata ``stock.finance.get_core_index``。失败抛异常（调用方处理）。
+
+        **DEFECT-HANG-1（R2）**：adata 内部走 requests 打 datacenter.eastmoney.com，
+        超时语义不保证（依赖库版本/代理行为）——套 :func:`fetch_with_timeout` 墙钟
+        硬上限（缺省 30s）。fetch_f10 / available() 自检两条路径都经本方法 → 一处
+        包裹全覆盖。超时抛 FetchTimeoutError（⊂ RuntimeError，调用方既有 except 接住）。
+        """
         import adata
 
-        return adata.stock.finance.get_core_index(code6)
+        from .common import fetch_with_timeout
+
+        return fetch_with_timeout(adata.stock.finance.get_core_index, code6)
 
     @staticmethod
     def _code6(ts_code: str) -> str:

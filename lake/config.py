@@ -68,6 +68,12 @@ _DEFAULTS: Dict[str, Any] = {
     "sina_min_interval_s": 1.0,       # 新浪 ≥1s/股（2 次调用=raw+hfq，留余量）
     "tdx_min_interval_s": 0.5,        # tdx ≥0.5s/股
     "adata_f10_min_interval_s": 1.0,  # adata F10 ≥1s/股
+
+    # DEFECT-HANG-1（R3）：进度停滞看门狗阈值（分钟）。progress 文件 mtime 连续无推进
+    # 超此值 → 主线程 SIGINT abort + 干净退出（下次续传）。缺省 10min（brief R3"建议
+    # 10min，config 可调"）；正常最坏任务间隔 = 单取数墙钟上限(30s)×源数 + 限速 ≈ 分钟级，
+    # 10min 对健康运行零误杀。<=0 → 看门狗禁用（不启动）。
+    "hang_stall_minutes": 10.0,
 }
 
 

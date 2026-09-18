@@ -72,12 +72,23 @@ class BaoStockAdapter:
         """BaoStock 复权因子（仅除权日有行）。失败/空 → {}（调用方回退下一源）。
 
         QuotaGuard 内（1 次配额/股）；配额耗尽抛 BaoStockError → 调用方捕获回退。
+
+        **DEFECT-HANG-1（R2）**：baostock 协议层在**服务端关连接**时 ``send_msg``
+        内部 ``while True: recv`` 对空读 IndexError→except→返回 None→上层重试，形成
+        **~100% CPU 紧循环**（09-16 shutdown-spin 根因：strace 327k recvfrom/8s on
+        CLOSE-WAIT socket）。socket timeout patch 只救"半死连接慢滴答"，救不了这种
+        协议层自旋。套 fetch_with_timeout 墙钟硬上限：超时抛 FetchTimeoutError →
+        本方法返回 {}（回退下一源），挂死线程 daemon 随进程退出回收（其持有的
+        baostock 模块级 socket fd 由 OS 随进程消失）。
         """
         from .baostock_ingest import fetch_adjust_factor, load_t2_adj_factor
 
+        from .common import fetch_with_timeout
+
         try:
-            fields, rows = fetch_adjust_factor(self._get_client(), ts_code, start, end)
-        except Exception as exc:  # noqa: BLE001 - BaoStock 失败 → {}（回退，不 crash）
+            fields, rows = fetch_with_timeout(
+                fetch_adjust_factor, self._get_client(), ts_code, start, end)
+        except Exception as exc:  # noqa: BLE001 - BaoStock 失败/超时 → {}（回退，不 crash）
             log.warning("baostock adj_factor 失败 %s: %s", ts_code, exc)
             return {}
         return load_t2_adj_factor(None, ts_code, rows) if rows else {}
@@ -96,13 +107,18 @@ class BaoStockAdapter:
 
         start = start or "1990-01-01"
         end = end or "2099-12-31"
+        # DEFECT-HANG-1（R2）：同 fetch_adj_factor——baostock 协议层紧循环/半死连接
+        # 墙钟兜底。超时抛 FetchTimeoutError → 本方法 except 转 RuntimeError（回退）。
+        from .common import fetch_with_timeout
+
         try:
-            fields, rows = self._get_client().call_with_fields(
+            fields, rows = fetch_with_timeout(
+                self._get_client().call_with_fields,
                 bs.query_history_k_data_plus, label=f"lake_kline_{ts_code}",
                 code=ts_code, start_date=start, end_date=end,
                 fields="date,open,high,low,close,volume,amount",
                 frequency="d", adjustflag="2")  # 2=raw 不复权（adj 单独取）
-        except Exception as exc:  # noqa: BLE001 - BaoStock 失败 → 显式抛（回退下一源）
+        except Exception as exc:  # noqa: BLE001 - BaoStock 失败/超时 → 显式抛（回退下一源）
             raise RuntimeError(f"baostock K线失败 {ts_code}: {exc}") from exc
 
         ohlcv: List[Dict[str, Any]] = []
@@ -149,6 +165,23 @@ class BaoStockAdapter:
                 q, y = 4, y - 1
 
         client = self._get_client()
+        out: List[Dict[str, Any]] = []
+        # DEFECT-HANG-1（R2）：整段 F10（≤4 季 ×3 查询）墙钟兜底——baostock 协议层
+        # 紧循环/半死连接。超时抛 FetchTimeoutError → 本方法 except 返回已取部分
+        # （交叉校验源，缺失不阻断 T5 主源 adata）。
+        from .common import fetch_with_timeout
+
+        try:
+            out = fetch_with_timeout(self._fetch_f10_inner, client, ts_code, candidates)
+        except Exception as exc:  # noqa: BLE001 - F10 失败/超时 → 返回已取部分（不阻断）
+            log.warning("baostock T5 F10 失败 %s: %s", ts_code, exc)
+        return out
+
+    def _fetch_f10_inner(self, client, ts_code: str,
+                         candidates: List[Tuple[int, int]]) -> List[Dict[str, Any]]:
+        """fetch_f10 的取数主体（供 fetch_with_timeout 墙钟包裹；见其 docstring）。"""
+        from .baostock_ingest import fetch_balance, fetch_growth, fetch_profit
+
         out: List[Dict[str, Any]] = []
         for year, quarter in candidates:
             try:
