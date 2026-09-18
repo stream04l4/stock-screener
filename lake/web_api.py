@@ -1113,6 +1113,11 @@ def status() -> Dict[str, Any]:
     v6.1：**仅 ready 态**追加 ``source_pool``（by_source 9表恒定 / conflict_rows
     T1-T7+total / adapters / baostock_probe / stale，见 :func:`_build_source_pool`）
     ——locked/uninitialized 键集一个字节不动（三态契约红线）。
+
+    **coverage 键三态保留 = v6.0.4 契约，不得移除**：uninitialized/locked/ready 三态
+    响应体均含 ``coverage`` 键（uninitialized 全零 / locked 降级读 progress / ready 实算）——
+    test_lake_v604_lock 断言 uninitialized 响应逐字节不变，移除该键即破坏契约。
+    （v6.1.2 D-2 补录：原 commit message 声称已加此防争议注释、实测未加。）
     """
     import duckdb
 

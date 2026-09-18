@@ -8,6 +8,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import { nextTick } from "vue";
 
 // ---- LakeKlineChart（纯 props，无 store；echarts 动态 import 需 mock 防 happy-dom 无 canvas）----
 vi.mock("echarts", () => ({
@@ -129,6 +130,58 @@ describe("MarketTable：跳页输入框（v6.1.2 P3）", () => {
     await w.find("#btn-lake-market-jump").trigger("click");
     await new Promise((r) => setTimeout(r, 0));
     expect(marketMock.mock.calls.length).toBe(before);   // 无新请求
+    w.unmount();
+  });
+});
+
+// ---- D-1 回归守卫（v6.1.2 rework）：琥珀块总进度条必须是块级元素 ----
+// 缺陷根因：P2-A 总进度行原用 <span class="progress-bar">（display:inline），CSS
+// app.css .progress-bar{width:...} 对非替换 inline 元素不生效 → 渲染宽度恒 0，
+// 用户看不到进度填充。tester Playwright 实测 rect_w=0 / fill_pct_of_track=0。
+// 主仓自守（stages/ 的 tester 独立守卫不入库）：断言 #lake-backfill-total .progress-bar
+// 是块级元素（tagName=DIV，或 style/display 显式 block/inline-block）。
+// 注：api client 已在文件顶部 mock（marketMock，零网络）；此处 4 子组件全 stub，
+// 且 onActivated 在无 <KeepAlive> 时不触发 → 直接置位 store.backfillView 渲染琥珀块。
+const LakeTab = (await import("../../LakeTab.vue")).default;
+
+function mountLakeTabWithBackfill(tasks) {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useLakeStore();
+  // backfillView 仅成功拉取且 backfill_in_progress=true 时非 null（store.fetchStatus 语义）；
+  // 此处直接置位以渲染琥珀块（与真实 /status locked 态响应同形）。
+  store.backfillView = {
+    installed: true, initialized: true, backfill_in_progress: true, stopping: false,
+    lock_holder_pid: 3979536, updated_at: "2026-09-18 00:00:00",
+    coverage: {}, tasks,
+  };
+  return mount(LakeTab, {
+    attachTo: document.body,   // getBoundingClientRect / CSS display 需真实挂载
+    global: { plugins: [pinia],
+              stubs: { LakeSearchBar: true, StockPanoramaCard: true,
+                       MarketTable: true, LakeStatusCard: true } },
+  });
+}
+
+describe("D-1 回归守卫：琥珀块总进度条必须是块级元素（v6.1.2 rework）", () => {
+  it("#lake-backfill-total .progress-bar 为块级元素（tagName=DIV 或显式 block/inline-block），非 inline span", async () => {
+    // done/total≈60%（3126/5219，与 tester 复现口径一致）
+    const w = mountLakeTabWithBackfill([
+      { table: "kline_history", tier: "P3", state: "running", done: 3126, total: 5219, eta_min: 480 },
+    ]);
+    await nextTick();
+    const bar = w.find("#lake-backfill-total .progress-bar");
+    expect(bar.exists()).toBe(true);
+    // 核心断言：块级元素——tagName=DIV，或 style/display 显式 block/inline-block。
+    // <span>（inline）两者皆不满足 → 回归即 FAIL。
+    const tag = bar.element.tagName;
+    const inlineStyle = (bar.attributes("style") || "").toLowerCase();
+    const explicitBlock = /display\s*:\s*(block|inline-block)/.test(inlineStyle);
+    expect(tag === "DIV" || explicitBlock).toBe(true);
+    // 双保险：不得是 inline <span>（D-1 原缺陷形态）
+    expect(tag).not.toBe("SPAN");
+    // width 绑定生效（60% → 3126/5219*100=59.9→60），证明 :style 落在块级元素上
+    expect(inlineStyle).toContain("width: 60%");
     w.unmount();
   });
 });

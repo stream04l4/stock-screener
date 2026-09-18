@@ -89,7 +89,10 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
       <div class="lake-backfill-total" id="lake-backfill-total">
         <span class="muted small">总进度</span>
         <div class="progress-track lake-backfill-total-track">
-          <span class="progress-bar" :style="{ width: totalProgress.pct + '%' }"></span>
+          <!-- v6.1.2 D-1 修复：进度条必须是块级元素（<div>，与明细表行内/af-coverage
+               两处既有 .progress-bar 口径一致）。<span> 为 display:inline，CSS width 对
+               非替换 inline 元素不生效 → 渲染宽度恒 0，用户看不到进度填充。 -->
+          <div class="progress-bar" :style="{ width: totalProgress.pct + '%' }"></div>
         </div>
         <span class="mono small">{{ totalProgress.done }}/{{ totalProgress.total }}</span>
         <span class="muted small">预计剩余 {{ totalProgress.etaText }}</span>
