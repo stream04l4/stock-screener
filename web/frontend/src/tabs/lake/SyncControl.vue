@@ -62,7 +62,17 @@ const btn = computed(() => {
     const pid = lake.status.lock_holder_pid != null ? lake.status.lock_holder_pid : "未知";
     return { label: `⏹ 停止同步 (${pid})`, disabled: false, busy: false, action: "stop" };
   }
-  return { label: "▶ 启动同步", disabled: false, busy: false, action: "start" };
+  // v6.1.4 O2：idle → 主按钮=全史补库（原"▶ 启动同步"改名，语义不变）
+  return { label: "▶ 启动全史补库", disabled: false, busy: false, action: "start" };
+});
+
+// v6.1.4 O2：增量同步按钮（P3 每日增量）。仅 idle+installed+未 running 时可点；
+// running/starting/stopping/错误态 → 禁用（brief：running 时两按钮都禁）。
+const incBtn = computed(() => {
+  void lake._tick;   // 依赖锚点（与 btn 同节奏）
+  const enabled = (lake.syncState === "idle" && !!lake.status
+    && lake.status.installed && !lake.backfillRunning);
+  return { label: "▶ 启动增量同步", disabled: !enabled, busy: false };
 });
 
 const meta = computed(() => {
@@ -75,8 +85,12 @@ const meta = computed(() => {
 });
 
 function onClick() {
-  if (btn.value.action === "start") lake.startSync();
+  if (btn.value.action === "start") lake.startSync("history");
   else if (btn.value.action === "stop") lake.stopSync();
+}
+function onIncClick() {
+  // v6.1.4 O2：增量同步（P3）——mode=incremental 透传后端 ?mode=
+  lake.startSync("incremental");
 }
 </script>
 
@@ -87,6 +101,11 @@ function onClick() {
             :disabled="btn.disabled" @click="onClick">
       <span v-if="btn.muted" class="muted">{{ btn.label }}</span>
       <template v-else>{{ btn.label }}</template>
+    </button>
+    <!-- v6.1.4 O2：增量同步（P3）按钮——idle 时可点；running/starting/stopping/错误态禁用 -->
+    <button id="btn-lake-sync-incremental" class="primary-btn"
+            :disabled="incBtn.disabled" @click="onIncClick">
+      {{ incBtn.label }}
     </button>
     <span id="lake-sync-meta" class="muted small">{{ meta }}</span>
   </div>

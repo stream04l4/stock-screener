@@ -1111,6 +1111,344 @@ def run_reconcile(con, db_path: str, codes: Optional[List[str]],
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v6.1.4 O2：incremental（P3 每日增量——kline_daily 最近缺口 / valuation_daily 最新
+# 快照 / index_daily 近 N 日；占位 tasks 从未有 runner 消费，本命令首次实现）
+# ---------------------------------------------------------------------------
+def _kline_gap_start(con, code: str, fallback_days: int) -> str:
+    """T2 增量起点：该股库内 date_max+1（无行 → 近 fallback_days 自然日）。
+
+    为什么按股取缺口而非全市场统一窗口：history 灌完的股与漏灌/新股的 date_max
+    可能不同（停牌、补录），统一窗口要么重复拉老数据要么漏掉真缺口。date_max+1
+    精确到"缺的第一天"；无行（新股/漏灌）回退近 250 日（≈一年，覆盖 IPO 首日）。
+    """
+    row = con.execute(
+        "SELECT MAX(date) FROM kline_daily WHERE ts_code=?", [code]).fetchone()
+    dmax = row[0] if row else None
+    if dmax is None:
+        return (_dt.date.today() - _dt.timedelta(days=fallback_days)).isoformat()
+    # DATE 列 → datetime.date；+1 天 = 缺口第一天（ISO 字符串，与窗口比较同口径）
+    return (dmax + _dt.timedelta(days=1)).isoformat()
+
+
+def run_incremental(con, db_path: str, codes: Optional[List[str]],
+                    days: int) -> Dict[str, Any]:
+    """P3 每日增量（v6.1.4 O2，brief 逐字）：
+
+    - **kline_daily**：对全市场取**最近缺口**（每股 date_max+1→今日；无行→近 250 日），
+      走 source_pool ``resolve_source("kline_daily","ohlcv_amount")`` + adj_factor 组
+      （Q1 优先级 sina→tencent→tdx / sina→tdx→baostock，与 history/p0 同一 worker 语义）；
+      upsert 复用 load_t2（内部 common.upsert）。限速：sina/tdx adapter 内置
+      RateLimiter（config sina_min_interval_s 等）+ worker 尾 0.3s。
+    - **valuation_daily**：Tencent load_t3 逐只取最新快照（date=今日；腾讯快照是
+      "当前时点"数据，滞后多少补多少 = 每次覆盖写最新值）。取空前置一批探测
+      （全空=网络故障 → 抛错不标 done；个别缺失=停牌/批次失败 → 跳过该只）。
+    - **index_daily**：四指数腾讯主源近 N 日 upsert（同 run_t7 取数，done 键换新周期）。
+
+    **幂等**：done 键 per-table+code+**运行日**（``inc:YYYY-MM-DD`` / T3=日期本身）——
+    同日重跑跳过已灌；次日新键自动重取。全源失败 → worker 抛错**不 mark_done**
+    （下轮重试，防 done 键毒化）。"缺口内无新数据"（节假日/未收盘：源正常返回但
+    窗口 [start..今日] 无行）→ **视为完成**（确实无可补，标 done 避免每日空转报错；
+    下一交易日新运行日键自动重取）。
+
+    **quota/progress 落盘沿用 BackfillRunner 机制**（done 键/mark_done/save_progress
+    零改动复用）；收尾把 tasks 占位条目刷成真实 total/done（见
+    :func:`_refresh_incremental_task_view`——O3：kline_history 完成态如实标 done、
+    T5 加 pending 条目、T6 标 no_source）。
+
+    :param days: T7 指数窗口（交易日数，默认 250；取数 n=days+30 自然日缓冲，同 run_t7）。
+    """
+    from lake.backfill import BackfillRunner, Task
+    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.ingest import source_pool as sp
+    from lake.ingest.tencent_ingest import (INDEX_CODES, fetch_kline_ohlcv,
+                                            fetch_snapshot, load_t2, load_t3, load_t7)
+    from screener.data.tencent import TencentClient
+
+    today_s = _today_beijing()
+    inc_period = f"inc:{today_s}"   # T2/T7 幂等键的周期段（per-table+code+运行日）
+
+    # Q6/健康探测（与 p0/history 一致：baostock adapter available() 读 Q6 结果；
+    # 落 source_health.json 按 db_path 派生——自定义 --db 不污染生产目录）
+    probe_res = _run_bs_probe(db_path)
+    health_res = _probe_all_adapters(db_path)
+
+    codes = codes or _universe_codes(con)
+    runner = BackfillRunner(db_path=db_path)
+    tclient = TencentClient()
+    stats: Dict[str, Any] = {"codes_requested": len(codes), "as_of": today_s}
+
+    # 多源池（门控同 run_t2/run_history：LAKE_MULTISOURCE=0 / 源开关全关 → [] → legacy）
+    ohlcv_srcs = sp.resolve_source("kline_daily", "ohlcv_amount")
+    adj_srcs = sp.resolve_source("kline_daily", "adj_factor")
+    t2_close_pct = crosscheck_threshold("t2_close_pct", 0.5)
+    t2_amount_pct = crosscheck_threshold("t2_amount_pct", 2.0)
+    t2_af_pct = crosscheck_threshold("t2_adj_factor_pct", 0.5)
+
+    # ---- T2 kline_daily：每股最近缺口（date_max+1→今日；无行→近 250 日）----
+    gap_starts: Dict[str, str] = {c: _kline_gap_start(con, c, 250) for c in codes}
+
+    def t2_worker(task: Task) -> None:
+        code = task.ts_code
+        start = gap_starts[code]
+        if not ohlcv_srcs and not adj_srcs:
+            # legacy 单源路径（池全不可用：离线单测/新源全降级）——腾讯窗口取数
+            kl = fetch_kline_ohlcv(tclient, code, n=days + 30) or []
+            kl = [r for r in kl if str(r["date"]) >= start]
+            if not kl:
+                return   # 缺口内无新数据（节假日/未收盘）→ 视为完成（不写库）
+            load_t2(con, code, kl, adj_map=None)
+            time.sleep(0.3)
+            return
+
+        kl: Optional[List[Dict[str, Any]]] = None
+        source = "tencent"
+        adj_map: Optional[Dict[str, float]] = None
+        for ad in ohlcv_srcs:
+            try:
+                res = ad.fetch_kline(code, start=start)   # sina 忽略 start→全史取尾部窗口
+            except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源（fallback）
+                log.warning("incremental T2 %s source=%s 取数失败，回退下一源: %s",
+                            code, ad.name, exc)
+                continue
+            if res and res.get("ohlcv"):
+                kl = res["ohlcv"]
+                source = ad.name
+                adj_map = res.get("adj_factor")
+                break
+        if kl is None:
+            raise RuntimeError(f"T2 增量 K线所有源均失败 {code}（不标 done，下轮重试）")
+
+        # 窗口化：只 upsert 缺口 [start..今日] 内的行（更早历史不动）
+        kl = [r for r in kl if str(r["date"]) >= start]
+        if not kl:
+            return   # 源正常但缺口内无新数据（节假日/未收盘）→ 视为完成
+
+        # adj_factor：主源自带推导值优先；否则按 adj 优先级补取（同 run_t2）
+        if not adj_map:
+            for ad in adj_srcs:
+                try:
+                    m = ad.fetch_adj_factor(code, start, today_s)
+                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
+                    log.warning("incremental T2 %s adj source=%s 失败，回退下一源: %s",
+                                code, ad.name, exc)
+                    continue
+                if m:
+                    adj_map = m
+                    break
+
+        # cross_check：采用 sina 主源 → tdx 缺口窗口轻量验证（不阻断，写 conflict_src）
+        conflict_src: Optional[str] = None
+        if source == "sina":
+            tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+            if tdx_ad is not None:
+                try:
+                    if tdx_ad.available():
+                        vres = tdx_ad.fetch_kline(code, start=start, end=None)
+                        vrows = (vres or {}).get("ohlcv") or []
+                        if vrows:
+                            conflict_src = sp.cross_check_kline(
+                                kl, "sina", vrows, "tdx",
+                                close_pct=t2_close_pct, amount_pct=t2_amount_pct)
+                            if adj_map and (vres or {}).get("adj_factor"):
+                                af_conf = sp.cross_check_adj_factor(
+                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
+                                conflict_src = _merge_conflict(conflict_src, af_conf)
+                except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
+                    log.warning("incremental T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
+
+        load_t2(con, code, kl, adj_map=adj_map, source=source,
+                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
+        time.sleep(0.3)   # 限速纪律（adapter RateLimiter 之外的兜底小睡，同 run_t2）
+
+    t2_tasks = [Task(priority=3, table="kline_daily", ts_code=c,
+                     period_or_date=inc_period, tier="P3") for c in codes]
+    stats["t2"] = runner.run(t2_tasks, t2_worker)
+
+    # ---- T3 valuation_daily：腾讯批量快照（date=今日；滞后多少补多少）----
+    # 前置一批探测：全空 = 网络/接口故障 → 抛错中止（不标 done，防"假完成"毒化）；
+    # 个别缺失 = 停牌/单批失败 → 该只跳过（次日新运行日键自动补）。
+    probe_snaps = fetch_snapshot(tclient, codes[:50]) if codes else {}
+    if not probe_snaps:
+        raise RuntimeError("T3 估值快照全空（腾讯接口故障？）——本轮增量中止，"
+                           "不标 done（下轮重试）")
+
+    def t3_worker(task: Task) -> None:
+        snaps = fetch_snapshot(tclient, [task.ts_code])
+        snap = snaps.get(task.ts_code)
+        if snap:
+            load_t3(con, task.ts_code, snap, today_s)
+        # 缺失（停牌/批次失败）→ 跳过不写（视为完成；次日新键重取）
+        time.sleep(0.3)
+
+    t3_tasks = [Task(priority=3, table="valuation_daily", ts_code=c,
+                     period_or_date=today_s, tier="P3") for c in codes]
+    stats["t3"] = runner.run(t3_tasks, t3_worker)
+
+    # ---- T7 index_daily：四指数腾讯主源近 N 日 upsert（同 run_t7 取数口径）----
+    def t7_worker(task: Task) -> None:
+        ic = task.ts_code
+        srcs = sp.resolve_source("index_daily", "ohlcv")
+        kl, source = None, "tencent"
+        if srcs:
+            for ad in srcs:
+                try:
+                    rows = ad.fetch_index_kline(ic, n=days + 30)
+                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
+                    log.warning("incremental T7 %s source=%s 取数失败，回退下一源: %s",
+                                ic, ad.name, exc)
+                    continue
+                if rows:
+                    kl, source = rows, ad.name
+                    break
+        else:
+            kl = fetch_kline_ohlcv(tclient, ic, n=days + 30)   # legacy 直连（零回归兜底）
+        # tdx amount 补充 + close 交叉校验（同 run_t7：腾讯指数行 amount 缺→NULL；
+        # tdx 提供则补上，>0.3% 记 conflict_src 不阻断）
+        tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
+        conflict = None
+        tdx_rows: List[Dict[str, Any]] = []
+        if kl and tdx_ad is not None:
+            try:
+                if tdx_ad.available():
+                    tdx_rows = tdx_ad.fetch_index_kline(ic, n=days + 30) or []
+            except Exception as exc:  # noqa: BLE001 - amount 补充失败不阻断（留 NULL）
+                log.warning("incremental T7 %s tdx amount 补充失败（留 NULL）: %s", ic, exc)
+        if kl and tdx_rows:
+            tdx_map = {r["date"]: r for r in tdx_rows}
+            for r in kl:
+                tr = tdx_map.get(r["date"])
+                if tr is not None and r.get("amount") is None \
+                        and tr.get("amount") is not None:
+                    r["amount"] = tr["amount"]   # 补缺口（不覆盖腾讯已有值）
+            conflict = sp.cross_check_kline(kl, source, tdx_rows, "tdx",
+                                            close_pct=crosscheck_threshold("t7_close_pct", 0.3))
+        if kl:
+            load_t7(con, ic, kl, source=source, conflict_src=conflict)
+        time.sleep(0.3)   # 指数间小睡（同 run_t7）
+
+    t7_tasks = [Task(priority=3, table="index_daily", ts_code=ic,
+                     period_or_date=inc_period, tier="P3") for ic in INDEX_CODES]
+    stats["t7"] = runner.run(t7_tasks, t7_worker)
+
+    # O2/O3：tasks 占位条目刷成真实 total/done + kline_history 完成态 + T5/T6 条目
+    _refresh_incremental_task_view(runner, con, today_s)
+    return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
+            "baostock_probe": probe_res, "source_health": health_res,
+            "multisource": bool(ohlcv_srcs or adj_srcs),
+            "ohlcv_sources": [a.name for a in ohlcv_srcs],
+            "adj_sources": [a.name for a in adj_srcs]}
+
+
+def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
+    """O2/O3：incremental 收尾把 progress tasks 视图刷成**真实** total/done。
+
+    - kline_daily/valuation_daily（P3）：total=stock_master 行数（brief 逐字；含
+      --codes 冒烟子集时也按全集口径，done=今日已灌数），done==total → state="done"；
+    - index_daily（P3）：total=四指数数、done=今日已灌指数数；
+    - **kline_history（P2）**：完成态如实标 done——done 明细从 progress ``done`` 键集
+      重算（**不依赖已死进程自报**：history 长跑被杀后 entry 停在 state=running，
+      incremental/status 路径负责纠正）；total=当前 universe 行数、done=universe 内
+      已灌数（退市股 done 键不计入，防 done>total）；done==total → state="done"；
+    - **fundamentals_quarterly（T5）**：加进 tasks（total=universe 行数、state=pending、
+      备注"history --t5 或增量均可灌"；已跑过 history --t5 的按 f10_full done 键计 done）；
+    - **holders_snapshot（T6）**：state="no_source"（无可用源，前端灰 badge"暂无数据源"）。
+
+    runner.run 的 _refresh_task_view 只回填**本次队列**分组（--codes 子集时 total=子集数）——
+    本函数在其后按全集口径覆盖写 + save_progress（Web /status 3s 轮询可见）。
+    """
+    from lake.backfill import save_progress
+    from lake.ingest.tencent_ingest import INDEX_CODES
+
+    prog = runner.progress
+    universe = set(_universe_codes(con))
+    universe_n = len(universe)
+    inc_period = f"inc:{today_s}"
+
+    def _entry(table: str, tier: str = "P3") -> Dict[str, Any]:
+        e = next((t for t in prog["tasks"] if t.get("table") == table), None)
+        if e is None:
+            e = {"table": table, "tier": tier, "total": 0, "done": 0,
+                 "quota_used_today": runner.quota_used_today(),
+                 "quota_budget": runner.budget_per_day,
+                 "state": "pending", "eta_min": None, "last_error": ""}
+            prog["tasks"].append(e)
+        return e
+
+    def _done_codes(table: str, period: Optional[str] = None,
+                    codes: Optional[set] = None) -> set:
+        """该表 done 键的 code 集合（∩ codes——默认 universe；T7 传指数集，
+        指数 code 不在股票 universe 里，交集恒空=done 恒 0 的 bug 源）。"""
+        out = set()
+        for k in runner._done:
+            if k[0] != table:
+                continue
+            if period is not None and k[2] != period:
+                continue
+            out.add(k[1])
+        return out & (codes if codes is not None else universe)
+
+    # T2/T3（per-code+运行日 done 键）：total=universe、done=今日已灌
+    for table, period in (("kline_daily", inc_period), ("valuation_daily", today_s)):
+        e = _entry(table)
+        done_n = len(_done_codes(table, period))
+        e["total"] = universe_n
+        e["done"] = done_n
+        if universe_n > 0 and done_n >= universe_n:
+            e["state"] = "done"
+        elif e.get("state") in ("running", "stopping"):
+            # runner.run 对未灌完的分组把 state 留在 "running"（v6.0.8 视图语义）——
+            # 但本函数在**进程收尾**调用，此刻无活跃 writer → 非 done 一律归位 pending
+            # （防 Web /status 永久误报"灌数中"；真在跑时 status 走 locked 分支不读此文件）
+            e["state"] = "pending"
+
+    # T7（四指数）——done 键按**指数集**计（指数 code 不在股票 universe，不能走默认交集）
+    e7 = _entry("index_daily")
+    done7 = len(_done_codes("index_daily", inc_period, codes=set(INDEX_CODES)))
+    e7["total"] = len(INDEX_CODES)
+    e7["done"] = min(done7, len(INDEX_CODES))
+    if e7["done"] >= e7["total"]:
+        e7["state"] = "done"
+    elif e7.get("state") in ("running", "stopping"):
+        e7["state"] = "pending"   # 同 T2/T3：收尾态无活跃 writer，非 done 归位 pending
+
+    # kline_history（P2 全史）：完成态如实标 done（不依赖已死进程自报）
+    eh = _entry("kline_history", tier="P2")
+    hist_done = len(_done_codes("kline_history"))   # 固定键 full_history，跨天累计
+    eh["total"] = universe_n
+    eh["done"] = hist_done
+    if universe_n > 0 and hist_done >= universe_n:
+        eh["state"] = "done"
+    elif eh.get("state") in ("running", "stopping"):
+        # 死进程残留纠正（生产实况：history 被杀后停在 running，done 明细齐全）
+        eh["state"] = "pending"
+
+    # T5 fundamentals_quarterly：加进 tasks（pending；已灌的按 f10_full done 键计）
+    e5 = _entry("fundamentals_quarterly", tier="P2")
+    done5 = len(_done_codes("fundamentals_quarterly"))   # 固定键 f10_full
+    e5["total"] = universe_n
+    e5["done"] = done5
+    e5["state"] = "done" if (universe_n > 0 and done5 >= universe_n) else "pending"
+    e5["note"] = "history --t5 或增量均可灌（adata F10 主源）"
+
+    # T6 holders_snapshot：无可用源 → no_source（前端灰 badge"暂无数据源"）
+    e6 = _entry("holders_snapshot", tier="P3")
+    e6["total"] = 0
+    e6["done"] = 0
+    e6["state"] = "no_source"
+    e6["note"] = "无可用数据源（controller_* 待补源）"
+
+    save_progress(prog, runner.progress_path)
+
+
+def cmd_incremental(args, con, db_path: str) -> int:
+    """incremental 子命令入口（v6.1.4 O2）。"""
+    codes = _parse_codes(args.codes)
+    summary = run_incremental(con, db_path, codes, args.days)
+    _print_summary("incremental", summary)
+    return EXIT_OK
+
+# ---------------------------------------------------------------------------
 # status（coverage + progress 摘要）
 # ---------------------------------------------------------------------------
 def run_status(con, db_path: str) -> Dict[str, Any]:
@@ -1155,6 +1493,20 @@ def run_status(con, db_path: str) -> Dict[str, Any]:
     # monkeypatch + 行为不变；自定义 --db → 该库旁，不再硬编码 data/lake/）。
     prog_path = _progress_for_db(db_path)
     prog = load_progress(prog_path)
+    # v6.1.4 O3：status 路径刷新 tasks 视图（kline_history 完成态如实标 done、T5/T6 条目）——
+    # **能拿到有效 con = 无活跃 writer**（DuckDB 独占写锁下在跑灌数会让 status 的
+    # connect 直接 LakeLocked，到不了这里）→ 无条件刷新安全。纠正场景：history 长跑被
+    # 强杀后 entry 停在 state=running（生产实况），由 incremental/status 路径负责纠正——
+    # **不依赖已死进程自报**。load_progress 每次重读文件 → 纠正后 Web /status（直接读
+    # 同一文件）立即可见。
+    try:
+        from lake.backfill import BackfillRunner
+
+        _refresh_incremental_task_view(BackfillRunner(db_path=db_path), con,
+                                       _today_beijing())
+        prog = load_progress(prog_path)
+    except Exception as exc:  # noqa: BLE001 - status 只读语义：刷新失败不阻断（旧视图）
+        log.warning("status tasks 视图刷新失败（不阻断，沿用文件现值）: %s", exc)
     return {
         "sub": "status",
         "db_path": db_path,
@@ -1229,6 +1581,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--t5", action="store_true",
                     help="v6.1：同时灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）")
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser(
+        "incremental",
+        help="v6.1.4 O2：P3 每日增量（kline_daily 最近缺口 / valuation_daily 最新快照 / index_daily 近 N 日）")
+    sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=全集）")
+    sp.add_argument("--days", type=int, default=250,
+                    help="T7 指数窗口交易日数（默认 250；取数 n=days+30 自然日缓冲）")
+    sp.set_defaults(func=cmd_incremental)
 
     sp = sub.add_parser("reconcile",
                         help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
@@ -1327,9 +1687,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from lake.conn import LakeInvalidFile, LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
-    # B-4：写命令（init/p0/history/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
+    # B-4：写命令（init/p0/history/incremental/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
-    write_cmd = args.cmd in ("init", "p0", "history", "reconcile")
+    write_cmd = args.cmd in ("init", "p0", "history", "incremental", "reconcile")
 
     if not write_cmd:
         return _run_unlocked(args)

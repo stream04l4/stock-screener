@@ -57,6 +57,28 @@ function stateCell(t) {
 // ---- tasks 表（lakeRenderTasksTable L1199-1212）----
 function taskPct(t) { return t.total ? Math.round((t.done / t.total) * 100) : 0; }
 
+// v6.1.4 O3：T1~T9 ↔ tasks 对应关系（"对应表"列——让 Joel 一眼看懂 pending 三表 =
+// T2/T3/T7 的每日增量部分（P3），与 kline_history（T2 全史，已完成）是同一张库表的
+// 不同灌数阶段）。未收录的 table → 原样显示（不猜映射）。
+const TASK_TABLE_CN = {
+  stock_master: "T1 股票主档",
+  kline_history: "= T2 全史（kline_daily）",
+  kline_daily: "T2 增量（kline_daily）",
+  valuation_daily: "T3 估值日线",
+  fundamentals_quarterly: "T5 季度基本面",
+  holders_snapshot: "T6 前十大股东",
+  index_daily: "T7 指数日线",
+};
+function taskTableCn(t) { return TASK_TABLE_CN[t.table] || t.table; }
+
+// v6.1.4 O3：tasks 状态徽章。no_source（T6 holders_snapshot 无可用源）→ 灰 badge
+// "暂无数据源"（区别于 pending"待补"——不是没做，是**没有源可做**）。
+function taskStateCell(t) {
+  if (t.state === "no_source") return { cls: "lake-st-empty", label: "暂无数据源" };
+  const [cls, label] = STATE_BADGE[t.state] || ["lake-st-empty", String(t.state ?? "idle")];
+  return { cls, label };
+}
+
 const views = computed(() => (d.value && d.value.views) || []);
 const afPct = computed(() => {
   const p = d.value && d.value.adj_factor_coverage_pct;
@@ -139,19 +161,24 @@ const tables = computed(() => (d.value && d.value.tables) || []);
           </div>
         </div>
 
-        <!-- tasks 表（正常态显示；v6.1.2 P1-B：灌数中态**不渲染**——琥珀块 #lake-backfill-tasks
-             已展示同一份 tasks，避免底部再渲染一遍造成双份冗余。非灌数态照常显示。） -->
-        <div v-if="!d.backfill_in_progress" class="tbl-wrap lake-tasks-wrap">
+        <!-- tasks 表（v6.1.4 O3：**仅 backfill_in_progress=true 时显示**——非同步态整块隐藏；
+             琥珀块 #lake-backfill-tasks 同条件出现，两表数据同源 progress.tasks。
+             v6.1.2 P1-B 的"灌数中不渲染去冗余"被 O3 显隐规则取代：Joel 要的是
+             "非同步态别看到一堆 pending"，同步态才需要看补齐进度。）
+             v6.1.4 O3：加"对应表"列（T1~T9 ↔ tasks 映射；kline_history="= T2 全史"、
+             kline_daily="T2 增量"…）+ no_source 灰 badge"暂无数据源"（T6）。 -->
+        <div v-if="d.backfill_in_progress" class="tbl-wrap lake-tasks-wrap">
           <table class="data" id="lake-tasks-table">
             <thead><tr>
-              <th>表</th><th>层级</th><th>状态</th><th class="num">进度</th>
+              <th>表</th><th>对应表</th><th>层级</th><th>状态</th><th class="num">进度</th>
               <th class="num">ETA(min)</th>
             </tr></thead>
             <tbody>
-              <tr v-if="!d.tasks || !d.tasks.length"><td colspan="5" class="placeholder">暂无后台补齐任务</td></tr>
+              <tr v-if="!d.tasks || !d.tasks.length"><td colspan="6" class="placeholder">暂无后台补齐任务</td></tr>
               <tr v-for="(t, i) in d.tasks || []" :key="i">
-                <td>{{ t.table }}</td><td>{{ t.tier }}</td>
-                <td><span class="badge" :class="t.state || 'idle'">{{ t.state || "idle" }}</span></td>
+                <td>{{ t.table }}</td>
+                <td class="muted small">{{ taskTableCn(t) }}</td><td>{{ t.tier }}</td>
+                <td><span class="badge" :class="taskStateCell(t).cls">{{ taskStateCell(t).label }}</span></td>
                 <td class="num lake-task-progress">
                   <div class="progress-track" style="margin:0"><div class="progress-bar" :style="{ width: taskPct(t) + '%' }"></div></div>
                   {{ (t.done ?? 0) + "/" + (t.total ?? 0) }}

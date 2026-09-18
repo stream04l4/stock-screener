@@ -175,6 +175,37 @@ describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
     lake._stopTimerForTest();
   });
 
+  it("startSync('incremental')：URL 带 ?mode=incremental + toast'增量同步已启动'（v6.1.4 O2）", async () => {
+    const s = mockFetch();
+    let lastStartUrl = "";
+    // 在 mockFetch 路由基础上包一层记录 start URL（其余行为不变）
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.startsWith("/api/lake/sync/start")) { s.startCalls += 1; lastStartUrl = u; }
+      return fetchImpl(u);
+    });
+    // 复用 mockFetch 的路由语义（status/start/stop）——fetchImpl 捕获原实现不可行，
+    // 直接按同一契约重写路由（s.status/s.startRes/s.stopRes 共享状态）。
+    async function fetchImpl(u) {
+      if (u.startsWith("/api/lake/status")) return jsonRes(200, s.status || statusBody());
+      if (u.startsWith("/api/lake/sync/start")) return s.startRes;
+      if (u.startsWith("/api/lake/sync/stop")) return s.stopRes;
+      return jsonRes(404, {});
+    }
+    const lake = useLakeStore();
+    await flush();
+    await lake.startSync("incremental");
+    await flush();
+    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=incremental");
+    expect(toastMsg()).toBe("✓ 增量同步已启动（PID 4321）");
+    // history 缺省：URL 显式带 ?mode=history（后端 default 兜底，前端恒传 mode）
+    lastStartUrl = "";
+    await lake.startSync();
+    await flush();
+    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=history");
+    lake._stopTimerForTest();
+  });
+
   it("stopSync：waiting_task → 锁定 stopping；轮询失败（status=null）**不覆盖锁定态**", async () => {
     const s = mockFetch(statusBody({ backfill_in_progress: true, lock_holder_pid: 99 }));
     const lake = useLakeStore();

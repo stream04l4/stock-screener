@@ -401,6 +401,21 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-spp-bar { flex: 1; height: 12px; display: flex; border-radius: 4px; overflow: hidden; background: #edf1f7; min-width: 80px; }
 .lake-spp-bar i { display: block; height: 100%; }
 .lake-spp-row-total { width: 90px; flex: none; text-align: right; font-size: 12px; font-family: var(--mono); color: #475569; }
+/* v6.1.4 O5：固定色板图例行（区块1标题下；● 色点 + 中文名，同源 sourceMeta.js） */
+.lake-spp-legend { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 6px; font-size: 11.5px; color: #475569; }
+.lake-spp-legend-item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.lake-spp-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+/* v6.1.4 O4：源卡片勾选 + 探测按钮（标题行内联） */
+.lake-spp-toggle { display: inline-flex; align-items: center; cursor: pointer; margin: 0; }
+.lake-spp-toggle input { margin: 0; cursor: pointer; accent-color: var(--accent, #2563eb); }
+.lake-spp-probe, .lake-spp-probe-all { font-size: 11px; padding: 1px 7px; line-height: 1.5; }
+.lake-spp-probe:disabled, .lake-spp-probe-all:disabled { opacity: .5; cursor: default; }
+/* v6.1.4 O1：全市场表头可点排序（▲▼指示；active 列高亮） */
+.lake-sort-th { cursor: pointer; user-select: none; white-space: nowrap; }
+.lake-sort-th:hover { color: var(--accent, #2563eb); }
+.lake-sort-active { color: var(--accent, #2563eb); font-weight: 700; }
+.lake-sort-mark { font-size: 10px; margin-left: 2px; }
+
 /* 区块2（v6.1.3）：数据源状态卡（每源一张；SOURCE_COLORS 左边框在组件内联着色） */
 .lake-spp-adapters { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
 .lake-spp-adapter { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; display: flex; flex-direction: column; gap: 4px; }

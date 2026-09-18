@@ -2,8 +2,8 @@
 // 覆盖：
 // - LakeKlineChart：复权三态按钮组（默认 qfq 高亮）+ 点击 emit adjust-change +
 //   adjustNote 降级提示小字（P1-A）。
-// - LakeStatusCard：backfill_in_progress=true → #lake-tasks-table 不渲染（去双份冗余，
-//   P1-B）；非灌数态照常渲染。
+// - LakeStatusCard：tasks 表显隐（v6.1.4 O3：仅 backfill_in_progress=true 渲染——
+//   取代 v6.1.2 P1-B"灌数中不渲染去冗余"；含'对应表'列 + no_source 灰 badge）。
 // - MarketTable：跳页输入框 clamp[1,pages] + Go/回车触发 page 变化 → 重取（P3）。
 import { describe, it, expect, vi } from "vitest";
 import { mount } from "@vue/test-utils";
@@ -65,25 +65,34 @@ function mountStatus(status) {
   });
 }
 
-describe("LakeStatusCard：tasks 表灌数中不渲染（v6.1.2 P1-B）", () => {
-  it("backfill_in_progress=true → #lake-tasks-table 不渲染（琥珀块已展示同一份 tasks）", () => {
+describe("LakeStatusCard：tasks 表显隐（v6.1.4 O3：仅 backfill_in_progress=true 显示）", () => {
+  it("backfill_in_progress=true → #lake-tasks-table 渲染 + '对应表'列（O3；取代 v6.1.2 P1-B 去冗余规则）", () => {
     const w = mountStatus({
       installed: true, initialized: true, backfill_in_progress: true,
       lock_holder_pid: 12345, updated_at: "2026-09-17 21:00:00",
-      tasks: [{ table: "kline_history", tier: "P3", state: "running", done: 10, total: 100 }],
+      tasks: [
+        { table: "kline_history", tier: "P2", state: "running", done: 10, total: 100 },
+        { table: "holders_snapshot", tier: "P3", state: "no_source", done: 0, total: 0 },
+      ],
     });
-    expect(w.find("#lake-tasks-table").exists()).toBe(false);
+    expect(w.find("#lake-tasks-table").exists()).toBe(true);
+    // O3：'对应表'列（T1~T9 ↔ tasks 映射）
+    const heads = w.findAll("#lake-tasks-table thead th").map((h) => h.text());
+    expect(heads).toContain("对应表");
+    const rows = w.findAll("#lake-tasks-table tbody tr");
+    expect(rows.length).toBe(2);
+    expect(rows[0].text()).toContain("= T2 全史（kline_daily）");
+    // O3：no_source → 灰 badge '暂无数据源'（T6 holders_snapshot 无可用源）
+    expect(rows[1].text()).toContain("暂无数据源");
   });
 
-  it("非灌数态（backfill_in_progress=false）→ #lake-tasks-table 照常渲染", () => {
+  it("非灌数态（backfill_in_progress=false）→ #lake-tasks-table **整块隐藏**（O3：非同步态不显示补齐进度）", () => {
     const w = mountStatus({
       installed: true, initialized: true, backfill_in_progress: false,
       updated_at: "2026-09-17 21:00:00",
-      tasks: [{ table: "kline_history", tier: "P3", state: "done", done: 100, total: 100 }],
+      tasks: [{ table: "kline_history", tier: "P2", state: "done", done: 100, total: 100 }],
     });
-    expect(w.find("#lake-tasks-table").exists()).toBe(true);
-    // tasks 行渲染
-    expect(w.findAll("#lake-tasks-table tbody tr").length).toBe(1);
+    expect(w.find("#lake-tasks-table").exists()).toBe(false);
   });
 });
 

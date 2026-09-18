@@ -32,13 +32,42 @@ beforeEach(() => { vi.useFakeTimers(); pinia = createPinia(); setActivePinia(pin
 afterEach(() => { vi.useRealTimers(); });
 
 describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", () => {
-  it("idle → [▶ 启动同步] 可点、meta 空", async () => {
+  it("idle → [▶ 启动全史补库] + [▶ 启动增量同步] 均可点、meta 空（v6.1.4 O2：双按钮）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody();
     await tick();
-    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动同步");
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("▶ 启动全史补库");
     expect(w.find("#btn-lake-sync-toggle").attributes("disabled")).toBeUndefined();
+    // v6.1.4 O2：增量按钮（P3）——idle 时可点
+    expect(w.find("#btn-lake-sync-incremental").text()).toBe("▶ 启动增量同步");
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeUndefined();
     expect(w.find("#lake-sync-meta").text()).toBe("");
+  });
+
+  it("running → 两按钮都禁（brief：running 时两按钮都禁）+ [⏹ 停止同步 (pid)]", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 5 });
+    await tick();
+    expect(w.find("#btn-lake-sync-toggle").text()).toBe("⏹ 停止同步 (5)");
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
+  });
+
+  it("starting/stopping/错误态 → 增量按钮禁用（锁定态两按钮都禁）", async () => {
+    const { lake, w } = mountSC();
+    lake.status = statusBody();
+    await tick();
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeUndefined();
+    lake.syncState = "starting";
+    await tick();
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
+    lake.syncState = "stopping";
+    lake.stoppingSince = Date.now() - 1000;
+    await tick();
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
+    lake.syncState = "idle";
+    lake.status = null;   // 错误态
+    await tick();
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
   });
 
   it("running → [⏹ 停止同步 (pid)] + meta 'PID x · 进度更新于 …'（会话未观察跃迁）", async () => {
@@ -48,6 +77,8 @@ describe("SyncControl：按钮态（vanilla lakeRenderSyncControl 对齐）", ()
     const btn = w.find("#btn-lake-sync-toggle");
     expect(btn.text()).toBe("⏹ 停止同步 (4242)");
     expect(btn.attributes("disabled")).toBeUndefined();
+    // v6.1.4 O2：running 时增量按钮禁用（两个"启动"都不可点——history/incremental 互斥）
+    expect(w.find("#btn-lake-sync-incremental").attributes("disabled")).toBeDefined();
     // runningSince=null（测试直接置 status，未走 fetchStatus 跃迁观察）→ 显示进度更新时间
     expect(w.find("#lake-sync-meta").text()).toContain("PID 4242");
     // vanilla 口径：String(updated_at).slice(5,16) → "09-17T08:00"（T 保留，与 app.js 一致）

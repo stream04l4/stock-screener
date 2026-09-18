@@ -17,15 +17,38 @@ const emit = defineEmits(["select", "error"]);
 
 // ---- 筛选/分页本地 state（变化即拉）----
 const page = ref(1);
-const sort = ref("total_mv");      // total_mv | ttm_yield_pct（降序 NULLS LAST）
+// v6.1.4 O1：排序 = 表头点击（列名白名单 code/name/industry_name/close/volume/
+// amount/pe_ttm/pb/date + asc|desc；后端非法→400）。sort/order 进 useLiveQuery key
+// → 变化即重取（与分页同机制）。缺省 sort=code&order=desc（后端默认列）。
+const sort = ref("code");
+const order = ref("desc");
 const industry = ref("");          // industry_csric2 精确过滤（""=全部行业）
 const soe = ref("");               // all | soe | other（""=all，不传参）
 
+// v6.1.4 O1：表头可点排序列（现有表格全部数值列 + 代码/名称/行业）。key=后端白名单列名，
+// label=表头文案，num=右对齐。再点同列 → 切换 asc/desc；点新列 → desc（brief：▲▼指示）。
+const SORT_COLS = [
+  { key: "code", label: "代码" },
+  { key: "name", label: "名称" },
+  { key: "industry_name", label: "行业" },
+  { key: "pe_ttm", label: "PE", num: true },
+  { key: "pb", label: "PB", num: true },
+];
+function onSortCol(key) {
+  if (sort.value === key) order.value = order.value === "desc" ? "asc" : "desc";
+  else { sort.value = key; order.value = "desc"; }
+  page.value = 1;   // 排序变化 → 回第 1 页（与筛选同语义）
+}
+function sortMark(key) {
+  if (sort.value !== key) return "";
+  return order.value === "desc" ? " ▼" : " ▲";
+}
+
 // ---- 市场数据（key 含全部参数 → 变化即拉；TTL0：纯按需+事件失效）----
 const marketQ = useLiveQuery(
-  () => `lake:market:${page.value}:${sort.value}:${industry.value}:${soe.value}`,
+  () => `lake:market:${page.value}:${sort.value}:${order.value}:${industry.value}:${soe.value}`,
   () => {
-    let qs = `page=${page.value}&sort=${encodeURIComponent(sort.value)}`;
+    let qs = `page=${page.value}&sort=${encodeURIComponent(sort.value)}&order=${encodeURIComponent(order.value)}`;
     if (industry.value) qs += "&industry=" + encodeURIComponent(industry.value);
     if (soe.value && soe.value !== "all") qs += "&soe=" + encodeURIComponent(soe.value);
     return api("/api/lake/market?" + qs);
@@ -93,10 +116,8 @@ function go(p) { if (p >= 1) page.value = p; }
         <option value="soe">央国企</option>
         <option value="other">非央国企</option>
       </select>
-      <select id="lake-sort-select" :value="sort" @change="onFilter(); sort = $event.target.value">
-        <option value="total_mv">按总市值</option>
-        <option value="ttm_yield_pct">按股息率</option>
-      </select>
+      <!-- v6.1.4 O1：排序改表头点击（▲▼指示，再点切换方向；旧"按总市值/股息率"下拉移除——
+           白名单不含 total_mv/ttm_yield_pct） -->
       <span id="lake-market-count" class="count">
         {{ d ? `共 ${d.total} 只 · 第 ${d.page}/${Math.max(1, d.pages)} 页` : "" }}
       </span>
@@ -105,8 +126,14 @@ function go(p) { if (p >= 1) page.value = p; }
     <div class="tbl-wrap">
       <table class="data" id="lake-market-table">
         <thead><tr>
-          <th>代码</th><th>名称</th><th>行业</th><th class="num">总市值(亿)</th>
-          <th class="num">PE</th><th class="num">PB</th><th class="num">股息率%</th><th>央国企</th>
+          <!-- v6.1.4 O1：可点排序表头（代码/名称/行业/PE/PB；点击=desc 起，再点切 asc）。
+               总市值(亿) 保留展示列但**不可排**（白名单不含 total_mv——brief 逐字） -->
+          <th v-for="c in SORT_COLS" :key="c.key" class="lake-sort-th clickable"
+              :class="{ num: c.num, 'lake-sort-active': sort === c.key }"
+              :title="'点击按' + c.label + '排序'" @click="onSortCol(c.key)">
+            {{ c.label }}<span class="lake-sort-mark">{{ sortMark(c.key) }}</span>
+          </th>
+          <th class="num">总市值(亿)</th><th class="num">股息率%</th><th>央国企</th>
         </tr></thead>
         <tbody>
           <tr v-if="loading"><td colspan="8" class="lake-loading-label">加载中…</td></tr>

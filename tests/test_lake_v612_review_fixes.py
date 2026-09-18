@@ -10,8 +10,8 @@
   键只在 ready 态出现（stock_detail 仅 ready 可达，locked/uninitialized 上游已 409）。
 - **前端契约**（离线断言 Vue 源码，防前后端脱节）：P0 行业只显示 industry_name、
   P1-A 复权三态按钮+adjust_note+标题动态、P2-B 分红小表 #lake-dividends-table、
-  P1-B tasks 表灌数中不渲染（v-if !backfill_in_progress）、P2-A 琥珀块总进度行、
-  P3 market 跳页输入框。
+  P1-B tasks 表灌数中不渲染（v6.1.4 O3 已反转为仅 backfill_in_progress 渲染）、
+  P2-A 琥珀块总进度行、P3 market 跳页输入框。
 
 纪律：库一律 tmp_path（**绝不触碰 data/lake/ 生产库**，p0 灌数运行中），离线；
 分红日期用相对 today() 计算（不硬编码具体日期，防测试随时间过期）。
@@ -371,9 +371,11 @@ def test_frontend_v612_contract():
     assert "dividends_recent" in card, "P2-B：未消费 dividends_recent 字段"
     assert "近 5 年无分红记录" in card, "P2-B：空态文案必须逐字"
 
-    # P1-B：tasks 表灌数中不渲染（v-if !backfill_in_progress；琥珀块已展示同一份）
-    assert 'v-if="!d.backfill_in_progress"' in status, \
-        "P1-B：#lake-tasks-table 须 v-if=!backfill_in_progress（去双份冗余）"
+    # v6.1.4 O3（取代 v6.1.2 P1-B）：tasks 表**仅 backfill_in_progress=true 渲染**
+    # （非同步态整块隐藏）+ "对应表"列（T1~T9 ↔ tasks 映射）。
+    assert 'v-if="d.backfill_in_progress"' in status, \
+        "O3：#lake-tasks-table 须 v-if=backfill_in_progress（非同步态整块隐藏）"
+    assert ">对应表<" in status, "O3：tasks 表缺'对应表'列（T1~T9 ↔ tasks 映射）"
 
     # P2-A：琥珀块总进度行（done/total 合计 + 进度条 + 预计剩余）
     assert "lake-backfill-total" in lt, "P2-A：缺琥珀块总进度行 .lake-backfill-total"

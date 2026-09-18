@@ -257,7 +257,7 @@ def test_d4_concurrent_endpoints_no_interleaving(tmp_path):
 
             ts = [threading.Thread(target=w, args=("status", "/api/lake/status")),
                   threading.Thread(target=w, args=("industries", "/api/lake/industries")),
-                  threading.Thread(target=w, args=("market", "/api/lake/market?page=1&sort=total_mv"))]
+                  threading.Thread(target=w, args=("market", "/api/lake/market?page=1&sort=code"))]
             for t in ts:
                 t.start()
             for t in ts:

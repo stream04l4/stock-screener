@@ -33,6 +33,10 @@ _DEFAULTS: Dict[str, Any] = {
     "tdx_enabled": True,             # easy-tdx（T2/T7 fallback + T7 amount）
     "adata_f10_enabled": True,       # adata get_core_index（T5 主源，仅 F10）
     "baostock_probe_enabled": True,  # Q6：灌数启动探一次 BaoStock 判活
+    # v6.1.4 O4：tencent 原无开关键（腾讯是 legacy 直连兜底+T3/T7 主源）——补齐开关
+    # （默认 True=现状不变；False=T2/T7 池跳过 tencent、T3 快照仍走腾讯直连——
+    # T3 是"当前时点"数据唯一源，不受本开关门控，见 web_api /sources/toggle 文档）。
+    "tencent_enabled": True,
 
     # v6.1 字段组→源优先级（Q1 拍板序）。key=表名，value={field_group: [src,...]}。
     # resolve_source 按此返回 adapter 序列；worker 取第一个 available() 且成功的源。
@@ -81,6 +85,75 @@ def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def strategy_yaml_path() -> str:
+    """strategy.yaml 绝对路径（**独立函数**：O4 toggle 写盘 + 测试 monkeypatch 注入点）。
+
+    lake_cfg() 读与 set_lake_source_switch() 写都经此函数——测试 patch 本函数指向
+    tmp 副本即可全离线验证写盘，绝不触碰生产 config/strategy.yaml（brief 红线）。
+    """
+    return os.path.join(_project_root(), "config", "strategy.yaml")
+
+
+def set_lake_source_switch(name: str, enabled: bool) -> Dict[str, Any]:
+    """v6.1.4 O4：写 strategy.yaml ``lake`` 段源开关（ruamel roundtrip 保注释/格式）。
+
+    :param name: 源名（sina/tencent/baostock/tdx/adata_f10）→ 开关键
+        ``{name}_enabled``（baostock → ``baostock_probe_enabled``，与 _DEFAULTS 对齐）。
+    :param enabled: True/False。
+
+    **写盘纪律**（brief 红线）：
+    - **ruamel roundtrip**：注释/键序/缩进逐字保留，只改目标布尔值；文件缺失 →
+      新建最小 ``lake:`` 段（不伪造其余内容）。
+    - **写前备份 .bak**：``strategy.yaml.bak``（覆盖式——最近一次写入前的状态；
+      原子性=先写 tmp 再 rename，.bak 与最终文件同目录）。
+    - **立即生效**：lake_cfg() 每次调用现读文件（无进程级缓存，见 lake_cfg docstring）
+      → 下次 resolve_source/灌数启动读到新值；**运行中灌数不受影响**（adapter 池在
+      启动时构建，文档注明"下次启动生效"）。
+
+    :return: ``{"name", "key", "enabled", "path", "backup"}``（调用方回显/日志）。
+    :raises ValueError: name 不在 5 源白名单（不猜键名——写错键=配置静默失效）。
+    """
+    key = {"sina": "sina_enabled", "tencent": "tencent_enabled",
+           "baostock": "baostock_probe_enabled", "tdx": "tdx_enabled",
+           "adata_f10": "adata_f10_enabled"}.get(name)
+    if key is None:
+        raise ValueError(f"未知源名: {name!r}（白名单 sina/tencent/baostock/tdx/adata_f10）")
+
+    from ruamel.yaml import YAML   # 项目依赖（screener 配置工具链已用；roundtrip 保注释）
+
+    yaml_rt = YAML()
+    yaml_rt.preserve_quotes = True          # 引号风格保留（'true' vs "true" 不漂移）
+    path = strategy_yaml_path()
+    backup = path + ".bak"
+
+    doc = None
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            doc = yaml_rt.load(f) or {}
+        # 写前备份（.bak=写入前的完整文件；覆盖式，保留最近一份）
+        import shutil
+        shutil.copyfile(path, backup)
+    else:
+        doc = {}   # 缺失 → 新建最小文档（只含 lake 段目标键；不伪造其余内容）
+
+    if not isinstance(doc, dict):
+        raise ValueError(f"strategy.yaml 顶层非 mapping（{type(doc).__name__}）——拒绝写入")
+    lake = doc.get("lake")
+    if not isinstance(lake, dict):
+        lake = {}
+        doc["lake"] = lake
+    # ruamel CommentedMap：直接赋值保留既有注释；新键追加到段尾（roundtrip 保序）
+    lake[key] = bool(enabled)
+
+    # 原子写：tmp + rename（同目录，防半截文件被灌数进程读到）
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml_rt.dump(doc, f)
+    os.replace(tmp, path)
+    return {"name": name, "key": key, "enabled": bool(enabled),
+            "path": path, "backup": backup if os.path.exists(backup) else None}
+
+
 def lake_cfg() -> Dict[str, Any]:
     """读 strategy.yaml 的 ``lake`` 段，叠加缺省值。文件缺失/无 lake 段 → 纯缺省。
 
@@ -88,7 +161,7 @@ def lake_cfg() -> Dict[str, Any]:
     部分字段组时不整块覆盖缺省（防 yaml 半配置导致某表优先级丢失）。
     """
     cfg = _deep_default()
-    path = os.path.join(_project_root(), "config", "strategy.yaml")
+    path = strategy_yaml_path()   # v6.1.4 O4：与写盘同一路径函数（测试 monkeypatch 注入点）
     try:
         import yaml
 

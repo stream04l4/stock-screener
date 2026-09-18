@@ -60,6 +60,8 @@ import logging
 import math
 import os
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("lake.web_api")
@@ -594,6 +596,38 @@ def industries() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # GET /market
 # ---------------------------------------------------------------------------
+# v6.1.4 O1：排序列白名单（brief 逐字）→ ORDER BY 表达式。close/volume/amount/date
+# 来自 kline_daily **每股最新行**（arg_max+GROUP BY 聚合，生产实测全市场 join ~20ms、
+# 整条 market 查询 ~70ms——远低于 3s 轮询节奏可接受）；pe_ttm/pb 来自 valuation_daily
+# 最新快照（既有 v join）；code/name/industry_name 走 stock_master。ORDER BY 统一
+# ``{expr} {ASC|DESC} NULLS LAST``（brief：NULLS LAST）。白名单是 SQL 注入面——
+# 值只允许落在这组固定列上，绝不拼接用户原文。
+_MARKET_SORT_WHITELIST: Dict[str, str] = {
+    "code":          "m.ts_code",
+    "name":          "m.name",
+    "industry_name": "m.industry_name",
+    "close":         'k."close"',
+    "volume":        "k.volume",
+    "amount":        "k.amount",
+    "pe_ttm":        "v.pe_ttm",
+    "pb":            "v.pb",
+    "date":          "k.date",
+}
+_MARKET_SORT_DEFAULT = "code"   # brief 白名单不含旧 total_mv → 缺省改 code（稳定可断言）
+
+
+def _market_kline_join() -> str:
+    """kline_daily 每股最新行聚合子查询（close/volume/amount/date 排序列的数据源）。
+
+    arg_max(col, date) + GROUP BY ts_code：一次全表扫描取每股最新值（生产实测 ~18ms，
+    比 ROW_NUMBER 窗口更省——无需物化 rn 中间层）。``"close"`` 带引号（DuckDB 保留字，
+    lake.ddl 同纪律）。别名 c/v/a/d → 外层 k.close/k.volume/k.amount/k.date。
+    """
+    return ("LEFT JOIN (SELECT ts_code, arg_max(\"close\",date) AS \"close\", "
+            "arg_max(volume,date) volume, arg_max(amount,date) amount, MAX(date) date "
+            "FROM kline_daily GROUP BY ts_code) k ON k.ts_code=m.ts_code")
+
+
 def _clamp_page_size(v: Any) -> int:
     """v6.0.6：market page_size clamp（brief 契约）。
 
@@ -633,18 +667,27 @@ def _clamp_page_size(v: Any) -> int:
 @router.get("/market")
 def market(industry: Optional[str] = Query(default=None),
            soe: Optional[str] = Query(default=None),
-           sort: str = Query(default="total_mv"),
+           sort: str = Query(default="code"),
+           order: str = Query(default="desc"),
            page: int = Query(default=1, ge=1),
            page_size: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    """T1⋈T3 全市场浏览（v6.0.6：默认分页 20/页，page_size clamp [10,50]）。
+    """T1⋈T3(⋈T2最新行) 全市场浏览（v6.0.6 分页 + **v6.1.4 O1 排序**）。
 
     :param industry: industry_csric2 精确过滤（如 J66）。
     :param soe: all | soe | other（soe_flag='央国企' / 其余）。
-    :param sort: total_mv | ttm_yield_pct（降序；NULL 排最后）。
+    :param sort: 列名白名单（v6.1.4 O1，brief 逐字）：code/name/industry_name/
+        close/volume/amount/pe_ttm/pb/date。**非法 → 400**（与 page_size 的"回退 20"
+        不同——排序列是 SQL 注入面，白名单外一律拒绝而非静默降级）。close/volume/
+        amount/date = kline_daily 每股最新行；pe_ttm/pb = valuation 最新快照。
+    :param order: asc | desc（默认 desc）；**非法 → 400**。ORDER BY 恒 ``NULLS LAST``
+        （brief：无论方向 NULL 都排最后——asc 时"无数据"股不霸占榜首）。
     :param page_size: 可选每页条数——**声明为 str**（若声明 int，FastAPI 会把
         ``page_size=abc`` 请求级打回 422，brief 的"非法值回退 20"执行不到）；
         缺省 20、clamp [10,50]、非法回退 20（_clamp_page_size）。响应
         ``page_size`` 字段返回 **int 实际生效值**（brief：响应字段不变）。
+
+    v6.1.4 O1：响应追加 ``"sort": {"column": <生效列>, "order": <asc|desc>}`` 回显
+    （前端表头 ▲▼ 指示的单一事实源；既有 rows/total/page/page_size/pages 键不变）。
     """
     # ⚠️ 直接函数调用（单测）时缺省参数值是 FastAPI Query() 返回的 FieldInfo
     # 对象而非 None/默认值——统一归一化，HTTP 路径（恒为实际值）行为不变。
@@ -653,7 +696,17 @@ def market(industry: Optional[str] = Query(default=None),
     if not isinstance(soe, str):
         soe = None
     if not isinstance(sort, str):
-        sort = "total_mv"
+        sort = _MARKET_SORT_DEFAULT   # FieldInfo（直接调用缺省）→ 默认列；HTTP 缺参
+                                      # 时 FastAPI 已填 default="code"，此处只兜底单测直调
+    elif sort not in _MARKET_SORT_WHITELIST:
+        # 白名单外（含旧值 total_mv/ttm_yield_pct、空串——v6.1.4 契约变更，前端已同步改
+        # 表头点击）→ 400（不猜、不降级：静默回退会让前端以为按某列排了序）
+        raise HTTPException(status_code=400, detail=f"非法 sort: {sort!r}"
+                            f"（白名单: {', '.join(_MARKET_SORT_WHITELIST)}）")
+    if not isinstance(order, str):
+        order = "desc"                # FieldInfo（直接调用缺省）→ 默认方向（同 sort 口径）
+    elif order not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail=f"非法 order: {order!r}（asc|desc）")
     if not isinstance(page, int) or isinstance(page, bool):
         page = 1
     # D-4：每请求短连接，with 保证异常路径也 close（查询语义不变）
@@ -670,7 +723,7 @@ def market(industry: Optional[str] = Query(default=None),
             where.append("(m.soe_flag IS NULL OR m.soe_flag <> '央国企')")
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
-        sort_col = {"total_mv": "v.total_mv", "ttm_yield_pct": "v.ttm_yield_pct"}.get(sort, "v.total_mv")
+        order_expr = _MARKET_SORT_WHITELIST[sort]
         total = con.execute(
             f"SELECT COUNT(*) FROM stock_master m LEFT JOIN valuation_daily v "
             f"ON v.ts_code=m.ts_code AND v.date=(SELECT MAX(date) FROM valuation_daily)"
@@ -683,11 +736,15 @@ def market(industry: Optional[str] = Query(default=None),
             "m.soe_flag,v.total_mv,v.float_mv,v.pe_ttm,v.pb,v.turnover_pct,v.ttm_yield_pct "
             "FROM stock_master m LEFT JOIN valuation_daily v "
             "ON v.ts_code=m.ts_code AND v.date=(SELECT MAX(date) FROM valuation_daily)"
+            + _market_kline_join()
             + where_sql +
-            f" ORDER BY {sort_col} DESC NULLS LAST LIMIT {ps} OFFSET {offset}",
+            f" ORDER BY {order_expr} {'ASC' if order == 'asc' else 'DESC'} NULLS LAST "
+            f"LIMIT {ps} OFFSET {offset}",
             params)
         return {"rows": rows, "total": total, "page": page, "page_size": ps,
-                "pages": (total + ps - 1) // ps if total else 0}
+                "pages": (total + ps - 1) // ps if total else 0,
+                # v6.1.4 O1：排序回显（前端表头 ▲▼ 指示的单一事实源）
+                "sort": {"column": sort, "order": order}}
 
 
 # ---------------------------------------------------------------------------
@@ -1268,6 +1325,178 @@ def status() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# v6.1.4 O4：数据源勾选（写 strategy.yaml）+ 手动探测（adapter.available() 网络自检）
+#
+# **toggle**：POST /sources/toggle {name, enabled} → lake.config.set_lake_source_switch
+# （ruamel roundtrip 保注释 + 写前 .bak 备份 + tmp/rename 原子写）。立即生效=下次
+# resolve_source/灌数启动读到新值（lake_cfg() 每次现读文件、无进程级缓存）；**运行中
+# 灌数不受影响**（adapter 池在启动时构建——文档注明"下次启动生效"）。
+# **probe**：POST /sources/probe {names:[...]} → 逐源清懒缓存 + available()（baostock
+# 走 Q6 probe_baostock_alive 真探测），每源 ≤15s 线程隔离超时（hang 场景不拖死请求，
+# 超时记 available=false detail="probe timeout"）→ 合并写 source_health.json（复用
+# _read_source_health 的落盘格式）+ 返回各源结果。灌数运行中允许探测（只读网络自检、
+# 不碰库——health 是 JSON 文件，与 DuckDB 锁无关）。
+# ---------------------------------------------------------------------------
+_SOURCE_SWITCH_NAMES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
+_PROBE_TIMEOUT_S = 15.0   # O4 超时纪律：每源最多 15s（baostock hang 不能拖死请求）
+
+
+def _probe_one_source(name: str) -> Dict[str, Any]:
+    """单源探测（**调用方须在独立线程跑**——本函数内部可能阻塞至网络层超时）。
+
+    - sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
+      （首次触发 EU 自检；失败→False，不抛）。
+    - baostock：available() 只读 Q6 进程内结果（未探测恒 False）——手动探测须**真探**：
+      probe_baostock_alive(10s socket 超时) + set_baostock_alive 回写（与灌数启动
+      _run_bs_probe 同语义；Web 进程内的 Q6 结果只影响本进程后续 resolve_source，
+      灌数子进程有自己的探测——不串味）。
+    """
+    from .ingest import source_pool as sp
+
+    now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    t0 = time.monotonic()
+    detail = ""
+    try:
+        if name == "baostock":
+            from screener.data.baostock_client import probe_baostock_alive
+
+            res = probe_baostock_alive(timeout_s=10.0)
+            sp.set_baostock_alive(bool(res.get("alive", False)), res.get("detail", ""))
+            ok = bool(res.get("alive", False))
+            detail = res.get("detail") or ""
+        else:
+            ad = sp.get_adapter(name)
+            if ad is None:
+                return {"available": False, "probed_at": now_s, "latency_ms": None,
+                        "detail": "adapter 未注册（依赖库未装）"}
+            reset = getattr(ad, "reset_available_for_test", None)   # 懒缓存先清（brief 逐字）
+            if callable(reset):
+                reset()
+            ok = bool(ad.available())
+    except Exception as exc:  # noqa: BLE001 - 单源异常→false（不 crash、不拖死请求）
+        ok, detail = False, f"probe error: {exc}"
+    return {"available": ok, "probed_at": now_s,
+            "latency_ms": int((time.monotonic() - t0) * 1000),
+            "detail": detail}
+
+
+def _write_source_health(merged: Dict[str, Any]) -> Optional[str]:
+    """合并写 source_health.json（tmp+rename 原子；复用 _read_source_health 格式）。
+
+    返回实际路径；写失败 → None（不阻断——探测结果仍在响应里，Web 下轮 /status 读旧值）。
+    """
+    import tempfile
+
+    path = _source_health_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".lake_sh_", suffix=".tmp",
+                                   dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - 写失败不阻断（Web 显旧值）
+        log.warning("source_health.json 手动探测写入失败（不阻断）: %s", exc)
+        return None
+    return path
+
+
+@router.post("/sources/toggle")
+def sources_toggle(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """O4：数据源开关 → 写 config/strategy.yaml lake 段（立即生效于下次灌数启动）。
+
+    :param payload: ``{"name": "sina"|"tencent"|"baostock"|"tdx"|"adata_f10",
+        "enabled": true|false}``。
+    - 200 ``{name, key, enabled, path, backup, note}``：写入成功（.bak=写前备份）。
+    - **400**：name 不在 5 源白名单 / enabled 非 bool（不猜键名——写错键=配置静默失效）。
+    - **500**：yaml 顶层结构异常（拒绝写入，原文件不动）。
+
+    **生效语义**（brief 逐字）：lake_cfg() 每次读文件现读现用（无进程级缓存）→
+    resolve_source 在**灌数启动时**读取 → "运行中灌数不受影响，下次启动生效"。
+    """
+    from . import config as lconfig
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="body 必须是 JSON 对象 {name, enabled}")
+    name = payload.get("name")
+    enabled = payload.get("enabled")
+    if name not in _SOURCE_SWITCH_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"非法源名: {name!r}（白名单: {', '.join(_SOURCE_SWITCH_NAMES)}）")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled 必须是 true/false")
+    try:
+        res = lconfig.set_lake_source_switch(name, enabled)
+    except ValueError as exc:
+        # 未知源名（理论不可达——上面已白名单）或 yaml 顶层非 mapping（配置损坏）
+        raise HTTPException(status_code=500, detail=f"strategy.yaml 写入失败: {exc}")
+    return {**res, "note": "已写入配置（立即生效于下次灌数启动；运行中灌数不受影响）"}
+
+
+@router.post("/sources/probe")
+def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """O4：手动探测各源连通性（每源 ≤15s 超时隔离；写 source_health.json）。
+
+    :param payload: ``{"names": ["sina", ...]}``（缺省/空 = 全部 5 源）。
+    - 200 ``{results: {name: {available, probed_at, latency_ms, detail?}}, path}``。
+    - **400**：names 含非白名单源名。
+
+    **超时纪律**（brief 逐字）：每源最多 15s——baostock hang 场景不能拖死请求。
+    实现=每源一个 daemon 线程 + join(15)；超时 → available=false detail="probe timeout"
+    （线程无法强杀，hang 的后台线程泄漏但请求已返回；socket 层 10s 超时是主防线）。
+    **灌数运行中允许探测**：只读网络自检、不碰库（health 是 JSON 文件）。
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="body 必须是 JSON 对象 {names:[...]}")
+    names = payload.get("names") or list(_SOURCE_SWITCH_NAMES)
+    if not isinstance(names, list) or not names:
+        raise HTTPException(status_code=400, detail="names 必须是非空数组")
+    bad = [n for n in names if n not in _SOURCE_SWITCH_NAMES]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"非法源名: {bad}（白名单: {', '.join(_SOURCE_SWITCH_NAMES)}）")
+
+    results: Dict[str, Any] = {}
+    for name in dict.fromkeys(names):   # 去重保序（重复探测无意义）
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def _worker(n=name, b=box, d=done) -> None:
+            try:
+                b["res"] = _probe_one_source(n)
+            except Exception as exc:  # noqa: BLE001 - 双保险（_probe_one_source 已兜底）
+                b["res"] = {"available": False, "probed_at": None, "latency_ms": None,
+                            "detail": f"probe error: {exc}"}
+            finally:
+                d.set()
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        if done.wait(_PROBE_TIMEOUT_S):
+            results[name] = box.get("res") or {"available": False, "probed_at": None,
+                                               "latency_ms": None, "detail": "probe error"}
+        else:
+            # 15s 未返回（hang）→ 记超时（线程泄漏但请求不拖死；brief 逐字语义）
+            log.warning("source %s 探测超时 >%.0fs（按不可达处理）", name, _PROBE_TIMEOUT_S)
+            results[name] = {"available": False, "probed_at": None, "latency_ms": None,
+                             "detail": "probe timeout"}
+
+    # 合并写 source_health.json（保留未探测源的既有记录；格式同 _read_source_health）
+    existing, _stale = _read_source_health()
+    merged: Dict[str, Any] = {n: dict(existing.get(n) or {}) for n in _ADAPTER_NAMES}
+    for name, r in results.items():
+        merged[name] = {"available": r.get("available"), "probed_at": r.get("probed_at"),
+                        "latency_ms": r.get("latency_ms")}
+    path = _write_source_health(merged)
+    return {"results": results, "path": path}
+
+
+# ---------------------------------------------------------------------------
 # v6.0.9：同步控制（启动/停止灌数）——Web"数据湖页"按钮后端
 #
 # 设计（TL 拍板）："启动" = scripts/lake_backfill.py history（P2 全史补库，
@@ -1280,12 +1509,17 @@ def status() -> Dict[str, Any]:
 # 这正是 Joel 要的"随时启动/停止"；E2E/单测一律显式 tmp 库，绝不触碰生产灌数进程。
 # ---------------------------------------------------------------------------
 @router.post("/sync/start")
-def sync_start(codes: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    """启动全史数据补库（``lake_backfill.py history``，后台长跑）。
+def sync_start(codes: Optional[str] = Query(default=None),
+               mode: str = Query(default="history")) -> Dict[str, Any]:
+    """启动数据补库（后台长跑；v6.1.4 O2：mode 选灌数阶段）。
 
     :param codes: 可选逗号分隔股票子集（透传 driver ``--codes``）——**E2E/冒烟限定
         ≤3 只用**；Web 按钮不传 → 全集（Joel"启动数据更新"的默认语义）。
-    - 200 ``{started: true, pid, log_path}``：spawn 成功且 ~5s 内确认 running。
+    :param mode: **v6.1.4 O2** 灌数模式——``history``（缺省，P2 全史补库，行为与
+        v6.0.9 逐字节一致）| ``incremental``（P3 每日增量：kline_daily 最近缺口 /
+        valuation_daily 最新快照 / index_daily 近 N 日）。两者**互斥**（同一 backfill
+        scope + DuckDB 独占写锁）——已 running → 409 现状不变。非法 mode → 400。
+    - 200 ``{started: true, pid, log_path, mode}``：spawn 成功且 ~5s 内确认 running。
     - **409** ``{error: "sync_already_running", hint, pid}``（顶层契约体）：已有灌数
       在跑（v6.0.4 三态检测）——防双开，不 spawn。
     - 200 ``{started: false, pid, log_path, reason}``：spawn 后进程提前退出/日志现
@@ -1293,22 +1527,31 @@ def sync_start(codes: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     """
     from . import sync_control
 
-    # ⚠️ 直接函数调用（单测）时缺省值是 FieldInfo 对象而非 None——isinstance 归一化
-    # （与 /kline days、/market page_size 同口径；HTTP 路径恒为 str/None，行为不变）。
+    # ⚠️ 直接函数调用（单测）时缺省值是 FieldInfo 对象而非 None/str——isinstance 归一化
+    # （与 /kline days、/market page_size/sort 同口径；HTTP 路径恒为 str，行为不变）。
     if not isinstance(codes, str):
         codes = None
+    if not isinstance(mode, str) or not mode.strip():
+        mode = "history"   # FieldInfo（直接调用缺省）→ 默认全史
+    mode = mode.strip()
+    if mode not in ("history", "incremental"):
+        raise HTTPException(status_code=400, detail=f"非法 mode: {mode!r}（history|incremental）")
     extra_args: Optional[List[str]] = None
     if codes and codes.strip():
         cs = [c.strip() for c in codes.split(",") if c.strip()]
         if cs:
             extra_args = ["--codes", ",".join(cs)]
-    res = sync_control.start_sync(extra_args=extra_args)   # 缺省库（生产默认）
+    # history 缺省 → sub="history"（start_sync 既有默认，行为逐字节不变）；
+    # incremental → driver `incremental` 子命令（v6.1.4 O2）。
+    res = sync_control.start_sync(sub=mode, extra_args=extra_args)   # 缺省库（生产默认）
     if not res["started"] and res.get("reason") == "already_running":
         raise LakeSyncConflict(
             "sync_already_running",
             f"已有灌数在运行（PID={res['pid'] if res['pid'] is not None else '未知'}），"
             "请先停止再启动")
-    return {k: v for k, v in res.items() if v is not None}
+    out = {k: v for k, v in res.items() if v is not None}
+    out["mode"] = mode   # 回显（前端按钮态/日志对账；409 契约体不受影响——异常先抛）
+    return out
 
 
 @router.post("/sync/stop")

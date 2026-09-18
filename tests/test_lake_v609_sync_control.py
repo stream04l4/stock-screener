@@ -722,7 +722,10 @@ def test_web_sync_stop_not_running_409_contract(monkeypatch):
 
 
 def test_web_sync_start_success_200_shape(monkeypatch):
-    """start 成功 → 200 {started, pid, log_path}（None 值字段被过滤，不出现 null）。"""
+    """start 成功 → 200 {started, pid, log_path}（None 值字段被过滤，不出现 null）。
+
+    v6.1.4 O2：响应追加 ``mode`` 回显（缺省 history；新字段只追加，旧字段不变）。
+    """
     import lake.web_api as wapi
     from lake import sync_control
 
@@ -730,7 +733,8 @@ def test_web_sync_start_success_200_shape(monkeypatch):
         sync_control, "start_sync",
         lambda **k: {"started": True, "pid": 999, "log_path": "/tmp/s.log"})
     d = wapi.sync_start()
-    assert d == {"started": True, "pid": 999, "log_path": "/tmp/s.log"}
+    assert d == {"started": True, "pid": 999, "log_path": "/tmp/s.log",
+                 "mode": "history"}
 
 
 def test_web_sync_stop_async_waiting_task_200(monkeypatch):
