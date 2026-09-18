@@ -39,6 +39,14 @@ class BaoStockAdapter:
     def __init__(self) -> None:
         self._client = None
         self._lock = threading.Lock()
+        # F3（v6.1.5）：available() 懒缓存（None=未探测）。首次调用触发真探测，
+        # 后续直接返回缓存——与既有"懒缓存"契约一致，避免每轮 resolve_source 重复探网。
+        self._avail_cache: Optional[bool] = None
+
+    def reset_available_for_test(self) -> None:
+        """测试隔离：清 available() 懒缓存（下次调用重新探测）。与其他 adapter 同接口。"""
+        with self._lock:
+            self._avail_cache = None
 
     # ---------- client 管理（懒建；QuotaGuard 内） ----------
     def _get_client(self):
@@ -60,12 +68,74 @@ class BaoStockAdapter:
                     pass
                 self._client = None
 
-    # ---------- available：Q6 探测结果门控（不在本 adapter 重复探测） ----------
-    def available(self) -> bool:
-        """BaoStock 是否存活 = Q6 灌数启动探测结果（未探测 → False，保守按死处理）。"""
-        from .source_pool import baostock_alive
+    # ---------- available：F3 硬超时真探（懒缓存 + 复用 Q6 共享结果） ----------
+    @staticmethod
+    def _available_timeout_s() -> float:
+        """available() 真探墙钟上限（秒）。env ``BS_AVAILABLE_TIMEOUT_S`` 可覆盖（测试提速），
+        缺省 **15s**（brief F3"thread+join(15s)"；<20s 红线）。与 common.fetch_timeout_s
+        同模式：每次调用现读 env（monkeypatch.setenv 对已 import 模块生效）。"""
+        import os as _os
 
-        return baostock_alive()
+        try:
+            return max(1.0, float(_os.environ.get("BS_AVAILABLE_TIMEOUT_S", "15")))
+        except ValueError:
+            return 15.0
+
+    def available(self) -> bool:
+        """BaoStock 是否存活——**F3（v6.1.5）任何路径阻塞 ≤20s**。
+
+        三级短路（避免重复探网 / 双连接触发 BaoStock 服务端黑名单，团队纪律）：
+        1. **懒缓存命中**（``_avail_cache`` 非 None）→ 直接返回（首次后零网络）。
+        2. **本进程 Q6 已探过**（:func:`baostock_probed`）→ 复用共享结果
+           （灌数启动 _run_bs_probe 已探一次；此处不重复探网，只回写缓存）。
+        3. **未探 → 真探**：``probe_baostock_alive``（login+query_all_stock）包
+           :func:`_with_timeout` 墙钟硬上限（缺省 15s <20s 红线）——EU hang 场景在
+           上限内必返回 False（detail="timeout"），绝不长挂。结果回写共享状态（后续
+           resolve_source 的 baostock_alive() 直接读）+ 懒缓存。
+
+        为什么不再只读 Q6 结果：v6.1.4 的 available() 恒读 ``baostock_alive()``，
+        未探测时保守按死——但**若某路径绕过 Q6 直接调 available()（如 O4 手动探测
+        之外的健康检查、或灌数启动前），它会静默 False 而不探网**；更关键的是 F3
+        要求"任何代码路径在 baostock 上阻塞不得超过 20s"——available() 本身必须是有界
+        的真探，而非依赖外部是否先跑过 Q6。
+        """
+        from .source_pool import baostock_alive, baostock_probed
+
+        with self._lock:
+            if self._avail_cache is not None:
+                return self._avail_cache   # 1) 懒缓存命中（首次后零网络）
+        if baostock_probed():
+            # 2) Q6/其他路径已探过 → 复用共享结果（不重复探网，防双连接黑名单）
+            ok = bool(baostock_alive())
+            with self._lock:
+                self._avail_cache = ok
+            return ok
+        # 3) 未探 → 真探（login+query 包硬超时 ≤20s；失败/超时→False）
+        from .source_pool import _with_timeout, set_baostock_alive
+
+        tmo = self._available_timeout_s()   # 缺省 15s（<20s 红线）；env 可覆盖（测试提速）
+        try:
+            from screener.data.baostock_client import probe_baostock_alive
+
+            # 内层 wall_budget_s=15（probe 自身硬预算，原缺省会到 40s > 红线，现显式收紧）；
+            # 外层 _with_timeout(tmo≤20) 双保险——任一层先到上限即判超时。两层都 <20s。
+            res = _with_timeout(
+                lambda: probe_baostock_alive(timeout_s=10.0, wall_budget_s=min(15.0, tmo)),
+                secs=tmo, name="bs-available")
+            ok = bool(res.get("alive", False))
+            set_baostock_alive(ok, res.get("detail", ""))
+        except TimeoutError:
+            # 外层硬超时（内层线程 hang 未释放）→ False + detail="timeout"（F3 逐字）
+            log.warning("baostock available() 真探墙钟超时 >%.0fs → False（EU hang 场景）", tmo)
+            ok = False
+            set_baostock_alive(False, "timeout")
+        except Exception as exc:  # noqa: BLE001 - 探测异常→False（保守按死，不 crash）
+            log.warning("baostock available() 真探失败 → False: %s", exc)
+            ok = False
+            set_baostock_alive(False, f"{type(exc).__name__}: {str(exc)[:80]}")
+        with self._lock:
+            self._avail_cache = bool(ok)
+        return self._avail_cache
 
     # ---------- fetch_adj_factor：query_adjust_factor（事件值） ----------
     def fetch_adj_factor(self, ts_code: str, start: str, end: str) -> Dict[str, float]:

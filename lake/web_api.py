@@ -1349,7 +1349,8 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
     - baostock：available() 只读 Q6 进程内结果（未探测恒 False）——手动探测须**真探**：
       probe_baostock_alive(10s socket 超时) + set_baostock_alive 回写（与灌数启动
       _run_bs_probe 同语义；Web 进程内的 Q6 结果只影响本进程后续 resolve_source，
-      灌数子进程有自己的探测——不串味）。
+      灌数子进程有自己的探测——不串味）。**F3/v6.1.5**：显式 wall_budget_s=15（<20s
+      红线；screener/ 零改动——内层预算在本调用点收紧）+ 外层 _with_timeout(15s) 双保险。
     """
     from .ingest import source_pool as sp
 
@@ -1360,7 +1361,7 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
         if name == "baostock":
             from screener.data.baostock_client import probe_baostock_alive
 
-            res = probe_baostock_alive(timeout_s=10.0)
+            res = probe_baostock_alive(timeout_s=10.0, wall_budget_s=15.0)
             sp.set_baostock_alive(bool(res.get("alive", False)), res.get("detail", ""))
             ok = bool(res.get("alive", False))
             detail = res.get("detail") or ""
@@ -1463,28 +1464,24 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     results: Dict[str, Any] = {}
     for name in dict.fromkeys(names):   # 去重保序（重复探测无意义）
-        box: Dict[str, Any] = {}
-        done = threading.Event()
+        # F3/v6.1.5：O4 手动探测复用 source_pool._with_timeout（与 baostock available()/
+        # Q6 同一超时工具，不各写一套）。每源 ≤_PROBE_TIMEOUT_S(15s) 墙钟隔离——hang 场景
+        # 请求不拖死；超时 → available=false detail="probe timeout"（brief 逐字语义）。
+        try:
+            from .ingest.source_pool import _with_timeout
 
-        def _worker(n=name, b=box, d=done) -> None:
-            try:
-                b["res"] = _probe_one_source(n)
-            except Exception as exc:  # noqa: BLE001 - 双保险（_probe_one_source 已兜底）
-                b["res"] = {"available": False, "probed_at": None, "latency_ms": None,
-                            "detail": f"probe error: {exc}"}
-            finally:
-                d.set()
-
-        th = threading.Thread(target=_worker, daemon=True)
-        th.start()
-        if done.wait(_PROBE_TIMEOUT_S):
-            results[name] = box.get("res") or {"available": False, "probed_at": None,
-                                               "latency_ms": None, "detail": "probe error"}
-        else:
-            # 15s 未返回（hang）→ 记超时（线程泄漏但请求不拖死；brief 逐字语义）
+            r = _with_timeout(lambda n=name: _probe_one_source(n),
+                              secs=_PROBE_TIMEOUT_S, name=f"src-probe-{name}")
+            results[name] = r or {"available": False, "probed_at": None,
+                                  "latency_ms": None, "detail": "probe error"}
+        except TimeoutError:
+            # 15s 未返回（hang）→ 记超时（挂死线程 daemon 随进程退出回收；请求不拖死）
             log.warning("source %s 探测超时 >%.0fs（按不可达处理）", name, _PROBE_TIMEOUT_S)
             results[name] = {"available": False, "probed_at": None, "latency_ms": None,
                              "detail": "probe timeout"}
+        except Exception as exc:  # noqa: BLE001 - 双保险（_probe_one_source 已兜底）
+            results[name] = {"available": False, "probed_at": None, "latency_ms": None,
+                             "detail": f"probe error: {exc}"}
 
     # 合并写 source_health.json（保留未探测源的既有记录；格式同 _read_source_health）
     existing, _stale = _read_source_health()
@@ -1515,10 +1512,12 @@ def sync_start(codes: Optional[str] = Query(default=None),
 
     :param codes: 可选逗号分隔股票子集（透传 driver ``--codes``）——**E2E/冒烟限定
         ≤3 只用**；Web 按钮不传 → 全集（Joel"启动数据更新"的默认语义）。
-    :param mode: **v6.1.4 O2** 灌数模式——``history``（缺省，P2 全史补库，行为与
-        v6.0.9 逐字节一致）| ``incremental``（P3 每日增量：kline_daily 最近缺口 /
-        valuation_daily 最新快照 / index_daily 近 N 日）。两者**互斥**（同一 backfill
-        scope + DuckDB 独占写锁）——已 running → 409 现状不变。非法 mode → 400。
+    :param mode: 灌数模式——``history``（缺省，P2 全史补库，行为与 v6.0.9 逐字节一致）|
+        ``incremental``（v6.1.4 O2，P3 每日增量：kline_daily 最近缺口 / valuation_daily
+        最新快照 / index_daily 近 N 日）| **``t5``（v6.1.5 F4，基本面一键启动）**→
+        子进程 ``history --t5``（kline_history 部分幂等全跳过、只灌 T5；T6 无源不动）。
+        三者**互斥**（同一 backfill scope + DuckDB 独占写锁）——已 running → 409 现状不变。
+        非法 mode → 400。
     - 200 ``{started: true, pid, log_path, mode}``：spawn 成功且 ~5s 内确认 running。
     - **409** ``{error: "sync_already_running", hint, pid}``（顶层契约体）：已有灌数
       在跑（v6.0.4 三态检测）——防双开，不 spawn。
@@ -1534,16 +1533,23 @@ def sync_start(codes: Optional[str] = Query(default=None),
     if not isinstance(mode, str) or not mode.strip():
         mode = "history"   # FieldInfo（直接调用缺省）→ 默认全史
     mode = mode.strip()
-    if mode not in ("history", "incremental"):
-        raise HTTPException(status_code=400, detail=f"非法 mode: {mode!r}（history|incremental）")
+    if mode not in ("history", "incremental", "t5"):
+        raise HTTPException(
+            status_code=400, detail=f"非法 mode: {mode!r}（history|incremental|t5）")
     extra_args: Optional[List[str]] = None
     if codes and codes.strip():
         cs = [c.strip() for c in codes.split(",") if c.strip()]
         if cs:
             extra_args = ["--codes", ",".join(cs)]
     # history 缺省 → sub="history"（start_sync 既有默认，行为逐字节不变）；
-    # incremental → driver `incremental` 子命令（v6.1.4 O2）。
-    res = sync_control.start_sync(sub=mode, extra_args=extra_args)   # 缺省库（生产默认）
+    # incremental → driver `incremental` 子命令（v6.1.4 O2）；
+    # **t5（v6.1.5 F4）**→ driver `history --t5`：kline_history 已灌部分幂等全跳过、
+    # 只灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）。sub 恒 "history"
+    # （T5 是 history 子命令的 --t5 开关，非独立子命令），互斥/409/锁语义与现有一致。
+    sub = mode if mode in ("history", "incremental") else "history"
+    if mode == "t5":
+        extra_args = (extra_args or []) + ["--t5"]
+    res = sync_control.start_sync(sub=sub, extra_args=extra_args)   # 缺省库（生产默认）
     if not res["started"] and res.get("reason") == "already_running":
         raise LakeSyncConflict(
             "sync_already_running",

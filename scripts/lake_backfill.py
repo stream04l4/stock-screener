@@ -125,13 +125,29 @@ def _quota_state() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # v6.1（Q6）：BaoStock 恢复探测——灌数启动时探一次，结果写日志+progress
 # ---------------------------------------------------------------------------
+def _q6_probe_timeout_s() -> float:
+    """Q6 启动探测墙钟硬上限（秒）。缺省 **20.0**（brief F3 红线"不得超过 20s"逐字值）。
+
+    env ``BS_Q6_PROBE_TIMEOUT_S`` 可覆盖——**仅供离线测试提速**（生产不设=20s）。
+    与 baostock_adapter._available_timeout_s 同模式：每次现读 env。非法值回退 20.0。
+    """
+    try:
+        return max(1.0, float(os.environ.get("BS_Q6_PROBE_TIMEOUT_S", "20")))
+    except ValueError:
+        return 20.0
+
+
 def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
     """灌数启动的 Q6 BaoStock 存活探测（p0/history/reconcile 各调一次）。
 
     - config ``baostock_probe_enabled=False`` → 跳过（按"死"处理，零网络——离线单测契约）。
     - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 同样跳过（与 resolve_source 一致）。
-    - 探测本身 fail-fast：socket 10s 超时 + 墙钟硬预算（绝不阻塞灌数启动）；
-      结果 :func:`set_baostock_alive` 进程内共享 → baostock adapter available() 门控。
+    - 探测本身 fail-fast：socket 10s 超时 + **F3/v6.1.5 墙钟硬上限 20s**（绝不阻塞灌数启动；
+      红线"任何代码路径在 baostock 上阻塞不得超过 20s"）。实现=``_with_timeout``（与
+      O4/adapter.available() 同一超时工具，不各写一套）：内层 probe 显式 wall_budget_s=15
+      （<20，正常 hang 由内层先判死并给出干净 detail），外层 20s 硬兜底——任一层先到即
+      alive=false（detail="probe timeout >20s"）。**红线：screener/ 零改动**——超时全部在
+      lake/scripts 层施加，probe_baostock_alive 本身未动。
     - 结果写日志 + progress 顶层 ``baostock_probe``（Web /status 可观测）。
 
     **progress 路径按 db_path 派生**（v6.1 隔离修复）：自定义 --db（E2E/tmp 库）→
@@ -152,10 +168,24 @@ def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
                 "detail": "baostock disabled (LAKE_DISABLE_BAOSTOCK=1)"}
     if not lake_cfg().get("baostock_probe_enabled", True):
         return {"enabled": False, "alive": False, "detail": "probe disabled by config"}
-    from screener.data.baostock_client import probe_baostock_alive
+    from lake.ingest.source_pool import _with_timeout, set_baostock_alive
 
-    res = probe_baostock_alive(timeout_s=10.0)
-    from lake.ingest.source_pool import set_baostock_alive
+    # F3/v6.1.5：Q6 启动探测 ≤20s 硬上限（brief 逐字"同样 ≤20s 硬超时，超时记
+    # alive=false detail='probe timeout >20s'"）。内层 wall_budget_s=15 <20（正常 hang
+    # 由 probe 自身先判死、detail 干净）；外层 _with_timeout(缺省 20s) 兜底——协议层若
+    # 吞掉 socket.timeout 进内部循环，必在预算内返回。screener/ 零改动：超时全在本调用点施加。
+    tmo = _q6_probe_timeout_s()   # 缺省 20.0（brief 红线值）；env BS_Q6_PROBE_TIMEOUT_S 仅测试提速
+    t0 = time.monotonic()
+    try:
+        from screener.data.baostock_client import probe_baostock_alive
+
+        res = _with_timeout(
+            lambda: probe_baostock_alive(timeout_s=10.0, wall_budget_s=15.0),
+            secs=tmo, name="bs-q6-probe")
+    except TimeoutError:
+        log.warning("Q6 BaoStock 探测超时 >%.0fs（按死处理，不阻塞灌数启动）", tmo)
+        res = {"alive": False, "elapsed_s": round(time.monotonic() - t0, 2),
+               "detail": f"probe timeout >{tmo:.0f}s"}
 
     set_baostock_alive(res.get("alive", False), res.get("detail", ""))
     log.info("Q6 BaoStock 恢复探测: alive=%s elapsed=%ss %s",

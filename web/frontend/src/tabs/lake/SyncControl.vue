@@ -75,6 +75,15 @@ const incBtn = computed(() => {
   return { label: "▶ 启动增量同步", disabled: !enabled, busy: false };
 });
 
+// v6.1.5 F4：T5 基本面一键启动按钮（第三个）。状态机复用 incBtn——仅 idle+installed+
+// 未 running 时可点；running/starting/stopping/错误态 → 禁用（brief：running 时三按钮全禁）。
+const t5Btn = computed(() => {
+  void lake._tick;   // 依赖锚点（与 btn/incBtn 同节奏）
+  const enabled = (lake.syncState === "idle" && !!lake.status
+    && lake.status.installed && !lake.backfillRunning);
+  return { label: "▶ 启动基本面(T5)", disabled: !enabled, busy: false };
+});
+
 const meta = computed(() => {
   void lake._tick;   // 依赖锚点（与 btn 同节奏）
   if (lake.syncState === "starting") return "正在启动（确认进程拉起中）";
@@ -92,6 +101,10 @@ function onIncClick() {
   // v6.1.4 O2：增量同步（P3）——mode=incremental 透传后端 ?mode=
   lake.startSync("incremental");
 }
+function onT5Click() {
+  // v6.1.5 F4：T5 基本面一键启动——mode=t5 透传后端 ?mode=t5（→ driver history --t5）
+  lake.startSync("t5");
+}
 </script>
 
 <template>
@@ -106,6 +119,11 @@ function onIncClick() {
     <button id="btn-lake-sync-incremental" class="primary-btn"
             :disabled="incBtn.disabled" @click="onIncClick">
       {{ incBtn.label }}
+    </button>
+    <!-- v6.1.5 F4：T5 基本面一键启动（第三个按钮）——状态机复用增量按钮；running 时三按钮全禁 -->
+    <button id="btn-lake-sync-t5" class="primary-btn"
+            :disabled="t5Btn.disabled" @click="onT5Click">
+      {{ t5Btn.label }}
     </button>
     <span id="lake-sync-meta" class="muted small">{{ meta }}</span>
   </div>

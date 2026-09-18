@@ -16,7 +16,7 @@
 import { computed, reactive, ref } from "vue";
 // v6.1.4 O5：色板/中文源名抽到共享模块（SourcePoolPanel 图例 + 卡片边框/标题色 +
 // 悬停提示同源，防漂移；O4 探测按钮着色同引一份）。
-import { SOURCE_COLORS, UNKNOWN_COLOR, SOURCE_LABELS, LEGEND_ORDER } from "./sourceMeta.js";
+import { SOURCE_COLORS, UNKNOWN_COLOR, SOURCE_LABELS, LEGEND_ORDER, sourceMeta } from "./sourceMeta.js";
 // v6.1.4 O4：勾选开关 + 手动探测（POST /sources/toggle|probe；结果经 store 重拉 /status）
 import { api } from "../../api/client.js";
 import { useToastStore } from "../../stores/toastStore.js";
@@ -113,7 +113,8 @@ const rows = computed(() => {
       .map(([src, count]) => ({
         src, count, total,
         pct: total > 0 ? (count / total) * 100 : 0,
-        color: SOURCE_COLORS[src] || UNKNOWN_COLOR,
+        // v6.1.5 F1：颜色走 sourceMeta（当前活跃源=固定色板；legacy/未知=灰 UNKNOWN_COLOR）
+        color: sourceMeta(src).color,
       }));
     return { key, label: TABLE_LABELS[key] || key, total, segs };
   });
@@ -123,8 +124,10 @@ const rows = computed(() => {
 const legend = LEGEND_ORDER.map((src) => ({ src, color: SOURCE_COLORS[src], label: SOURCE_LABELS[src] }));
 
 // v6.1.4 O5：堆叠条悬停提示改中文源名+数量（"新浪:12345 腾讯:…"；原 "src:count"）。
+// v6.1.5 F1：走 sourceMeta()——legacy 别名（em_local_static→本地缓存等）显示中文，
+// 真正未知值 → "其他·<原值>"（保留可追溯性，不再裸显英文）。
 function barTitle(segs) {
-  return segs.map((s) => (SOURCE_LABELS[s.src] || s.src) + ":" + s.count).join(" ");
+  return segs.map((s) => sourceMeta(s.src).label + ":" + s.count).join(" ");
 }
 
 // 区块2（v6.1.3）：数据源状态卡。优先用 pool.sources（后端 v6.1.3 数组，固定 5 源

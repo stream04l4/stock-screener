@@ -29,9 +29,69 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 log = logging.getLogger("lake.ingest.source_pool")
+
+
+# ---------------------------------------------------------------------------
+# F3（v6.1.5）：_with_timeout —— 任意代码路径的墙钟硬超时工具（单一事实来源）
+# ---------------------------------------------------------------------------
+# **为什么抽到 source_pool**：F3 要求"任何代码路径在 baostock 上阻塞不得超过
+# 20s"，且 O4 手动探测 / Q6 启动探测 / adapter.available() 三处**共用同一超时
+# 工具函数**（brief 逐字），不各写一套。本函数 = daemon 线程 + join(硬预算)：
+#   - 正常完成 → 返回 fn 的返回值；
+#   - 超预算   → 抛 :class:`TimeoutError`（⊂ OSError ⊂ Exception，调用方 except
+#     接住按"失败/超时"处理）。挂死的 daemon 线程**不取消、不强杀**（C 层 socket
+#     recv 不可安全中断），随进程退出由 OS 终结（fd 同回收）——与 common.py 的
+#     fetch_with_timeout 同语义，但本函数是**通用版**（无取数池/停止轮询依赖），
+#     供 baostock 探测类路径复用。
+# 为什么独立于 common.fetch_with_timeout：fetch_with_timeout 绑死取数线程池 +
+# SIGTERM 停止轮询（R2/R4 语义）；探测路径只需要"纯墙钟上限"，抽薄版避免把
+# 停止信号耦合进 O4/Q6 探测。两者共享 daemon-不 join 的回收纪律。
+class _TimeoutBox:
+    """_with_timeout 的结果载体（区分"已完成"与"超时放弃"）。"""
+
+    __slots__ = ("done", "value", "error")
+
+    def __init__(self) -> None:
+        self.done = False
+        self.value: Any = None
+        self.error: Optional[BaseException] = None
+
+
+def _with_timeout(fn: Callable[[], Any], secs: float,
+                  *, name: str = "timeout-task") -> Any:
+    """在墙钟硬超时 ``secs`` 内执行无参 ``fn()``；超预算抛 :class:`TimeoutError`。
+
+    :param fn: 无参 callable（调用方用 lambda/closure 绑定参数）。
+    :param secs: 墙钟上限（秒）；<=0 → 视为 0（立即判超时，防误传负值）。
+    :return: ``fn()`` 的返回值（正常完成时）。
+    :raises TimeoutError: 超预算未完成（挂死线程 daemon 随进程退出回收，不阻塞）。
+
+    **F3 纪律**：这是 baostock 三条探测路径（available / Q6 / O4）共用的超时工具。
+    任何调用方传入的 secs 必须 ≤20s（brief 红线"阻塞不得超过 20s"）。
+    """
+    budget = max(0.0, float(secs))
+    box = _TimeoutBox()
+
+    def _runner() -> None:
+        try:
+            box.value = fn()
+            box.done = True
+        except BaseException as exc:  # noqa: BLE001 - 异常经 box 传回主线程
+            box.error = exc
+            box.done = True
+
+    th = threading.Thread(target=_runner, name=name, daemon=True)
+    th.start()
+    th.join(budget)
+    if not box.done:
+        # 硬预算耗尽：socket hang 未被协议层释放 → 判超时（daemon 线程随进程退出，无泄漏）
+        raise TimeoutError(f"{name} 墙钟超时 {budget:.0f}s（挂死线程 daemon 随进程退出回收）")
+    if box.error is not None:
+        raise box.error
+    return box.value
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +465,18 @@ def baostock_alive() -> bool:
     """当前进程内 BaoStock 是否存活（未探测 → False，按"死"处理——保守）。"""
     with _BS_ALIVE_LOCK:
         return bool(_BS_ALIVE)
+
+
+def baostock_probed() -> bool:
+    """本进程是否**已做过一次真实探测**（Q6 启动探测 / adapter.available() 真探）。
+
+    F3（v6.1.5）：区分"未探测（None，保守按死）"与"已探测得 False（真死）"。
+    adapter.available() 用它判断能否直接复用共享结果——**已探过就不再重复探网**
+    （避免 Q6 启动探测 + available() 各探一次 = 双连接，团队纪律：BaoStock >~4 并发
+    连接触发服务端黑名单）。未探 → False（调用方应做自己的硬超时真探）。
+    """
+    with _BS_ALIVE_LOCK:
+        return _BS_ALIVE is not None
 
 
 def reset_baostock_state_for_test() -> None:

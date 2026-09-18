@@ -206,6 +206,29 @@ describe("lakeStore：v6.0.10 同步状态机（移植回归）", () => {
     lake._stopTimerForTest();
   });
 
+  it("startSync('t5')：URL 带 ?mode=t5 + toast'T5 基本面灌数已启动'（v6.1.5 F4）", async () => {
+    const s = mockFetch();
+    let lastStartUrl = "";
+    globalThis.fetch = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.startsWith("/api/lake/sync/start")) { s.startCalls += 1; lastStartUrl = u; }
+      async function fetchImpl(v) {
+        if (v.startsWith("/api/lake/status")) return jsonRes(200, s.status || statusBody());
+        if (v.startsWith("/api/lake/sync/start")) return s.startRes;
+        if (v.startsWith("/api/lake/sync/stop")) return s.stopRes;
+        return jsonRes(404, {});
+      }
+      return fetchImpl(u);
+    });
+    const lake = useLakeStore();
+    await flush();
+    await lake.startSync("t5");
+    await flush();
+    expect(lastStartUrl).toBe("/api/lake/sync/start?mode=t5");
+    expect(toastMsg()).toBe("✓ T5 基本面灌数已启动（PID 4321）");
+    lake._stopTimerForTest();
+  });
+
   it("stopSync：waiting_task → 锁定 stopping；轮询失败（status=null）**不覆盖锁定态**", async () => {
     const s = mockFetch(statusBody({ backfill_in_progress: true, lock_holder_pid: 99 }));
     const lake = useLakeStore();
