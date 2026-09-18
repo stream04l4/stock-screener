@@ -1513,8 +1513,11 @@ def cmd_incremental(args, con, db_path: str) -> int:
 #   run_incremental/run_t5 的既有异常语义（HangWatchdogError 穿透、T3 全空中止等）
 #   逐字节不动，full 只在编排层兜底——零回归。
 # - hang1 R3 停滞看门狗照旧兜底：run_history 内 arm()（主线程调用，full 也在主
-#   线程顺序执行各阶段 → 满足 signal.signal 限制）；R3 abort 抛 HangWatchdogError
-#   （BaseException）→ full 的 except Exception **不捕获**它 → 穿透到 main → rc=1
+#   线程顺序执行各阶段 → 满足 signal.signal 限制）；R3 abort 两路都致 rc=1：
+#   ①直接抛出的 HangWatchdogError（BaseException）→ full 的 except Exception
+#   **不捕获**它 → 穿透到 main → rc=1；②run_history 内部收尾 handler 转成的
+#   hang_watchdog=True 返回值（v6.1.5 cmd_history 契约，不 re-raise）→ run_full
+#   检查该标志：phase 记 error + break 不执行后续阶段 → cmd_full rc=1。两路都
 #   干净退出（done 键已落盘，下次续传无损）。
 _FULL_PHASES = (
     ("history", "T2 全史"),
@@ -1599,7 +1602,11 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
 
     :return: ``{"sub": "full", "phases": {phase: stats|error}, ...}``——summary 打印。
         各阶段异常**不抛**（记 phases[phase]["error"] + progress state=error），
-        唯一例外 HangWatchdogError（R3 看门狗 abort，BaseException 穿透 → rc=1）。
+        唯一例外 HangWatchdogError（R3 看门狗 abort）：①直接抛出时 BaseException
+        穿透到 main → rc=1；②被 run_history 内部收尾 handler 转成返回值
+        ``hang_watchdog=True``（v6.1.5 cmd_history 已验收的契约，逐字不动）时由本
+        编排层检查该标志 → 该 phase 记 ok=False + state=error + last_error +
+        phase_errors 留痕并 **break 不再执行后续阶段**（cmd_full 据此 rc=1）。
     """
     from lake.backfill import BackfillRunner
 
@@ -1626,6 +1633,29 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
                 stats = run_t5(con, db_path, codes, BackfillRunner(db_path=db_path))
             summary["phases"][phase] = {"ok": True, "elapsed_s": round(time.monotonic() - t0, 1),
                                         **stats}
+            # R3 看门狗 abort（D-1 修复）：run_history 的 `except HangWatchdogError`
+            # （L951，v6.1.5 cmd_history 已验收的收尾契约——记 hang_watchdog=True 后
+            # return，不抛）会先把 abort 转成普通返回值，run_full 若只靠"BaseException
+            # 穿透"就漏掉了这条真实路径（full 继续 p3/t5、rc=0、all_ok=True 误报成功）。
+            # 故编排层显式检查该标志：命中 → 该 phase 记 ok=False + state=error +
+            # last_error + phase_errors 留痕，**break 不再执行后续阶段**（看门狗线程已在
+            # run_history finally stop()，后续阶段无 R3 保护——卡死根因若延续则进程可
+            # 无限挂起）。cmd_full 见 phases[phase]["hang_watchdog"] → rc=1（与
+            # cmd_history L1897-1898 同口径）。run_history 本身**不 re-raise**——那会改
+            # v6.1.5 已验收的 cmd_history rc 语义（回归基线风险）。
+            if stats.get("hang_watchdog"):
+                _wd_msg = (f"R3 看门狗 abort: {stats.get('last_error', 'progress 停滞')}"
+                           f" → full 终止后续阶段（rc=1，done 键已落盘，续传无损）")
+                log.error("===== phase: %s =====（%s R3 看门狗 abort，终止 full）: %s",
+                          phase, label, stats.get("last_error"))
+                print(f"===== phase: {phase} =====（{label} R3 看门狗 abort，终止 full）: "
+                      f"{stats.get('last_error')}")
+                summary["phases"][phase]["ok"] = False
+                summary["phases"][phase]["error"] = _wd_msg[:500]
+                failed[phase] = stats.get("last_error") or _wd_msg
+                _full_mark_phase_error(phase, db_path,
+                                       stats.get("last_error") or _wd_msg)
+                break
             # brief"任一阶段异常 → last_error + 该任务 state=error"：runner 吞单任务
             # 异常（记 stats["errors"]、entry.state=error 但**不写 last_error**——
             # _update_task_view 无此字段）→ 编排层补标 last_error（可观测"错在哪"）。
@@ -1679,12 +1709,27 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
 
 def cmd_full(args, con, db_path: str) -> int:
     """full 子命令入口（v6.1.6：单按钮全量补齐）。"""
+    from lake.ingest.common import HangWatchdogError
+
     codes = _parse_codes(args.codes)
     end_date = args.end_date or _today_beijing()
     summary = run_full(con, db_path, codes, args.start_date, end_date, args.days)
     _print_summary("full", summary)
     # 单阶段故障不拖死全量（各阶段 error 已记 progress）→ 进程 rc=0；R3 看门狗
-    # abort（HangWatchdogError）在 run_full 内穿透 → main 层异常路径 rc=1。
+    # abort 两路都致 rc=1：①直接抛出的 HangWatchdogError（BaseException）穿透到
+    # main → 异常路径 rc=1；②run_history 内部收尾转成的 hang_watchdog=True 返回值
+    # ——run_full 已把该 phase 记 error + break，这里**不捕获、向上抛**（与 ① 同路：
+    # main 无 handler → 进程干净退出 rc=1；__main__ 的 sys.exit(main()) 下同样 rc=1）。
+    # 为什么 raise 而非 return EXIT_RUNTIME：brief §A"HangWatchdogError 不捕获、穿透
+    # rc=1"——cmd_history L1897-1898 的 return 口径仅对 `python -m`/sys.exit(main())
+    # 调用链成立，driver 被 API/脚本直接调 main() 时 return 值不映射进程码；raise 在
+    # 两种调用方式下都保证 rc=1（"卡死自愈退出"与"正常完成"可区分）。run_history 本身
+    # **不 re-raise**——cmd_history 的既有行为逐字不变（v6.1.5 已验收，零回归）。
+    for _ph, _st in summary["phases"].items():
+        if _st.get("hang_watchdog"):
+            raise HangWatchdogError(
+                f"phase {_ph}: R3 看门狗 abort —— full 终止（done 键已落盘，续传无损）: "
+                f"{_st.get('last_error', 'progress 停滞')}")
     return EXIT_OK
 
 

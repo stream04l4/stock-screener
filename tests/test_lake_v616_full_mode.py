@@ -481,3 +481,135 @@ def test_start_deprecated_modes_still_spawn_correctly(monkeypatch):
     assert captured.get("sub") == "incremental"
     wapi.sync_start(mode="t5")
     assert captured.get("sub") == "history" and captured.get("extra_args") == ["--t5"]
+
+
+# ===========================================================================
+# 6) D-1 回归（v6.1.6 修复轮）：full 模式 R3 看门狗 abort 必须 rc=1 + 终止后续阶段
+#    run_history 的真实 R3 收尾契约是**返回** hang_watchdog=True（不抛——L951
+#    except HangWatchdogError 分支，v6.1.5 cmd_history 已验收，逐字不动）；full
+#    编排层必须检查该标志：phase error 化 + break + all_ok=False + cmd_full rc=1。
+# ===========================================================================
+def test_d1_run_full_hang_watchdog_flag_stops_subsequent_phases(tmp_path, monkeypatch):
+    """run_history 按真实 R3 收尾契约返回 hang_watchdog=True → run_full：
+
+    - history phase ok=False + error（含 R3/看门狗字样）+ hang_watchdog 标志留痕；
+    - **break**：p3/t5 不执行（summary.phases 只有 history）；
+    - all_ok=False（不得误报成功）；
+    - progress kline_history state=error + last_error + phase_errors 留痕。
+    """
+    db = str(tmp_path / "d1full.duckdb")
+    codes = ["sh.600001", "sz.000002"]
+    _seed_master(db, codes)
+    con = lconn.open(db)
+    _wire_fakes(monkeypatch, codes)
+
+    def rh_hang(*a, **k):   # run_history 真实 R3 收尾契约：记标志后 return，不抛
+        return {"sub": "history", "codes_requested": len(codes),
+                "hang_watchdog": True,
+                "last_error": "progress 停滞 >10min → 看门狗 abort"}
+
+    p3_calls = {"n": 0}
+    t5_calls = {"n": 0}
+
+    def boom_p3(*a, **k):   # 若被调用即说明未 break（回归）
+        p3_calls["n"] += 1
+        raise AssertionError("R3 abort 后不得执行 p3")
+
+    def boom_t5(*a, **k):
+        t5_calls["n"] += 1
+        raise AssertionError("R3 abort 后不得执行 t5")
+
+    monkeypatch.setattr(drv, "run_history", rh_hang)
+    monkeypatch.setattr(drv, "run_incremental", boom_p3)
+    monkeypatch.setattr(drv, "run_t5", boom_t5)
+
+    summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
+
+    # 只跑了 history（break 生效）——p3/t5 键不存在
+    assert list(summary["phases"]) == ["history"], f"应仅含 history: {list(summary['phases'])}"
+    assert p3_calls["n"] == 0 and t5_calls["n"] == 0, "R3 abort 后 p3/t5 不得执行"
+    # history phase error 化 + 标志留痕
+    ph = summary["phases"]["history"]
+    assert ph["ok"] is False, f"R3 abort 的 phase 不得 ok=True: {ph}"
+    assert ph.get("hang_watchdog") is True
+    assert "看门狗" in (ph.get("error") or ""), f"error 应说明 R3 原因: {ph}"
+    # all_ok=False（D-1 核心：不得误报成功）
+    assert summary["all_ok"] is False, f"R3 abort 后 all_ok 必须 False: {summary['all_ok']}"
+
+    # progress：kline_history state=error + last_error + phase_errors 留痕
+    prog = _read_prog()
+    eh = _task_entry(prog, "kline_history")
+    assert eh is not None and eh["state"] == "error", f"kline_history 应 error: {eh}"
+    assert eh.get("last_error"), f"应有 last_error: {eh}"
+    assert any(e.get("phase") == "history" for e in prog.get("phase_errors", [])), \
+        f"phase_errors 应含 history: {prog.get('phase_errors')}"
+    con.close()
+
+
+def test_d1_cmd_full_rc1_on_real_watchdog(tmp_path):
+    """子进程驱动真实 driver `full`（tmp 库 + fake，零网络）：run_history 按真实 R3
+    收尾契约返回 hang_watchdog=True → 进程 rc=1、段标仅 history、p3/t5 不执行。
+
+    （与 tester FA4b 同口径的 coder 侧回归——tester 复测仍独立执行其套件。）
+    """
+    import subprocess
+
+    db = str(tmp_path / "d1sub.duckdb")
+    codes = ["sh.600001", "sz.000002"]
+    _seed_master(db, codes)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO_ROOT + os.pathsep + SCRIPTS_DIR
+    env["LAKE_MULTISOURCE"] = "0"
+    prelude = (
+        f"import sys; sys.path[:0]={[REPO_ROOT, SCRIPTS_DIR]!r}\n"
+        "import lake_backfill as drv\n"
+        "import lake.ingest.tencent_ingest as ti\n"
+        "import lake.ingest.baostock_ingest as bsi\n"
+        "import screener.data.baostock_client as bsc\n"
+        "import screener.data.tencent as tmod\n"
+        "from lake.ingest import source_pool as sp\n"
+        f"drv._today_beijing=lambda:'{FIXED_TODAY}'\n"
+        "drv.time.sleep=lambda s:None\n"
+        "def _kl():\n"
+        "    return [{'date':d,'open':10.0,'high':11.0,'low':9.5,'close':10.5,'volume':100.0}"
+        " for d in ('2026-09-16','2026-09-17','2026-09-18')]\n"
+        "ti.fetch_kline_full_history=lambda c,t,page_size=2000:[dict(r) for r in _kl()]\n"
+        "ti.fetch_kline_ohlcv=lambda c,t,n:[dict(r) for r in _kl()]\n"
+        "ti.fetch_snapshot=lambda c,ts:{x:{'total_mv_yi':1.0,'float_mv_yi':1.0,'pe_ttm':5.0,"
+        "'pb':0.8,'turnover':1.0} for x in ts}\n"
+        "bsi.fetch_adjust_factor=lambda bs,code,s,e:(['code','adjustFactor'],[])\n"
+        "class _BS:\n    def __init__(s,*a,**k):pass\n    def close(s):pass\n"
+        "class _TC:pass\n"
+        "bsc.BaoStockClient=_BS; tmod.TencentClient=_TC\n"
+        "class _AD:\n    def available(s):return True\n"
+        "    def fetch_f10(s,c):return [{'period':'2026Q1','pub_date':'2026-04-30',"
+        "'roe_weighted':5.0,'gross_margin':30.0,'liability_pct':40.0,'yoy_pni':8.0,"
+        "'npi':1e9,'ocf':None}]\n"
+        "sp._REGISTRY={'adata_f10':_AD()}\n"
+        "def _rh(con,db,codes,s,e):\n"
+        "    # run_history 真实 R3 收尾契约（lake_backfill.py except HangWatchdogError）：\n"
+        "    # 记 hang_watchdog=True + last_error 后 return，不抛\n"
+        "    return {'sub':'history','codes_requested':2,'hang_watchdog':True,\n"
+        "            'last_error':'progress 停滞 >10min → 看门狗 abort'}\n"
+        "drv.run_history=_rh\n"
+        f"rc=drv.main(['--db', r'{db}', 'full', '--start-date','1990-01-01',"
+        f"'--end-date','{FIXED_TODAY}','--days','3'])\n"
+        "print('RC='+str(rc),flush=True)\n"
+    )
+    p = subprocess.run([sys.executable, "-c", prelude], capture_output=True,
+                       text=True, timeout=120, env=env, cwd=REPO_ROOT)
+    out = (p.stdout or "") + (p.stderr or "")
+    # rc=1（"卡死自愈退出"与"正常完成"可区分——D-1 核心）
+    assert p.returncode == 1, f"R3 abort 应致进程 rc=1，实测 {p.returncode}\n{out[-800:]}"
+    # 段标：仅 history（开始 + R3 abort 终止），p3/t5 未执行
+    marks = [ln for ln in out.splitlines() if "===== phase:" in ln]
+    assert any("phase: history" in ln and "开始" in ln for ln in marks), f"应有 history 开始段标: {marks}"
+    assert not any("phase: p3" in ln or "phase: t5" in ln for ln in marks), \
+        f"R3 abort 后不得执行 p3/t5: {marks}"
+    # progress（B-2：自定义 --db → 库同目录）：kline_history state=error + phase_errors
+    with open(os.path.join(str(tmp_path), "backfill_progress.json"), encoding="utf-8") as f:
+        prog = json.load(f)
+    eh = next((t for t in prog.get("tasks", []) if t.get("table") == "kline_history"), None)
+    assert eh is not None and eh["state"] == "error", f"kline_history 应 error: {eh}"
+    assert any(e.get("phase") == "history" for e in prog.get("phase_errors", [])), \
+        f"phase_errors 应含 history: {prog.get('phase_errors')}"
