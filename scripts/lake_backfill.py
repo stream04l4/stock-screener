@@ -21,8 +21,8 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                         **本批次只构建不跑**——TL 验收后由 TL 实际执行。
 - full                ← v6.1.6 单按钮全量补齐（Joel 拍板：一个按钮负责启动停止，
                         启动了就是要把所有历史及现状数据全部补上）。**一个 backfill
-                        进程内顺序执行三阶段**，同一把 DuckDB 独占锁贯穿全程
-                        （main() 的 LakeLock 包住整个 full——天然无竞争）：
+                        进程内顺序执行四阶段**（v6.1.7 加 t6），同一把 DuckDB 独占锁
+                        贯穿全程（main() 的 LakeLock 包住整个 full——天然无竞争）：
                           phase1 history（T2 全史 + adj_factor，幂等 done 键全跳过；
                                   --t5 不在此处——T5 是独立阶段 3）
                           phase2 P3 增量（kline_daily→valuation_daily→index_daily，
@@ -30,6 +30,10 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                           phase3 T5 fundamentals_quarterly（run_t5 原样复用：
                                   adata F10 主源 + BaoStock 探测存活时交叉校验，
                                   限速 adata_f10_min_interval_s）
+                          phase4 T6 holders_snapshot（v6.1.7：SinaClient.fetch_holders
+                                  全史前十大股东 → sina_ingest.load_t6；限速/WAF退避/
+                                  熔断全在 SinaClient 内部 ≥1s/只；done 键 (t6, ts_code)
+                                  幂等续传；--no-t6 可跳过——排障用）
                         每阶段开始/结束打 sync.log 段标（===== phase: X =====）；
                         任一阶段异常 → last_error + 该任务 state=error，**继续下一
                         阶段**（单表故障不拖死全量；hang1 R3 停滞看门狗照旧兜底）。
@@ -1036,6 +1040,96 @@ def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
 
 
 # ---------------------------------------------------------------------------
+# T6 holders_snapshot（v6.1.7：full 模式第 4 阶段——SinaClient.fetch_holders → load_t6）
+# ---------------------------------------------------------------------------
+def _t6_client_factory():
+    """T6 SinaClient 构造点（**独立函数=离线单测注入点**）。
+
+    brief §A 逐字口径：``SinaClient(sina_cfg(yaml strategy.yaml))``——screener/config.py
+    ``load_config(config/strategy.yaml)`` + ``sina_cfg(cfg)``（interval_s>=1.0 等纪律由
+    config 层校验）。限速/WAF456退避/连续失败熔断**全部在 SinaClient 内部**（≥1s/只、
+    每 cooldown_every_n 次请求长冷却）——本函数不另设节奏。
+    """
+    import os
+
+    from screener.config import load_config, sina_cfg
+    from screener.data.sina import SinaClient
+
+    cfg = load_config(os.path.join(_project_root(), "config", "strategy.yaml"))
+    return SinaClient(sina_cfg(cfg))
+
+
+def run_t6(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
+    """T6 前十大股东快照（v6.1.7 full 阶段 4；brief §A）。
+
+    - **全市场逐只** ``SinaClient.fetch_holders(code6)`` → ``sina_ingest.load_t6``：
+      一次返回该股**全部报告期**（TL 实测工行 79 期 2006→今，每期前十大
+      {holder_rank, holder_name, hold_shares, circ_ratio_pct, share_nature}）；
+      load_t6 as_of_date=None → 删该股全部快照后整体重灌（幂等；零行 no-op 不删旧）。
+    - **done 键 (t6, ts_code)**（brief 逐字；固定字符串跨天续传——与 kline_history 的
+      "full_history" / T5 的 "f10_full" 同模式）：中断重跑跳过已灌股，不重复耗新浪配额。
+    - **单只失败不阻断后续**（runner 既有语义：worker 抛错 → 记 errors、不 mark_done、
+      继续下一只；下轮续传自动重试该股）。SinaClient 熔断（连续 N 只失败）→ 后续
+      fetch_holders 立即抛 SinaDataError → 同走单任务失败路径，不拖死整阶段。
+    - **progress tasks 条目升级**（brief 逐字：由 no_source/total=0 升级为真实任务，
+      tier=P2）：阶段开始时把 holders_snapshot entry 置 total=stock_master 全集行数、
+      state=running——runner.run 的 _update_task_view/_refresh_task_view 随后按
+      (holders_snapshot, P2) 分组推进 done/eta；收尾 _refresh_incremental_task_view
+      再按全集口径归位（done==total→done，否则 pending）。
+    - 限速纪律：SinaClient 内部 ≥1s/只 + WAF 冷却（5219 只约 1.5h——长跑正常）；
+      worker 尾 0.3s 兜底小睡（同 T2/T5 节奏，不绕过 adapter 限速）。
+
+    :param codes: 股票子集（None=stock_master 全集；透传 --codes 冒烟口径）。
+    """
+    from lake.backfill import Task, save_progress
+    from lake.ingest.sina_ingest import load_t6
+
+    codes = codes or _universe_codes(con)
+    tasks = [Task(priority=2, table="holders_snapshot", ts_code=c,
+                  period_or_date="t6", tier="P2") for c in codes]
+    stats: Dict[str, Any] = {"codes_requested": len(codes)}
+
+    # brief 逐字：progress tasks 的 holders_snapshot 条目**在 t6 阶段开始时**由
+    # no_source/total=0 升级为真实任务（total=stock_master 行数、tier=P2、
+    # state pending→running）。runner.run 开始处 _update_task_view 会把 state 推成
+    # running——这里先落一次"升级"快照（total/tier/state），让阶段边界即可观测。
+    try:
+        e6 = next((t for t in runner.progress.get("tasks", [])
+                   if t.get("table") == "holders_snapshot"), None)
+        if e6 is None:
+            e6 = {"table": "holders_snapshot", "tier": "P2", "total": 0, "done": 0,
+                  "quota_used_today": runner.quota_used_today(),
+                  "quota_budget": runner.budget_per_day,
+                  "state": "pending", "eta_min": None, "last_error": ""}
+            runner.progress.setdefault("tasks", []).append(e6)
+        e6["tier"] = "P2"   # 升级：原 no_source 条目是 P3（v6.1.4 O3 占位）→ P2
+        e6["total"] = len(codes)
+        e6["state"] = "running"
+        e6["note"] = "SinaClient.fetch_holders 全史前十大股东（sina_f10；controller_* 待补源）"
+        save_progress(runner.progress, runner.progress_path)
+    except Exception as exc:  # noqa: BLE001 - 视图升级写失败不阻断灌数（run 内仍会建 entry）
+        log.warning("T6 progress 条目升级落盘失败（不阻断）: %s", exc)
+
+    client = _t6_client_factory()
+
+    def worker(task: Task) -> None:
+        code = task.ts_code
+        # ts_code "sh.601398" → code6 "601398"（新浪 F10 URL 口径，同 screener 引擎）
+        periods = client.fetch_holders(code.split(".")[1])
+        if not periods:
+            # fetch_holders 契约上取空即抛 SinaDataError；双保险——绝不在无数据时
+            # mark_done（done 键毒化防线，同 history/T5 纪律）
+            raise RuntimeError(f"T6 新浪 F10 股东页取空 {code}（不标 done，下轮重试）")
+        n = load_t6(con, code, periods)   # as_of_date=None → 全部报告期（全史快照）
+        if n <= 0:
+            raise RuntimeError(f"T6 load_t6 转换零行 {code}（页面结构漂移?不标 done，下轮重试）")
+        time.sleep(0.3)   # 兜底小睡（SinaClient 内部 ≥1s/只限速之外的节奏余量，同 T2/T5）
+
+    stats.update(runner.run(tasks, worker))
+    return {"table": "holders_snapshot", **stats}
+
+
+# ---------------------------------------------------------------------------
 # reconcile（v6.1 --reconcile：仅跨源校验补 conflict_src，不重取主源数据）
 # ---------------------------------------------------------------------------
 def run_reconcile(con, db_path: str, codes: Optional[List[str]],
@@ -1396,7 +1490,8 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
       已灌数（退市股 done 键不计入，防 done>total）；done==total → state="done"；
     - **fundamentals_quarterly（T5）**：加进 tasks（total=universe 行数、state=pending、
       备注"history --t5 或增量均可灌"；已跑过 history --t5 的按 f10_full done 键计 done）；
-    - **holders_snapshot（T6）**：state="no_source"（无可用源，前端灰 badge"暂无数据源"）。
+    - **holders_snapshot（T6）**：v6.1.7 起有源 → 真实任务（total=universe 行数、tier=P2、
+      done 按固定键 "t6" 计、done==total→done，否则 pending；full 阶段 4 灌数）。
 
     runner.run 的 _refresh_task_view 只回填**本次队列**分组（--codes 子集时 total=子集数）——
     本函数在其后按全集口径覆盖写 + save_progress（Web /status 3s 轮询可见）。
@@ -1475,12 +1570,21 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
     e5["state"] = "done" if (universe_n > 0 and done5 >= universe_n) else "pending"
     e5["note"] = "history --t5 或增量均可灌（adata F10 主源）"
 
-    # T6 holders_snapshot：无可用源 → no_source（前端灰 badge"暂无数据源"）
-    e6 = _entry("holders_snapshot", tier="P3")
-    e6["total"] = 0
-    e6["done"] = 0
-    e6["state"] = "no_source"
-    e6["note"] = "无可用数据源（controller_* 待补源）"
+    # T6 holders_snapshot：v6.1.7 起有源（SinaClient.fetch_holders → load_t6，full 阶段 4）
+    # ——由 v6.1.4 O3 的 no_source/total=0 占位升级为**真实任务**（brief §A 逐字：
+    # total=stock_master 行数、tier=P2、state pending→running→done）：
+    # done 按 (holders_snapshot, *, "t6") done 键计（∩ universe，防退市股虚增）；
+    # done==total → done；否则 running/stopping 归位 pending（收尾态无活跃 writer，
+    # 同 T2/T3/T5 口径）。full t6 阶段运行中由 run_t6 置 running + runner 逐任务推进。
+    e6 = _entry("holders_snapshot", tier="P2")
+    done6 = len(_done_codes("holders_snapshot", period="t6"))   # 固定键 "t6"（run_t6）
+    e6["total"] = universe_n
+    e6["done"] = done6
+    if universe_n > 0 and done6 >= universe_n:
+        e6["state"] = "done"
+    elif e6.get("state") in ("running", "stopping"):
+        e6["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
+    e6["note"] = "SinaClient.fetch_holders 全史前十大股东（full 阶段 4；controller_* 待补源）"
 
     save_progress(prog, runner.progress_path)
 
@@ -1494,15 +1598,19 @@ def cmd_incremental(args, con, db_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# full（v6.1.6：单按钮全量补齐——一个 backfill 进程顺序跑完所有阶段）
+# full（v6.1.6：单按钮全量补齐——一个 backfill 进程顺序跑完所有阶段；
+#      v6.1.7：+阶段 4 T6 holders_snapshot）
 # ---------------------------------------------------------------------------
 # v6.1.6 brief §A：Joel 拍板"三个按钮没必要，一个按钮负责启动停止——只要启动了
-# 就是需要把所有历史及现状数据全部都补上"。full = 同一进程内**顺序**执行三阶段，
+# 就是需要把所有历史及现状数据全部都补上"。full = 同一进程内**顺序**执行四阶段，
 # 同一把 DuckDB 独占锁贯穿全程（main() 的 LakeLock 包住整个 full → 天然无竞争）：
 #   phase1 history（T2 全史 + adj_factor；幂等——done 键全跳过；--t5 不在此处）
 #   phase2 P3 增量（kline_daily→valuation_daily→index_daily，run_incremental 原样复用）
 #   phase3 T5 fundamentals_quarterly（run_t5 原样复用：adata F10 主源 + BaoStock
 #          探测存活时交叉校验；限速 adata_f10_min_interval_s 在 adapter 内）
+#   phase4 T6 holders_snapshot（v6.1.7：run_t6——SinaClient.fetch_holders 全史前十大
+#          股东 → sina_ingest.load_t6；限速/WAF退避/熔断在 SinaClient 内部 ≥1s/只；
+#          done 键 (t6, ts_code) 幂等续传；--no-t6 可跳过——排障用）
 #
 # 阶段间契约（brief 逐字）：
 # - 每阶段开始/结束打 sync.log 段标（===== phase: X =====）——Web spawn 时 stdout
@@ -1523,6 +1631,11 @@ _FULL_PHASES = (
     ("history", "T2 全史"),
     ("p3", "P3 增量"),
     ("t5", "T5 基本面"),
+    # v6.1.7：第 4 阶段 T6（Joel 拍板方案 A——holders_snapshot 接进 full）。
+    # t6 是最后阶段、无后续：单只/单表故障 last_error+state=error 不阻断的纪律
+    # 保持一致（收尾视图刷新后重标 error，同前三阶段）；R3 hang_watchdog abort
+    # 穿透 rc=1 的 D-1 修复语义不变（run_history 在 phase1，abort 时 break 终止）。
+    ("t6", "T6 股东"),
 )
 
 
@@ -1532,6 +1645,7 @@ def _full_phase_tables(phase: str) -> List[str]:
         "history": ["kline_history"],
         "p3": ["kline_daily", "valuation_daily", "index_daily"],
         "t5": ["fundamentals_quarterly"],
+        "t6": ["holders_snapshot"],
     }[phase]
 
 
@@ -1558,7 +1672,8 @@ def _full_set_phase_entries_error(phase: str, db_path: str, exc: BaseException) 
 
     prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径；自定义→库目录
     prog = load_progress(prog_path)
-    tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2"}
+    tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2",
+             "holders_snapshot": "P2"}   # v6.1.7：T6 升级真实任务后 tier=P2（run_t6）
     for table in _full_phase_tables(phase):
         e = _full_ensure_entry(prog, table, tiers.get(table, "P3"))
         e["state"] = "error"
@@ -1578,7 +1693,8 @@ def _full_mark_phase_error(phase: str, db_path: str, exc: BaseException) -> None
         prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径；自定义→库目录
         prog = load_progress(prog_path)
         now_s = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2"}
+        tiers = {"kline_history": "P2", "fundamentals_quarterly": "P2",
+                 "holders_snapshot": "P2"}   # v6.1.7：T6 tier=P2（同 _full_set_phase_entries_error）
         for table in _full_phase_tables(phase):
             e = _full_ensure_entry(prog, table, tiers.get(table, "P3"))
             e["state"] = "error"
@@ -1592,13 +1708,17 @@ def _full_mark_phase_error(phase: str, db_path: str, exc: BaseException) -> None
 
 
 def run_full(con, db_path: str, codes: Optional[List[str]],
-             start_date: str, end_date: str, days: int) -> Dict[str, Any]:
-    """v6.1.6 full 模式：单进程顺序执行 history → P3 增量 → T5（brief §A）。
+             start_date: str, end_date: str, days: int,
+             t6_enabled: bool = True) -> Dict[str, Any]:
+    """v6.1.7 full 模式：单进程顺序执行 history → P3 增量 → T5 → T6（brief §A）。
 
-    :param con: driver 主连接（LakeLock 内；三阶段共用——同锁天然无竞争）。
+    :param con: driver 主连接（LakeLock 内；四阶段共用——同锁天然无竞争）。
     :param codes: 股票子集（None=stock_master 全集；透传各阶段）。
     :param start_date/end_date: history 全史窗口（与 cmd_history 同口径）。
     :param days: P3 T7 指数窗口交易日数（run_incremental 的 days，默认 250）。
+    :param t6_enabled: **v6.1.7 --no-t6 开关**（默认 True=跑 T6；False=跳过——排障用）。
+        跳过时 summary.phases["t6"] = {"ok": True, "skipped": True}（all_ok 不受影响，
+        holders_snapshot entry 不动——保持收尾视图刷新后的真实态）。
 
     :return: ``{"sub": "full", "phases": {phase: stats|error}, ...}``——summary 打印。
         各阶段异常**不抛**（记 phases[phase]["error"] + progress state=error），
@@ -1615,6 +1735,11 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
                                "days": days, "phases": {}}
     failed: Dict[str, Any] = {}   # phase → 异常/错误摘要（收尾视图刷新后重标 error 用）
     for phase, label in _FULL_PHASES:
+        if phase == "t6" and not t6_enabled:
+            # v6.1.7 --no-t6（排障用）：跳过阶段 4——不打段标、不碰 progress/holders_snapshot
+            # entry（保持收尾视图刷新后的真实态），summary 留痕 skipped（all_ok 不受影响）。
+            summary["phases"]["t6"] = {"ok": True, "skipped": True}
+            continue
         log.info("===== phase: %s =====（%s 开始）", phase, label)
         print(f"===== phase: {phase} =====（{label} 开始）")
         t0 = time.monotonic()
@@ -1627,10 +1752,15 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
                 # 阶段 2：P3 增量（kline_daily→valuation_daily→index_daily，
                 # 现有 incremental 逻辑原样复用——含收尾 tasks 视图刷新）。
                 stats = run_incremental(con, db_path, codes, days)
-            else:   # t5
+            elif phase == "t5":
                 # 阶段 3：T5 fundamentals_quarterly（现有 --t5 逻辑抽出复用：
                 # adata F10 主源 + BaoStock 探测存活时交叉校验，限速在 adapter）。
                 stats = run_t5(con, db_path, codes, BackfillRunner(db_path=db_path))
+            else:   # t6（v6.1.7）
+                # 阶段 4：T6 holders_snapshot——SinaClient.fetch_holders 全史前十大股东
+                # → sina_ingest.load_t6（限速/WAF退避/熔断在 SinaClient 内部 ≥1s/只；
+                # done 键 (t6, ts_code) 幂等续传；单只失败不阻断后续）。
+                stats = run_t6(con, db_path, codes, BackfillRunner(db_path=db_path))
             summary["phases"][phase] = {"ok": True, "elapsed_s": round(time.monotonic() - t0, 1),
                                         **stats}
             # R3 看门狗 abort（D-1 修复）：run_history 的 `except HangWatchdogError`
@@ -1708,12 +1838,13 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
 
 
 def cmd_full(args, con, db_path: str) -> int:
-    """full 子命令入口（v6.1.6：单按钮全量补齐）。"""
+    """full 子命令入口（v6.1.6：单按钮全量补齐；v6.1.7：+阶段 4 T6，--no-t6 可跳）。"""
     from lake.ingest.common import HangWatchdogError
 
     codes = _parse_codes(args.codes)
     end_date = args.end_date or _today_beijing()
-    summary = run_full(con, db_path, codes, args.start_date, end_date, args.days)
+    summary = run_full(con, db_path, codes, args.start_date, end_date, args.days,
+                       t6_enabled=bool(getattr(args, "t6", True)))
     _print_summary("full", summary)
     # 单阶段故障不拖死全量（各阶段 error 已记 progress）→ 进程 rc=0；R3 看门狗
     # abort 两路都致 rc=1：①直接抛出的 HangWatchdogError（BaseException）穿透到
@@ -1877,13 +2008,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "full",
-        help="v6.1.6：单按钮全量补齐——一个进程顺序跑完 history→P3 增量→T5（同一把锁贯穿全程；"
+        help="v6.1.7：单按钮全量补齐——一个进程顺序跑完 history→P3 增量→T5→T6（同一把锁贯穿全程；"
              "任一阶段异常记 error 后继续下一阶段）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=全集）")
     sp.add_argument("--start-date", default="1990-01-01", help="全史起点（默认 1990-01-01）")
     sp.add_argument("--end-date", default=None, help="全史终点（缺省=今日北京时间）")
     sp.add_argument("--days", type=int, default=250,
                     help="P3 T7 指数窗口交易日数（默认 250）")
+    # v6.1.7：T6 独立开关——默认开（full 含阶段 4）；--no-t6 跳过（排障用）。
+    # deprecated 单模式通道（history/incremental/t5）不加 t6（brief 红线：逐字节不变）。
+    sp.add_argument("--t6", dest="t6", action="store_true", default=True,
+                    help="跑 T6 股东阶段（默认开；显式 --t6 无行为变化）")
+    sp.add_argument("--no-t6", dest="t6", action="store_false",
+                    help="跳过 T6 股东阶段（排障用；默认不跳）")
     sp.set_defaults(func=cmd_full)
 
     sp = sub.add_parser("reconcile",

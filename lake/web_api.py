@@ -1071,8 +1071,9 @@ def _current_phase(db_path: Optional[str] = None) -> Optional[str]:
     append 落 sync.log）：``===== phase: history =====（T2 全史 开始）`` /
     ``……结束，Xs）`` / ``……异常，继续下一阶段）``。本函数扫日志尾部（64KB 足够——
     阶段标记之间至多隔几十行进度输出）按序回放：见"开始"→ 记当前 phase；见同一
-    phase 的"结束/异常"→ 清空。返回 ``history|p3|t5`` 或 None（无 full 段标 /
-    非 full 模式进程 / 日志缺失——此时前端不显示 phase 小字，三态契约其余字段不动）。
+    phase 的"结束/异常"→ 清空。返回 ``history|p3|t5|t6``（v6.1.7 +t6 股东阶段）或
+    None（无 full 段标 / 非 full 模式进程 / 日志缺失——此时前端不显示 phase 小字，
+    三态契约其余字段不动）。
 
     为什么读日志而非 progress 文件：progress 的 tasks 视图是**按表**聚合的
     （kline_history/kline_daily/…），没有"阶段"概念；段标是 full 编排层的原生
@@ -1098,7 +1099,8 @@ def _current_phase(db_path: Optional[str] = None) -> Optional[str]:
         if not m:
             continue
         name = m.group(1)
-        if name not in ("history", "p3", "t5"):
+        # v6.1.7：full 第 4 阶段 t6（T6 股东）加入白名单——未知段标仍忽略（不猜）。
+        if name not in ("history", "p3", "t5", "t6"):
             continue   # 未知段标忽略（不猜）
         if "开始" in line:
             cur = name

@@ -9,7 +9,7 @@
 //   running → 【■ 停止数据补齐】（红色危险样式 sync-danger；点击走现有 /sync/stop——
 //          v6.0.10 状态机 + v6.1.5 hang1 R4 ≤20s 快退，语义零改动）
 //   按钮下方小字显示当前 phase（来自 /status.phase，仅 backfill_in_progress=true 时
-//   后端追加）："正在灌：T2 全史 / T3 估值增量 / T5 基本面"。非 full 模式进程无段标
+//   后端追加）："正在灌：T2 全史 / T3 估值增量 / T5 基本面 / T6 股东"。非 full 模式进程无段标
 //   → 无 phase 键 → 小字不渲染（三态契约其余字段不动）。
 //
 // 按钮态优先级（与 v6.0.10 状态机逐字对齐）：
@@ -26,7 +26,8 @@ import { useLakeStore, fmtElapsed, STOP_SOFT_MS } from "../../stores/lakeStore.j
 const lake = useLakeStore();
 
 // v6.1.6：phase 小字文案映射（brief §A："T2 全史 / T3 估值增量 / T5 基本面"）。
-const PHASE_LABELS = { history: "T2 全史", p3: "T3 估值增量", t5: "T5 基本面" };
+// v6.1.7：+t6 股东阶段（full 第 4 阶段——holders_snapshot 接入 full）。
+const PHASE_LABELS = { history: "T2 全史", p3: "T3 估值增量", t5: "T5 基本面", t6: "T6 股东" };
 
 // 运行中 meta 拼接（v6.1.4 口径保留）：stopping=true → 友好文案；已耗时/进度更新时间。
 const runningMeta = computed(() => {

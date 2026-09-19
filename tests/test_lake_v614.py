@@ -18,7 +18,8 @@ O4 源开关+手动探测 /（O5 前端色板见 vitest）。
   零重复取数；tasks 占位条目刷成真实 total/done。
 - **O3** tasks 视图刷新（incremental/status 路径）：kline_history 完成态如实标 done
   （不依赖已死进程自报）、T5 fundamentals_quarterly 加 pending 条目、
-  T6 holders_snapshot state="no_source"。
+  T6 holders_snapshot v6.1.7 起为真实任务（total=universe、tier=P2、pending——
+  full 阶段 4 灌数；旧 no_source 占位随源接入移除）。
 - **O4** ``POST /sources/toggle``（写 tmp yaml，.bak 备份 + ruamel roundtrip 保注释）
   + ``POST /sources/probe``（fake _probe_one_source；15s 超时纪律 → "probe timeout"）。
 """
@@ -409,7 +410,7 @@ def _seed_stuck_history_progress(codes) -> None:
 def test_o3_refresh_marks_kline_history_done_and_adds_t5_t6(tmp_path):
     """incremental 收尾刷新：kline_history running→done（不依赖已死进程自报）；
     T5 fundamentals_quarterly 加 pending 条目（备注 history --t5）；
-    T6 holders_snapshot state=no_source。"""
+    T6 holders_snapshot v6.1.7 起为真实任务（total=universe、tier=P2、pending）。"""
     db = str(tmp_path / "o3.duckdb")
     codes = ["sh.600001", "sz.000002"]
     _seed_master(db, codes)
@@ -433,8 +434,10 @@ def test_o3_refresh_marks_kline_history_done_and_adds_t5_t6(tmp_path):
         f"T5 应加 pending 条目: {e5}"
     assert "--t5" in (e5.get("note") or "")
     e6 = _task_entry(prog, "holders_snapshot")
-    assert e6 is not None and e6["state"] == "no_source", \
-        f"T6 应标 no_source: {e6}"
+    assert e6 is not None and e6["state"] == "pending", \
+        f"T6 应为真实任务 pending（v6.1.7）: {e6}"
+    assert e6["tier"] == "P2" and e6["total"] == 2, \
+        f"T6 应 total=universe tier=P2: {e6}"
     con.close()
 
 
@@ -453,7 +456,8 @@ def test_o3_status_path_refreshes_tasks_view(tmp_path):
     eh = _task_entry(prog, "kline_history")
     assert eh["state"] == "done", f"status 路径应纠正死进程残留: {eh}"
     e6 = _task_entry(prog, "holders_snapshot")
-    assert e6 is not None and e6["state"] == "no_source"
+    assert e6 is not None and e6["state"] == "pending", \
+        f"T6 应为真实任务 pending（v6.1.7）: {e6}"
     con.close()
 
 

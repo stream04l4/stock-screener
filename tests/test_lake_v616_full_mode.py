@@ -123,22 +123,51 @@ def _f10_recs():
              "npi": 1e9, "ocf": None}]
 
 
-def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False):
-    """离线 fake（v614/v607 同模式）：legacy 路径模块级取数函数 + T5 mock adapter。
+def _holders_periods():
+    """T6 fake periods（parse_holders_page 结构）：固定 2 报告期 × 3 股东。
+
+    load_t6 逐期展开 → 每股 6 行；字段名与真实 SinaClient.fetch_holders 输出一致
+    （holder_rank/holder_name/hold_shares/circ_ratio_pct/share_nature）。
+    """
+    def _holders(ratio_base):
+        return [
+            {"holder_rank": 1, "holder_name": f"股东A{ratio_base}",
+             "hold_shares": 1000.0, "circ_ratio_pct": ratio_base, "share_nature": "国有股"},
+            {"holder_rank": 2, "holder_name": f"股东B{ratio_base}",
+             "hold_shares": 500.0, "circ_ratio_pct": round(ratio_base / 2, 4),
+             "share_nature": None},
+            {"holder_rank": 3, "holder_name": f"股东C{ratio_base}",
+             "hold_shares": 200.0, "circ_ratio_pct": round(ratio_base / 5, 4),
+             "share_nature": "境内法人股"},
+        ]
+
+    return [
+        {"end_date": "2026-03-31", "notice_date": "2026-04-20", "holders": _holders(12.5)},
+        {"end_date": "2026-06-30", "notice_date": "2026-07-15", "holders": _holders(11.0)},
+    ]
+
+
+def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
+                t6_fail_codes=()):
+    """离线 fake（v614/v607 同模式）：legacy 路径模块级取数函数 + T5 mock adapter
+    + v6.1.7 T6 SinaClient 构造替身。
 
     - history legacy：ti.fetch_kline_full_history（全史）+ bsi.fetch_adjust_factor
       （adj，空行=无除权，合法）；BaoStockClient/TencentClient 构造替身（零网络）。
     - P3 legacy：ti.fetch_kline_ohlcv（T2 窗口/T7 指数共用）+ ti.fetch_snapshot（T3）。
     - T5：mock adata_f10 adapter 注入注册表（run_t5 直接 get_adapter）。
+    - T6（v6.1.7）：drv._t6_client_factory → fake SinaClient（fetch_holders 返回
+      _holders_periods()，固定 2 报告期×3 股东；t6_fail_codes 内的 code6 抛错——
+      单只失败不阻断后续用例用）。
 
-    :return: counter dict（full_history/kline/snapshot/f10 调用计数，可清零重跑）。
+    :return: counter dict（full_history/kline/snapshot/f10/holders 调用计数，可清零重跑）。
     """
     import lake.ingest.tencent_ingest as ti
     import lake.ingest.baostock_ingest as bsi
     import screener.data.baostock_client as bsc
     import screener.data.tencent as tmod
 
-    counter = {"full_history": 0, "kline": 0, "snapshot": 0}
+    counter = {"full_history": 0, "kline": 0, "snapshot": 0, "holders": {}}
     adata = _MockAdata(fail=t5_fail)
 
     def fake_full_history(client, ts_code, page_size=2000):
@@ -170,6 +199,16 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False):
     class _FakeTClient:
         pass
 
+    class _FakeSina:   # v6.1.7：T6 SinaClient 替身（fetch_holders 固定 periods；零网络）
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch_holders(self, code6):
+            counter["holders"][code6] = counter["holders"].get(code6, 0) + 1
+            if code6 in t6_fail_codes:
+                raise RuntimeError(f"新浪 F10 股东页故障（测试注入）{code6}")
+            return [dict(p) for p in _holders_periods()]
+
     monkeypatch.setattr(ti, "fetch_kline_full_history", fake_full_history)
     monkeypatch.setattr(ti, "fetch_kline_ohlcv", fake_kline)
     monkeypatch.setattr(ti, "fetch_snapshot", fake_snapshot)
@@ -177,6 +216,7 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False):
                         lambda bs, code, s, e: (["code", "adjustFactor"], []))
     monkeypatch.setattr(bsc, "BaoStockClient", _FakeBS)
     monkeypatch.setattr(tmod, "TencentClient", _FakeTClient)
+    monkeypatch.setattr(drv, "_t6_client_factory", lambda: _FakeSina())
     _set_registry(monkeypatch, {"adata_f10": adata})
     counter["f10"] = 0   # 占位（真实计数在 adata.f10_calls）
     return counter
@@ -195,7 +235,7 @@ def _task_entry(prog: dict, table: str):
 # 1) full 三阶段顺序执行 + 数据落库
 # ===========================================================================
 def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, capsys):
-    """full → history→P3→T5 顺序跑完：summary.phases 顺序正确、各表行数正确。"""
+    """full → history→P3→T5→T6 顺序跑完（v6.1.7 四阶段）：summary.phases 顺序正确、各表行数正确。"""
     db = str(tmp_path / "full.duckdb")
     codes = ["sh.600001", "sz.000002"]
     _seed_master(db, codes)
@@ -204,10 +244,10 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
 
     summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
 
-    # 三阶段全 ok + 顺序 history→p3→t5（dict 插入序即执行序）
-    assert summary["all_ok"] is True, f"三阶段应全成功: {summary['phases']}"
-    assert list(summary["phases"]) == ["history", "p3", "t5"]
-    for ph in ("history", "p3", "t5"):
+    # 四阶段全 ok + 顺序 history→p3→t5→t6（dict 插入序即执行序）
+    assert summary["all_ok"] is True, f"四阶段应全成功: {summary['phases']}"
+    assert list(summary["phases"]) == ["history", "p3", "t5", "t6"]
+    for ph in ("history", "p3", "t5", "t6"):
         assert summary["phases"][ph]["ok"] is True, f"phase {ph} 应成功: {summary['phases'][ph]}"
 
     # 阶段 1 history：kline_daily 全史（fake 3 日/股）+ done 键 full_history
@@ -228,16 +268,23 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
     # 阶段 3 T5：fundamentals_quarterly（adata F10，每股 1 期）
     n_t5 = con.execute("SELECT COUNT(*) FROM fundamentals_quarterly").fetchone()[0]
     assert n_t5 == 2, f"fundamentals_quarterly 应 2 行: {n_t5}"
-    # 取数计数：history 每股 1 次全史；P3 T2/T7 用窗口 K线（T2 2 股 + T7 4 指数）
+    # 阶段 4 T6（v6.1.7）：holders_snapshot（fake 2 期×3 股东/股 → 每股 6 行）
+    n_t6 = con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0]
+    assert n_t6 == 2 * 6, f"holders_snapshot 应 12 行（2 股×2 期×3 股东）: {n_t6}"
+    # 取数计数：history 每股 1 次全史；P3 T2/T7 用窗口 K线（T2 2 股 + T7 4 指数）；
+    # T6 每股 1 次 fetch_holders（code6 口径）
     assert counter["full_history"] == 2, f"history 应每股一次全史: {counter}"
     assert counter["kline"] == 2 + len(INDEX_CODES), f"P3 T2/T7 窗口取数: {counter}"
-    # 段标日志（stdout）：三阶段开始/结束成对、顺序正确（耗时值不硬断言——计时非契约）
+    assert counter["holders"] == {"600001": 1, "000002": 1}, \
+        f"T6 应每股一次 fetch_holders（code6）: {counter['holders']}"
+    # 段标日志（stdout）：四阶段开始/结束成对、顺序正确（耗时值不硬断言——计时非契约）
     out = capsys.readouterr().out
     marks = [ln for ln in out.splitlines() if "===== phase:" in ln]
-    assert len(marks) == 6, f"应 6 条段标（3 阶段×开始/结束）: {marks}"
+    assert len(marks) == 8, f"应 8 条段标（4 阶段×开始/结束）: {marks}"
     expect_seq = [("history", "开始"), ("history", "结束"),
                   ("p3", "开始"), ("p3", "结束"),
-                  ("t5", "开始"), ("t5", "结束")]
+                  ("t5", "开始"), ("t5", "结束"),
+                  ("t6", "开始"), ("t6", "结束")]
     for ln, (ph, kind) in zip(marks, expect_seq):
         assert f"===== phase: {ph} =====" in ln and kind in ln, \
             f"段标顺序错误（期望 {ph}/{kind}）: {marks}"
@@ -248,7 +295,7 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
 # 2) full 幂等：done keys 全在 → 三阶段全跳过、零重取
 # ===========================================================================
 def test_full_idempotent_rerun_all_skipped(tmp_path, monkeypatch):
-    """同日重跑 full → history/p3/t5 全 skipped_done、fake 零重取（幂等契约）。"""
+    """同日重跑 full → history/p3/t5/t6 全 skipped_done、fake 零重取（幂等契约）。"""
     db = str(tmp_path / "fullid.duckdb")
     codes = ["sh.600001"]
     _seed_master(db, codes)
@@ -259,6 +306,7 @@ def test_full_idempotent_rerun_all_skipped(tmp_path, monkeypatch):
     assert r1["all_ok"] is True
     # 计数清零 → Run2
     counter["full_history"] = counter["kline"] = counter["snapshot"] = 0
+    counter["holders"] = {}
 
     r2 = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
     assert r2["all_ok"] is True
@@ -273,11 +321,21 @@ def test_full_idempotent_rerun_all_skipped(tmp_path, monkeypatch):
     # T5：f10_full done 键全跳过 → adata 零重取
     assert r2["phases"]["t5"]["skipped_done"] == 1
     assert r2["phases"]["t5"]["processed"] == 0
+    # T6（v6.1.7）：(t6, ts_code) done 键全跳过 → fetch_holders 零重取
+    assert r2["phases"]["t6"]["skipped_done"] == 1
+    assert r2["phases"]["t6"]["processed"] == 0
     assert counter["full_history"] == 0, f"Run2 history 应零全史重取: {counter}"
     assert counter["kline"] == 0, f"Run2 P3 应零窗口重取: {counter}"
-    # upsert 幂等：行数不翻倍
+    assert counter["holders"] == {}, f"Run2 T6 应零 fetch_holders 重取: {counter['holders']}"
+    # upsert 幂等：行数不翻倍（T6 load_t6 先删后插——重灌也不翻倍）
     assert con.execute("SELECT COUNT(*) FROM kline_daily").fetchone()[0] == 3
     assert con.execute("SELECT COUNT(*) FROM fundamentals_quarterly").fetchone()[0] == 1
+    assert con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0] == 6
+    # done 键含 (holders_snapshot, ts_code, "t6")（brief 逐字幂等键）
+    prog = _read_prog()
+    done_keys = [tuple(k) for k in prog.get("done", [])]
+    assert ("holders_snapshot", "sh.600001", "t6") in done_keys, \
+        f"T6 done 键应为 (t6, ts_code): {done_keys}"
     con.close()
 
 
@@ -349,6 +407,10 @@ def test_full_t5_phase_exception_marks_error_and_survives_view_refresh(tmp_path,
     # P3 各表 state 不受 T5 故障影响（done==total → done）
     ek = _task_entry(prog, "kline_daily")
     assert ek["state"] == "done", f"P3 kline_daily 应 done: {ek}"
+    # v6.1.7：T6 是 T5 的**下一阶段**——T5 阶段级故障不得阻断 t6（单表故障不拖死全量）
+    assert summary["phases"]["t6"]["ok"] is True, "T5 阶段故障不得阻断 T6"
+    e6 = _task_entry(prog, "holders_snapshot")
+    assert e6["state"] == "done", f"T6 应照常 done: {e6}"
     con.close()
 
 
@@ -401,7 +463,7 @@ def test_phase_p3_after_history_done(tmp_path, monkeypatch):
 
 
 def test_phase_t5_and_done_clears(tmp_path, monkeypatch):
-    """t5 开始 → phase='t5'；三阶段全结束 → phase=None（**键不出现**，三态契约）。"""
+    """t5 开始 → phase='t5'；四阶段全结束 → phase=None（**键不出现**，三态契约）。"""
     d = _locked_status(monkeypatch, tmp_path,
                        "===== phase: history =====（T2 全史 开始）\n"
                        "===== phase: history =====（T2 全史 结束，1s）\n"
@@ -417,8 +479,35 @@ def test_phase_t5_and_done_clears(tmp_path, monkeypatch):
                         "===== phase: p3 =====（P3 增量 结束，2s）\n"
                         "===== phase: t5 =====（T5 基本面 开始）\n"
                         "===== phase: t5 =====（T5 基本面 结束，3s）\n")
+    # v6.1.7：t5 结束后进入 t6 阶段——但本日志无 t6 段标（模拟旧 full / t6 尚未开始），
+    # 回放结果 phase=None（键不出现）。
     assert d2.get("phase") is None and "phase" not in d2, \
         f"全结束后不应有 phase 键: {list(d2.keys())}"
+
+
+def test_phase_t6_and_done_clears(tmp_path, monkeypatch):
+    """v6.1.7：t6 开始 → phase='t6'；四阶段全结束（含 t6）→ phase=None（键不出现）。"""
+    d = _locked_status(monkeypatch, tmp_path,
+                       "===== phase: history =====（T2 全史 开始）\n"
+                       "===== phase: history =====（T2 全史 结束，1s）\n"
+                       "===== phase: p3 =====（P3 增量 开始）\n"
+                       "===== phase: p3 =====（P3 增量 结束，2s）\n"
+                       "===== phase: t5 =====（T5 基本面 开始）\n"
+                       "===== phase: t5 =====（T5 基本面 结束，3s）\n"
+                       "===== phase: t6 =====（T6 股东 开始）\n")
+    assert d.get("phase") == "t6", f"应报 phase=t6: {d.get('phase')}"
+
+    d2 = _locked_status(monkeypatch, tmp_path,
+                        "===== phase: history =====（T2 全史 开始）\n"
+                        "===== phase: history =====（T2 全史 结束，1s）\n"
+                        "===== phase: p3 =====（P3 增量 开始）\n"
+                        "===== phase: p3 =====（P3 增量 结束，2s）\n"
+                        "===== phase: t5 =====（T5 基本面 开始）\n"
+                        "===== phase: t5 =====（T5 基本面 结束，3s）\n"
+                        "===== phase: t6 =====（T6 股东 开始）\n"
+                        "===== phase: t6 =====（T6 股东 结束，4s）\n")
+    assert d2.get("phase") is None and "phase" not in d2, \
+        f"四阶段全结束后不应有 phase 键: {list(d2.keys())}"
 
 
 def test_phase_absent_for_non_full_process(tmp_path, monkeypatch):
@@ -613,3 +702,179 @@ def test_d1_cmd_full_rc1_on_real_watchdog(tmp_path):
     assert eh is not None and eh["state"] == "error", f"kline_history 应 error: {eh}"
     assert any(e.get("phase") == "history" for e in prog.get("phase_errors", [])), \
         f"phase_errors 应含 history: {prog.get('phase_errors')}"
+
+
+# ===========================================================================
+# 7) v6.1.7：full 第 4 阶段 T6（holders_snapshot 接入 full——Joel 拍板方案 A）
+#    brief §C：load_t6 行数/字段、幂等跳过、单只失败不阻断后续、progress 条目升级、
+#    --no-t6 跳过、full 四阶段段标顺序（段标顺序已并入用例 1）。
+# ===========================================================================
+def test_t6_rows_fields_and_progress_upgrade(tmp_path, monkeypatch):
+    """run_t6 直驱：load_t6 行数/字段正确 + progress 条目由 no_source/P3/0 升级为
+    P2/total=universe/done（brief §A"由 no_source/total=0 升级为真实任务"）。"""
+    db = str(tmp_path / "t6rows.duckdb")
+    codes = ["sh.600001", "sz.000002"]
+    _seed_master(db, codes)
+    # 预置 v6.1.4 O3 旧占位条目（no_source/P3/total=0）——验证升级路径
+    p = lb._progress_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"updated_at": None, "tasks": [
+            {"table": "holders_snapshot", "tier": "P3", "total": 0, "done": 0,
+             "quota_used_today": 0, "quota_budget": 5000,
+             "state": "no_source", "eta_min": None, "last_error": "",
+             "note": "无可用数据源（controller_* 待补源）"}],
+            "coverage": {}, "done": []}, f)
+
+    con = lconn.open(db)
+    _wire_fakes(monkeypatch, codes)
+    from lake.backfill import BackfillRunner
+
+    stats = drv.run_t6(con, db, codes, BackfillRunner(db_path=db))
+
+    # load_t6 行数：2 股 × 2 期 × 3 股东 = 12（brief §C"load_t6 行数/字段"）
+    assert stats["processed"] == 2 and not stats.get("errors"), f"run_t6 应全成功: {stats}"
+    n = con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0]
+    assert n == 12, f"holders_snapshot 应 12 行: {n}"
+    # 字段：hold_ratio=circ_ratio_pct（流通股口径）、controller_* 恒 NULL（待补源）、
+    # source=sina_f10、as_of_date=报告期 end_date
+    row = con.execute(
+        "SELECT ts_code, as_of_date, holder_rank, holder_name, hold_ratio, share_nature, "
+        "controller_name, controller_type, controller_ratio, source "
+        "FROM holders_snapshot WHERE ts_code='sh.600001' AND as_of_date='2026-03-31' "
+        "AND holder_rank=1").fetchone()
+    assert row is not None, "首行（rank=1/2026-03-31）应存在"
+    (ts_code, as_of, rank, name, ratio, nature, cn, ct, cr, source) = row
+    assert ts_code == "sh.600001" and str(as_of) == "2026-03-31" and rank == 1
+    assert name == "股东A12.5" and ratio == 12.5, f"hold_ratio 应=circ_ratio_pct: {row}"
+    assert nature == "国有股"
+    assert cn is None and ct is None and cr is None, "controller_* 应恒 NULL（待补源）"
+    assert source == "sina_f10"
+    # progress 条目升级：no_source/P3/total=0 → P2/total=universe/done==total
+    prog = _read_prog()
+    e6 = _task_entry(prog, "holders_snapshot")
+    assert e6 is not None and e6["tier"] == "P2", f"条目应升级 tier=P2: {e6}"
+    assert e6["total"] == 2, f"total 应=stock_master 行数: {e6}"
+    assert e6["done"] == 2, f"done 应=2（run_t6 直驱后）: {e6}"
+    # run_t6 直驱收尾 state=running（runner.run 末次 _update_task_view 态）——full 模式
+    # 由收尾 _refresh_incremental_task_view 归位 done；此处只断言非 no_source。
+    assert e6["state"] != "no_source", f"升级后不得再是 no_source: {e6}"
+    con.close()
+
+
+def test_t6_single_code_failure_not_blocking(tmp_path, monkeypatch):
+    """T6 单只失败（600001 抛错）→ 不阻断后续（000002 照常灌）；phase ok=False +
+    errors；holders_snapshot state=error + last_error（收尾刷新后重标）。"""
+    db = str(tmp_path / "t6fail.duckdb")
+    codes = ["sh.600001", "sz.000002"]
+    _seed_master(db, codes)
+    con = lconn.open(db)
+    counter = _wire_fakes(monkeypatch, codes, t6_fail_codes=("600001",))
+
+    summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
+
+    # 前三个阶段不受影响
+    for ph in ("history", "p3", "t5"):
+        assert summary["phases"][ph]["ok"] is True, f"{ph} 应 ok: {summary['phases'][ph]}"
+    # t6：单只失败 → phase ok=False + errors（runner 记 errors、不 mark_done）
+    t6 = summary["phases"]["t6"]
+    assert t6["ok"] is False, f"t6 应记 error: {t6}"
+    assert "600001" in (t6.get("error") or ""), f"errors 应含失败股: {t6}"
+    # 后续只照常：000002 落库（6 行），600001 零行
+    n = con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0]
+    assert n == 6, f"仅 000002 应落 6 行: {n}"
+    c6 = con.execute("SELECT DISTINCT ts_code FROM holders_snapshot").fetchall()
+    assert [r[0] for r in c6] == ["sz.000002"], f"仅 000002: {c6}"
+    # fetch_holders 两只都调了（单只失败不阻断后续取数）
+    assert set(counter["holders"]) == {"600001", "000002"}, f"两只都应尝试: {counter['holders']}"
+    # done 键：仅成功股（防 done 键毒化——失败股下轮重试）
+    prog = _read_prog()
+    done_keys = [tuple(k) for k in prog.get("done", [])]
+    assert ("holders_snapshot", "sz.000002", "t6") in done_keys, f"成功股应标 done: {done_keys}"
+    assert not any(k[1] == "sh.600001" and k[0] == "holders_snapshot" for k in done_keys), \
+        f"失败股不得标 done: {done_keys}"
+    # holders_snapshot entry：state=error + last_error（收尾视图刷新后重标——同 T5 契约）
+    e6 = _task_entry(prog, "holders_snapshot")
+    assert e6 is not None and e6["state"] == "error", f"应 state=error: {e6}"
+    assert e6.get("last_error"), f"应有 last_error: {e6}"
+    assert any(e.get("phase") == "t6" for e in prog.get("phase_errors", [])), \
+        f"phase_errors 应含 t6: {prog.get('phase_errors')}"
+    assert summary["all_ok"] is False, "有任务失败 → all_ok=False"
+    con.close()
+
+
+def test_t6_phase_exception_marks_error(tmp_path, monkeypatch):
+    """T6 阶段级异常（run_t6 抛出）→ holders_snapshot state=error + last_error，
+    收尾视图刷新后重标生效（brief §A"单表故障 last_error+state=error"）。"""
+    db = str(tmp_path / "t6exc.duckdb")
+    codes = ["sh.600001"]
+    _seed_master(db, codes)
+    con = lconn.open(db)
+    _wire_fakes(monkeypatch, codes)
+    monkeypatch.setattr(drv, "run_t6",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("T6 阶段故障（测试注入）")))
+
+    summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
+
+    assert summary["phases"]["t6"]["ok"] is False
+    assert "T6 阶段故障" in summary["phases"]["t6"]["error"]
+    for ph in ("history", "p3", "t5"):
+        assert summary["phases"][ph]["ok"] is True, f"{ph} 应不受影响: {summary['phases'][ph]}"
+    assert summary["all_ok"] is False
+
+    prog = _read_prog()
+    e6 = _task_entry(prog, "holders_snapshot")
+    assert e6 is not None and e6["state"] == "error", f"T6 阶段异常后收尾仍须 error: {e6}"
+    assert "phase t6 failed" in (e6.get("last_error") or ""), f"last_error 应含原因: {e6}"
+    assert any(e.get("phase") == "t6" for e in prog.get("phase_errors", []))
+    con.close()
+
+
+def test_full_no_t6_skips_phase(tmp_path, monkeypatch, capsys):
+    """--no-t6（排障用）：t6 阶段跳过——无段标、零 fetch_holders、holders_snapshot 零行；
+    summary.phases['t6']={'ok':True,'skipped':True}；all_ok=True。"""
+    db = str(tmp_path / "not6.duckdb")
+    codes = ["sh.600001", "sz.000002"]
+    _seed_master(db, codes)
+    con = lconn.open(db)
+    counter = _wire_fakes(monkeypatch, codes)
+
+    summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3,
+                           t6_enabled=False)
+
+    # 前三阶段照常；t6 跳过留痕（不打段标、不取数）
+    for ph in ("history", "p3", "t5"):
+        assert summary["phases"][ph]["ok"] is True
+    assert summary["phases"]["t6"] == {"ok": True, "skipped": True}, \
+        f"t6 应 skipped: {summary['phases']['t6']}"
+    assert summary["all_ok"] is True
+    assert counter["holders"] == {}, f"--no-t6 不得调用 fetch_holders: {counter['holders']}"
+    assert con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0] == 0
+    # stdout 无 t6 段标（4→3 阶段：6 条段标）
+    out = capsys.readouterr().out
+    marks = [ln for ln in out.splitlines() if "===== phase:" in ln]
+    assert len(marks) == 6, f"--no-t6 应 6 条段标（3 阶段）: {marks}"
+    assert not any("phase: t6" in ln for ln in marks), f"不得有 t6 段标: {marks}"
+    # holders_snapshot entry：收尾视图刷新为真实任务 pending（total=universe、tier=P2，
+    # done=0——跳过未灌）
+    prog = _read_prog()
+    e6 = _task_entry(prog, "holders_snapshot")
+    assert e6 is not None and e6["state"] == "pending" and e6["total"] == 2 \
+        and e6["tier"] == "P2", f"--no-t6 后 entry 应 pending/total=universe: {e6}"
+    con.close()
+
+
+def test_full_cli_no_t6_flag_parses():
+    """argparse：full --no-t6 → t6=False；缺省/--t6 → True（deprecated 通道无该 flag）。"""
+    p = drv.build_parser()
+    a = p.parse_args(["full"])
+    assert a.t6 is True, "缺省应开 T6"
+    a = p.parse_args(["full", "--no-t6"])
+    assert a.t6 is False, "--no-t6 应关 T6"
+    a = p.parse_args(["full", "--t6"])
+    assert a.t6 is True, "显式 --t6 无行为变化（仍开）"
+    # deprecated 单模式通道不加 t6（brief 红线：逐字节不变）
+    for sub in ("history", "incremental"):
+        a = p.parse_args([sub])
+        assert not hasattr(a, "t6"), f"{sub} 不得有 t6 flag: {a}"

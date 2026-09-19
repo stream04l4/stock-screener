@@ -200,11 +200,15 @@ describe("F4→v6.1.6：SyncControl 单按钮（T5/增量并入全量 toggle）"
     w.unmount();
   });
 
-  it("running + phase → 小字 '正在灌：…'（history/p3/t5 映射；无 phase 键不渲染）", async () => {
+  it("running + phase → 小字 '正在灌：…'（history/p3/t5/t6 映射；无 phase 键不渲染）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t5" });
     await tick();
     expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T5 基本面");
+    // v6.1.7：full 第 4 阶段 t6（T6 股东）
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t6" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T6 股东");
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9 });
     await tick();
     expect(w.find("#lake-sync-phase").exists()).toBe(false);   // 非 full 进程无段标

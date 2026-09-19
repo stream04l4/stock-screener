@@ -71,10 +71,11 @@ const TASK_TABLE_CN = {
 };
 function taskTableCn(t) { return TASK_TABLE_CN[t.table] || t.table; }
 
-// v6.1.4 O3：tasks 状态徽章。no_source（T6 holders_snapshot 无可用源）→ 灰 badge
-// "暂无数据源"（区别于 pending"待补"——不是没做，是**没有源可做**）。
+// v6.1.4 O3：tasks 状态徽章。v6.1.7 起 holders_snapshot（T6）接入 full 阶段 4，
+// 不再是 no_source——由真实任务态（pending/running/done/error）走下方通用渲染
+// （STATE_BADGE 命中 pending→"⏳ 待补"，其余回退原始态字符串）。旧的 no_source
+// 灰 badge"暂无数据源"分支随数据源接入移除（brief §B：硬编码 no_source 文案清理）。
 function taskStateCell(t) {
-  if (t.state === "no_source") return { cls: "lake-st-empty", label: "暂无数据源" };
   const [cls, label] = STATE_BADGE[t.state] || ["lake-st-empty", String(t.state ?? "idle")];
   return { cls, label };
 }

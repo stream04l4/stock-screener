@@ -3,7 +3,9 @@
 // - LakeKlineChart：复权三态按钮组（默认 qfq 高亮）+ 点击 emit adjust-change +
 //   adjustNote 降级提示小字（P1-A）。
 // - LakeStatusCard：tasks 表显隐（v6.1.4 O3：仅 backfill_in_progress=true 渲染——
-//   取代 v6.1.2 P1-B"灌数中不渲染去冗余"；含'对应表'列 + no_source 灰 badge）。
+//   取代 v6.1.2 P1-B"灌数中不渲染去冗余"；含'对应表'列）。v6.1.7：T6 holders_snapshot
+//   接入 full 阶段 4 → 不再是 no_source，灰 badge"暂无数据源"分支移除（brief §B），
+//   T6 行走真实任务态通用渲染（pending→"⏳ 待补"）。
 // - MarketTable：跳页输入框 clamp[1,pages] + Go/回车触发 page 变化 → 重取（P3）。
 import { describe, it, expect, vi } from "vitest";
 import { mount } from "@vue/test-utils";
@@ -72,7 +74,9 @@ describe("LakeStatusCard：tasks 表显隐（v6.1.4 O3：仅 backfill_in_progres
       lock_holder_pid: 12345, updated_at: "2026-09-17 21:00:00",
       tasks: [
         { table: "kline_history", tier: "P2", state: "running", done: 10, total: 100 },
-        { table: "holders_snapshot", tier: "P3", state: "no_source", done: 0, total: 0 },
+        // v6.1.7：T6 holders_snapshot 接入 full 阶段 4 → 真实任务（tier=P2、pending、
+        // total=universe）——不再是 no_source/total=0 占位。
+        { table: "holders_snapshot", tier: "P2", state: "pending", done: 0, total: 5219 },
       ],
     });
     expect(w.find("#lake-tasks-table").exists()).toBe(true);
@@ -82,8 +86,12 @@ describe("LakeStatusCard：tasks 表显隐（v6.1.4 O3：仅 backfill_in_progres
     const rows = w.findAll("#lake-tasks-table tbody tr");
     expect(rows.length).toBe(2);
     expect(rows[0].text()).toContain("= T2 全史（kline_daily）");
-    // O3：no_source → 灰 badge '暂无数据源'（T6 holders_snapshot 无可用源）
-    expect(rows[1].text()).toContain("暂无数据源");
+    // v6.1.7：T6 行走真实任务态通用渲染——pending → "⏳ 待补"，进度 0/5219；
+    // 旧的 no_source 灰 badge"暂无数据源"不再出现（brief §B）。
+    expect(rows[1].text()).toContain("T6 前十大股东");
+    expect(rows[1].text()).toContain("⏳ 待补");
+    expect(rows[1].text()).toContain("0/5219");
+    expect(rows[1].text()).not.toContain("暂无数据源");
   });
 
   it("非灌数态（backfill_in_progress=false）→ #lake-tasks-table **整块隐藏**（O3：非同步态不显示补齐进度）", () => {
