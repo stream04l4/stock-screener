@@ -210,7 +210,10 @@ async function confirmSaveAs() {
     selectedName.value = res.name; // 下拉直接定位到新保存项（便于紧接着加载/删除）
     await loadLib(); // 刷新下拉
   } catch (e) {
-    if (e.status === 409 && e.body && e.body.error === "strategy_exists") {
+    // D1 修复：FastAPI HTTPException(detail=dict) 标准包裹 → {"detail":{...}}；
+    // 读 detail.error（仅当 detail 为对象时取——其它端点 detail 可能是字符串）。
+    const d = e.body && typeof e.body.detail === "object" ? e.body.detail : null;
+    if (e.status === 409 && d && d.error === "strategy_exists") {
       toast.toast(`策略库中已存在「${saveAsName.value}」，请换一个名称`, false);
     } else {
       toast.toast("另存为失败：" + e.message, false);

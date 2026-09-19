@@ -65,7 +65,12 @@ function mockApi() {
     if (path === "/api/strategies" && opts.method === "POST") {
       const name = JSON.parse(opts.body).name;
       if (LIB.some((s) => s.name === name)) {
-        const e = new Error("strategy_exists"); e.status = 409; e.body = { error: "strategy_exists" }; throw e;
+        // D1 修复：mock 对齐真实 client 行为——FastAPI HTTPException(detail=dict) 标准包裹，
+        // err.body = 完整 JSON（detail 内层才是 error），与 web/app.py L1210 实际响应一致。
+        const e = new Error(JSON.stringify({ error: "strategy_exists", name }));
+        e.status = 409;
+        e.body = { detail: { error: "strategy_exists", name } };
+        throw e;
       }
       LIB.push({ name, saved_at: "2026-09-19 12:00:00", size_bytes: 999 }); // 落库（真实后端写文件）
       return { name, path: `/tmp/strategies/${name}.yaml`, saved_at: "2026-09-19 12:00:00" };
@@ -141,6 +146,33 @@ describe("S1 · 另存为弹窗（默认名 + POST /api/strategies）", () => {
     await w.find("#btn-saveas-confirm").trigger("click");
     await flushPromises();
     expect(toastMsg()).toContain("已存在");
+    expect(w.find("#input-saveas-name").exists()).toBe(true); // 弹窗仍开着
+    w.unmount();
+  });
+
+  it("D1 回归：非重名 409（detail 为字符串，如其它端点形状）→ 通用 toast「另存为失败：」", async () => {
+    const w = mk();
+    await flushPromises();
+    // 拦截下一次 POST /api/strategies（=【保存】触发）→ detail 为字符串的 409（非 strategy_exists）。
+    // 用 armed 标志而非 mockImplementationOnce：若先有其它调用（live-query 重拉 GET），once 会被误消费。
+    let armed = true;
+    const defImpl = apiMock.getMockImplementation();
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (armed && path === "/api/strategies" && (opts || {}).method === "POST") {
+        armed = false;
+        const e = new Error("服务器繁忙");
+        e.status = 409;
+        e.body = { detail: "服务器繁忙" };
+        throw e;
+      }
+      return defImpl(path, opts);
+    });
+    await w.find("#btn-strategy-save-as").trigger("click");
+    await w.find("#input-saveas-name").setValue("不重名的新策略");
+    await w.find("#btn-saveas-confirm").trigger("click");
+    await flushPromises();
+    expect(toastMsg()).toContain("另存为失败："); // 通用文案，而非「已存在」
+    expect(toastMsg()).not.toContain("已存在");
     expect(w.find("#input-saveas-name").exists()).toBe(true); // 弹窗仍开着
     w.unmount();
   });

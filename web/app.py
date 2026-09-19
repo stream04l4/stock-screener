@@ -1197,7 +1197,8 @@ def save_strategy(req: SaveStrategyRequest) -> Dict[str, Any]:
     """命名保存当前 config/strategy.yaml 原文 → data/strategies/<name>.yaml。
 
     - name 为空/缺省 → 默认名 策略_YYYYMMDD_HHMM；sanitize 后仍为空 → 400 {error:"invalid_name"}；
-    - 重名（文件已存在）→ 409 {"error": "strategy_exists"}（brief 契约标签，前端 toast 用）；
+    - 重名（文件已存在）→ 409 {"detail": {"error": "strategy_exists", "name": <name>}}
+      （FastAPI HTTPException(detail=dict) 标准包裹；前端读 e.body.detail.error，v6.2.1-D1）；
     - 成功 → 201 {name, path, saved_at}。
     """
     if not CONFIG_PATH.exists():
