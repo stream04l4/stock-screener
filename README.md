@@ -20,6 +20,15 @@
 | **v5.2** | **数据源强化** | raw/canonical 本地数据层 + 多源交叉校验 v1 + 数据源健康度报告（Phase 1；Phase 2/3 见 §11） |
 | **v5.2-p2a** | **BaoStock 配额守卫** | 每日 49900 次硬上限（官网限 50000/日/IP，超限封禁 6h×年内次数），跨进程 flock 计数、超限显式失败不静默 |
 | **v5.3** | **可信度强化** | 健康度阈值告警（rf 回退 / F10 降级标的数 / 交叉校验冲突数，yaml 驱动，超阈值报告顶部标红）+ canonical `version_log.csv` 追加式数据版本日志 |
+| **v6** | **本地 DuckDB 数据湖** | 全 A 股 K 线/分红/多维基础数据统一入湖 + Web 查询页；前端切 Vue3 SPA（:9090） |
+| v6.1.1 | 灌数提速 | upsert 临时表批量冲突 + industry_csric2 自愈回填 |
+| v6.1.2 | lake 页修复 | review P0-P3 + amber total progress bar block-level |
+| v6.1.3 | 源池状态面板 | 数据源池健康度可视化 |
+| v6.1.4 | 五项优化 | market 排序 / P3 增量同步 / 进度显隐+T映射 / 源勾选+手动探测 / 统一色板 |
+| v6.1.5 | 修复轮 | legacy 源名中文 / local 色对比度 / baostock fail-fast≤20s / T5 一键启动 |
+| v6.1.6 | 同步单按钮 | 全量启动/停止合并为单按钮（signal-then-return + stopping 态） |
+| v6.1.7 | T6 股东快照 | holders_snapshot 接入 full 模式（第 4 阶段 t6） |
+| **v6.1.8** | **T8/T9 接入 + 数据质量** | full 六阶段 history→p3→t8→t9→t5→t6；t8 因子快照（as_of=T2 max date、幂等）；t9 利率更新（抓取失败回退现有 csv 不阻断）；T5 baostock 量纲 ×100 修复 + ~100× 错位交叉校验跳过不误报；交叉校验抽样（默认 5%，跨进程稳定 hash）；BaoStockClient 显式 daily_quota=lake 预算（off-by-one 消除，严格 ≤budget） |
 
 当前默认配置 = v5.3（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
 作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
