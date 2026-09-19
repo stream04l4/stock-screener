@@ -30,8 +30,13 @@ export const SECTION_META = {
 };
 
 // ---------------------------------------------------------------------------
-// O1 — 三段分组（有序）。group.id 用于 localStorage 折叠记忆键；defaultOpen 为首次访问默认态。
-//   策略核心 = 选股逻辑本体（主视觉，默认展开）；回测与再投资 / 数据与基础设施 默认折叠、可点开。
+// O1 — 分组（有序）。group.id 用于 localStorage 折叠记忆键；defaultOpen 为首次访问默认态。
+// v6.2.1 S2（页面归属调整）：
+//   - backtest/reinvest 两段移出 StrategyTab → BacktestTab（"回测参数"编辑区，复用
+//     StrategyCards/FieldEditor + "load full json → 编辑子集 → PUT full" 保存模式）；
+//   - lake 段移除（TL 拍板：数据湖页不新增设置表单，高级键保持 yaml-only、很少改）；
+//   - 本表 = StrategyTab 渲染的分组：📌策略核心 8 段（默认展开）+ ⚙️高级配置 5 段
+//     （screener 基础设施、很少调 → 默认折叠，仍可编辑）。
 //   编辑态强制全部展开（防漏改），由 StrategyCards 的 editing prop 驱动，不读这里的 defaultOpen。
 // ---------------------------------------------------------------------------
 export const SECTION_GROUPS = [
@@ -40,12 +45,17 @@ export const SECTION_GROUPS = [
     sections: ["technical", "dividend", "industry", "fundamental", "universe", "scoring", "badges", "hard_filter"],
   },
   {
-    id: "backtest", title: "回测与再投资", icon: "🧪", defaultOpen: false,
-    sections: ["backtest", "reinvest"],
+    id: "advanced", title: "高级配置", icon: "⚙️", defaultOpen: false,
+    sections: ["datasource", "data", "crosscheck", "health", "canonical"],
   },
+];
+
+// v6.2.1 S2：BacktestTab"回测参数"区渲染的分组（backtest + reinvest 两段，默认展开——
+// 该页签的主内容就是回测；StrategyCards 按传入 groups 渲染，组件本身不区分页面）。
+export const BACKTEST_GROUPS = [
   {
-    id: "infra", title: "数据与基础设施", icon: "⚙️", defaultOpen: false,
-    sections: ["datasource", "data", "crosscheck", "health", "canonical", "lake"],
+    id: "bt_params", title: "回测参数", icon: "🧪", defaultOpen: true,
+    sections: ["backtest", "reinvest"],
   },
 ];
 

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -43,6 +43,9 @@ PROJECT_ROOT = WEB_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
 BAK_PATH = CONFIG_PATH.with_suffix(".yaml.bak")
+# v6.2.1 S1：本机策略库（命名快照 data/strategies/*.yaml；.gitignore 不入库——本机策略变体）。
+# 模块级常量供测试 monkeypatch（同 CONFIG_PATH 模式）；目录懒创建（仅保存时 mkdir）。
+STRATEGIES_DIR = PROJECT_ROOT / "data" / "strategies"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DIST_DIR = WEB_DIR / "dist"   # v6 FE-D3+：Vue3+Vite 构建产物（`npm run build` @ web/frontend → ../dist，不入库）
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
@@ -1149,6 +1152,118 @@ def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
     backup, sections = _apply_strategy_write(data)
     return {"ok": True, "backup": backup, "sections": sections}
+
+
+# ---------------------------------------------------------------------------
+# v6.2.1 S1 — 策略库：本机命名保存 + 下拉加载 + 删除（data/strategies/*.yaml）
+#   存储 = config/strategy.yaml 原文快照（读盘直存，保留注释/排版）。
+#   加载 = safe_load → **复用 PUT 同一套 _apply_strategy_write**（校验→.bak→写盘，
+#   行为逐字节同 PUT/import），保证"策略库加载"与"文件导入"走完全相同的写路径。
+#   测试隔离：CONFIG_PATH / STRATEGIES_DIR 均为模块级常量，monkeypatch 到 tmp 即可
+#   全离线可测（生产 config/ 与 data/strategies/ 零触碰）。
+# ---------------------------------------------------------------------------
+def _sanitize_strategy_name(name: str) -> str:
+    """策略名 → 安全文件名。
+
+    规则（brief S1）：去路径分隔符 / \\ 与 ..、首尾空白；空格→下划线；
+    保留 CJK/字母数字/-_（Linux UTF-8 文件名，中文名直接可用）。
+    其余字符一律剔除（防控制字符/特殊符号落盘）。
+    """
+    s = str(name or "").strip()
+    s = s.replace("/", "_").replace("\\", "_")
+    s = s.replace("..", "")
+    s = s.replace(" ", "_")  # 空格→下划线（brief S1；必须在字符过滤前做，否则空格会被当非法字符剔除）
+    out = "".join(ch for ch in s if ch.isalnum() or ch in "-_" or "\u4e00" <= ch <= "\u9fff")
+    return out
+
+
+def _strategy_path(name: str) -> Path:
+    """策略名 → data/strategies/<name>.yaml（调用方保证 name 已 sanitize 且非空）。"""
+    return STRATEGIES_DIR / f"{name}.yaml"
+
+
+class SaveStrategyRequest(BaseModel):
+    """v6.2.1 S1：POST /api/strategies 请求体 {name}（可缺省 → 默认名带时间戳）。"""
+    name: Optional[str] = None
+
+
+def _default_strategy_name() -> str:
+    """缺省策略名：策略_YYYYMMDD_HHMM（本地时间，与前端 defaultExportName 同口径）。"""
+    return "策略_" + datetime.now().strftime("%Y%m%d_%H%M")
+
+
+@app.post("/api/strategies", status_code=201)
+def save_strategy(req: SaveStrategyRequest) -> Dict[str, Any]:
+    """命名保存当前 config/strategy.yaml 原文 → data/strategies/<name>.yaml。
+
+    - name 为空/缺省 → 默认名 策略_YYYYMMDD_HHMM；sanitize 后仍为空 → 400 {error:"invalid_name"}；
+    - 重名（文件已存在）→ 409 {"error": "strategy_exists"}（brief 契约标签，前端 toast 用）；
+    - 成功 → 201 {name, path, saved_at}。
+    """
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
+    name = _sanitize_strategy_name(req.name) if req.name else ""
+    if not name:
+        name = _default_strategy_name()
+    path = _strategy_path(name)
+    if path.exists():
+        raise HTTPException(status_code=409, detail={"error": "strategy_exists", "name": name})
+    STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
+    # 原文快照（读盘直存，保留注释/排版——与 GET /api/strategy 的 raw 同义）
+    _atomic_write_text(path, CONFIG_PATH.read_text(encoding="utf-8"))
+    return {
+        "name": name,
+        "path": str(path),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/api/strategies")
+def list_strategies() -> List[Dict[str, Any]]:
+    """策略库列表 [{name, saved_at, size_bytes}]，按 saved_at 降序；目录不存在 → []。"""
+    if not STRATEGIES_DIR.is_dir():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in STRATEGIES_DIR.glob("*.yaml"):
+        if not p.is_file():
+            continue
+        st = p.stat()
+        out.append({
+            "name": p.stem,
+            "saved_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "size_bytes": st.st_size,
+        })
+    out.sort(key=lambda x: x["saved_at"], reverse=True)  # saved_at 降序（brief S1）
+    return out
+
+
+@app.delete("/api/strategies/{name}", status_code=204)
+def delete_strategy(name: str) -> Response:
+    """删除策略库中指定快照 → 204；不存在 → 404。"""
+    path = _strategy_path(_sanitize_strategy_name(name))
+    if not (path.is_file()):
+        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
+    path.unlink()
+    return Response(status_code=204)
+
+
+@app.post("/api/strategies/{name}/load")
+def load_strategy(name: str) -> Dict[str, Any]:
+    """加载策略库快照 → 复用 PUT 同一套 _apply_strategy_write（校验→.bak→写盘）。
+
+    - 200 {ok, backup}：加载成功（前端 invalidate("strategy") 重拉 + toast 显示备份名）；
+    - 400 {errors}：yaml 解析失败 / 非 mapping / 校验不过（与 PUT/import 400 同语义）；
+    - 404：快照不存在。
+    """
+    path = _strategy_path(_sanitize_strategy_name(name))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
+        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
+    backup, _ = _apply_strategy_write(data)
+    return {"ok": True, "backup": backup}
 
 
 @app.post("/api/runs")

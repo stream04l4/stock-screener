@@ -14,6 +14,10 @@ cache/
 logs/
 output/
 
+# v6.2.1 S1：本机策略库（命名快照 data/strategies/*.yaml，本机策略变体、不入库）。
+# 已被下方锚定的 /data/ 覆盖；此处显式列出（意图自明 + 防未来 /data/ 规则调整时漏网）。
+/data/strategies/
+
 # v5.2 Phase 1：raw/canonical 数据层（append-only 审计 + 派生 Schema；回滚=整删）。
 # ⚠️必须锚定仓库根 /data/——裸 data/ 会误伤 screener/data/ 源码目录。
 /data/

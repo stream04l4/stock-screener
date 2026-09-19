@@ -4,7 +4,7 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  SECTION_META, SECTION_GROUPS, SECTION_DESC, FIELD_DESC, FIELD_TYPE, ENUM_OPTIONS, WEIGHT_DIMS,
+  SECTION_META, SECTION_GROUPS, BACKTEST_GROUPS, SECTION_DESC, FIELD_DESC, FIELD_TYPE, ENUM_OPTIONS, WEIGHT_DIMS,
   parseSubWeightsText, displayValue,
 } from "../strategyMeta.js";
 
@@ -44,17 +44,30 @@ describe("strategyMeta · SECTION_META / SECTION_GROUPS / SECTION_DESC（v6.2 O1
     }
   });
 
-  it("SECTION_GROUPS = 三段有序分组，section 无重叠且覆盖全部 16 段", () => {
-    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["core", "backtest", "infra"]);
+  it("SECTION_GROUPS = v6.2.1 S2 两组（StrategyTab）：8 核心段 + ⚙️高级配置 5 段，无重叠", () => {
+    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["core", "advanced"]);
     const all = SECTION_GROUPS.flatMap((g) => g.sections);
     // 无重叠
     expect(new Set(all).size).toBe(all.length);
-    // 覆盖全部 16 段（与 SECTION_META 键集一致）
-    expect([...all].sort()).toEqual(Object.keys(SECTION_META).sort());
-    // 策略核心默认展开，其余默认折叠
+    // 8 核心段（真正的"策略"）+ 5 基础设施段（screener 很少调 → 默认折叠仍可编辑）
+    expect(SECTION_GROUPS[0].sections).toEqual([
+      "technical", "dividend", "industry", "fundamental", "universe", "scoring", "badges", "hard_filter"]);
+    expect(SECTION_GROUPS[1].sections).toEqual(["datasource", "data", "crosscheck", "health", "canonical"]);
+    // 策略核心默认展开，高级配置默认折叠
     expect(SECTION_GROUPS[0].defaultOpen).toBe(true);
     expect(SECTION_GROUPS[1].defaultOpen).toBe(false);
-    expect(SECTION_GROUPS[2].defaultOpen).toBe(false);
+    // lake 段不再渲染（S2 TL 拍板：数据湖页不新增设置表单，高级键保持 yaml-only）
+    expect(all).not.toContain("lake");
+  });
+
+  it("BACKTEST_GROUPS = backtest/reinvest 两段（BacktestTab 回测参数区），与 SECTION_GROUPS 无重叠", () => {
+    expect(BACKTEST_GROUPS.map((g) => g.id)).toEqual(["bt_params"]);
+    expect(BACKTEST_GROUPS[0].sections).toEqual(["backtest", "reinvest"]);
+    expect(BACKTEST_GROUPS[0].defaultOpen).toBe(true);
+    // 两页签渲染的 section 合计无重叠（15 段 = 16 段 − lake）
+    const stratAll = SECTION_GROUPS.flatMap((g) => g.sections);
+    const btAll = BACKTEST_GROUPS.flatMap((g) => g.sections);
+    expect(new Set([...stratAll, ...btAll]).size).toBe(stratAll.length + btAll.length);
   });
 
   it("SECTION_DESC 覆盖全部 16 段（每段一行说明）", () => {

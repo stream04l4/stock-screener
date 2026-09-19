@@ -193,6 +193,25 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 .s-readonly { font-family: var(--mono); font-size: 12.5px; color: var(--muted); background: color-mix(in srgb, var(--line) 30%, transparent);
   border: 1px dashed var(--line); border-radius: 7px; padding: 6px 9px; margin-top: 5px; word-break: break-all; }
 .toolbar-sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+/* v6.2.1 S1：策略库工具栏（加载下拉 + 删除按钮 + 另存为弹窗） */
+.lib-label { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.lib-select {
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px;
+  background: #fff; color: var(--ink); max-width: 260px; cursor: pointer;
+}
+.lib-select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.lib-select:disabled { opacity: .5; cursor: not-allowed; }
+.lib-del { padding: 6px 10px; }
+.saveas-box { width: min(480px, 92vw); }
+.saveas-box input[type="text"] {
+  width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
+  font-family: var(--mono); font-size: 13.5px; margin-top: 6px;
+}
+.saveas-box input[type="text"]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.saveas-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+/* v6.2.1 S2：BacktestTab 回测参数区（backtest/reinvest 两段编辑） */
+.bt-params-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.bt-params-head h3 { margin: 0; }
 
 .msg-box { margin-top: 14px; }
 .msg-ok { background: var(--good-soft); color: #166534; border: 1px solid #bbf7d0; padding: 10px 14px; border-radius: 9px; }
