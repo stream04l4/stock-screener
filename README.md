@@ -29,6 +29,7 @@
 | v6.1.6 | 同步单按钮 | 全量启动/停止合并为单按钮（signal-then-return + stopping 态） |
 | v6.1.7 | T6 股东快照 | holders_snapshot 接入 full 模式（第 4 阶段 t6） |
 | **v6.1.8** | **T8/T9 接入 + 数据质量** | full 六阶段 history→p3→t8→t9→t5→t6；t8 因子快照（as_of=T2 max date、幂等）；t9 利率更新（抓取失败回退现有 csv 不阻断）；T5 baostock 量纲 ×100 修复 + ~100× 错位交叉校验跳过不误报；交叉校验抽样（默认 5%，跨进程稳定 hash）；BaoStockClient 显式 daily_quota=lake 预算（off-by-one 消除，严格 ≤budget） |
+| **v6.2** | **策略页重做** | O1 三段分组规整（📌策略核心8/🧪回测与再投资2/⚙️数据与基础设施6，可折叠+localStorage 记忆，编辑态强制全展开）；O2 参数解释全覆盖（FIELD_DESC 84/84 顶层字段含单位/边界语义，嵌套 dict 只读摘要，desc 只读+编辑双态可见，vitest 守卫防漏）；O3 另存为/加载策略文件（Blob 下载 + POST /api/strategy/import 复用 PUT 校验，.bak 备份，PUT 对外行为逐字节不变） |
 
 当前默认配置 = v5.3（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
 作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
@@ -196,7 +197,7 @@ v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q          # 436 passed
+python -m pytest -q          # 806 passed
 ```
 
 覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
