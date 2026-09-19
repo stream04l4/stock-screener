@@ -31,6 +31,7 @@ const strategyJson = ref(null); // GET 成功后的 d.json（只读态数据源 
 const editing = ref(false);     // D-W02：strategyEditing 标志
 const draft = ref(null);        // 编辑态草稿（JSON 深拷贝 + 编辑值覆盖）
 const saving = ref(false);      // PUT 在途（保存按钮禁用，finally 恢复）
+const importing = ref(false);   // O3：POST /api/strategy/import 在途（另存为/加载按钮禁用）
 const msg = ref({ text: "", kind: null }); // msg-box：ok/err
 
 // D-W02：唯一入口。所有进入/退出编辑态的路径必须经过它。
@@ -146,6 +147,73 @@ function onCancel() {
   invalidate("strategy"); // 重拉 GET（报告 §2.1 事件触发）
 }
 
+// ---------------------------------------------------------------------------
+// O3 — 另存为 / 加载策略文件
+//   另存为 = 完整配置快照（含基础设施段），Blob 下载；文件名可输入、默认带时间戳。
+//   加载 = file input(.yaml/.yml) → POST /api/strategy/import {raw} → 服务端复用 PUT 校验。
+//   编辑态下两者禁用（防丢未保存修改，与 Toolbar disabled 一致）。
+// ---------------------------------------------------------------------------
+const fileInput = ref(null); // O3：隐藏 file input（accept=.yaml,.yml）
+
+function defaultExportName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `strategy_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.yaml`;
+}
+
+// 另存为：GET /api/strategy 取 raw（新鲜读盘，保证导出=当前磁盘内容）→ Blob 下载
+async function onExport() {
+  if (editing.value || importing.value) return; // 与按钮 disabled 一致
+  try {
+    const d = await api("/api/strategy");
+    const raw = d && typeof d.raw === "string" ? d.raw : "";
+    if (!raw) { toast.toast("无可导出的策略内容", false); return; }
+    const name = window.prompt("另存为文件名（默认带时间戳，可改）：", defaultExportName());
+    if (name === null) return; // 用户取消 prompt
+    const fname = (name.trim() || "strategy.yaml");
+    const blob = new Blob([raw], { type: "text/yaml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast.toast("已导出完整策略配置（含数据源/健康检查等基础设施配置）");
+  } catch (e) {
+    toast.toast("另存为失败：" + e.message, false);
+  }
+}
+
+// 加载：点【📂 加载】→ 触发隐藏 file input
+function onImport() {
+  if (editing.value || importing.value) return; // 与按钮 disabled 一致
+  if (fileInput.value) fileInput.value.click();
+}
+
+// file input change → 读文本 → POST /api/strategy/import
+async function onFileChosen(ev) {
+  const f = ev.target.files && ev.target.files[0];
+  ev.target.value = ""; // 复位，允许重复选同一文件
+  if (!f) return;
+  importing.value = true;
+  try {
+    const raw = await f.text();
+    const res = await api("/api/strategy/import", { method: "POST", body: JSON.stringify({ raw }) });
+    toast.toast(`已加载策略文件 ${f.name}`);
+    setMsg(`✓ 已加载策略文件（备份: ${String(res.backup).split("/").pop()}）`, "ok");
+    invalidate("strategy"); // 事件触发重拉 GET（用 API 返回 JSON 为底重渲染只读视图）
+  } catch (e) {
+    // 400 → 保持现状（不改 strategyJson、不重拉），msg-box 展示 errors（与 PUT 400 同 UI）
+    const errs = e.body && e.body.detail && e.body.detail.errors ? e.body.detail.errors.join("\n") : e.message;
+    setMsg("✗ 加载被拒绝（400）：\n" + errs, "err");
+    toast.toast("策略文件加载失败", false);
+  } finally {
+    importing.value = false;
+  }
+}
+
 function setMsg(text, kind) { msg.value = { text, kind }; }
 
 onMounted(() => { /* useLiveQuery 已订阅；首帧由 watch(data) 驱动 */ });
@@ -153,7 +221,10 @@ onMounted(() => { /* useLiveQuery 已订阅；首帧由 watch(data) 驱动 */ })
 
 <template>
   <section class="tab-panel active">
-    <Toolbar :editing="editing" :meta="metaText" :saving="saving" @edit="onEdit" @save="onSave" @cancel="onCancel" />
+    <Toolbar :editing="editing" :meta="metaText" :saving="saving" :importing="importing"
+             @edit="onEdit" @save="onSave" @cancel="onCancel" @export="onExport" @import="onImport" />
+    <!-- O3：隐藏 file input（accept=.yaml,.yml）；【📂 加载】触发 click() -->
+    <input ref="fileInput" type="file" accept=".yaml,.yml" style="display:none" @change="onFileChosen" />
     <p v-if="error && !strategyJson" class="msg-err">加载策略失败: {{ error.message }}</p>
     <p v-else-if="loading && !strategyJson" class="placeholder">加载中…</p>
     <StrategyCards v-else :json="strategyJson" :draft="draft" :editing="editing" @update="onDraftUpdate" />

@@ -6,7 +6,7 @@
 // 所有变更经 emit("update", {section, field, value}) 上报父组件 draft（保存时统一校验/合并）。
 <script setup>
 import { computed, ref } from "vue";
-import { FIELD_TYPE, ENUM_OPTIONS, WEIGHT_DIMS, parseSubWeightsText } from "../../data/strategyMeta.js";
+import { FIELD_TYPE, ENUM_OPTIONS, WEIGHT_DIMS, parseSubWeightsText, readableValue } from "../../data/strategyMeta.js";
 
 const props = defineProps({ section: String, field: String, value: {} });
 const emit = defineEmits(["update"]);
@@ -88,6 +88,11 @@ const enumOpts = computed(() => ENUM_OPTIONS[`${props.section}.${props.field}`] 
       <span class="w-label">{{ dim }}</span>
       <input type="text" :value="swModel[dim]" placeholder="key:值,key:值" @input="onSWInput(dim, $event.target)">
     </div>
+  </div>
+  <!-- readonly：嵌套 dict/list-of-dict（costs/tencent/em/alerts/...）——本期不做深编辑，
+       只读展示可读摘要（v6.2 O2 范围外，已注明）；改值走【📂 加载】整文件导入 -->
+  <div v-else-if="t === 'readonly'" class="s-readonly" :title="'嵌套配置（本期只读展示，不做深编辑）'">
+    {{ readableValue(value) }}
   </div>
   <!-- str / 未知类型 -->
   <input v-else type="text" :value="String(value)" @input="onScalarInput">

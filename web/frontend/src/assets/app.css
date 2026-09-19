@@ -176,6 +176,23 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
   font-family: var(--mono); font-size: 13px; margin-top: 5px;
 }
 .s-field input:focus, .s-field select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+/* v6.2 O1：三段分组（📌策略核心 / 🧪回测与再投资 / ⚙️数据与基础设施）+ section 级说明 + 只读嵌套展示 */
+.cards-groups { display: flex; flex-direction: column; gap: 18px; }
+.s-group { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.s-group-head { background: color-mix(in srgb, var(--accent-soft) 45%, var(--panel)); border-bottom: 1px solid var(--line); }
+.s-group-toggle { width: 100%; display: flex; align-items: center; gap: 8px; padding: 9px 14px;
+  background: none; border: 0; cursor: pointer; font-size: 13.5px; font-weight: 600; color: #374151; text-align: left; }
+.s-group-toggle:disabled { cursor: not-allowed; opacity: .75; }
+.s-group-caret { width: 12px; display: inline-block; color: var(--muted); }
+.s-group-icon { font-size: 16px; }
+.s-group-count { font-weight: 400; font-size: 12px; }
+.s-group .cards { padding: 14px; }
+.s-sec-desc { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+/* O2：编辑态 desc（控件下方 muted small）——只读态位置保留，共用 .s-desc */
+.s-field .s-desc { margin-top: 4px; }
+.s-readonly { font-family: var(--mono); font-size: 12.5px; color: var(--muted); background: color-mix(in srgb, var(--line) 30%, transparent);
+  border: 1px dashed var(--line); border-radius: 7px; padding: 6px 9px; margin-top: 5px; word-break: break-all; }
+.toolbar-sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
 
 .msg-box { margin-top: 14px; }
 .msg-ok { background: var(--good-soft); color: #166534; border: 1px solid #bbf7d0; padding: 10px 14px; border-radius: 9px; }

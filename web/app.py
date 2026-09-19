@@ -1076,8 +1076,25 @@ def _r2(v: Optional[float]) -> Optional[float]:
     return None if v is None else round(float(v), 4)
 
 
-@app.put("/api/strategy")
-def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
+    """PUT /api/strategy 与 POST /api/strategy/import 共用的「校验 → 备份 → 写盘」路径。
+
+    v6.2 O3：从 put_strategy 抽出（**PUT 对外行为逐字节不变**——PUT 改调本函数，现有测试原样全绿）：
+    1) _validate_strategy 逐项类型/范围校验；
+    2) screener.config.load_config 最终结构/语义校验（写临时文件）；
+    3) .bak 备份（保留最近一份，shutil.copy2 保留 mtime）；
+    4) D-W03：ruamel round-trip 保留注释与排版写回（失败退回 safe_dump）。
+    返回 (backup_path_str, sections)——PUT 只取 backup（响应不含 sections，逐字节同旧版），
+    import 额外带 sections。
+
+    备份路径用 CONFIG_PATH.with_suffix(".yaml.bak") **现算**（与模块级 BAK_PATH 同式）：
+    生产环境两者恒等；import/测试 monkeypatch CONFIG_PATH 到 tmp 时备份随之落 tmp，绝不碰生产 .bak。
+    """
+    if not isinstance(payload, dict):
+        # PUT 侧由 FastAPI Dict[str, Any] 类型约束拦截；import 侧 yaml.safe_load 可能解出
+        # list/标量 → 在这里统一拦成 400（与 _validate_strategy 顶层报错同语义）。
+        raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
+
     errors = _validate_strategy(payload)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
@@ -1096,12 +1113,42 @@ def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail={"errors": [f"配置校验失败: {exc}"]})
 
     # 备份（保留最近一份）
+    bak_path = CONFIG_PATH.with_suffix(".yaml.bak")
     if CONFIG_PATH.exists():
-        shutil.copy2(CONFIG_PATH, BAK_PATH)
+        shutil.copy2(CONFIG_PATH, bak_path)
 
     # D-W03：写回时保留原文件注释与排版（ruamel round-trip，失败退回 safe_dump）
     _write_strategy_preserving_comments(payload)
-    return {"ok": True, "backup": str(BAK_PATH)}
+    return str(bak_path), list(payload.keys())
+
+
+@app.put("/api/strategy")
+def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # v6.2 O3：校验/备份/写盘抽公共函数（与 import 共用同一套校验）。
+    # **对外行为逐字节不变**：响应仍为 {"ok": True, "backup": str}（不含 sections）。
+    backup, _ = _apply_strategy_write(payload)
+    return {"ok": True, "backup": backup}
+
+
+class ImportStrategyRequest(BaseModel):
+    """v6.2 O3：POST /api/strategy/import 请求体 {raw: <yaml 文本>}。"""
+    raw: str
+
+
+@app.post("/api/strategy/import")
+def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
+    """v6.2 O3：加载策略文件——body={raw}（yaml 文本），服务端 safe_load → 复用 PUT 同一套
+    校验函数（_apply_strategy_write）→ 通过则 .bak 备份 + 写盘（与 PUT 同路径逻辑）。
+
+    - 200 {ok, backup, sections}：加载成功（前端 invalidate("strategy") 重拉 + msg-box 显示备份名）；
+    - 400 {errors}：yaml 解析失败 / 非 mapping / 校验不过（与 PUT 400 同 UI，前端保持现状）。
+    """
+    try:
+        data = yaml.safe_load(req.raw)
+    except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
+        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
+    backup, sections = _apply_strategy_write(data)
+    return {"ok": True, "backup": backup, "sections": sections}
 
 
 @app.post("/api/runs")
