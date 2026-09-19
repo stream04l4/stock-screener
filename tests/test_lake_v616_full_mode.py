@@ -217,6 +217,31 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
     monkeypatch.setattr(bsc, "BaoStockClient", _FakeBS)
     monkeypatch.setattr(tmod, "TencentClient", _FakeTClient)
     monkeypatch.setattr(drv, "_t6_client_factory", lambda: _FakeSina())
+    # v6.1.8 F1：t8/t9 离线替身（零网络、不碰真实 factor/rf 取数）。run_full 经 drv.run_t8/
+    # run_t9 调用 → patch 模块属性即拦截。计数供"轻量阶段前置/顺序"断言；返回值形状与
+    # 真实 run_t8/run_t9 一致（无 errors 键 → run_full 不标 phase error）。
+    counter["t8"] = {"n": 0}
+    counter["t9"] = {"n": 0}
+
+    def fake_run_t8(con, db_path, codes, runner):
+        counter["t8"]["n"] += 1
+        return {"table": "factor_snapshot", "as_of_date": FIXED_TODAY,
+                "codes_requested": len(codes or []), "rows_written": 0,
+                "elapsed_s": 0.0}
+
+    def fake_run_t9(con, db_path, codes, runner):
+        counter["t9"]["n"] += 1
+        return {"table": "macro_rf", "rows_loaded": 0,
+                "rf_source": "existing_cache", "elapsed_s": 0.0}
+
+    monkeypatch.setattr(drv, "run_t8", fake_run_t8)
+    monkeypatch.setattr(drv, "run_t9", fake_run_t9)
+    # T9 rf 取数替身（双保险：即便某用例直接调真实 run_t9 也不触网）
+    import screener.data.rf as _rf_mod
+
+    monkeypatch.setattr(_rf_mod, "fetch_rf_10y",
+                        lambda cfg, cache_dir, run_day, session=None: (0.025,
+                                                                       {"source": "fake"}))
     _set_registry(monkeypatch, {"adata_f10": adata})
     counter["f10"] = 0   # 占位（真实计数在 adata.f10_calls）
     return counter
@@ -235,7 +260,7 @@ def _task_entry(prog: dict, table: str):
 # 1) full 三阶段顺序执行 + 数据落库
 # ===========================================================================
 def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, capsys):
-    """full → history→P3→T5→T6 顺序跑完（v6.1.7 四阶段）：summary.phases 顺序正确、各表行数正确。"""
+    """full → history→P3→T8→T9→T5→T6 顺序跑完（v6.1.8 六阶段）：summary.phases 顺序正确、各表行数正确。"""
     db = str(tmp_path / "full.duckdb")
     codes = ["sh.600001", "sz.000002"]
     _seed_master(db, codes)
@@ -244,10 +269,10 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
 
     summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
 
-    # 四阶段全 ok + 顺序 history→p3→t5→t6（dict 插入序即执行序）
-    assert summary["all_ok"] is True, f"四阶段应全成功: {summary['phases']}"
-    assert list(summary["phases"]) == ["history", "p3", "t5", "t6"]
-    for ph in ("history", "p3", "t5", "t6"):
+    # 六阶段全 ok + 顺序 history→p3→t8→t9→t5→t6（dict 插入序即执行序；轻量 t8/t9 前置）
+    assert summary["all_ok"] is True, f"六阶段应全成功: {summary['phases']}"
+    assert list(summary["phases"]) == ["history", "p3", "t8", "t9", "t5", "t6"]
+    for ph in ("history", "p3", "t8", "t9", "t5", "t6"):
         assert summary["phases"][ph]["ok"] is True, f"phase {ph} 应成功: {summary['phases'][ph]}"
 
     # 阶段 1 history：kline_daily 全史（fake 3 日/股）+ done 键 full_history
@@ -277,17 +302,22 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
     assert counter["kline"] == 2 + len(INDEX_CODES), f"P3 T2/T7 窗口取数: {counter}"
     assert counter["holders"] == {"600001": 1, "000002": 1}, \
         f"T6 应每股一次 fetch_holders（code6）: {counter['holders']}"
-    # 段标日志（stdout）：四阶段开始/结束成对、顺序正确（耗时值不硬断言——计时非契约）
+    # 段标日志（stdout）：六阶段开始/结束成对、顺序正确（耗时值不硬断言——计时非契约）
     out = capsys.readouterr().out
     marks = [ln for ln in out.splitlines() if "===== phase:" in ln]
-    assert len(marks) == 8, f"应 8 条段标（4 阶段×开始/结束）: {marks}"
+    assert len(marks) == 12, f"应 12 条段标（6 阶段×开始/结束）: {marks}"
     expect_seq = [("history", "开始"), ("history", "结束"),
                   ("p3", "开始"), ("p3", "结束"),
+                  ("t8", "开始"), ("t8", "结束"),
+                  ("t9", "开始"), ("t9", "结束"),
                   ("t5", "开始"), ("t5", "结束"),
                   ("t6", "开始"), ("t6", "结束")]
     for ln, (ph, kind) in zip(marks, expect_seq):
         assert f"===== phase: {ph} =====" in ln and kind in ln, \
             f"段标顺序错误（期望 {ph}/{kind}）: {marks}"
+    # v6.1.8 F1：轻量阶段前置——t8/t9 各执行一次且在 t5 之前（fake 计数 + 段标序已证）
+    assert counter["t8"]["n"] == 1 and counter["t9"]["n"] == 1, \
+        f"t8/t9 应各执行一次: {counter['t8']}, {counter['t9']}"
     con.close()
 
 
@@ -851,10 +881,10 @@ def test_full_no_t6_skips_phase(tmp_path, monkeypatch, capsys):
     assert summary["all_ok"] is True
     assert counter["holders"] == {}, f"--no-t6 不得调用 fetch_holders: {counter['holders']}"
     assert con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0] == 0
-    # stdout 无 t6 段标（4→3 阶段：6 条段标）
+    # stdout 无 t6 段标（6→5 阶段：10 条段标）
     out = capsys.readouterr().out
     marks = [ln for ln in out.splitlines() if "===== phase:" in ln]
-    assert len(marks) == 6, f"--no-t6 应 6 条段标（3 阶段）: {marks}"
+    assert len(marks) == 10, f"--no-t6 应 10 条段标（5 阶段×开始/结束）: {marks}"
     assert not any("phase: t6" in ln for ln in marks), f"不得有 t6 段标: {marks}"
     # holders_snapshot entry：收尾视图刷新为真实任务 pending（total=universe、tier=P2，
     # done=0——跳过未灌）

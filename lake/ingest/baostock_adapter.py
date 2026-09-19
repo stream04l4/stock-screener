@@ -30,6 +30,25 @@ log = logging.getLogger("lake.ingest.baostock_adapter")
 _F10_CROSSCHECK_QUARTERS = 4
 
 
+def _bs_to_pct(v: Optional[float]) -> Optional[float]:
+    """BaoStock 比率字段（小数口径）→ 百分数口径（×100），None 透传。
+
+    **v6.1.8 F2 量纲修复**：实测核对（brief 要求"先实测核对"）——BaoStock 官方 API
+    ``query_profit_data.gpMargin`` / ``query_balance_data.liabilityToAsset`` /
+    ``query_growth_data.YOYPNI`` 原始返回**小数（分数）口径**，非百分数：
+      - sh.601398 2026Q2 liabilityToAsset=0.923676（浦发负债率 ~92%）；
+      - sh.600519 2026Q2 gpMargin=0.895552（茅台毛利率 ~89.6%）；
+      - sz.000333 2026Q2 gpMargin=0.252558（美的毛利率 ~25.3%）。
+    T5 主源 adata_f10 是**百分数口径**（浦发 gross_margin~18、liability~92）——两源
+    直接比会恰好差 100×，cross_check_f10 全量误报（v6.1.7 实锤 52796 行 conflict_src
+    100% 非空）。本 adapter 原为**裸 to_float 透传、无任何 /100**（brief 假设"adapter
+    多除了 100"不成立——BaoStock 本就返回小数），故对齐口径须在此 **×100**，使
+    fetch_f10 输出与 adata 同为百分数。仅比率字段缩放；npi（netProfit，绝对额=元）
+    不得缩放。
+    """
+    return None if v is None else float(v) * 100.0
+
+
 class BaoStockAdapter:
     """BaoStock 适配器（Q6 存活门控；fallback/交叉校验源）。"""
 
@@ -50,12 +69,25 @@ class BaoStockAdapter:
 
     # ---------- client 管理（懒建；QuotaGuard 内） ----------
     def _get_client(self):
-        """懒建 BaoStockClient（构造即挂 QuotaGuard；stop_checker=SIGTERM 收尾钩子）。"""
+        """懒建 BaoStockClient（构造即挂 QuotaGuard；stop_checker=SIGTERM 收尾钩子）。
+
+        **v6.1.8 F4 配额 off-by-one**：``daily_quota`` 显式取 lake 日预算
+        （config ``baostock_daily_budget``，缺省 5000）——与 BackfillRunner.budget_per_day
+        同口径。为什么必须传：BaoStockClient 默认 daily_quota=49900（screener 侧硬上限），
+        若 lake 不覆盖，QuotaGuard 硬上限(49900)≫lake 预算(5000)，到顶后仍放行大量调用
+        （v6.1.7 实锤 bs_quota.json count=5004>budget 5000——守卫在到顶后仍放行）。传 budget
+        后 QuotaGuard 硬上限==lake 预算，**严格 ≤budget**（acquire 在 count>budget 时拒），
+        与 BackfillRunner._quota_state 的 per-task ``used>=budget`` 门形成双保险：per-task
+        门防跨任务越界、QuotaGuard 硬上限防单任务内多次调用（如 T5 fetch_f10=4季×3查询）
+        在任务中途越界。screener/ 零改动（本参数为既有可选构造参数，主路径默认值不变）。
+        """
         if self._client is None:
             from lake.backfill import stop_requested as _bk_stop
+            from lake.config import lake_cfg
             from screener.data.baostock_client import BaoStockClient
 
-            self._client = BaoStockClient(stop_checker=_bk_stop)
+            budget = int(lake_cfg().get("baostock_daily_budget", 5000))
+            self._client = BaoStockClient(stop_checker=_bk_stop, daily_quota=budget)
         return self._client
 
     def close(self) -> None:
@@ -215,9 +247,11 @@ class BaoStockAdapter:
         :return: [{period, pub_date, roe_weighted(None→BaoStock 无加权ROE), gross_margin,
                   liability_pct, yoy_pni, npi, ocf(None)}]；失败/空 → []。
 
-        字段口径对齐 adata_f10_adapter（cross_check_f10 按 period 对齐比 roe_weighted/
-        gross_margin/liability_pct——BaoStock roe_avg≠加权ROE，该字段两边都 None 时
-        cross_check 自动跳过，不误报分歧）。
+        **字段口径（v6.1.8 F2）**：gross_margin/liability_pct/yoy_pni 已 **×100 转百分数**
+        （BaoStock 原始=小数，见 :func:`_bs_to_pct`），与 adata_f10_adapter 同口径——
+        cross_check_f10 按 period 对齐比 roe_weighted/gross_margin/liability_pct（绝对差
+        >1pp）时两源单位一致，不再全量误报。npi=netProfit 绝对额（元），不缩放。
+        BaoStock roe_avg≠加权ROE，该字段两边都 None 时 cross_check 自动跳过，不误报分歧。
         """
         import datetime as _dt
 
@@ -268,9 +302,11 @@ class BaoStockAdapter:
                 "pub_date": profit.get("pubDate"),
                 # BaoStock 无加权 ROE（只有 roeAvg）→ None（cross_check 跳过该字段）
                 "roe_weighted": None,
-                "gross_margin": (profit or {}).get("gpMargin"),
-                "liability_pct": (balance or {}).get("liabilityToAsset"),
-                "yoy_pni": (growth or {}).get("YOYPNI"),
+                # F2 量纲：BaoStock 比率原始=小数 → ×100 对齐 adata 百分数口径
+                # （实测核对见 _bs_to_pct docstring；npi 是绝对额=元，不缩放）
+                "gross_margin": _bs_to_pct((profit or {}).get("gpMargin")),
+                "liability_pct": _bs_to_pct((balance or {}).get("liabilityToAsset")),
+                "yoy_pni": _bs_to_pct((growth or {}).get("YOYPNI")),
                 "npi": (profit or {}).get("netProfit"),
                 "ocf": None,
             })

@@ -27,7 +27,8 @@ const lake = useLakeStore();
 
 // v6.1.6：phase 小字文案映射（brief §A："T2 全史 / T3 估值增量 / T5 基本面"）。
 // v6.1.7：+t6 股东阶段（full 第 4 阶段——holders_snapshot 接入 full）。
-const PHASE_LABELS = { history: "T2 全史", p3: "T3 估值增量", t5: "T5 基本面", t6: "T6 股东" };
+// v6.1.8 F1：+t8 因子/t9 利率轻量阶段（full 顺序 history→p3→t8→t9→t5→t6）。
+const PHASE_LABELS = { history: "T2 全史", p3: "T3 估值增量", t8: "T8 因子重算", t9: "T9 利率更新", t5: "T5 基本面", t6: "T6 股东" };
 
 // 运行中 meta 拼接（v6.1.4 口径保留）：stopping=true → 友好文案；已耗时/进度更新时间。
 const runningMeta = computed(() => {

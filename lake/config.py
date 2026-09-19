@@ -28,6 +28,16 @@ from typing import Any, Dict
 _DEFAULTS: Dict[str, Any] = {
     "baostock_daily_budget": 5000,   # Q2：BaoStock 日预算默认 5,000 次/日
 
+    # v6.1.8 F3：T5 交叉校验抽样比例（%）。run_t5 按此比例随机抽样做 BaoStock
+    # 交叉校验（种子=日期+code 可复现；pct=0 全跳、pct=100 全量）。
+    # **成本账（为什么默认 5 而非 100）**：BaoStock 判活后每轮 full，T5 交叉校验 =
+    # 抽样股数 × _F10_CROSSCHECK_QUARTERS(4) 季 × 3 API(query_profit/growth/balance)
+    # = 抽样股数 × 12 次。全量 100% → 5219×12 ≈ 6.3万 次/轮，远超 baostock_daily_budget
+    # (5000)，且交叉校验是**辅助**链路却抢走主链路（adata F10）预算——v6.1.7 实锤今日
+    # T5 只灌 500/5219 就被配额拦。默认 5% → ≈261 股×12 ≈ 3100 次 < 5000 日预算，
+    # 主链路（adata F10 全量 5219 只）不受交叉校验挤占；需全量核对时设 100。
+    "t5_crosscheck_sample_pct": 5,
+
     # v6.1 源开关（默认全开；False=该源不进池，worker 跳过）
     "sina_enabled": True,            # 新浪 akshare stock_zh_a_daily（T2 OHLCV/amount 主源）
     "tdx_enabled": True,             # easy-tdx（T2/T7 fallback + T7 amount）
@@ -207,3 +217,18 @@ def crosscheck_threshold(name: str, default: float) -> float:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def t5_crosscheck_sample_pct() -> int:
+    """取 T5 交叉校验抽样比例（%）；夹到 [0,100]。
+
+    v6.1.8 F3：run_t5 按此比例随机抽样做 BaoStock 交叉校验（种子=日期+code 可复现）。
+    非法值（非数值/越界）→ 夹到边界而非抛错——配置项失效不应阻断 T5 主链路灌数
+    （fail-open 到安全侧：>100 按 100 全量、<0 按 0 全跳，与"抽样比例"语义一致）。
+    """
+    v = lake_cfg().get("t5_crosscheck_sample_pct", 5)
+    try:
+        p = int(float(v))
+    except (TypeError, ValueError):
+        p = 5
+    return max(0, min(100, p))

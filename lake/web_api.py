@@ -1071,7 +1071,7 @@ def _current_phase(db_path: Optional[str] = None) -> Optional[str]:
     append 落 sync.log）：``===== phase: history =====（T2 全史 开始）`` /
     ``……结束，Xs）`` / ``……异常，继续下一阶段）``。本函数扫日志尾部（64KB 足够——
     阶段标记之间至多隔几十行进度输出）按序回放：见"开始"→ 记当前 phase；见同一
-    phase 的"结束/异常"→ 清空。返回 ``history|p3|t5|t6``（v6.1.7 +t6 股东阶段）或
+    返回 ``history|p3|t8|t9|t5|t6``（v6.1.7 +t6 股东阶段；v6.1.8 F1 +t8 因子/t9 利率）或
     None（无 full 段标 / 非 full 模式进程 / 日志缺失——此时前端不显示 phase 小字，
     三态契约其余字段不动）。
 
@@ -1100,7 +1100,8 @@ def _current_phase(db_path: Optional[str] = None) -> Optional[str]:
             continue
         name = m.group(1)
         # v6.1.7：full 第 4 阶段 t6（T6 股东）加入白名单——未知段标仍忽略（不猜）。
-        if name not in ("history", "p3", "t5", "t6"):
+        # v6.1.8 F1：+t8（因子）/t9（利率）轻量阶段（history→p3→t8→t9→t5→t6）。
+        if name not in ("history", "p3", "t8", "t9", "t5", "t6"):
             continue   # 未知段标忽略（不猜）
         if "开始" in line:
             cur = name

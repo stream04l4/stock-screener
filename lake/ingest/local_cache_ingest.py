@@ -23,7 +23,14 @@ from .common import DATA_VERSION, clean_date, now_ts, to_float, upsert
 
 log = logging.getLogger("lake.ingest.local_cache")
 
-_CACHE_SENTINEL = "stock-screener-cache-v1"
+# 缓存文件哨兵（与 DiskCache 同语义：区分本程序写入的有效缓存）。
+# **v6.1.8 F1**：接受两个哨兵——``stock-screener-cache-v1``（lake bootstrap 缓存，
+# kline_af3/adjfactor/profit_* 均用此）与 ``stock-screener-em-cache-v1``（screener/data/em.py
+# 的 EM_CACHE_SENTINEL，rf_10y_daily.csv 由 screener.data.rf 写入时用此）。历史缺陷：本模块
+# 原只认前者，而 rf csv 是后者 → load_macro_rf 恒读 None → macro_rf 0 行（T9 落库静默失败）。
+# 两哨兵都合法（同一项目的两套缓存写入器），放宽为白名单而非改成单一值——避免误伤已用
+# 前者写入的 kline_af3/adjfactor/profit 缓存。
+_CACHE_SENTINELS = ("stock-screener-cache-v1", "stock-screener-em-cache-v1")
 
 
 def _read_cache_csv(path: str) -> Optional[Dict[str, Any]]:
@@ -34,7 +41,7 @@ def _read_cache_csv(path: str) -> Optional[Dict[str, Any]]:
         with open(path, "r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
             sentinel = next(reader, None)
-            if not sentinel or sentinel[0] != _CACHE_SENTINEL:
+            if not sentinel or sentinel[0] not in _CACHE_SENTINELS:
                 return None
             columns = next(reader, None)
             if columns is None:

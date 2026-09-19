@@ -399,6 +399,7 @@ def cross_check_f10(recs_a: Sequence[Dict[str, Any]], src_a: str,
     """
     map_b = {r["period"]: r for r in recs_b if r.get("period")}
     conf: List[str] = []
+    skipped_dim = 0   # v6.1.8 F2：量纲错位（~100×）被防御跳过的字段数
     for ra in recs_a:
         period = ra.get("period")
         rb = map_b.get(period)
@@ -408,8 +409,27 @@ def cross_check_f10(recs_a: Sequence[Dict[str, Any]], src_a: str,
             va, vb = ra.get(field), rb.get(field)
             if va is None or vb is None:
                 continue
-            if abs(float(va) - float(vb)) > pp:
-                conf.append(f"{period}.{field}:{src_a}:{_fmt_num(va)}|{src_b}:{_fmt_num(vb)}")
+            # v6.1.8 F2 量纲防御：比较前检测"两值相差 ~99~100×"的量纲错位特征
+            # （百分数 vs 小数，如 adata liability_pct=91.92 vs baostock 旧口径 0.9192）。
+            # 命中 → log error "疑似量纲未对齐" + **跳过该字段比较**（不记分歧）——防未来
+            # 某源口径回退/再犯时静默全量误报。判据：大值/小值 ∈ [99,101]（容浮点+真实
+            # 业务值不可能恰好差 100× 的比率字段）。两值同号才可能量纲错位（异号是真实
+            # 分歧，照常比）；任值为 0 → 比值无意义，照常走绝对差。
+            fa, fb = float(va), float(vb)
+            if fa * fb > 0:   # 同号（含同负——比率字段实际非负，防御性判断）
+                ratio = max(abs(fa), abs(fb)) / min(abs(fa), abs(fb))
+                if 99.0 <= ratio <= 101.0:
+                    log.error(
+                        "cross_check T5 疑似量纲未对齐（相差 ~%.0f×）%s.%s: %s=%s vs %s=%s"
+                        "——跳过该字段比较（防静默误报；核对两源口径）",
+                        ratio, period, field, src_a, _fmt_num(fa), src_b, _fmt_num(fb))
+                    skipped_dim += 1
+                    continue
+            if abs(fa - fb) > pp:
+                conf.append(f"{period}.{field}:{src_a}:{_fmt_num(fa)}|{src_b}:{_fmt_num(fb)}")
+    if not conf and skipped_dim:
+        # 仅量纲错位、无真实分歧 → 返回 None（不写 conflict_src），但已 log error 留痕
+        return None
     if not conf:
         return None
     log.warning("cross_check T5 分歧 %s vs %s (%d 项超阈 %.1fpp): %s",

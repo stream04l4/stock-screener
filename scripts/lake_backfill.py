@@ -314,9 +314,13 @@ def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
     from lake.ingest import baostock_ingest as bsi
     from screener.data.baostock_client import BaoStockClient
 
-    # v6.0.10：注入停止检查钩子——SIGTERM 后重试循环提前中断（收尾加速；
+    # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
     # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）
-    bs = BaoStockClient(stop_checker=_bk_stop)  # 构造即挂 QuotaGuard（默认路径，跨进程共享计数）
+    # v6.1.8 F4：daily_quota=lake 日预算（与 BackfillRunner.budget_per_day 同口径）——
+    # 硬上限==预算，严格 ≤budget（acquire 在 count>budget 时拒），防单任务内多次调用越界。
+    from lake.config import lake_cfg as _lcfg_t1
+    bs = BaoStockClient(stop_checker=_bk_stop,
+                        daily_quota=int(_lcfg_t1().get("baostock_daily_budget", 5000)))
     try:
         basic_fields, basic_rows = bsi.fetch_stock_basic(bs)      # 1 次配额
         ind_fields, ind_rows = bsi.fetch_industry(bs)             # 1 次配额
@@ -851,8 +855,11 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
 
     # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
     # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）。
-    # 多源模式下本源仅 legacy 回退路径使用（构造不登录、零网络；用不到则零成本）。
-    bs = BaoStockClient(stop_checker=_bk_stop)     # QuotaGuard 内；adj_factor 1 次/股
+    # v6.1.8 F4：daily_quota=lake 日预算（硬上限==预算，严格 ≤budget——防单任务内多次
+    # 调用越界；同 run_t1/run_t5 口径）。多源模式下本源仅 legacy 回退路径使用。
+    from lake.config import lake_cfg as _lcfg_hist
+    bs = BaoStockClient(stop_checker=_bk_stop,
+                        daily_quota=int(_lcfg_hist().get("baostock_daily_budget", 5000)))
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes),
                              "start_date": start_date, "end_date": end_date}
@@ -992,17 +999,41 @@ def _merge_conflict(a: Optional[str], b: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # T5 fundamentals_quarterly（v6.1：adata F10 主源 + BaoStock 交叉校验）
 # ---------------------------------------------------------------------------
+def _t5_crosscheck_sampled(code: str, pct: int) -> bool:
+    """F3 抽样判定：该 code 今日是否做 BaoStock 交叉校验（种子=日期+code，可复现）。
+
+    - pct<=0 → 恒 False（全跳）；pct>=100 → 恒 True（全量）——边界短路，零哈希开销。
+    - 中间值：``md5(f"{today_beijing()}|{code}")`` 前 8 hex → [0,1) 均匀伪随机数 < pct/100
+      则选中。为什么用 md5 而非内置 hash()：hash() 受 PYTHONHASHSEED 影响（跨进程/重启
+      不可复现）；md5 稳定——**同一天同一 code 判定恒一致**（断点续传重跑不漂移），
+      **不同天自然轮换**（交叉校验覆盖随日期滚动，长期看全市场都被抽样到）。
+    - 纯函数、零网络、确定性——离线单测可 monkeypatch 本函数验证 pct=0/100/种子可复现。
+    """
+    if pct <= 0:
+        return False
+    if pct >= 100:
+        return True
+    import hashlib
+
+    seed = f"{_today_beijing()}|{code}"
+    h = int(hashlib.md5(seed.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    return h < (pct / 100.0)
+
+
 def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
-    """T5 基本面（v6.1 多源，brief §D）。
+    """T5 基本面（v6.1 多源，brief §D；v6.1.8 F3 交叉校验抽样）。
 
     - **adata F10 主源**（Q4：仅 fetch_f10；全报告期 PIT）→ load_t5 upsert。
     - **BaoStock 探测存活时交叉校验**（最近 4 季；>1pp 记 conflict_src，不阻断）。
       BaoStock 死（Q6 探测 False）→ 零调用、conflict_src=NULL（单源）。
+    - **v6.1.8 F3 抽样**：交叉校验按 config ``t5_crosscheck_sample_pct``（默认 5%）随机
+      抽样做（种子=日期+code，可复现；pct=0 全跳/100 全量）——成本账见 lake.config。
+      主源 adata F10 **不受抽样影响**（全量灌），抽样只省 BaoStock 交叉校验配额。
     - done 键 (fundamentals_quarterly, ts_code, "f10_full")——固定字符串跨天续传。
     - adata 不可用/取空 → worker 抛错**不 mark_done**（下轮重试，防 done 键毒化）。
     """
     from lake.backfill import Task
-    from lake.config import crosscheck_threshold, lake_cfg
+    from lake.config import crosscheck_threshold, lake_cfg, t5_crosscheck_sample_pct
     from lake.ingest import source_pool as sp
     from lake.ingest.adata_f10_adapter import load_t5
 
@@ -1011,20 +1042,21 @@ def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
                   period_or_date="f10_full", tier="P2") for c in codes]
     stats: Dict[str, Any] = {"codes_requested": len(codes)}
     t5_pp = crosscheck_threshold("t5_pp", 1.0)
+    cc_pct = t5_crosscheck_sample_pct()   # F3：交叉校验抽样比例（%）
 
     def worker(task: Task) -> None:
         code = task.ts_code
-        # adata F10 主源（Q4 硬编码边界：仅 fetch_f10）
+        # adata F10 主源（Q4 硬编码边界：仅 fetch_f10；**全量**，不受交叉校验抽样影响）
         ad = sp.get_adapter("adata_f10")
         if ad is None or not lake_cfg().get("adata_f10_enabled", True) or not ad.available():
             raise RuntimeError(f"T5 adata F10 不可用 {code}（不标 done，下轮重试）")
         recs = ad.fetch_f10(code)
         if not recs:
             raise RuntimeError(f"T5 adata F10 取空 {code}（不标 done，下轮重试）")
-        # BaoStock 交叉校验（仅 Q6 探测存活时；>1pp 记 conflict_src）
+        # BaoStock 交叉校验（F3：仅抽样命中的 code；Q6 探测存活时；>1pp 记 conflict_src）
         conflict_src: Optional[str] = None
         bs_ad = sp.get_adapter("baostock")
-        if bs_ad is not None and bs_ad.available():
+        if bs_ad is not None and bs_ad.available() and _t5_crosscheck_sampled(code, cc_pct):
             try:
                 bs_recs = bs_ad.fetch_f10(code)  # 最近 4 季（配额内）
                 if bs_recs:
@@ -1036,6 +1068,9 @@ def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
         time.sleep(0.3)
 
     stats.update(runner.run(tasks, worker))
+    sampled_n = sum(1 for c in codes if _t5_crosscheck_sampled(c, cc_pct))
+    log.info("T5 交叉校验抽样：pct=%d%% → %d/%d 股（种子=日期+code，可复现）",
+             cc_pct, sampled_n, len(codes))
     return {"table": "fundamentals_quarterly", **stats}
 
 
@@ -1586,6 +1621,43 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
         e6["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
     e6["note"] = "SinaClient.fetch_holders 全史前十大股东（full 阶段 4；controller_* 待补源）"
 
+    # T8 factor_snapshot：v6.1.8 起有源（recompute_all 纯本地重算，full 阶段 3）。
+    # total=universe 行数、tier=P3（本地计算，非网络取数）；done=as_of=T2 max date 已
+    # 落库的因子股数（factor_snapshot 按 as_of_date 计——重算幂等覆盖同 as_of，不翻倍）。
+    e8 = _entry("factor_snapshot", tier="P3")
+    try:
+        t2_max_d = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+        if t2_max_d is not None:
+            t2_max_s = str(t2_max_d)[:10]
+            done8_rows = con.execute(
+                "SELECT COUNT(DISTINCT ts_code) FROM factor_snapshot WHERE as_of_date=?",
+                [t2_max_s]).fetchone()[0]
+        else:
+            done8_rows = 0
+    except Exception:  # noqa: BLE001 - 视图刷新失败不阻断（表缺失/查询异常 → done=0）
+        done8_rows = 0
+    e8["total"] = universe_n
+    e8["done"] = min(int(done8_rows), universe_n)
+    if universe_n > 0 and e8["done"] >= universe_n:
+        e8["state"] = "done"
+    elif e8.get("state") in ("running", "stopping"):
+        e8["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
+    e8["note"] = "recompute_all 全市场纯本地重算（full 阶段 3；as_of=T2 max date；零网络）"
+
+    # T9 macro_rf：v6.1.8 起有源（rf.fetch_rf_10y 抓 TE 现值 + load_macro_rf，full 阶段 4）。
+    # total=1（单序列）、tier=P3（本地/免费取数）；done=表内已落行数（≥1 即 done）。
+    e9 = _entry("macro_rf", tier="P3")
+    try:
+        done9 = con.execute("SELECT COUNT(*) FROM macro_rf").fetchone()[0]
+    except Exception:  # noqa: BLE001 - 表缺失/查询异常 → done=0
+        done9 = 0
+    e9["total"] = 1
+    e9["done"] = 1 if int(done9) >= 1 else 0
+    e9["state"] = "done" if e9["done"] >= 1 else ("pending"
+                                                  if e9.get("state") in ("running", "stopping")
+                                                  else e9.get("state"))
+    e9["note"] = "rf.fetch_rf_10y TE 现值 + load_macro_rf（full 阶段 4；cache/rf_10y_daily.csv）"
+
     save_progress(prog, runner.progress_path)
 
 
@@ -1598,6 +1670,153 @@ def cmd_incremental(args, con, db_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# T8 factor_snapshot（v6.1.8：full 阶段 3——recompute_all 全市场纯本地重算，零网络）
+# ---------------------------------------------------------------------------
+def run_t8(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
+    """T8 因子快照（v6.1.8 full 阶段 3；brief F1）。
+
+    - **纯本地重算**：``lake.factors.recompute_all(con, as_of_date, ts_codes)``——读 T1-T7
+      算因子写 factor_snapshot，**零网络**（不耗 BaoStock/新浪配额）。as_of_date =
+      库内 T2 ``kline_daily`` max date（brief 逐字；无 T2 数据 → 该阶段 error 留痕、不阻断）。
+    - **progress tasks 条目**：factor_snapshot（total=universe 行数、tier=P3 本地计算）——
+      run_t8 开始时置 total/state=running，recompute_all 收尾后按 as_of 已落因子股数归位
+      done/pending（_refresh_incremental_task_view 亦兜底刷新）。
+    - **单阶段异常纪律同 D-1**：本函数抛错 → run_full 编排层记 phases[t8].error +
+      factor_snapshot state=error，**继续下一阶段**（t9/t5/t6 不受影响）；耗时如实进 summary。
+
+    :param codes: 股票子集（None=stock_master 全集；透传 --codes 冒烟口径）。
+    """
+    from lake.backfill import save_progress
+    from lake.factors import recompute_all
+
+    codes = codes or _universe_codes(con)
+    # as_of_date = 库内 T2 max date（brief 逐字）；无 T2 数据 → 显式失败（不硬造 as_of）
+    t2_max = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+    if t2_max is None:
+        raise RuntimeError("T8 recompute_all 无 as_of：库内 T2 kline_daily 无数据"
+                           "（history 未灌？）——跳过因子重算")
+    as_of = str(t2_max)[:10]
+
+    # progress tasks 条目升级（brief 逐字：total=5219、tier=P3 本地计算）——阶段开始即可观测
+    try:
+        e8 = next((t for t in runner.progress.get("tasks", [])
+                   if t.get("table") == "factor_snapshot"), None)
+        if e8 is None:
+            e8 = {"table": "factor_snapshot", "tier": "P3", "total": 0, "done": 0,
+                  "quota_used_today": runner.quota_used_today(),
+                  "quota_budget": runner.budget_per_day,
+                  "state": "pending", "eta_min": None, "last_error": ""}
+            runner.progress.setdefault("tasks", []).append(e8)
+        e8["tier"] = "P3"   # 本地计算（非网络取数）
+        e8["total"] = len(codes)
+        e8["state"] = "running"
+        e8["note"] = f"recompute_all 全市场纯本地重算（as_of={as_of}；零网络）"
+        save_progress(runner.progress, runner.progress_path)
+    except Exception as exc:  # noqa: BLE001 - 视图升级写失败不阻断灌数
+        log.warning("T8 progress 条目升级落盘失败（不阻断）: %s", exc)
+
+    t0 = time.monotonic()
+    rows_written = recompute_all(con, as_of_date=as_of, ts_codes=codes)
+    elapsed = round(time.monotonic() - t0, 1)
+    log.info("T8 recompute_all 完成：%d 股、%d 因子行（as_of=%s，%.1fs）",
+             len(codes), rows_written, as_of, elapsed)
+
+    # 收尾：按 as_of 已落因子股数归位 done/pending（_refresh_incremental_task_view 亦兜底）
+    try:
+        done8 = con.execute(
+            "SELECT COUNT(DISTINCT ts_code) FROM factor_snapshot WHERE as_of_date=?",
+            [as_of]).fetchone()[0]
+        e8b = next((t for t in runner.progress.get("tasks", [])
+                    if t.get("table") == "factor_snapshot"), None)
+        if e8b is not None:
+            e8b["done"] = min(int(done8), len(codes))
+            e8b["state"] = "done" if (len(codes) > 0 and done8 >= len(codes)) else "pending"
+            save_progress(runner.progress, runner.progress_path)
+    except Exception as exc:  # noqa: BLE001 - 收尾视图写失败不阻断（summary 已含结果）
+        log.warning("T8 收尾 progress 归位失败（不阻断）: %s", exc)
+
+    return {"table": "factor_snapshot", "as_of_date": as_of, "codes_requested": len(codes),
+            "rows_written": int(rows_written), "elapsed_s": elapsed}
+
+
+# ---------------------------------------------------------------------------
+# T9 macro_rf（v6.1.8：full 阶段 4——rf.fetch_rf_10y 抓 TE 现值 + load_macro_rf 落库）
+# ---------------------------------------------------------------------------
+def run_t9(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
+    """T9 无风险利率（v6.1.8 full 阶段 4；brief F1）。
+
+    - **先抓现值**：``screener.data.rf.fetch_rf_10y(rf_cfg, cache_dir, run_day)``——**1 次
+      网络调用、免费**（TE 页面，非 BaoStock/新浪配额源），追加 ``cache/rf_10y_daily.csv``。
+      **失败 → log warning + 用现有 csv 继续，不阻断**（brief 逐字；fetch_rf_10y 内部已对
+      解析失败走 fallback+告警、请求失败也走 fallback 不抛——本处再包一层兜底防意外异常）。
+    - **再落库**：``local_cache_ingest.load_macro_rf(con, cache_dir)`` 读 csv → macro_rf
+      （date PK 幂等 upsert；零网络）。
+    - **progress tasks 条目**：macro_rf（total=1、tier=P3）——阶段开始置 running，落库后
+      done/pending（_refresh_incremental_task_view 亦兜底刷新）。
+    - **单阶段异常纪律同 D-1**：本函数抛错 → run_full 记 phases[t9].error + macro_rf
+      state=error，继续下一阶段。
+
+    :param codes: 透传参数（T9 单序列与股票集无关；保持签名一致便于编排层统一调用）。
+    """
+    from lake.backfill import save_progress
+    from lake.ingest.local_cache_ingest import load_macro_rf
+    from screener.config import load_config, rf_cfg as _rf_cfg_fn
+
+    cache_dir = _cache_dir()
+    run_day = _today_beijing()
+
+    # progress tasks 条目（brief 逐字：total=1、tier=P3）——阶段开始即可观测
+    try:
+        e9 = next((t for t in runner.progress.get("tasks", [])
+                   if t.get("table") == "macro_rf"), None)
+        if e9 is None:
+            e9 = {"table": "macro_rf", "tier": "P3", "total": 1, "done": 0,
+                  "quota_used_today": runner.quota_used_today(),
+                  "quota_budget": runner.budget_per_day,
+                  "state": "pending", "eta_min": None, "last_error": ""}
+            runner.progress.setdefault("tasks", []).append(e9)
+        e9["tier"] = "P3"
+        e9["total"] = 1
+        e9["state"] = "running"
+        save_progress(runner.progress, runner.progress_path)
+    except Exception as exc:  # noqa: BLE001 - 视图升级写失败不阻断灌数
+        log.warning("T9 progress 条目升级落盘失败（不阻断）: %s", exc)
+
+    # ① 抓 TE 现值（1 次网络、免费；失败→warning+用现有 csv 继续，不阻断——brief 逐字）
+    rf_meta: Dict[str, Any] = {"source": "existing_cache"}
+    try:
+        from screener.data import rf as _rf_mod
+
+        cfg = load_config(os.path.join(_project_root(), "config", "strategy.yaml"))
+        _dec, rf_meta = _rf_mod.fetch_rf_10y(_rf_cfg_fn(cfg), cache_dir, run_day)
+    except Exception as exc:  # noqa: BLE001 - TE 抓取失败 → warning + 用现有 csv 继续（不阻断）
+        log.warning("T9 rf.fetch_rf_10y 抓取失败（不阻断，用现有 cache/rf_10y_daily.csv 继续）: %s", exc)
+        rf_meta = {"source": "fetch_failed_use_existing"}
+
+    # ② load_macro_rf 落库（零网络；date PK 幂等 upsert）
+    t0 = time.monotonic()
+    rows_loaded = load_macro_rf(con, cache_dir)
+    elapsed = round(time.monotonic() - t0, 1)
+    log.info("T9 macro_rf 落库 %d 行（source=%s，%.1fs）",
+             rows_loaded, rf_meta.get("source"), elapsed)
+
+    # 收尾：按表内已落行数归位 done/pending
+    try:
+        n = con.execute("SELECT COUNT(*) FROM macro_rf").fetchone()[0]
+        e9b = next((t for t in runner.progress.get("tasks", [])
+                    if t.get("table") == "macro_rf"), None)
+        if e9b is not None:
+            e9b["done"] = 1 if int(n) >= 1 else 0
+            e9b["state"] = "done" if int(n) >= 1 else "pending"
+            save_progress(runner.progress, runner.progress_path)
+    except Exception as exc:  # noqa: BLE001 - 收尾视图写失败不阻断（summary 已含结果）
+        log.warning("T9 收尾 progress 归位失败（不阻断）: %s", exc)
+
+    return {"table": "macro_rf", "rows_loaded": int(rows_loaded),
+            "rf_source": rf_meta.get("source"), "elapsed_s": elapsed}
+
+
+# ---------------------------------------------------------------------------
 # full（v6.1.6：单按钮全量补齐——一个 backfill 进程顺序跑完所有阶段；
 #      v6.1.7：+阶段 4 T6 holders_snapshot）
 # ---------------------------------------------------------------------------
@@ -1606,9 +1825,13 @@ def cmd_incremental(args, con, db_path: str) -> int:
 # 同一把 DuckDB 独占锁贯穿全程（main() 的 LakeLock 包住整个 full → 天然无竞争）：
 #   phase1 history（T2 全史 + adj_factor；幂等——done 键全跳过；--t5 不在此处）
 #   phase2 P3 增量（kline_daily→valuation_daily→index_daily，run_incremental 原样复用）
-#   phase3 T5 fundamentals_quarterly（run_t5 原样复用：adata F10 主源 + BaoStock
-#          探测存活时交叉校验；限速 adata_f10_min_interval_s 在 adapter 内）
-#   phase4 T6 holders_snapshot（v6.1.7：run_t6——SinaClient.fetch_holders 全史前十大
+#   phase3 T8 factor_snapshot（v6.1.8：recompute_all 全市场纯本地重算，零网络——as_of=库内
+#          T2 max date；轻量阶段前置，T5 被配额拦也不影响因子表更新）
+#   phase4 T9 macro_rf（v6.1.8：rf.fetch_rf_10y 抓 TE 现值追加 cache/rf_10y_daily.csv
+#          （1 次网络、免费；失败→warning+用现有 csv 继续不阻断）→ load_macro_rf 落库）
+#   phase5 T5 fundamentals_quarterly（run_t5 原样复用：adata F10 主源 + BaoStock
+#          探测存活时交叉校验【F3 抽样】；限速 adata_f10_min_interval_s 在 adapter 内）
+#   phase6 T6 holders_snapshot（v6.1.7：run_t6——SinaClient.fetch_holders 全史前十大
 #          股东 → sina_ingest.load_t6；限速/WAF退避/熔断在 SinaClient 内部 ≥1s/只；
 #          done 键 (t6, ts_code) 幂等续传；--no-t6 可跳过——排障用）
 #
@@ -1630,6 +1853,10 @@ def cmd_incremental(args, con, db_path: str) -> int:
 _FULL_PHASES = (
     ("history", "T2 全史"),
     ("p3", "P3 增量"),
+    # v6.1.8：轻量阶段前置（t8/t9 在重配额阶段 t5/t6 之前）——纯本地/免费，
+    # T5 被 BaoStock 配额拦也不影响因子表(T8)/利率表(T9)更新。
+    ("t8", "T8 因子"),
+    ("t9", "T9 利率"),
     ("t5", "T5 基本面"),
     # v6.1.7：第 4 阶段 T6（Joel 拍板方案 A——holders_snapshot 接进 full）。
     # t6 是最后阶段、无后续：单只/单表故障 last_error+state=error 不阻断的纪律
@@ -1644,6 +1871,9 @@ def _full_phase_tables(phase: str) -> List[str]:
     return {
         "history": ["kline_history"],
         "p3": ["kline_daily", "valuation_daily", "index_daily"],
+        # v6.1.8：t8/t9 关联表（error 时标 state=error；tier=P3 本地计算，见 run_full）
+        "t8": ["factor_snapshot"],
+        "t9": ["macro_rf"],
         "t5": ["fundamentals_quarterly"],
         "t6": ["holders_snapshot"],
     }[phase]
@@ -1710,9 +1940,15 @@ def _full_mark_phase_error(phase: str, db_path: str, exc: BaseException) -> None
 def run_full(con, db_path: str, codes: Optional[List[str]],
              start_date: str, end_date: str, days: int,
              t6_enabled: bool = True) -> Dict[str, Any]:
-    """v6.1.7 full 模式：单进程顺序执行 history → P3 增量 → T5 → T6（brief §A）。
+    """v6.1.8 full 模式：单进程顺序执行 history → P3 增量 → **T8** → **T9** → T5 → T6（brief §A）。
 
-    :param con: driver 主连接（LakeLock 内；四阶段共用——同锁天然无竞争）。
+    v6.1.8 F1：在重配额阶段（t5/t6）之前插入两个轻量阶段——
+      - **t8 factor_snapshot**：recompute_all 全市场纯本地重算（零网络，as_of=T2 max date）；
+      - **t9 macro_rf**：rf.fetch_rf_10y 抓 TE 现值（1 次网络、免费；失败→warning+用现有 csv
+        继续不阻断）→ load_macro_rf 落库。
+    轻量前置的意义：T5 被 BaoStock 配额拦也不影响因子表(T8)/利率表(T9)更新。
+
+    :param con: driver 主连接（LakeLock 内；六阶段共用——同锁天然无竞争）。
     :param codes: 股票子集（None=stock_master 全集；透传各阶段）。
     :param start_date/end_date: history 全史窗口（与 cmd_history 同口径）。
     :param days: P3 T7 指数窗口交易日数（run_incremental 的 days，默认 250）。
@@ -1752,12 +1988,20 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
                 # 阶段 2：P3 增量（kline_daily→valuation_daily→index_daily，
                 # 现有 incremental 逻辑原样复用——含收尾 tasks 视图刷新）。
                 stats = run_incremental(con, db_path, codes, days)
+            elif phase == "t8":
+                # 阶段 3（v6.1.8）：T8 factor_snapshot——recompute_all 全市场纯本地重算
+                # （零网络；as_of=库内 T2 max date）。轻量前置：T5 被配额拦也不影响因子表。
+                stats = run_t8(con, db_path, codes, BackfillRunner(db_path=db_path))
+            elif phase == "t9":
+                # 阶段 4（v6.1.8）：T9 macro_rf——rf.fetch_rf_10y 抓 TE 现值（1 次网络、
+                # 免费；失败→warning+用现有 csv 继续不阻断）→ load_macro_rf 落库。
+                stats = run_t9(con, db_path, codes, BackfillRunner(db_path=db_path))
             elif phase == "t5":
-                # 阶段 3：T5 fundamentals_quarterly（现有 --t5 逻辑抽出复用：
-                # adata F10 主源 + BaoStock 探测存活时交叉校验，限速在 adapter）。
+                # 阶段 5：T5 fundamentals_quarterly（现有 --t5 逻辑抽出复用：
+                # adata F10 主源 + BaoStock 探测存活时交叉校验【F3 抽样】，限速在 adapter）。
                 stats = run_t5(con, db_path, codes, BackfillRunner(db_path=db_path))
             else:   # t6（v6.1.7）
-                # 阶段 4：T6 holders_snapshot——SinaClient.fetch_holders 全史前十大股东
+                # 阶段 6：T6 holders_snapshot——SinaClient.fetch_holders 全史前十大股东
                 # → sina_ingest.load_t6（限速/WAF退避/熔断在 SinaClient 内部 ≥1s/只；
                 # done 键 (t6, ts_code) 幂等续传；单只失败不阻断后续）。
                 stats = run_t6(con, db_path, codes, BackfillRunner(db_path=db_path))

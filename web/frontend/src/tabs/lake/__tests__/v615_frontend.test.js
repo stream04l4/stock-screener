@@ -200,7 +200,7 @@ describe("F4→v6.1.6：SyncControl 单按钮（T5/增量并入全量 toggle）"
     w.unmount();
   });
 
-  it("running + phase → 小字 '正在灌：…'（history/p3/t5/t6 映射；无 phase 键不渲染）", async () => {
+  it("running + phase → 小字 '正在灌：…'（history/p3/t8/t9/t5/t6 映射；无 phase 键不渲染）", async () => {
     const { lake, w } = mountSC();
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t5" });
     await tick();
@@ -209,6 +209,13 @@ describe("F4→v6.1.6：SyncControl 单按钮（T5/增量并入全量 toggle）"
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t6" });
     await tick();
     expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T6 股东");
+    // v6.1.8 F1：full 轻量阶段 t8（因子重算）/t9（利率更新）——history→p3→t8→t9→t5→t6
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t8" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T8 因子重算");
+    lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9, phase: "t9" });
+    await tick();
+    expect(w.find("#lake-sync-phase").text()).toBe("正在灌：T9 利率更新");
     lake.status = statusBody({ backfill_in_progress: true, lock_holder_pid: 9 });
     await tick();
     expect(w.find("#lake-sync-phase").exists()).toBe(false);   // 非 full 进程无段标
