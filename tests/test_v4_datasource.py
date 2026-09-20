@@ -437,13 +437,18 @@ def test_kline_baostock_path_unchanged_when_primary_baostock(tmp_path):
     assert f._snapshot is None                # 未触发腾讯快照
 
 
-def test_datasource_cfg_self_loads_tencent_from_strategy_yaml(tmp_path):
+def test_datasource_cfg_self_loads_from_strategy_yaml(tmp_path):
     """生产路径：DataFetcher(client, cache) 不传 cfg → 惰性从 config/strategy.yaml
-    加载 datasource 段（primary=tencent）。引擎零改动下由此自动切源。"""
+    加载 datasource 段（02_code 修正轮后 primary=lake）。引擎零改动下由此自动切源。
+
+    注：run_screener 总是显式传 ds_cfg 构造 fetcher——本用例验证的是 DataFetcher
+    自身的惰性加载语义；primary=lake 时 run_screener 会实例化 LakeDataFetcher
+    （screener.py 分支），不会用此默认 cfg 的 DataFetcher 走腾讯路径。
+    """
     client = FakeBSClient([["sh.600036", "1", "招商银行"]])
     f = DataFetcher(client, DiskCache(str(tmp_path / "cache")))  # 无 cfg 参数
-    assert f.datasource_cfg["primary"] == "tencent"
-    assert f._is_tencent_primary() is True
+    assert f.datasource_cfg["primary"] == "lake"
+    assert f._is_tencent_primary() is False
 
 
 # ===========================================================================
@@ -562,12 +567,12 @@ def test_datasource_cfg_defaults_to_baostock_when_absent():
 
 
 def test_datasource_cfg_real_strategy_yaml():
-    """真实 strategy.yaml 的 datasource 段可加载且 primary=tencent。"""
+    """真实 strategy.yaml 的 datasource 段可加载且 primary=lake（02_code 修正轮已切）。"""
     from screener.config import load_config
     path = os.path.join(os.path.dirname(__file__), "..", "config", "strategy.yaml")
     cfg = load_config(path)
     dc = datasource_cfg(cfg)
-    assert dc["primary"] == "tencent" and dc["fallback"] == "fail_fast"
+    assert dc["primary"] == "lake" and dc["fallback"] == "fail_fast"
     assert dc["tencent"]["snapshot_batch_size"] == 200
     assert dc["exdate_detector"]["preclose_dev_threshold_pct"] == 0.5
 

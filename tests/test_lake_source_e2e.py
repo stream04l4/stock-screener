@@ -61,13 +61,19 @@ def _build_e2e_lake(tmp_path) -> str:
     short_days = days[-100:]                                          # 次新：仅 100 行 < 250
 
     def _kline(ts_code, seed, day_list):
+        """造数 + **存储 T2 adj_factor**（修正轮：因子源=sina hfq÷raw 灌入的前向填充值）。
+
+        af 在 T4 除权日 2026-07-15 跳变（1.0 → 1.03，模拟一次现金分红除权），
+        此前此后逐日前向填充——与生产库 load_t2(forward_fill_af) 同构。
+        """
         rng = random.Random(seed)
         price = 8.0 + (seed % 7)
         rows = []
         for d in day_list:
             price = max(1.0, price * (1 + rng.uniform(-0.01, 0.011)))
+            af = 1.03 if d >= date(2026, 7, 15) else 1.0
             rows.append([ts_code, d.isoformat(), price, price, price, price, 5000,
-                         None, None, 0, None, None, "test", None, None])
+                         None, None, 0, None, af, "test", None, None])
         con.executemany(
             "INSERT INTO kline_daily (ts_code, date, open, high, low, close, volume, amount, "
             "pct_chg, is_st, preclose, adj_factor, source, fetched_at, data_version) "
@@ -174,6 +180,38 @@ def test_run_screener_lake_e2e_offline(tmp_path, monkeypatch):
     for s in result.scored:
         assert s.raw["dividend"]["ttm_yield"] is not None, f"{s.code} ttm_yield 缺失"
         assert s.raw["fundamental"]["roe_level"] is not None, f"{s.code} roe_level 缺失（D2'）"
+
+
+def test_lake_factor_source_is_stored_t2(tmp_path):
+    """修正轮断言：e2e 库的筛选因子源=**存储 T2 adj_factor**（非 r_event 推导）。
+
+    造数 af 在 2026-07-15 跳变 1.0→1.03 → kline_af3_rebuilt 的 af1 在该日
+    = close×1.03（精确），之前 = close×1.0；adjfactor_history 事件序列恰为
+    [首个非 NULL 基准日, 2026-07-15]（T4 除权行不直接产生因子）。
+    """
+    from screener.data.cache import DiskCache
+    from screener.data.lake_source import LakeDataFetcher
+
+    db = _build_e2e_lake(tmp_path)
+    f = LakeDataFetcher(None, DiskCache(str(tmp_path / "c")),
+                        datasource_cfg={"primary": "lake"}, db_path=db)
+    f.set_run_day(RUN_DAY)
+    code = CANDIDATES[0][0]   # sh.601398
+    rebuilt = f.kline_af3_rebuilt(code)
+    assert rebuilt is not None and len(rebuilt["dates"]) > 250
+    m = {d: (a3, a1) for d, a3, a1 in zip(rebuilt["dates"], rebuilt["af3_close"],
+                                          rebuilt["af1_close"])}
+    before = [d for d in rebuilt["dates"] if d < "2026-07-15"][-1]
+    on_ex = "2026-07-15"
+    after = [d for d in rebuilt["dates"] if d > "2026-07-15"][0]
+    # 存储 af 精确生效：除权日前 af=1.0、当日及之后 af=1.03
+    assert m[before][1] == pytest.approx(m[before][0])           # ×1.0
+    assert m[on_ex][1] == pytest.approx(m[on_ex][0] * 1.03)      # ×1.03
+    assert m[after][1] == pytest.approx(m[after][0] * 1.03)
+    # 事件序列：首个非 NULL 基准日 + 除权变化点（恰 2 个事件）
+    hit = f.adjfactor_history(code)
+    assert hit is not None and len(hit["rows"]) == 2
+    assert hit["rows"][-1][1] == on_ex and float(hit["rows"][-1][3]) == pytest.approx(1.03)
 
 
 def test_datasource_cfg_accepts_lake():

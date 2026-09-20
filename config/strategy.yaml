@@ -124,8 +124,10 @@ data:
   cache_dir: cache                  # 本地缓存目录（相对路径基于项目根）
 
 datasource:                         # v4 数据源架构（报告 R3 + TL 修正）：高频K线/快照切腾讯批量
-  primary: tencent                  # tencent | baostock | lake（lake=本地DuckDB数据湖主源，零网络；
-                                    #   lake-source 交付后灰度 diff 通过再切——当前保持 tencent）
+  primary: lake                     # tencent | baostock | lake（lake=本地DuckDB数据湖主源，零网络；
+                                    #   02_code 修正轮已切：G1 存储 T2 adj_factor vs BaoStock ground
+                                    #   truth 近 420 交易日窗口 PASS（sh.601688 已知损坏单列→t2_repair.md）。
+                                    #   **回退=改回 tencent**（一行；LakeDataFetcher 不实例化，零残留））
   fallback: fail_fast               # fail_fast(推荐,TL D2) | baostock；全批失败时不自动回退 BaoStock
   baostock:                         # v5.2-p2（TL D5）：BaoStock 每日配额守卫（防打穿配额被封禁）
     daily_quota: 49900              # 官网限 50000/日/IP，超限封禁 6h×次数；留 100 余量

@@ -806,11 +806,17 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
 # history（P2 全史后台补——v6.1 多源资源池）
 # ---------------------------------------------------------------------------
 def run_history(con, db_path: str, codes: Optional[List[str]],
-                start_date: str, end_date: str) -> Dict[str, Any]:
+                start_date: str, end_date: str, force: bool = False) -> Dict[str, Any]:
     """P2 全史（v6.1 多源资源池，Q1 拍板序）。
 
     走 BackfillRunner（budget_per_day 门 + done 键断点续传——**零改动**）。
     TL 验收后由 TL 实际执行（后台长跑，日预算到顶当日停、次日续）。
+
+    ``force=True``（--force；02_code 修正轮新增，仅加参数不执行）：重灌指定股票
+    T2（含 adj_factor）——清空这些 code 的 ``kline_history`` done 键强制重取
+    （镜像 run_t7 --force 的"清本表 done 键"口径；load_t2 upsert 幂等，重取安全）。
+    用于 t2_repair.md 的损坏股重灌（如 sh.601688）：done 键已存在时普通
+    ``history --codes`` 会全部 skipped_done、零重取 → 必须 --force。
 
     **v6.1 worker 新逻辑**（brief §D；worker 粒度保持按股）：
       ``for src in [sina, tencent, tdx]: fetch_kline+adj → cross_check(≥2源时)
@@ -852,6 +858,16 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                   period_or_date="full_history", tier="P2") for c in codes]
     # B-2：coverage 走 runner 自身 db_path（与 run_p0 一致）
     runner = BackfillRunner(db_path=db_path)  # budget_per_day 门：到顶当日停（state=blocked_quota）
+
+    if force:
+        # --force（02_code 修正轮；t2_repair.md 重灌用）：清空**指定 codes** 的
+        # kline_history done 键 → 强制重取（其余股票 done 键不动，幂等跳过）。
+        # 镜像 run_t7 --force"清本表 done 键"口径；load_t2 upsert 幂等，重取安全。
+        force_set = set(codes)
+        runner._done = {k for k in runner._done
+                        if not (k[0] == "kline_history" and k[1] in force_set)}
+        runner.progress["done"] = [list(k) for k in sorted(runner._done)]
+        log.info("history --force: 已清空 %d 只的 kline_history done 键（强制重取）", len(force_set))
 
     # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
     # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）。
@@ -2240,6 +2256,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--end-date", default=None, help="全史终点（缺省=今日北京时间）")
     sp.add_argument("--t5", action="store_true",
                     help="v6.1：同时灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）")
+    sp.add_argument("--force", action="store_true",
+                    help="02_code 修正轮：重灌指定 --codes 的 T2（含 adj_factor）——清空这些 code "
+                         "的 kline_history done 键强制重取（t2_repair.md 损坏股重灌用；"
+                         "缺省幂等跳过已完成股票，不重取）")
     sp.set_defaults(func=cmd_history)
 
     sp = sub.add_parser(
@@ -2309,7 +2329,8 @@ def cmd_p0(args, con, db_path: str) -> int:
 def cmd_history(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     end_date = args.end_date or _today_beijing()
-    summary = run_history(con, db_path, codes, args.start_date, end_date)
+    summary = run_history(con, db_path, codes, args.start_date, end_date,
+                          force=bool(getattr(args, "force", False)))
     # v6.1：--t5 同时灌 T5（adata F10 主源；独立 done 键，失败不影响 history 主体）
     if getattr(args, "t5", False):
         from lake.backfill import BackfillRunner

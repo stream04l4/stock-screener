@@ -45,13 +45,20 @@
   fetchers.py:169-172 既有约定）→ 落在 self.universe_notes + log.warning，
   与 DataFetcher 半封禁态陈旧回退注记同一渠道。
 
-复权序列（#11 kline_af3_rebuilt / #12 adjfactor_history）：
-- **G1-VERIFY**：口径待生产库只读实测确认（brief 前置门 G1，最高优先）。
-  实现按报告建议的 r_event 法：因子事件 = T4 分红 ex_date（cash_dps>0、dedup），
-  r_event = close(前一个交易日) / close(ex_date)，累计 F=Πr_event（IPO 起 1.0，
-  与 BaoStock backAdjustFactor 同构），af1 = af3 × F（reconstruct.rebuild_kline_series）。
-  ⚠️ G1 未通过前技术面路径不得上生产（灰度 diff 会暴露）；单测用临时库构造
-  已知因子数据验证逻辑自洽。
+复权序列（#11 kline_af3_rebuilt / #12 adjfactor_history）——**存储 T2 adj_factor**
+（02_code 修正轮 brief，TL 裁决 + Joel 拍板；r_event 推导路径已废弃删除）：
+- 因子源 = ``kline_daily.adj_factor``（sina hfq÷raw 灌入、逐日前向填充）。
+  TL 独立复测：存储 T2 vs BaoStock ground truth 近 251 交易日窗口 6/7 只 max<2%
+  （仅 sh.601688=26% 近期单点损坏 → t2_repair.md 重灌清单）；而 r_event 法同窗口
+  偏差 55~81%（T2 close 自身问题 + T4 事件与真实除权不对齐 → 永久水平偏移）。
+- ``kline_af3_rebuilt``：af1_close[i] = raw_close[i] × 存储 af（前向填充），
+  **必须 ORDER BY date**（漏排序会让前向填充乱序产生假偏差——brief 关键陷阱）。
+- adj_factor NULL 行（早期历史，如 sh.601398 23 行 / sh.600018 2000-2006）→
+  af1_close=None（MA 计算跳过，与 BaoStock 空 close 防御一致）。
+- ``adjfactor_history``/``adjfactor_fetch``：返回存储 T2 的**事件序列**
+  （af 变化点 + 首个非 NULL 基准日，BaoStock 布局列序）——与 kline_af3_rebuilt
+  同源，保证 Web K线图 hfq view、筛选因子、_adjfactor_r_event（v5.2 除权日交叉校验）
+  用同一套因子。
 """
 from __future__ import annotations
 
@@ -66,7 +73,6 @@ import pandas as pd
 from .baostock_client import DataSourceError
 from .cache import DiskCache
 from .fetchers import DataFetcher, KlineData, to_float, to_int
-from ..reconstruct import rebuild_kline_series
 
 log = logging.getLogger("screener.data.lake")
 
@@ -412,64 +418,49 @@ class LakeDataFetcher(DataFetcher):
         """no-op：同上。"""
         return None
 
-    def _derived_factor_rows(self, code: str) -> List[List[str]]:
-        """# G1-VERIFY 复权因子事件序列（r_event 法，报告 A 表 #12 建议口径）。
+    def _stored_af_events(self, code: str) -> List[Tuple[str, float]]:
+        """存储 T2 adj_factor 的**事件序列**（af 变化点 + 首个非 NULL 基准日）。
 
-        事件 = T4 dividend_events 中 cash_dps>0 且 ex_date<=run_day 的行，同 ex_date
-        dedup 取 ann_date 最新者（G3：生产库多行检查后确认 SQL 写法；当前按 em_dividend_records
-        的"plan_notice_date 最新优先"口径）。r_event = close(前一个交易日)/close(ex_date)；
-        累计 F=Πr_event（IPO 起 1.0，单调非降——与 BaoStock backAdjustFactor 同构）。
-        sanity：|r_event-1| > exdate_detector.factor_sanity_cap_pct → 跳过+告警
-        （防异常昨收污染因子序列，与 v4 腾讯推导同阈值来源=零硬编码）。
+        ``SELECT date, adj_factor FROM kline_daily WHERE ts_code=? AND
+        adj_factor IS NOT NULL ORDER BY date``——**必须 ORDER BY date**：
+        存储 af 是逐日前向填充的（每行都有值），事件=af 相对前一行发生变化的日期；
+        漏排序会让"变化点"检测乱序，产生假事件/漏事件（TL 诊断脚本曾因此得出
+        假阳性偏差——本 brief 关键陷阱）。
 
-        ⚠️ G1 未通过前本口径不得上生产（brief 前置门；灰度 diff 会暴露差异）。
+        返回 [(date_iso, af), ...] 升序：首行=首个非 NULL 日（基准 af，通常≈1.0），
+        其后每个变化点一行。无 af 数据（全 NULL）→ []。
+        与 BaoStock backAdjustFactor 事件序列同构（IPO/首个除权日起累计、单调非降）。
         """
-        con = self._con()
         end = self.run_day.isoformat() if self.run_day is not None else "9999-12-31"
-        ev_rows = con.execute(
-            "SELECT ex_date, ann_date FROM dividend_events "
-            "WHERE ts_code=? AND cash_dps > 0 AND ex_date <= ? "
-            "ORDER BY ex_date, ann_date DESC NULLS LAST", [code, end],
+        rows = self._con().execute(
+            "SELECT date, adj_factor FROM kline_daily WHERE ts_code=? AND date<=? "
+            "AND adj_factor IS NOT NULL ORDER BY date", [code, end],
         ).fetchall()
-        # 同 ex_date dedup（G3）：ann_date DESC → 每组首行=公告日最新者
-        events: List[date] = []
-        seen = set()
-        for ex_d, _ann in ev_rows:
-            if ex_d in seen:
+        events: List[Tuple[str, float]] = []
+        prev_af: Optional[float] = None
+        for d, af in rows:
+            if af is None:
                 continue
-            seen.add(ex_d)
-            events.append(ex_d)
-
-        cap = float(self.datasource_cfg.get("exdate_detector", {})
-                    .get("factor_sanity_cap_pct", 30.0)) / 100.0
-        rows: List[List[str]] = []
-        f = 1.0
-        for ex_d in events:
-            prev = con.execute(
-                "SELECT close FROM kline_daily WHERE ts_code=? AND date<? ORDER BY date DESC LIMIT 1",
-                [code, ex_d],
-            ).fetchone()
-            cur = con.execute(
-                "SELECT close FROM kline_daily WHERE ts_code=? AND date=?", [code, ex_d]
-            ).fetchone()
-            if not prev or prev[0] is None or not cur or cur[0] is None or cur[0] <= 0:
-                log.debug("复权因子 %s 除权日 %s 缺前收/当日 close → 跳过事件", code, ex_d)
-                continue
-            r_event = prev[0] / cur[0]
-            if abs(r_event - 1.0) > cap:
-                log.warning("复权因子 %s 除权日 %s r_event=%.4f 超 sanity ±%.0f%%，不写入",
-                            code, ex_d.isoformat(), r_event, cap * 100)
-                continue
-            f = round(f * r_event, 6)
-            rows.append([code, ex_d.isoformat(), "1.0", f"{f:.6f}", f"{f:.6f}"])
-        return rows
+            # 浮点变化判定：af 是 6 位小数精度灌入（sina round(ratio,6)），
+            # 用精确值比较即可（同一次前向填充内逐行复制，无舍入漂移）。
+            if prev_af is None or af != prev_af:
+                events.append((d.isoformat(), float(af)))
+                prev_af = af
+        return events
 
     def adjfactor_history(self, code: str) -> Optional[Dict[str, Any]]:
-        """全历史复权因子（# G1-VERIFY r_event 推导）。BaoStock 布局列序。"""
+        """全历史复权因子事件序列（**存储 T2 adj_factor**，BaoStock 布局列序）。
+
+        与 kline_af3_rebuilt **同源**（同一张表同一口径的存储 af；本方法把逐日值
+        提取为变化点事件）——Web K线图 hfq view、筛选因子、_adjfactor_r_event
+        （v5.2 除权日 r_event 交叉校验）用同一套因子。无 af 数据 → None
+        （与 DataFetcher 版"无缓存"语义一致）。
+        """
         self._check_freshness()
-        rows = self._derived_factor_rows(code)
-        if not rows:
+        events = self._stored_af_events(code)
+        if not events:
             return None
+        rows = [[code, d, "1.0", f"{af:.6f}", f"{af:.6f}"] for d, af in events]
         return {"columns": ["code", "dividOperateDate", "foreAdjustFactor",
                             "backAdjustFactor", "adjustFactor"], "rows": rows}
 
@@ -481,14 +472,15 @@ class LakeDataFetcher(DataFetcher):
         return last or None
 
     def adjfactor_fetch(self, code: str, start: str, end: str) -> Tuple[List[str], List[List[str]]]:
-        """[start, end] 复权因子事件（# G1-VERIFY）。"""
+        """[start, end] 复权因子事件（存储 T2；PIT：date<=run_day）。"""
         self._check_freshness()
-        rows = [r for r in self._derived_factor_rows(code) if start <= r[1] <= end]
+        rows = [[code, d, "1.0", f"{af:.6f}", f"{af:.6f}"]
+                for d, af in self._stored_af_events(code) if start <= d <= end]
         return ["code", "dividOperateDate", "foreAdjustFactor",
                 "backAdjustFactor", "adjustFactor"], rows
 
     def adjfactor_append(self, code: str, new_rows: List[List[str]]) -> None:
-        """no-op：lake 因子由 T4 事件实时推导，无需追加。"""
+        """no-op：lake 因子已全量在库（存储 T2 adj_factor），无需追加。"""
         return None
 
     def adjfactor_full(self, code: str, start: str, end: str) -> None:
@@ -515,15 +507,40 @@ class LakeDataFetcher(DataFetcher):
     def kline_af3_rebuilt(self, code: str) -> Optional[Dict[str, List]]:
         """全历史 (dates, af3_close, af1_close)（本地、离线）。
 
-        # G1-VERIFY：af1 = af3 × F，F 由 T4 ex_date + close 比值 r_event 推导
-        （与 BaoStock backAdjustFactor 重建同构）——口径待生产库实测确认。
+        **因子源=存储 T2 adj_factor**（02_code 修正轮 brief，TL 裁决；方案 B）：
+        ``af1_close[i] = raw_close[i] × stored_af_forward_filled[i]``——存储 af
+        在库内已是逐日前向填充值（sina hfq÷raw 灌入时 forward_fill），直接逐行相乘，
+        不经过 rebuild_kline_series 的事件因子逻辑（零事件提取误差）。
+
+        - **必须 ORDER BY date**（brief 关键陷阱：TL 诊断脚本曾漏排序导致前向填充
+          乱序产生假阳性偏差）。
+        - PIT：date<=run_day（沿用 _af3_rows 的钳制口径）。
+        - adj_factor NULL 行（早期历史，如 sh.601398 23 行 / sh.600018 2000-2006）
+          → af1_close=None（该日因子未知，不得用前值填充——与 rebuild_kline_series
+          对 None close 的处理一致：MA 计算跳过）。
+        - 返回形状 {"dates","af3_close","af1_close"} 不变（调用方契约：
+          screener._rebuild_window / ttm_pctile closes_map）。
         """
         self._check_freshness()
-        kl = self.kline_af3_history(code)
-        if not kl or not kl["rows"]:
+        end = self.run_day.isoformat() if self.run_day is not None else "9999-12-31"
+        rows = self._con().execute(
+            "SELECT date, close, adj_factor FROM kline_daily "
+            "WHERE ts_code=? AND date<=? ORDER BY date", [code, end],
+        ).fetchall()
+        if not rows:
             return None
-        factor_rows = self._derived_factor_rows(code)
-        return rebuild_kline_series(kl["rows"], factor_rows, kl["columns"])
+        dates: List[str] = []
+        af3: List[Optional[float]] = []
+        af1: List[Optional[float]] = []
+        for d, c, af in rows:
+            dates.append(d.isoformat())
+            c_f = float(c) if c is not None else None
+            af3.append(c_f)
+            if c_f is None or af is None:
+                af1.append(None)          # close 缺失 / 该日 adj_factor NULL（因子未知）
+            else:
+                af1.append(c_f * float(af))
+        return {"dates": dates, "af3_close": af3, "af1_close": af1}
 
     def maybe_refresh_adjfactor(self, code: str, div_records: List[Dict[str, Any]]) -> bool:
         """no-op → False：lake 因子已全量在库（T4 事件实时推导），无需事件驱动刷新。"""

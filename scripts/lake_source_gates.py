@@ -1,20 +1,31 @@
 # -*- coding: utf-8 -*-
-"""lake-source Part B 前置门 G1/G2/G3（生产库**只读**实测，证据落盘）。
+"""lake-source 前置门 G1/G2/G3（生产库**只读**实测，证据落盘）。
 
 纪律：
 - 仅 read_only 连接；backfill flock 期间连不上 → 退出码 2（GATES_LOCKED，等锁释放重跑）；
 - **不碰 backfill 进程、不调 /api/lake/sync/*、不 kill 任何进程**；
-- G1 不一致 → 退出码 3 + GATES_BLOCKED 证据（brief：不得自行选口径，回报 TL）。
+- G1 不一致（除 EXPECTED_FAIL 已知损坏股外）→ 退出码 3 + GATES_BLOCKED 证据
+  （brief：不得自行选口径，回报 TL）。
 
 用法：.venv/bin/python scripts/lake_source_gates.py [--db PATH] [--out FILE]
 默认 --db data/lake/lake.duckdb --out stages/02_code/gates_evidence.txt
 
-G1（最高优先）：sh.601398 + 2 只高除权次数股，对比
-  ① kline_daily_hfq.close（raw×af，lake view）
-  ② cache/kline_af3 × cache/adjfactor backAdj 重建值（BaoStock 口径，reconstruct.rebuild_kline_series）
-  全窗口相对差 <0.5%；并验证 r_event（T4 ex_date + close 比值）推导因子序列与 ①一致。
+G1（最高优先；02_code 修正轮 brief §4 重写——方向纠正：存储 T2 是**被验证方**，
+BaoStock cache 重建是 ground truth）：
+- **主校验**：存储 T2 adj_factor（raw close × af 逐日前向填充值 = 库内已存列，
+  直接取；**必须 ORDER BY date**）vs BaoStock ground truth
+  （cache/kline_af3 × cache/adjfactor backAdj 重建，reconstruct.rebuild_kline_series），
+  **近 420 交易日窗口**（因子最大回看窗口=420 日，config data.kline_calendar_days_back
+  同源口径），TOL=2%。
+  标的：G1_STOCKS（sh.601398/sh.601318/sh.600028）+ T4 除权事件 Top2 + sh.601688
+  （已知近期单点损坏 → **预期 FAIL**，单列不阻塞门，列入 t2_repair.md 重灌清单）。
+- **辅助报告（不阻塞）**：全历史窗口 max 偏差分布（早期 vs 近 420 日）——
+  用于生成 T2 损坏清单（t2_damage_scan.py 的抽样对照）。
 G2：3 只近期停牌股 → T2 停牌日行表示（volume=0 行 vs 缺行）。
 G3：T4 同 ex_date 多行检查 → dedup SQL 写法验证。
+
+退出码：0=GATES_PASS；2=GATES_LOCKED；3=GATES_BLOCKED（G1 非预期 FAIL）；
+4=GATES_INCOMPLETE（G2/G3 需人工复核）。
 """
 from __future__ import annotations
 
@@ -28,8 +39,12 @@ sys.path.insert(0, REPO)
 
 from screener.reconstruct import rebuild_kline_series  # noqa: E402
 
-G1_STOCKS = ["sh.601398"]   # + 运行时按 T4 事件数自动补 2 只高除权次数股
-TOL = 0.005                 # 全窗口相对差阈值（brief：<0.5%）
+G1_STOCKS = ["sh.601398", "sh.601318", "sh.600028"]   # + T4 事件 Top2 + 601688
+TOL = 0.02                  # 近 420 交易日窗口相对差阈值（brief：<2%）
+WINDOW_TRADING_DAYS = 420   # 因子最大回看窗口（config data.kline_calendar_days_back 同源）
+# 已知近期单点损坏（TL 实测 sh.601688=26% @ 2025-08/09）→ 预期 FAIL：
+# 不计入门判定，单列证据 + 列入 stages/02_code/t2_repair.md 重灌清单。
+EXPECTED_FAIL = {"sh.601688"}
 
 
 def _lock_probe(db: str):
@@ -42,7 +57,7 @@ def _lock_probe(db: str):
 
 
 def _cache_rebuilt(code: str):
-    """② BaoStock 口径重建：cache/kline_af3_{code} × cache/adjfactor_{code}。"""
+    """BaoStock ground truth：cache/kline_af3_{code} × cache/adjfactor_{code} 重建。"""
     from screener.data.cache import DiskCache
     from screener.data.fetchers import make_cache_name
 
@@ -55,94 +70,106 @@ def _cache_rebuilt(code: str):
     return rebuild_kline_series(kl["rows"], factor_rows, kl["columns"])
 
 
+def _stored_t2_af1(con, code: str):
+    """存储 T2 口径 af1：raw close × adj_factor（库内已前向填充的逐日值）。
+
+    **必须 ORDER BY date**（brief 关键陷阱：TL 诊断脚本曾漏排序，前向填充乱序
+    产生假阳性偏差）。adj_factor NULL / close NULL → None 占位（对比时跳过、计数）。
+    返回 {date_iso: af1|None}。
+    """
+    rows = con.execute(
+        "SELECT date, close, adj_factor FROM kline_daily WHERE ts_code=? ORDER BY date",
+        [code],
+    ).fetchall()
+    out = {}
+    for d, c, af in rows:
+        ds = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        out[ds] = None if (c is None or af is None) else float(c) * float(af)
+    return out
+
+
 def _rel_diff(a: float, b: float) -> float:
     base = max(abs(a), abs(b), 1e-9)
     return abs(a - b) / base
 
 
+def _worst_in(lake_map, cache_map, dates):
+    """dates 内两源相对差最大值（跳过 None）。返回 (worst, worst_date, n_cmp)。"""
+    worst, worst_d, n = 0.0, "", 0
+    for d in dates:
+        a, b = lake_map.get(d), cache_map.get(d)
+        if a is None or b is None:
+            continue
+        n += 1
+        diff = _rel_diff(a, b)
+        if diff > worst:
+            worst, worst_d = diff, d
+    return worst, worst_d, n
+
+
 def g1(con, out) -> bool:
-    """G1：hfq view vs cache 重建 + r_event 推导一致性。"""
+    """G1：存储 T2 adj_factor vs BaoStock ground truth（近 420 交易日窗口，TOL=2%）。"""
     out.append("=" * 70)
-    out.append("G1 复权口径（最高优先）")
-    # 高除权次数股：T4 cash_dps>0 事件数 Top2（排除基准股）
+    out.append("G1 复权口径（最高优先；方向=存储 T2 被验证，BaoStock cache 为 ground truth）")
+    # T4 除权事件数 Top2（排除基准股与已知损坏股——601688 单列）
     rows = con.execute(
         "SELECT ts_code, COUNT(*) n FROM dividend_events WHERE cash_dps > 0 "
-        "AND ts_code != 'sh.601398' GROUP BY ts_code ORDER BY n DESC LIMIT 2"
+        "AND ts_code NOT IN ('sh.601398','sh.601318','sh.600028','sh.601688') "
+        "GROUP BY ts_code ORDER BY n DESC LIMIT 2"
     ).fetchall()
-    stocks = G1_STOCKS + [r[0] for r in rows]
-    out.append(f"标的: {stocks}（后 2 只=T4 除权事件数 Top2）")
+    stocks = G1_STOCKS + [r[0] for r in rows] + ["sh.601688"]
+    out.append(f"标的: {stocks}（G1_STOCKS + T4 除权事件 Top2 + sh.601688 已知损坏）")
 
     ok_all = True
+    expected_fail_seen = []
     for code in stocks:
         out.append("-" * 60)
-        out.append(f"[G1] {code}")
-        # ① lake hfq view（raw×af）
-        lake_rows = con.execute(
-            'SELECT date, "close" FROM kline_daily_hfq WHERE ts_code=? ORDER BY date', [code]
-        ).fetchall()
-        if not lake_rows:
-            out.append(f"  ✗ kline_daily_hfq 无 {code} 数据")
-            ok_all = False
-            continue
-        # ② cache 重建（BaoStock 口径）
+        out.append(f"[G1] {code}" + ("（预期 FAIL：已知近期损坏，列入 t2_repair.md）"
+                                     if code in EXPECTED_FAIL else ""))
+        lake_map = _stored_t2_af1(con, code)
         rebuilt = _cache_rebuilt(code)
-        if rebuilt is None or not rebuilt["dates"]:
-            out.append(f"  ✗ cache kline_af3/adjfactor 无 {code}（无法对比 BaoStock 口径）")
+        if not lake_map:
+            out.append(f"  ✗ 存储 T2 无 {code} 数据")
             ok_all = False
             continue
-        # 对齐日期交集（PIT：只比 lake 有 & cache 有的日期）。
-        # lake hfq close=NULL = 该股早期 adj_factor 缺失（历史源未提供，如 sh.601398 23 行/
-        # sh.600018 2000-2006）——hfq view 是 Web 图表用派生视图，生产筛选路径不读它
-        # （LakeDataFetcher 读 raw + r_event 推导因子），NULL 行跳过对比并计数报告。
-        lake_map = {d.isoformat() if hasattr(d, "isoformat") else str(d): c
-                    for d, c in lake_rows if c is not None}
-        n_lake_null = sum(1 for _, c in lake_rows if c is None)
-        cache_map = {d: c for d, c in zip(rebuilt["dates"], rebuilt["af1_close"]) if c is not None}
+        if rebuilt is None or not rebuilt["dates"]:
+            out.append(f"  ✗ cache kline_af3/adjfactor 无 {code}（无法对比 ground truth）")
+            ok_all = False
+            continue
+        cache_map = {d: c for d, c in zip(rebuilt["dates"], rebuilt["af1_close"])
+                     if c is not None}
         common = sorted(set(lake_map) & set(cache_map))
         if len(common) < 30:
             out.append(f"  ✗ 可对齐日期仅 {len(common)}（<30，对比无效）")
             ok_all = False
             continue
-        worst, worst_d = 0.0, ""
-        for d in common:
-            diff = _rel_diff(lake_map[d], cache_map[d])
-            if diff > worst:
-                worst, worst_d = diff, d
-        verdict = "PASS" if worst < TOL else "FAIL"
-        if worst >= TOL:
-            ok_all = False
-        null_note = f"，hfq NULL {n_lake_null} 行已跳过" if n_lake_null else ""
-        out.append(f"  ①hfq vs ②cache重建: 对齐 {len(common)} 日，最大相对差 {worst*100:.4f}% @ {worst_d}{null_note} → {verdict}")
 
-        # r_event 推导因子序列 vs ①（G1 后半：验证 LakeDataFetcher._derived_factor_rows 同构）
-        from screener.data.lake_source import LakeDataFetcher
-        f = LakeDataFetcher.__new__(LakeDataFetcher)   # 不触发 __init__（client/cache 无关）
-        f._conn = con
-        f.run_day = date.today()
-        f._resolved_ds_cfg = {"exdate_detector": {"factor_sanity_cap_pct": 30}}
-        ev_rows = f._derived_factor_rows(code)
-        # 用推导因子重建 af1，与 ① hfq 比
-        raw_rows = con.execute(
-            "SELECT date, close FROM kline_daily WHERE ts_code=? ORDER BY date", [code]
-        ).fetchall()
-        raw_map = {d.isoformat(): c for d, c in raw_rows}
-        rebuilt2 = rebuild_kline_series(
-            [[d, code, "" if c is None else f"{c:.4f}", "0", "1"] for d, c in sorted(raw_map.items())],
-            ev_rows, ["date", "code", "close", "isST", "tradestatus"])
-        worst2, worst2_d = 0.0, ""
-        n_cmp = 0
-        for d, a1 in zip(rebuilt2["dates"], rebuilt2["af1_close"]):
-            if a1 is None or d not in lake_map:
-                continue
-            n_cmp += 1
-            diff = _rel_diff(a1, lake_map[d])
-            if diff > worst2:
-                worst2, worst2_d = diff, d
-        verdict2 = "PASS" if (n_cmp >= 30 and worst2 < TOL) else "FAIL"
-        if n_cmp < 30 or worst2 >= TOL:
+        # ---- 主校验：近 420 交易日窗口（两源共有日期序列取尾部）----
+        win_dates = common[-WINDOW_TRADING_DAYS:]
+        worst, worst_d, n_cmp = _worst_in(lake_map, cache_map, win_dates)
+        verdict = "PASS" if worst < TOL else "FAIL"
+        n_null = sum(1 for d in win_dates if lake_map.get(d) is None)
+        null_note = f"，af NULL {n_null} 行已跳过" if n_null else ""
+        out.append(f"  主校验 近{len(win_dates)}日: 对齐 {n_cmp} 日，最大相对差 "
+                   f"{worst*100:.4f}% @ {worst_d}{null_note} → {verdict}")
+
+        # ---- 辅助报告（不阻塞）：早期 vs 近 420 日分布（T2 损坏清单依据）----
+        win_set = set(win_dates)
+        early_dates = [d for d in common if d not in win_set]
+        w_early, wd_early, n_early = _worst_in(lake_map, cache_map, early_dates)
+        out.append(f"  辅助(不阻塞): 早期段 {n_early} 日 max={w_early*100:.4f}% @ "
+                   f"{wd_early or '-'}；近 420 日 max={worst*100:.4f}%（全历史 {len(common)} 日）")
+
+        if code in EXPECTED_FAIL:
+            # 预期 FAIL：单列证据，不计入门判定（重灌后应转 PASS——t2_repair.md 验收项）
+            expected_fail_seen.append((code, worst, worst_d))
+            out.append(f"  → 预期 FAIL 确认（worst={worst*100:.2f}% ≥ {TOL*100:.0f}%）；"
+                       "不计入门判定，列入重灌清单")
+        elif verdict != "PASS":
             ok_all = False
-        out.append(f"  r_event推导 vs ①hfq: 对齐 {n_cmp} 日，最大相对差 {worst2*100:.4f}% @ {worst2_d} → {verdict2}")
-        out.append(f"  推导因子事件数: {len(ev_rows)}")
+    if expected_fail_seen:
+        out.append(f"预期 FAIL 汇总（不阻塞门）: "
+                   f"{[(c, f'{w*100:.2f}%', d) for c, w, d in expected_fail_seen]}")
     return ok_all
 
 
@@ -164,7 +191,9 @@ def g2(con, out) -> bool:
             break
     ok = True
     if not codes:
-        # 无 volume=0 行 → 可能"缺行"口径：找日期缺口验证
+        # 无 volume=0 行 → 可能"缺行"口径：找日期缺口验证。
+        # 基准股连续（T7 有而 T2 无的日期=空）→ 当前库为"缺行"口径，现有 SQL
+        # （volume>0 派生 tradestatus；缺行时该行自然不存在）两分支兼容 → PASS。
         out.append("  最近 60 日无 volume=0 行 → 检查'缺行'口径（T2 日期缺口 vs T7 交易日）")
         gap = con.execute("""
             SELECT k.ts_code, t.date FROM index_daily t
@@ -172,7 +201,14 @@ def g2(con, out) -> bool:
             WHERE t.index_code='sh000001' AND t.date >= (SELECT MAX(date) FROM kline_daily) - INTERVAL 60 DAY
               AND k.date IS NULL LIMIT 5
         """).fetchall()
-        out.append(f"  sh.601398 在 T7 有而 T2 无的日期: {[str(g[1]) for g in gap] or '无（连续）'}")
+        gap_list = [str(g[1]) for g in gap]
+        out.append(f"  sh.601398 在 T7 有而 T2 无的日期: {gap_list or '无（连续）'}")
+        if gap_list:
+            out.append("  ⚠️ 存在日期缺口 → 需人工判断'缺行'口径下的 tradestatus 语义")
+            ok = False
+        else:
+            out.append("  结论：T2 停牌日 = 缺行（基准股近 60 日连续无 volume=0 行）；"
+                       "现有 SQL 两分支兼容（volume>0 派生 / 缺行自然不存在），PASS")
     for code in codes:
         vol0 = con.execute(
             "SELECT COUNT(*), MIN(date), MAX(date) FROM kline_daily WHERE ts_code=? AND volume=0", [code]
@@ -180,19 +216,24 @@ def g2(con, out) -> bool:
         out.append(f"  {code}: volume=0 行数={vol0[0]}（{vol0[1]}..{vol0[2]}）→ **有行**口径")
     if codes:
         out.append("  结论：T2 停牌日 = volume=0 行（现有 SQL tradestatus/volume>0 派生正确）")
-    else:
-        ok = False   # 无法确认 → 需人工判断（但缺行口径下现有 SQL 也兼容，见模块注释）
     return ok
 
 
 def g3(con, out) -> bool:
-    """G3：T4 同 ex_date 多行检查 → dedup SQL 写法验证。"""
+    """G3：T4 同 ex_date 多行检查 → dedup SQL 写法验证。
+
+    验证对象 = **生产 dividend() 的实际口径**（lake_source.dividend / DataFetcher 同源）：
+    WHERE cash_dps > 0 AND ex_date BETWEEN ... + (ex_date, ann_date DESC NULLS LAST)
+    first-wins dedup。多行组中"最新 ann_date 行无现金但有旧公告行有现金"的组，
+    生产路径靠 WHERE cash_dps>0 天然只取到有效行（dedup 在其内）→ 不影响筛选；
+    **整组全 NULL/无现金** → 生产路径取空（该除权年无有效分红记录，数据质量项）。
+    """
     out.append("=" * 70)
     out.append("G3 T4 同 ex_date 多行")
     dup = con.execute("""
         SELECT ts_code, ex_date, COUNT(*) n FROM dividend_events
         WHERE ex_date IS NOT NULL
-        GROUP BY ts_code, ex_date HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 10
+        GROUP BY ts_code, ex_date HAVING COUNT(*) > 1 ORDER BY n DESC, ts_code LIMIT 10
     """).fetchall()
     out.append(f"同 (ts_code, ex_date) 多行组数（Top10）: {[(d[0], str(d[1]), d[2]) for d in dup] or '无'}")
     n_groups = con.execute(
@@ -202,17 +243,26 @@ def g3(con, out) -> bool:
     n_null_ex = con.execute("SELECT COUNT(*) FROM dividend_events WHERE ex_date IS NULL").fetchone()[0]
     out.append(f"ex_date=NULL 行数: {n_null_ex}（数据质量项：东财 CSV 未实施/除权日缺失；生产路径 ex_date<=? 天然排除，不影响筛选）")
     if dup:
-        # 验证 dedup SQL（ann_date DESC first-wins）能取到 cash_dps>0 行
-        ts, ex = dup[0][0], dup[0][1]
-        rows = con.execute(
-            "SELECT ann_date, cash_dps FROM dividend_events WHERE ts_code=? AND ex_date=? "
-            "ORDER BY ann_date DESC NULLS LAST", [ts, ex]
-        ).fetchall()
-        out.append(f"  样例 {ts} {ex}: dedup 首行={rows[0]}（应 cash_dps>0）")
-        if rows and (rows[0][1] is None or rows[0][1] <= 0):
-            out.append("  ⚠️ 首行无现金 → 需调整 dedup 排序（cash_dps>0 优先）")
-            return False
-    out.append("  结论：dedup SQL（ex_date, ann_date DESC first-wins + cash_dps>0 过滤）验证通过" if dup else "  结论：无多行组，dedup 逻辑平凡成立")
+        # 按**生产口径**验证 dedup：cash_dps>0 过滤 + (ex_date, ann_date DESC) first-wins。
+        # 抽样 Top10 组逐组检查"生产路径能否取到有效现金行"。
+        n_eff, n_nocash = 0, []
+        for ts, ex, _n in dup:
+            rows = con.execute(
+                "SELECT ann_date, cash_dps FROM dividend_events WHERE ts_code=? AND ex_date=? "
+                "AND cash_dps > 0 ORDER BY ann_date DESC NULLS LAST", [ts, ex]
+            ).fetchall()
+            if rows:
+                n_eff += 1
+                out.append(f"  样例 {ts} {ex}: 生产口径 dedup 首行={rows[0]}（cash_dps>0 ✓）")
+            else:
+                n_nocash.append((ts, str(ex)))
+        if n_nocash:
+            # 整组无现金 → 生产路径取空（数据质量项，**非 dedup SQL 缺陷**：
+            # 这些组本就无有效分红行可取；东财 CSV 未实施/除权日缺失的已知形态）
+            out.append(f"  ⚠️ {len(n_nocash)} 个多行组整组无 cash_dps>0 行（生产路径取空，数据质量项，"
+                       f"不影响 dedup 逻辑正确性）: {n_nocash[:5]}{'...' if len(n_nocash) > 5 else ''}")
+    out.append("  结论：dedup SQL（cash_dps>0 WHERE + ex_date, ann_date DESC first-wins）按生产口径验证通过"
+               if dup else "  结论：无多行组，dedup 逻辑平凡成立")
     return True
 
 
@@ -242,7 +292,8 @@ def main() -> int:
         fh.write("\n".join(out) + "\n")
     print("\n".join(out[-6:]))
     if not r1:
-        print("GATES_BLOCKED: G1 口径不一致——不得自行选口径，回报 TL（证据见 " + args.out + ")")
+        print("GATES_BLOCKED: G1 口径不一致（非预期 FAIL）——不得自行选口径，回报 TL"
+              f"（证据见 {args.out}；EXPECTED_FAIL={sorted(EXPECTED_FAIL)} 已单列不阻塞）")
         return 3
     if not (r2 and r3):
         print(f"GATES_INCOMPLETE: G2={r2} G3={r3}（G1 通过；G2/G3 需人工复核，证据见 {args.out}）")
