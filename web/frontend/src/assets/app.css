@@ -85,7 +85,8 @@ h3 { margin: 0 0 10px; font-size: 15px; }
 }
 .mini-btn:hover { color: var(--accent); border-color: var(--accent); }
 
-/* ---------- 结果页 ---------- */
+/* ---------- 结果页（lake-source：已并入"运行"tab 下半区；样式保留供 .results-layout 复用） ---------- */
+.run-results-divider { border-top: 1px solid var(--line); margin: 20px 0 16px; }
 .results-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; align-items: start; }
 /* grid item 默认 min-width:auto（=内容固有宽度），宽表格会把 1fr 轨道撑破页面；
    min-width:0 让右栏收缩到视口内，由 .tbl-wrap 的 overflow-x:auto 自己滚动 */

@@ -1,5 +1,5 @@
 <script setup>
-// 应用根：AppShell（5 页签壳）+ 全局 StockModal（行点击弹框，跨 tab 复用）。
+// 应用根：AppShell（4 页签壳，运行/结果已合并）+ 全局 StockModal（行点击弹框，跨 tab 复用）。
 import { onMounted, ref } from "vue";
 import AppShell from "./components/AppShell.vue";
 import StockModal from "./components/StockModal.vue";

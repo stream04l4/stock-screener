@@ -280,7 +280,16 @@ def run_screener(
     client = BaoStockClient(max_attempts=datac["retry_max_attempts"],
                             daily_quota=datac["daily_quota"])  # v5.2-p2 配额守卫（TL D5）
     cache = DiskCache(datac["cache_dir"])
-    fetcher = DataFetcher(client, cache)
+    # lake-source（02_code brief 规格 2）：primary=="lake" → LakeDataFetcher（本地 DuckDB
+    # 数据湖，零网络）。BaoStockClient 占位惰性 login（baostock_client._ensure_login 仅首次
+    # 查询才连），lake 路径不发任何 BaoStock 查询 → 永不触发网络。一行切回 = config
+    # primary: tencent（LakeDataFetcher 不实例化，走原路径，零残留）。
+    ds_cfg = cfgmod.datasource_cfg(cfg)
+    if str(ds_cfg.get("primary", "")).lower() == "lake":
+        from .data.lake_source import LakeDataFetcher
+        fetcher = LakeDataFetcher(client, cache, datasource_cfg=ds_cfg)
+    else:
+        fetcher = DataFetcher(client, cache)
     result = ScreenResult(requested_date=requested_date.isoformat(), mode=mode, top_n=scfg["top_n"])
 
     no_candidates = False
@@ -457,7 +466,19 @@ def _final_count(result: ScreenResult) -> int:
 
 
 def _kline_first_date(fetcher: DataFetcher, code: str) -> Optional[str]:
-    """kline_af3 缓存**首行**日期（IPO 年代理；头部字节读，不加载全历史）。"""
+    """K线首行日期（IPO 年代理）。
+
+    lake-source：LakeDataFetcher 提供 ``kline_af3_first_date`` 钩子（T2 MIN(date)，
+    本地 SQL）——优先走钩子，不碰 DiskCache 文件。
+    DataFetcher（tencent/baostock）：kline_af3 缓存**首行**头部字节读，不加载全历史。
+    """
+    hook = getattr(fetcher, "kline_af3_first_date", None)
+    if callable(hook):
+        try:
+            first: Optional[str] = hook(code)  # type: ignore[assignment]
+            return first
+        except Exception:  # noqa: BLE001 — 钩子失败回退文件读（防御纵深）
+            pass
     path = fetcher.cache._path(fetcher._kline_af3_key(code))
     try:
         with open(path, "rb") as fh:

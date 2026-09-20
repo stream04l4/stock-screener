@@ -339,8 +339,10 @@ def datasource_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _validate_datasource(d: Dict[str, Any]) -> None:
     """datasource 段结构/语义校验（缺项直接报错，避免运行到一半才发现）。"""
-    if d.get("primary") not in ("tencent", "baostock"):
-        raise ConfigError("datasource.primary 只能是 tencent 或 baostock")
+    # lake-source（02_code brief 规格 2）：放行 "lake"（本地 DuckDB 数据湖主源；
+    # LakeDataFetcher 零网络，无 tencent/baostock 子段语义依赖）。
+    if d.get("primary") not in ("tencent", "baostock", "lake"):
+        raise ConfigError("datasource.primary 只能是 tencent、baostock 或 lake")
     if d.get("fallback") not in ("fail_fast", "baostock"):
         raise ConfigError("datasource.fallback 只能是 fail_fast 或 baostock")
     # v5.2-p2（TL D5）：BaoStock 每日配额硬上限必须是正整数（键缺失 → 默认值，不校验）
