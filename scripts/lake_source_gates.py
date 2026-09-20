@@ -4,27 +4,39 @@
 纪律：
 - 仅 read_only 连接；backfill flock 期间连不上 → 退出码 2（GATES_LOCKED，等锁释放重跑）；
 - **不碰 backfill 进程、不调 /api/lake/sync/*、不 kill 任何进程**；
-- G1 不一致（除 EXPECTED_FAIL 已知损坏股外）→ 退出码 3 + GATES_BLOCKED 证据
+- G1 不一致（除 --tolerated-codes 容忍股外）→ 退出码 3 + GATES_BLOCKED 证据
   （brief：不得自行选口径，回报 TL）。
 
 用法：.venv/bin/python scripts/lake_source_gates.py [--db PATH] [--out FILE]
-默认 --db data/lake/lake.duckdb --out stages/02_code/gates_evidence.txt
+      [--tolerated-codes FILE]
+默认 --db data/lake/lake.duckdb
+     --out stages/02_code/gates_evidence.txt
 
-G1（最高优先；02_code 修正轮 brief §4 重写——方向纠正：存储 T2 是**被验证方**，
-BaoStock cache 重建是 ground truth）：
+--tolerated-codes FILE：逗号/换行分隔的 code 清单（已知损坏待重灌，由调用方按最新
+t2_damage_scan checkpoint 提供）。被容忍 code：FAIL → 单列证据、不计入门判定；
+PASS → 打印"已修复转 PASS"（informational，不阻塞）。缺省=空。
+TL 复跑命令示例：
+    python scripts/lake_source_gates.py --tolerated-codes <damaged清单文件>
+
+G1（最高优先）——v6.3-O1 起判据口径与 t2_damage_scan.py **统一**（同一实现，import
+复用，禁止两处复制逻辑）：
 - **主校验**：存储 T2 adj_factor（raw close × af 逐日前向填充值 = 库内已存列，
   直接取；**必须 ORDER BY date**）vs BaoStock ground truth
   （cache/kline_af3 × cache/adjfactor backAdj 重建，reconstruct.rebuild_kline_series），
   **近 420 交易日窗口**（因子最大回看窗口=420 日，config data.kline_calendar_days_back
-  同源口径），TOL=2%。
+  同源口径），判据 = **逐日收益差 max|Δret| < RET_TOL(2%)**（t2_damage_scan.RET_TOL
+  单一事实源；low_vol/RSI/window_return 全部由 af1 逐日收益推导，两源复权基准可整体
+  差恒定比例、不改变任何收益 → 应豁免；裸水平相对差已降级为诊断输出 level_pct，
+  不参与 PASS/FAIL 判定）。
   标的：G1_STOCKS（sh.601398/sh.601318/sh.600028）+ T4 除权事件 Top2 + sh.601688
-  （已知近期单点损坏 → **预期 FAIL**，单列不阻塞门，列入 t2_repair.md 重灌清单）。
-- **辅助报告（不阻塞）**：全历史窗口 max 偏差分布（早期 vs 近 420 日）——
+  （已知近期单点损坏——保留在验证集中以便重灌后确认转 PASS；其 FAIL 是否阻塞门由
+  --tolerated-codes 决定：在清单内 → 单列不阻塞，不在 → 计入 GATES_BLOCKED）。
+- **辅助报告（不阻塞）**：早期段 vs 近 420 日分布（同样收益差口径）——
   用于生成 T2 损坏清单（t2_damage_scan.py 的抽样对照）。
 G2：3 只近期停牌股 → T2 停牌日行表示（volume=0 行 vs 缺行）。
 G3：T4 同 ex_date 多行检查 → dedup SQL 写法验证。
 
-退出码：0=GATES_PASS；2=GATES_LOCKED；3=GATES_BLOCKED（G1 非预期 FAIL）；
+退出码：0=GATES_PASS；2=GATES_LOCKED；3=GATES_BLOCKED（G1 非容忍股 FAIL）；
 4=GATES_INCOMPLETE（G2/G3 需人工复核）。
 """
 from __future__ import annotations
@@ -32,19 +44,20 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/：复用 t2_damage_scan
 
 from screener.reconstruct import rebuild_kline_series  # noqa: E402
+# v6.3-O1：判据口径与全市场扫描**同一实现**（import 复用，禁止复制两份逻辑）：
+# Δret 计算函数 + RET_TOL 常量均为 t2_damage_scan 的单一事实源。
+from t2_damage_scan import RET_TOL, worst_daily_ret_diff  # noqa: E402
 
-G1_STOCKS = ["sh.601398", "sh.601318", "sh.600028"]   # + T4 事件 Top2 + 601688
-TOL = 0.02                  # 近 420 交易日窗口相对差阈值（brief：<2%）
-WINDOW_TRADING_DAYS = 420   # 因子最大回看窗口（config data.kline_calendar_days_back 同源）
-# 已知近期单点损坏（TL 实测 sh.601688=26% @ 2025-08/09）→ 预期 FAIL：
-# 不计入门判定，单列证据 + 列入 stages/02_code/t2_repair.md 重灌清单。
-EXPECTED_FAIL = {"sh.601688"}
+G1_STOCKS = ["sh.601398", "sh.601318", "sh.600028"]   # + T4 事件 Top2
+TOL = RET_TOL                 # 近 420 交易日窗口 max|Δret| 阈值（与 scan 同源，单一事实源）
+WINDOW_TRADING_DAYS = 420     # 因子最大回看窗口（config data.kline_calendar_days_back 同源）
 
 
 def _lock_probe(db: str):
@@ -74,17 +87,22 @@ def _stored_t2_af1(con, code: str):
     """存储 T2 口径 af1：raw close × adj_factor（库内已前向填充的逐日值）。
 
     **必须 ORDER BY date**（brief 关键陷阱：TL 诊断脚本曾漏排序，前向填充乱序
-    产生假阳性偏差）。adj_factor NULL / close NULL → None 占位（对比时跳过、计数）。
+    产生假阳性偏差）。T2 按 config Q4 灌入时 adj_factor 已逐日前向填充；此处仍做
+    一遍防御性前向填充（与 t2_damage_scan._stored_af1_series 同语义：af NULL 行沿用
+    上一非空值，首段全 NULL → None），避免历史稀疏形态下静默漏对比。
+    adj_factor NULL / close NULL → None 占位（对比时跳过、计数）。
     返回 {date_iso: af1|None}。
     """
     rows = con.execute(
         "SELECT date, close, adj_factor FROM kline_daily WHERE ts_code=? ORDER BY date",
         [code],
     ).fetchall()
-    out = {}
+    out, cur = {}, None
     for d, c, af in rows:
         ds = d.isoformat() if hasattr(d, "isoformat") else str(d)
-        out[ds] = None if (c is None or af is None) else float(c) * float(af)
+        if af is not None:
+            cur = float(af)
+        out[ds] = None if (c is None or cur is None) else float(c) * cur
     return out
 
 
@@ -94,7 +112,11 @@ def _rel_diff(a: float, b: float) -> float:
 
 
 def _worst_in(lake_map, cache_map, dates):
-    """dates 内两源相对差最大值（跳过 None）。返回 (worst, worst_date, n_cmp)。"""
+    """dates 内两源**裸水平相对差**最大值（跳过 None）。返回 (worst, worst_date, n_cmp)。
+
+    v6.3-O1 起仅作诊断输出（level_pct，同 t2_damage_scan 报告列）——两源复权基准可整体
+    差恒定比例，水平差不代表因子影响，**不参与 PASS/FAIL 判定**。
+    """
     worst, worst_d, n = 0.0, "", 0
     for d in dates:
         a, b = lake_map.get(d), cache_map.get(d)
@@ -107,25 +129,35 @@ def _worst_in(lake_map, cache_map, dates):
     return worst, worst_d, n
 
 
-def g1(con, out) -> bool:
-    """G1：存储 T2 adj_factor vs BaoStock ground truth（近 420 交易日窗口，TOL=2%）。"""
+def g1(con, out, tolerated=None) -> bool:
+    """G1：存储 T2 adj_factor vs BaoStock ground truth（近 420 交易日窗口）。
+
+    判据 = 逐日收益差 max|Δret| < RET_TOL(2%)（与 t2_damage_scan 同一实现，v6.3-O1）。
+    tolerated：--tolerated-codes 提供的已知损坏待重灌 code 集合——FAIL 时单列证据、
+    不计入门判定；PASS 时打印"已修复转 PASS"（informational，不阻塞）。
+    """
+    tolerated = set(tolerated or ())
     out.append("=" * 70)
     out.append("G1 复权口径（最高优先；方向=存储 T2 被验证，BaoStock cache 为 ground truth）")
-    # T4 除权事件数 Top2（排除基准股与已知损坏股——601688 单列）
+    out.append(f"判据: 近 {WINDOW_TRADING_DAYS} 交易日窗口逐日收益差 max|Δret| < {TOL*100:.0f}% "
+               f"（与 t2_damage_scan 同一实现 worst_daily_ret_diff/RET_TOL；"
+               f"裸水平相对差仅诊断 level_pct，不判 PASS/FAIL）")
+    # T4 除权事件数 Top2（排除基准股与 sh.601688——601688 固定单列在验证集中）
     rows = con.execute(
         "SELECT ts_code, COUNT(*) n FROM dividend_events WHERE cash_dps > 0 "
         "AND ts_code NOT IN ('sh.601398','sh.601318','sh.600028','sh.601688') "
         "GROUP BY ts_code ORDER BY n DESC LIMIT 2"
     ).fetchall()
     stocks = G1_STOCKS + [r[0] for r in rows] + ["sh.601688"]
-    out.append(f"标的: {stocks}（G1_STOCKS + T4 除权事件 Top2 + sh.601688 已知损坏）")
+    out.append(f"标的: {stocks}（G1_STOCKS + T4 除权事件 Top2 + sh.601688）")
 
     ok_all = True
-    expected_fail_seen = []
+    tolerated_fail_seen = []
+    tolerated_fixed_seen = []
     for code in stocks:
         out.append("-" * 60)
-        out.append(f"[G1] {code}" + ("（预期 FAIL：已知近期损坏，列入 t2_repair.md）"
-                                     if code in EXPECTED_FAIL else ""))
+        out.append(f"[G1] {code}" + ("（容忍：已知损坏待重灌，不计入门判定）"
+                                     if code in tolerated else ""))
         lake_map = _stored_t2_af1(con, code)
         rebuilt = _cache_rebuilt(code)
         if not lake_map:
@@ -144,32 +176,44 @@ def g1(con, out) -> bool:
             ok_all = False
             continue
 
-        # ---- 主校验：近 420 交易日窗口（两源共有日期序列取尾部）----
+        # ---- 主校验：近 420 交易日窗口（两源共有日期序列取尾部），逐日收益差口径 ----
         win_dates = common[-WINDOW_TRADING_DAYS:]
-        worst, worst_d, n_cmp = _worst_in(lake_map, cache_map, win_dates)
+        worst, worst_d, n_cmp = worst_daily_ret_diff(lake_map, cache_map, win_dates)
         verdict = "PASS" if worst < TOL else "FAIL"
+        # 裸水平相对差：仅诊断（level_pct），不参与判定——两源复权基准可整体差恒定比例
+        lvl_worst, lvl_d, _ = _worst_in(lake_map, cache_map, win_dates)
         n_null = sum(1 for d in win_dates if lake_map.get(d) is None)
         null_note = f"，af NULL {n_null} 行已跳过" if n_null else ""
-        out.append(f"  主校验 近{len(win_dates)}日: 对齐 {n_cmp} 日，最大相对差 "
+        out.append(f"  主校验 近{len(win_dates)}日: 对齐 {n_cmp} 日，max|Δret| "
                    f"{worst*100:.4f}% @ {worst_d}{null_note} → {verdict}")
+        out.append(f"  诊断 level_pct（不判）: 裸水平相对差 max={lvl_worst*100:.4f}% @ "
+                   f"{lvl_d or '-'}（两源复权基准可整体不同，仅备查）")
 
-        # ---- 辅助报告（不阻塞）：早期 vs 近 420 日分布（T2 损坏清单依据）----
+        # ---- 辅助报告（不阻塞）：早期 vs 近 420 日分布（T2 损坏清单依据；同收益差口径）----
         win_set = set(win_dates)
         early_dates = [d for d in common if d not in win_set]
-        w_early, wd_early, n_early = _worst_in(lake_map, cache_map, early_dates)
-        out.append(f"  辅助(不阻塞): 早期段 {n_early} 日 max={w_early*100:.4f}% @ "
-                   f"{wd_early or '-'}；近 420 日 max={worst*100:.4f}%（全历史 {len(common)} 日）")
+        w_early, wd_early, n_early = worst_daily_ret_diff(lake_map, cache_map, early_dates)
+        out.append(f"  辅助(不阻塞): 早期段 {n_early} 日 max|Δret|={w_early*100:.4f}% @ "
+                   f"{wd_early or '-'}；近 420 日 max|Δret|={worst*100:.4f}%（全历史 {len(common)} 日）")
 
-        if code in EXPECTED_FAIL:
-            # 预期 FAIL：单列证据，不计入门判定（重灌后应转 PASS——t2_repair.md 验收项）
-            expected_fail_seen.append((code, worst, worst_d))
-            out.append(f"  → 预期 FAIL 确认（worst={worst*100:.2f}% ≥ {TOL*100:.0f}%）；"
-                       "不计入门判定，列入重灌清单")
+        if code in tolerated:
+            # 容忍股：FAIL → 单列证据不计入门判定（重灌后应转 PASS——t2_repair.md 验收项）；
+            # PASS → "已修复转 PASS"（informational，不阻塞）。**检查实际 verdict**
+            # （v6.3-O1 修正：旧硬编码预期 FAIL 分支不查 verdict，修复后仍误报"预期 FAIL 确认"）。
+            if verdict == "PASS":
+                tolerated_fixed_seen.append(code)
+                out.append(f"  → 已修复转 PASS（原容忍 code；可移出 --tolerated-codes 清单）")
+            else:
+                tolerated_fail_seen.append((code, worst, worst_d))
+                out.append(f"  → 容忍股 FAIL 确认（max|Δret|={worst*100:.2f}% ≥ {TOL*100:.0f}%）；"
+                           "不计入门判定，列入重灌清单")
         elif verdict != "PASS":
             ok_all = False
-    if expected_fail_seen:
-        out.append(f"预期 FAIL 汇总（不阻塞门）: "
-                   f"{[(c, f'{w*100:.2f}%', d) for c, w, d in expected_fail_seen]}")
+    if tolerated_fail_seen:
+        out.append(f"容忍股 FAIL 汇总（不阻塞门）: "
+                   f"{[(c, f'{w*100:.2f}%', d) for c, w, d in tolerated_fail_seen]}")
+    if tolerated_fixed_seen:
+        out.append(f"已修复转 PASS 汇总（informational）: {tolerated_fixed_seen}")
     return ok_all
 
 
@@ -266,11 +310,25 @@ def g3(con, out) -> bool:
     return True
 
 
-def main() -> int:
+def load_tolerated_codes(path: str) -> set:
+    """--tolerated-codes FILE → code 集合（逗号/换行分隔；空文件/缺省=空集）。"""
+    if not path or not os.path.exists(path):
+        raise SystemExit(f"TOLERATED_FILE_MISSING: --tolerated-codes 文件不存在: {path}")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    return {tok.strip() for tok in text.replace(",", "\n").split("\n") if tok.strip()}
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=os.path.join(REPO, "data/lake/lake.duckdb"))
     ap.add_argument("--out", default=os.path.join(REPO, "stages/02_code/gates_evidence.txt"))
-    args = ap.parse_args()
+    ap.add_argument("--tolerated-codes", default=None, metavar="FILE",
+                    help="已知损坏待重灌 code 清单（逗号/换行分隔）；FAIL 单列不阻塞门，"
+                         "PASS 打印'已修复转 PASS'")
+    args = ap.parse_args(argv)
+
+    tolerated = load_tolerated_codes(args.tolerated_codes) if args.tolerated_codes else set()
 
     con, err = _lock_probe(args.db)
     if con is None:
@@ -279,7 +337,7 @@ def main() -> int:
 
     out = [f"lake-source G 门证据 · {date.today().isoformat()} · db={args.db}"]
     try:
-        r1 = g1(con, out)
+        r1 = g1(con, out, tolerated)
         r2 = g2(con, out)
         r3 = g3(con, out)
     finally:
@@ -292,8 +350,11 @@ def main() -> int:
         fh.write("\n".join(out) + "\n")
     print("\n".join(out[-6:]))
     if not r1:
-        print("GATES_BLOCKED: G1 口径不一致（非预期 FAIL）——不得自行选口径，回报 TL"
-              f"（证据见 {args.out}；EXPECTED_FAIL={sorted(EXPECTED_FAIL)} 已单列不阻塞）")
+        tol_note = (f"；tolerated={sorted(tolerated)} 已单列不阻塞" if tolerated
+                    else "（未提供 --tolerated-codes；FAIL 股若属已知损坏待重灌，"
+                         "请按 t2_damage_scan checkpoint 提供清单后复跑）")
+        print(f"GATES_BLOCKED: G1 口径不一致（非容忍股 FAIL）——不得自行选口径，回报 TL"
+              f"（证据见 {args.out}{tol_note}）")
         return 3
     if not (r2 and r3):
         print(f"GATES_INCOMPLETE: G2={r2} G3={r3}（G1 通过；G2/G3 需人工复核，证据见 {args.out}）")

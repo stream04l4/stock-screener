@@ -189,38 +189,44 @@ def _worst_in(stored_map, ref_map, dates):
     return worst, worst_d, n
 
 
-def _worst_return_diff(stored_map, ref_map, dates):
-    """窗口内两源**逐日收益**最大绝对差（各自序列的相邻非空值）{date: max|Δret|}。
+def worst_daily_ret_diff(map_a, map_b, dates):
+    """两源 af1 序列**逐日收益**最大绝对差（各自序列的相邻非空值）。
 
-    返回 (worst_abs_ret_diff, worst_date, n_cmp)。这是筛选因子真正消费的口径：
-    low_vol/RSI/window_return 全部由 af1 序列的逐日收益推导。**恒定比例偏移**
-    （两源复权基准不同，如 sh.600256 GT/stored≡48.87×）不改变任何逐日收益 →
+    **模块级公共函数——G1 门（lake_source_gates.py）与本扫描脚本共用同一实现**
+    （v6.3-O1 判据口径统一；禁止两处复制逻辑）。返回 (worst, worst_date, n_cmp)。
+
+    这是筛选因子真正消费的口径：low_vol/RSI/window_return 全部由 af1 序列的逐日收益推导。
+    **恒定比例偏移**（两源复权基准不同，如 sh.600256 GT/stored≡48.87×）不改变任何逐日收益 →
     因子零影响（裸水平差会把这类股误判损坏）；而某除权事件两源不一致 → 该日
     收益跳变 → 因子序列从此分歧 → 真损坏。
 
     实测对照：sh.601398/601318/600028 max|Δret|<2%（健康）；sh.601688=36%@2025-12-12
     （真损坏，窗口中段）；sh.600256=96%@2026-07-17（GT 该日有除权事件、存储 T2 缺）。
     """
-    skeys = [d for d in sorted(stored_map) if stored_map[d] is not None]
-    rkeys = [d for d in sorted(ref_map) if ref_map[d] is not None]
-    spos = {d: i for i, d in enumerate(skeys)}
-    rpos = {d: i for i, d in enumerate(rkeys)}
+    akeys = [d for d in sorted(map_a) if map_a[d] is not None]
+    bkeys = [d for d in sorted(map_b) if map_b[d] is not None]
+    apos = {d: i for i, d in enumerate(akeys)}
+    bpos = {d: i for i, d in enumerate(bkeys)}
     worst, worst_d, n = 0.0, "", 0
     for d in dates:
-        si, ri = spos.get(d), rpos.get(d)
-        if si is None or ri is None or si == 0 or ri == 0:
+        ai, bi = apos.get(d), bpos.get(d)
+        if ai is None or bi is None or ai == 0 or bi == 0:
             continue
-        s0, s1 = stored_map[skeys[si - 1]], stored_map[d]
-        r0, r1 = ref_map[rkeys[ri - 1]], ref_map[d]
-        if not (s0 and r0):
+        a0, a1 = map_a[akeys[ai - 1]], map_a[d]
+        b0, b1 = map_b[bkeys[bi - 1]], map_b[d]
+        if not (a0 and b0):
             continue
-        rs = s1 / s0 - 1.0
-        rr = r1 / r0 - 1.0
+        ra = a1 / a0 - 1.0
+        rb = b1 / b0 - 1.0
         n += 1
-        diff = abs(rs - rr)
+        diff = abs(ra - rb)
         if diff > worst:
             worst, worst_d = diff, d
     return worst, worst_d, n
+
+
+# 私有别名（历史名）：内部调用点沿用，行为零变化。
+_worst_return_diff = worst_daily_ret_diff
 
 
 def _load_done(progress_path: str) -> dict:
