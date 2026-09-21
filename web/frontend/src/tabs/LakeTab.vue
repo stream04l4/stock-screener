@@ -23,6 +23,26 @@ import LakeStatusCard from "./lake/LakeStatusCard.vue";
 const lake = useLakeStore();
 const stockCode = ref("");      // 当前选中股（""=未选 → 全景卡占位）
 
+// v6.3.1 R4-a：tasks 状态中文映射（现状 raw 英文渲染，class 与文字同串）。
+// 返回 [cssClass, 中文文字]——class 复用既有 .badge.running/.done/.error/.idle
+// （stopped_by_signal→idle 灰色，语义"已停止"不是失败；未知 state 回退 raw，
+// 文字=raw 原文，CSS 无该 class 时退回 .badge 基础样式，不崩）。
+const TASK_STATE = {
+  running: ["running", "运行中"],
+  done: ["done", "已完成"],
+  error: ["error", "失败"],
+  stopped_by_signal: ["idle", "已停止"],
+  stopping: ["running", "停止中"],
+  pending: ["idle", "待处理"],
+  blocked_quota: ["running", "配额到顶"],
+  hang_watchdog: ["error", "看门狗中止"],
+  idle: ["idle", "空闲"],
+};
+function taskState(t) {
+  const s = (t && t.state) || "idle";
+  return TASK_STATE[s] || [s, s];
+}
+
 // v6.1.2 P2-A：琥珀块总进度（纯前端，数据=lake.backfillView.tasks）。
 // 所有 tasks 的 done 合计/total 合计 + 进度条 + 预计剩余（取各任务 eta_min 最大值，
 // 换算"约 N 小时 M 分"；无 eta → "—"）。
@@ -67,6 +87,19 @@ function onSelect(code) {
 // **单一事实源（DEFECT-D3-1）**：lake.lastError 只存**裸 msg**（子组件 @error 直传、
 // fetchStatus 的 duckdb 未安装/e.message 亦为裸值）——前缀**只在此处加一次**。
 const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.lastError : ""));
+
+// v6.3.1 R4-b：陈旧快照告警。progress 的 updated_at 是 UTC "YYYY-MM-DD HH:MM:SS"
+// （save_progress 落盘口径，与 String(ts).slice(5,16) 展示口径一致）——距 Date.now()
+// > 120s → 视为陈旧（浏览器后台标签 timer 节流，进程退出后快照冻结，本轮事故 Joel
+// 截图 14:44:19 仍显示 14:41:05 的旧 locked 快照）。仅 backfillView 存在时判。
+const staleSnapshot = computed(() => {
+  const v = lake.backfillView;
+  if (!v || !v.updated_at) return false;
+  const ts = String(v.updated_at).trim();
+  const d = new Date(ts.replace(" ", "T") + "Z");   // UTC 解析（progress 时间戳是 UTC）
+  if (Number.isNaN(d.getTime())) return false;
+  return (Date.now() - d.getTime()) > 120000;
+});
 </script>
 
 <template>
@@ -84,6 +117,11 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
         <span class="muted small">
           持锁 PID {{ (lake.backfillView.lock_holder_pid ?? "未知") + " · 进度更新于 " + (lake.backfillView.updated_at || "—") }}
         </span>
+      </div>
+      <!-- v6.3.1 R4-b：陈旧快照告警（updated_at 距今 >120s——进程可能已退出、
+           浏览器后台标签 timer 节流冻结在旧 locked 快照，本轮事故同因） -->
+      <div v-if="staleSnapshot" class="muted small">
+        ⚠ 进度更新已超时（&gt;2min）——进程可能已退出，点 ⟳ 刷新确认
       </div>
       <!-- v6.1.2 P2-A：总进度行（所有 tasks done/total 合计 + 进度条 + 预计剩余 max eta_min） -->
       <div class="lake-backfill-total" id="lake-backfill-total">
@@ -106,7 +144,8 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
             </tr>
             <tr v-for="(t, i) in lake.backfillView.tasks || []" :key="i">
               <td>{{ t.table }}</td><td>{{ t.tier }}</td>
-              <td><span class="badge" :class="t.state || 'idle'">{{ t.state || "idle" }}</span></td>
+              <!-- v6.3.1 R4-a：状态中文映射（class 复用既有 .badge.* 四色，文字中文） -->
+              <td><span class="badge" :class="taskState(t)[0]">{{ taskState(t)[1] }}</span></td>
               <td class="num lake-task-progress">
                 <div class="progress-track" style="margin:0"><div class="progress-bar" :style="{ width: (t.total ? Math.round((t.done / t.total) * 100) : 0) + '%' }"></div></div>
                 {{ (t.done ?? 0) + "/" + (t.total ?? 0) }}

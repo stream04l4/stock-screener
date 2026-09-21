@@ -1586,10 +1586,13 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
         e["done"] = done_n
         if universe_n > 0 and done_n >= universe_n:
             e["state"] = "done"
-        elif e.get("state") in ("running", "stopping"):
+        elif e.get("state") in ("running", "stopping", "done"):
             # runner.run 对未灌完的分组把 state 留在 "running"（v6.0.8 视图语义）——
             # 但本函数在**进程收尾**调用，此刻无活跃 writer → 非 done 一律归位 pending
-            # （防 Web /status 永久误报"灌数中"；真在跑时 status 走 locked 分支不读此文件）
+            # （防 Web /status 永久误报"灌数中"；真在跑时 status 走 locked 分支不读此文件）。
+            # v6.3.1 R1 纵深防御：elif 扩 "done"——done<total 的陈旧 "done"（上一轮残留、
+            # 本轮计数器重算为 0/total 的漏网路径）同样降级 pending；真 done 已在上方
+            # done>=total 分支命中，不会误伤。
             e["state"] = "pending"
 
     # T7（四指数）——done 键按**指数集**计（指数 code 不在股票 universe，不能走默认交集）
@@ -1599,7 +1602,8 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
     e7["done"] = min(done7, len(INDEX_CODES))
     if e7["done"] >= e7["total"]:
         e7["state"] = "done"
-    elif e7.get("state") in ("running", "stopping"):
+    elif e7.get("state") in ("running", "stopping", "done"):
+        # v6.3.1 R1 纵深防御：同 T2/T3，done<total 的陈旧 "done" 也降级 pending。
         e7["state"] = "pending"   # 同 T2/T3：收尾态无活跃 writer，非 done 归位 pending
 
     # kline_history（P2 全史）：完成态如实标 done（不依赖已死进程自报）
@@ -1609,8 +1613,9 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
     eh["done"] = hist_done
     if universe_n > 0 and hist_done >= universe_n:
         eh["state"] = "done"
-    elif eh.get("state") in ("running", "stopping"):
-        # 死进程残留纠正（生产实况：history 被杀后停在 running，done 明细齐全）
+    elif eh.get("state") in ("running", "stopping", "done"):
+        # 死进程残留纠正（生产实况：history 被杀后停在 running，done 明细齐全）。
+        # v6.3.1 R1 纵深防御：done<total 的陈旧 "done" 同样降级 pending。
         eh["state"] = "pending"
 
     # T5 fundamentals_quarterly：加进 tasks（pending；已灌的按 f10_full done 键计）
@@ -1633,7 +1638,9 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
     e6["done"] = done6
     if universe_n > 0 and done6 >= universe_n:
         e6["state"] = "done"
-    elif e6.get("state") in ("running", "stopping"):
+    elif e6.get("state") in ("running", "stopping", "done"):
+        # v6.3.1 R1 纵深防御：done<total 的陈旧 "done" 也降级 pending（本轮事故
+        # holders_snapshot error 的姊妹修复——state 与进度计数器不再脱节）。
         e6["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
     e6["note"] = "SinaClient.fetch_holders 全史前十大股东（full 阶段 4；controller_* 待补源）"
 
@@ -1656,7 +1663,9 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
     e8["done"] = min(int(done8_rows), universe_n)
     if universe_n > 0 and e8["done"] >= universe_n:
         e8["state"] = "done"
-    elif e8.get("state") in ("running", "stopping"):
+    elif e8.get("state") in ("running", "stopping", "done"):
+        # v6.3.1 R1 纵深防御：本轮新 as_of 未重算（done 重算为 0<total）时，上一轮
+        # full t8 收尾的 "done" 残留也降级 pending（本轮事故 factor_snapshot 同因）。
         e8["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
     e8["note"] = "recompute_all 全市场纯本地重算（full 阶段 3；as_of=T2 max date；零网络）"
 
@@ -1669,10 +1678,20 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
         done9 = 0
     e9["total"] = 1
     e9["done"] = 1 if int(done9) >= 1 else 0
+    # v6.3.1 R1 纵深防御：done=0（表空/重算）时，陈旧 "done" 也归位 pending
+    # （同 T2/T3——真 done 在 done>=1 分支命中，不在此列，不误伤）。
     e9["state"] = "done" if e9["done"] >= 1 else ("pending"
-                                                  if e9.get("state") in ("running", "stopping")
+                                                  if e9.get("state") in ("running", "stopping", "done")
                                                   else e9.get("state"))
     e9["note"] = "rf.fetch_rf_10y TE 现值 + load_macro_rf（full 阶段 4；cache/rf_10y_daily.csv）"
+
+    # v6.3.1 R2：陈旧 ETA 统一清理——非运行态 entry 不带 ETA。ETA 只对"正在跑的
+    # 任务"有意义；pending/done/error/stopped 一律 None（本轮事故：已停止任务残留
+    # 上一轮 t6 的 eta_min=416，前端取 max → "预计剩余 6h56m"误报）。
+    # （running/stopping 保持 runner 实时写的 eta_min——正常运行中不受影响。）
+    for e in prog["tasks"]:
+        if isinstance(e, dict) and e.get("state") not in ("running", "stopping"):
+            e["eta_min"] = None
 
     save_progress(prog, runner.progress_path)
 
@@ -1953,6 +1972,70 @@ def _full_mark_phase_error(phase: str, db_path: str, exc: BaseException) -> None
                     phase, wexc)
 
 
+# ---------------------------------------------------------------------------
+# v6.3.1 R1：full 启动 scope 重置（"状态=本轮状态"语义——核心修复）
+# ---------------------------------------------------------------------------
+# full 的 8 张表 scope（state 语义归位范围）。与 _FULL_PHASES 各 phase 的
+# _full_phase_tables 合集一致：history(kline_history) / p3(kline_daily,
+# valuation_daily, index_daily) / t8(factor_snapshot) / t9(macro_rf) /
+# t5(fundamentals_quarterly) / t6(holders_snapshot)。
+_FULL_SCOPE_TABLES = (
+    "kline_history", "kline_daily", "valuation_daily", "index_daily",
+    "fundamentals_quarterly", "holders_snapshot", "factor_snapshot", "macro_rf",
+)
+
+
+def _full_reset_scope_state(db_path: str) -> None:
+    """full 启动时把本 run 范围内全部表的 entry state 归位"本轮状态"（v6.3.1 R1）。
+
+    语义：state 表示**本 run** 的进度，不携带上一轮残留：
+    - done < total（或 total 未知=0）→ state="pending"、eta_min=None、last_error=""
+    - done >= total（且 total>0）→ 保持 "done"（幂等跳过，快速完成）
+    范围 = full 的 8 张表（见 _FULL_SCOPE_TABLES），entry 缺失时**不创建**（让各
+    phase 自己建——各 phase 的 runner/收尾刷新按需建 entry，避免凭空造 total=0 占位）。
+    写后 save_progress（原子落盘，Web 3s 轮询立即可见）。
+
+    为什么只在 run_full 调用（不动 cmd_history/cmd_incremental）：history/incremental
+    有各自独立的收尾刷新契约（v6.1.4/v6.1.6 测试断言依赖），full 是唯一"单进程顺序
+    多阶段、跨日续传"的入口——上一轮 full 的 stale done/error 只在 full 启动时才需
+    归位。纵深防御（漏网路径）由 _refresh_incremental_task_view 的 elif 扩 done 兜底。
+    """
+    from lake.backfill import load_progress, save_progress
+
+    prog_path = _progress_for_db(db_path)   # None=缺省库→生产默认路径；自定义→库目录
+    prog = load_progress(prog_path)
+    changed = False
+    for e in prog.get("tasks", []):
+        if not isinstance(e, dict):
+            continue
+        if e.get("table") not in _FULL_SCOPE_TABLES:
+            continue
+        total = e.get("total") or 0
+        done = e.get("done") or 0
+        if total > 0 and done >= total:
+            # 幂等跳过：本轮将快速完成，state 归位/保持 "done"（真 done 也不带 ETA，
+            # R2 统一清理同样要求非运行态 entry 无 ETA——这里幂等置 None）。
+            if e.get("state") != "done":
+                e["state"] = "done"
+                changed = True
+            if e.get("eta_min") is not None:
+                e["eta_min"] = None
+                changed = True
+        else:
+            # done<total 或 total 未知(0) → 本轮尚未完成：归位待处理、清陈旧 ETA/错误。
+            if e.get("state") != "pending":
+                e["state"] = "pending"
+                changed = True
+            if e.get("eta_min") is not None:
+                e["eta_min"] = None
+                changed = True
+            if e.get("last_error"):
+                e["last_error"] = ""
+                changed = True
+    if changed:
+        save_progress(prog, prog_path)
+
+
 def run_full(con, db_path: str, codes: Optional[List[str]],
              start_date: str, end_date: str, days: int,
              t6_enabled: bool = True) -> Dict[str, Any]:
@@ -1979,14 +2062,37 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
         ``hang_watchdog=True``（v6.1.5 cmd_history 已验收的契约，逐字不动）时由本
         编排层检查该标志 → 该 phase 记 ok=False + state=error + last_error +
         phase_errors 留痕并 **break 不再执行后续阶段**（cmd_full 据此 rc=1）。
+
+    v6.3.1 R1：phase 循环开始前调 :func:`_full_reset_scope_state`——把 scope 内
+    entry 的 state/eta/last_error 归位"本轮状态"（上一轮残留的 done/error/ETA 不
+    再与本轮 0/total 计数器脱节；"done 但 0/5219"矛盾的核心修复）。
+    v6.3.1 R3：phase 循环**每 phase 开始前**检查 ``lake.backfill.stop_requested()``
+    （SIGTERM handler 置位的模块级标志，跨 phase 不清除）——命中 → 当前 phase 及
+    后续 phase 全 skipped（ok=True：停止是用户操作不是故障，all_ok 不受影响），
+    break 立即收尾 rc=0（本轮事故：p3 优雅停止落盘后 t8 recompute_all 本地计算无
+    任务边界检查点，15s 看门狗 os._exit 强杀 → 僵尸。现在 t8 及后续不再启动）。
     """
-    from lake.backfill import BackfillRunner
+    from lake.backfill import BackfillRunner, stop_requested
+
+    # v6.3.1 R1：full 启动即把 scope 内 entry 归位"本轮状态"（幂等——done>=total
+    # 保持 done；其余 pending + 清陈旧 ETA/last_error；原子落盘 Web 立即可见）。
+    _full_reset_scope_state(db_path)
 
     summary: Dict[str, Any] = {"sub": "full", "db_path": db_path,
                                "start_date": start_date, "end_date": end_date,
                                "days": days, "phases": {}}
     failed: Dict[str, Any] = {}   # phase → 异常/错误摘要（收尾视图刷新后重标 error 用）
     for phase, label in _FULL_PHASES:
+        # v6.3.1 R3：phase 边界停止检查（SIGTERM 优雅停止的跨 phase 兜底）。
+        # p3 的 runner 收到 SIGTERM 已 break + stopped_by_signal 落盘，模块级
+        # stop_requested() 保持 True（clear 只在 runner._run_inner 开头，跨 phase
+        # 不重 arm）→ 这里命中：当前及后续 phase 全 skipped（ok=True——用户主动
+        # 停止不是故障，all_ok 不受影响、cmd_full rc=0），break 立即收尾。
+        if stop_requested():
+            log.info("SIGTERM 停止：phase %s 前 break，后续阶段跳过（done 键已落盘可续传）", phase)
+            print(f"SIGTERM 停止：phase {phase} 前 break，后续阶段跳过（done 键已落盘可续传）")
+            summary["phases"][phase] = {"ok": True, "skipped": True, "stopped": True}
+            break
         if phase == "t6" and not t6_enabled:
             # v6.1.7 --no-t6（排障用）：跳过阶段 4——不打段标、不碰 progress/holders_snapshot
             # entry（保持收尾视图刷新后的真实态），summary 留痕 skipped（all_ok 不受影响）。

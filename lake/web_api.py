@@ -1316,6 +1316,16 @@ def status() -> Dict[str, Any]:
 
     from .backfill import load_progress
 
+    # v6.3.1 R5：僵尸回收——顺带 waitpid 回收已退出的灌数子进程（防僵尸累积）。
+    # sync_control._reap_children 对 _CHILDREN 注册表 poll() WNOHANG（无阻塞）；
+    # /status 每 3s 一次开销可忽略。本轮事故：full 进程 os._exit 后 uvicorn 从不对
+    # 该 Popen 调 poll()/wait()（_reap 只在 sync_status 内触发，进程死后锁释放、
+    # 再无人触发 sync_status）→ 僵尸残留；_pid_alive 已有 /proc/stat Z 态防护，
+    # 这里补齐 web 侧的收尸路径（_pid_alive/探测逻辑不动——flock 已释放时 ready
+    # 态本就正确，三态契约不变）。
+    from . import sync_control as _sc
+
+    _sc._reap_children()
     state, con, holder_pid = _status_probe()
     if state == "locked":
         # v6.0.4：灌数持锁——库是好的（正在被写入），initialized=true；
