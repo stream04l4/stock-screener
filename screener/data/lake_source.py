@@ -606,8 +606,11 @@ class LakeDataFetcher(DataFetcher):
     def profit_data(self, code: str, year: int, quarter: int) -> Optional[Dict[str, Any]]:
         """T5 → query_profit_data 口径。未披露（PIT 无行）→ None。
 
-        ⚠️ D2'：roeAvg = T5.roe_weighted（**加权 ROE 代理平均 ROE，非严格同口径**，
+        ⚠️ D2'：roeAvg = T5.roe_weighted / 100（**加权 ROE 代理平均 ROE，非严格同口径**，
         口径差 ~0.48pp 在 crosscheck 容忍内——TL 拍板保 ROE 核心因子活口）。
+        单位：T5.roe_weighted 存百分数（16.83 = 16.83%）→ /100 对齐 BaoStock roeAvg
+        小数口径（0.0897 = 8.97%）。⚠️ 2026-09-21 修复（v6.3.2）：此前漏除 100，
+        导致 09-18 run ROE 全列 ×100（主页 avg ROE 1129.87%）。
         gpMargin：T5 存百分数 → /100（BaoStock=小数）。npMargin/epsTTM/MBRevenue/
         totalShare/liqaShare：T5 schema 无对应列 → None（neutral_renorm 兜底）。
         """
@@ -620,7 +623,7 @@ class LakeDataFetcher(DataFetcher):
             "code": code,
             "pubDate": pub_date.isoformat() if pub_date else None,
             "statDate": self._stat_date(year, quarter),
-            "roeAvg": to_float(roe_weighted),          # D2'：roe_weighted 代理（见 docstring）
+            "roeAvg": (roe_weighted / 100.0) if roe_weighted is not None else None,  # D2'：roe_weighted 代理（%→小数）
             "npMargin": None,
             "gpMargin": (gross_margin / 100.0) if gross_margin is not None else None,
             "netProfit": to_float(npi),

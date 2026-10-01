@@ -358,8 +358,9 @@ def test_fundamentals_pit_and_mapping(tmp_path):
     f = _fetcher(_base_lake(tmp_path))
     p = f.profit_data("sh.600001", 2025, 4)
     assert p is not None
-    # D2'：roeAvg = roe_weighted（12.5）；gpMargin 百分数→小数
-    assert p["roeAvg"] == 12.5
+    # D2'：roeAvg = roe_weighted/100（12.5% → 0.125 小数口径，对齐 BaoStock roeAvg）；
+    # gpMargin 百分数→小数。回归防护：v6.3.2 修复前此处漏除 100（主页 avg ROE ×100）。
+    assert p["roeAvg"] == pytest.approx(0.125)
     assert p["gpMargin"] == pytest.approx(0.30)
     assert p["netProfit"] == 1e9
     assert p["pubDate"] == "2026-08-20"
