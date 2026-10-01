@@ -254,15 +254,22 @@ systemctl --user status stock-screener-web.service
 建议每个交易日 **UTC 09:35**（北京 17:35）起跑，配节假日守卫避免回退重算旧数据：
 
 ```cron
-# crontab -e（周一~周五 UTC 09:35）
-35 9 * * 1-5 /home/ubuntu/stock-screener/run_cron.sh >> /home/ubuntu/stock-screener/logs/cron.log 2>&1
+# crontab -e（周一~周五 UTC）
+# ① 湖 P3 增量（kline_daily 缺口 + valuation_daily 快照 + index_daily）——先于选股
+30 11 * * 1-5 /home/ubuntu/stock-screener/scripts/run_lake_sync_daily.sh >> /home/ubuntu/stock-screener/logs/lake_sync_cron.log 2>&1 # lake-sync-daily
+# ② 选股运行（依赖①当日的 K线/快照已入湖）
+35 9 * * 1-5 /home/ubuntu/stock-screener/run_cron.sh >> /home/ubuntu/stock-screener/logs/cron.log 2>&1 # stock-screener-daily
 ```
 
 `run_cron.sh` 先用交易日历判断今天是否交易日（非交易日直接 exit 0），再跑 CLI。
 进程级超时兜底（BaoStock 是 ctypes C 库，socket 超时无效，必须进程级 `timeout -k`）。
 数据源级失败（如 BaoStock 封禁）显式失败 + sidecar 标红，**不写误导性空结果**。
 
-> 注：当前生产环境 cron 按需求保持精简，首次切换手动 / Web 按钮触发。
+> 注（2026-10-01 恢复）：v6 lake 切 primary 后，①的增量此前仅靠 Web「开始同步」
+> 按钮手工触发、②的选股 cron 亦缺失 → 湖 09-23 停更、选股 09-20 后无新 run。
+> 两条 cron 已恢复。①超时 16.7h（全市场增量最坏 ~14h），保证在次日 09:35 选股前
+> 释放 DuckDB 锁；incremental 断点续传（done 键 per code + 运行日），中断次日补。
+> 选股与湖增量抢锁时 read_only 连接被拒 → 显式报「backfill 灌数进行中」，不静默。
 
 ## 10. 目录结构
 
