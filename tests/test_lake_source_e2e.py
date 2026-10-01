@@ -145,6 +145,27 @@ def _no_network(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _frozen_today(monkeypatch):
+    """时钟确定性：把 lake_source 的 date.today() 冻结到 RUN_DAY 次日。
+
+    为什么：freshness 守卫首次查询时（_resolve_run_day 阶段，set_run_day 之前）
+    ref = self.run_day or date.today()——临时库 kline 只造到 RUN_DAY=09-15，若与真实
+    时钟（编写时≈09 月，现已过 09-30）比较，交易日差会随日历推进突破 10 而 raise，
+    测试从"某天后"开始无故失败（date-rot）。冻结到 RUN_DAY+1（gap=1 交易日）后
+    守卫语义照常可测，且与真实日期解耦。"""
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return RUN_DAY + timedelta(days=1)
+
+    import screener.data.lake_source as _ls
+
+    monkeypatch.setattr(_ls, "date", _FrozenDate)
+    yield
+
+
 def test_run_screener_lake_e2e_offline(tmp_path, monkeypatch):
     db = _build_e2e_lake(tmp_path)
     cfg = _lake_cfg(tmp_path)
