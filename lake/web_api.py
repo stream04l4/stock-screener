@@ -814,6 +814,9 @@ _VIEW_META = [
 # ---------------------------------------------------------------------------
 _SOURCE_TABLES = [t[0] for t in _TABLE_META]          # 9 表固定顺序（T1-T9）
 _CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 conflict_src 列）
+# v6.3.5：conflict 股票数口径的 code 列（index_daily=index_code，其余=ts_code）——
+# 与 _TABLE_META code_col 同口径，防 COUNT(DISTINCT ts_code) 在 index_daily 报列不存在。
+_CONFLICT_CODE_COL = {t[0]: t[5] for t in _TABLE_META}
 _ADAPTER_NAMES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
 _STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
 
@@ -958,13 +961,15 @@ def _build_source_pool(con, prog: Dict[str, Any]) -> Dict[str, Any]:
     与 source_pool 同规**仅 ready 态**出现（三态契约红线不变）。
     """
     db_path = _source_pool_db_path()
-    by_source, conflict_rows = _source_pool_cache(con, db_path)
+    by_source, conflict_rows, conflict_codes = _source_pool_cache(con, db_path)
 
     adapters, stale = _read_source_health()
     bs_probe = prog.get("baostock_probe")   # 直接透出 progress 既有键；无 → None
     return {
         "by_source": by_source,
         "conflict_rows": conflict_rows,
+        # v6.3.5：conflict 股票数口径（行级计数被 adj 摘要复制放大，误导）
+        "conflict_codes": conflict_codes,
         "adapters": adapters,
         "baostock_probe": bs_probe if isinstance(bs_probe, dict) else None,
         "stale": stale,
@@ -982,7 +987,7 @@ def _source_pool_db_path() -> str:
 # TTL 缓存（web 进程内）：键 = (db mtime, db size)——库被灌数更新（mtime 变）即失效；
 # 60s 内同键复用，3s 轮询不重复跑聚合查询。只读语义，无锁竞争问题（单值原子替换）。
 _SP_CACHE: Dict[str, Any] = {"key": None, "at": 0.0, "by_source": None,
-                             "conflict_rows": None}
+                             "conflict_rows": None, "conflict_codes": None}
 _SP_TTL_S = 60.0
 
 
@@ -998,7 +1003,8 @@ def _source_pool_cache(con, db_path: str) -> tuple:
     now = _time.monotonic()
     if (_SP_CACHE["key"] == key and _SP_CACHE["by_source"] is not None
             and now - _SP_CACHE["at"] < _SP_TTL_S):
-        return _SP_CACHE["by_source"], _SP_CACHE["conflict_rows"]
+        return (_SP_CACHE["by_source"], _SP_CACHE["conflict_rows"],
+                _SP_CACHE["conflict_codes"])
 
     by_source: Dict[str, Dict[str, int]] = {}
     for t in _SOURCE_TABLES:
@@ -1013,6 +1019,8 @@ def _source_pool_cache(con, db_path: str) -> tuple:
 
     conflict_rows: Dict[str, int] = {}
     total = 0
+    conflict_codes: Dict[str, int] = {}
+    codes_total = 0
     for t in _CONFLICT_TABLES:
         try:
             n = con.execute(
@@ -1022,15 +1030,31 @@ def _source_pool_cache(con, db_path: str) -> tuple:
         n = int(n or 0)
         conflict_rows[t] = n
         total += n
+        # v6.3.5：conflict 按"股票数"聚合——旧"行"口径误导（同一股的同一条 adj
+        # 摘要被 load_t2 打在其全史每行上：实测 970 万"行"≈1200 只股票）。
+        # 行级计数无 WHERE 下推可走（conflict_src 稀疏列）→ 仅 T2 有量
+        # （T1/T3-T7 单源或无跨源分歧，生产 0 行，DISTINCT 扫描成本可忽略）。
+        try:
+            nc = con.execute(
+                f"SELECT COUNT(DISTINCT {_CONFLICT_CODE_COL[t]}) FROM {t} "
+                f"WHERE conflict_src IS NOT NULL AND conflict_src <> ''").fetchone()[0]
+        except Exception:  # noqa: BLE001
+            nc = 0
+        nc = int(nc or 0)
+        conflict_codes[t] = nc
+        codes_total += nc
     conflict_rows["total"] = total
+    conflict_codes["total"] = codes_total
 
-    _SP_CACHE.update(key=key, at=now, by_source=by_source, conflict_rows=conflict_rows)
-    return by_source, conflict_rows
+    _SP_CACHE.update(key=key, at=now, by_source=by_source, conflict_rows=conflict_rows,
+                     conflict_codes=conflict_codes)
+    return by_source, conflict_rows, conflict_codes
 
 
 def _source_pool_cache_reset() -> None:
     """测试隔离：清 TTL 缓存（生产代码不得调用）。"""
-    _SP_CACHE.update(key=None, at=0.0, by_source=None, conflict_rows=None)
+    _SP_CACHE.update(key=None, at=0.0, by_source=None, conflict_rows=None,
+                     conflict_codes=None)
 
 
 def _iso_date(v) -> Optional[str]:

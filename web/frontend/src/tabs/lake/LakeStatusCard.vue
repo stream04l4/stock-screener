@@ -51,6 +51,9 @@ function stateCell(t) {
   const word = label.replace(/^[^\s]+\s*/, "");   // 去 emoji 留状态词
   if (detail === word) detail = "";
   else if (word && detail.startsWith(word + " ")) detail = detail.slice(word.length).trim();
+  // v6.3.5 防御：detail 以"状态词+（"开头（如"最新（截至…）"）同样去重——旧后端
+  // 文案曾与徽章叠加成"最新最新"；现后端 fresh 统一"截至{date}"，此分支纯防御。
+  else if (word && detail.startsWith(word + "（")) detail = detail.slice(word.length).trim();
   return { cls, label, detail };
 }
 

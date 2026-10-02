@@ -119,6 +119,16 @@ class AdataF10Adapter:
             pub_date = clean_date(str(r.get("notice_date") or ""))
             if not period or not pub_date:
                 continue  # PIT：pub_date 必存——缺失行跳过（不硬造）
+            # v6.3.5（2026-10-02）：东财 notice_date 缺失时返回默认值 1900-01-01
+            # （生产实锤 9 只老股 71 行，2001Q4~2007Q2）——原"缺失行跳过"防不住
+            # 这个哨兵，它让"未披露"行在 PIT 查询 pub_date<=run_day 里恒命中
+            # （伪"远古已披露"），且污染 /status T5 区间显示（1900-01-01 起点）。
+            # 判据 <1950：A 股交易所 1990 年才开市，财报真披露日不可能早于 1990
+            # （生产库真实最早=1990-03-21）；只挡 1900 系哨兵，1950 留 40 年缓冲。
+            if pub_date < "1950-01-01":
+                log.warning("adata F10 %s.%s notice_date 哨兵 %s → 跳过（PIT 不可用）",
+                            ts_code, period, pub_date)
+                continue
             out.append({
                 "period": period,
                 "pub_date": pub_date,

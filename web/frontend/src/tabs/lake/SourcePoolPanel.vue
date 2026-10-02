@@ -172,12 +172,18 @@ function quotaText(s) {
   return s.rate_limit || "无官方配额";
 }
 
-// 区块3：conflict_rows total + 非零表逐行（T8/T9 不在对象里；total 单独取）
+// 区块3：conflict 股票数（v6.3.5 主口径）+ 行级 total（保留参考；T8/T9 不在对象里）
+// 为什么股票数为主：同一股的 adj 分歧摘要被 load_t2 打在其全史每行——行级计数
+// 被复制放大（实测 970 万"行"≈1200 只股票），股票数才是"多少标的有分歧"。
 const conflicts = computed(() => {
   const cr = (props.pool && props.pool.conflict_rows) || {};
+  const cc = (props.pool && props.pool.conflict_codes) || {};
   const total = cr.total ?? 0;
+  const codesTotal = cc.total ?? 0;
   const nonzero = Object.entries(cr).filter(([k, v]) => k !== "total" && v > 0);
-  return { total, nonzero };
+  const codesByTable = Object.fromEntries(
+    Object.entries(cc).filter(([k, v]) => k !== "total"));
+  return { total, codesTotal, nonzero, codesByTable };
 });
 
 // 区块4：baostock_probe（progress 既有键透出；null → 未探测占位）
@@ -276,16 +282,16 @@ function fmtLatency(ms) {
         </div>
       </div>
 
-      <!-- 区块3：conflict_src（total + 非零表逐行） -->
+      <!-- 区块3：conflict_src（v6.3.5 股票数主口径 + 行级参考） -->
       <div class="lake-spp-block">
         <div class="lake-spp-title">跨源分歧（conflict_src · T1-T7）</div>
         <div class="lake-spp-conflict">
-          <span class="badge" :class="conflicts.total > 0 ? 'lake-st-lagging' : 'lake-st-fresh'">
-            total {{ conflicts.total }}
+          <span class="badge" :class="(conflicts.codesTotal || conflicts.total) > 0 ? 'lake-st-lagging' : 'lake-st-fresh'">
+            {{ conflicts.codesTotal > 0 ? `涉及 ${conflicts.codesTotal} 只` : "无分歧" }}
           </span>
           <template v-if="conflicts.nonzero.length">
             <div v-for="[t, n] in conflicts.nonzero" :key="t" class="muted small mono">
-              {{ t }}: {{ n }} 行
+              {{ t }}: {{ conflicts.codesByTable[t] ?? "—" }} 只 · {{ n }} 行（adj 摘要复制全史行）
             </div>
           </template>
           <span v-else class="muted small">无分歧（全部单源一致）</span>

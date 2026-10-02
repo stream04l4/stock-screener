@@ -109,10 +109,13 @@ def _uninitialized_status(tmp_path, monkeypatch):
 def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     sp = d["source_pool"]
-    # v6.1.3：sources 键随 source_pool 追加（旧 5 键仍在）
-    assert set(sp.keys()) == {"by_source", "conflict_rows", "adapters",
-                              "baostock_probe", "stale", "sources"}, \
-        f"source_pool 键集应含 sources: {sorted(sp)}"
+    # v6.1.3：sources 键随 source_pool 追加（旧 5 键仍在）；
+    # v6.3.5：追加 conflict_codes（股票数口径——行级被 adj 摘要复制放大误导）
+    assert set(sp.keys()) == {"by_source", "conflict_rows", "conflict_codes",
+                              "adapters", "baostock_probe", "stale", "sources"}, \
+        f"source_pool 键集: {sorted(sp)}"
+    # conflict_codes 形状 = conflict_rows 同键集（T1-T7 + total）
+    assert set(sp["conflict_codes"].keys()) == set(sp["conflict_rows"].keys())
     srcs = sp["sources"]
     assert isinstance(srcs, list) and len(srcs) == 5, f"sources 应 5 源: {len(srcs)}"
     # 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐）

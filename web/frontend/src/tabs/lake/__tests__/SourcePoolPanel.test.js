@@ -26,6 +26,9 @@ function makePool(over = {}) {
     by_source,
     conflict_rows: { stock_master: 0, kline_daily: 12, valuation_daily: 3, dividend_events: 0,
       fundamentals_quarterly: 0, holders_snapshot: 0, index_daily: 0, total: 15 },
+    // v6.3.5：conflict_codes（股票数口径，与 conflict_rows 同键集）
+    conflict_codes: { stock_master: 0, kline_daily: 3, valuation_daily: 1, dividend_events: 0,
+      fundamentals_quarterly: 0, holders_snapshot: 0, index_daily: 0, total: 4 },
     adapters,
     baostock_probe: { alive: false, at: "2026-09-17T08:01:00", elapsed_s: 3.2, detail: "黑名单用户" },
     stale: false,
@@ -105,18 +108,20 @@ describe("SourcePoolPanel：stale 角标", () => {
 });
 
 describe("SourcePoolPanel：conflict_rows + baostock_probe", () => {
-  it("total=15（非零表逐行：kline_daily 12 / valuation_daily 3；零值表不列出）", () => {
+  it("股票数口径（v6.3.5：'涉及 N 只'徽章 + 非零表逐行 'X 只 · N 行'；零值表不列出）", () => {
     const w = mountPanel({ pool: makePool() });
     const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("跨源分歧"));
-    expect(block.text()).toContain("total 15");
-    expect(block.text()).toContain("kline_daily: 12 行");
-    expect(block.text()).toContain("valuation_daily: 3 行");
-    expect(block.text()).not.toContain("stock_master: 0");
+    expect(block.text()).toContain("涉及 4 只");
+    expect(block.text()).toContain("kline_daily: 3 只 · 12 行");
+    expect(block.text()).toContain("valuation_daily: 1 只 · 3 行");
+    expect(block.text()).not.toContain("total 15");   // 旧行级主口径文案已移除
+    expect(block.text()).not.toContain("stock_master:");
   });
 
   it("全零 → '无分歧'文案 + fresh 徽章", () => {
     const pool = makePool();
     pool.conflict_rows = { total: 0, kline_daily: 0 };
+    pool.conflict_codes = { total: 0, kline_daily: 0 };   // v6.3.5：双口径同步清零
     const w = mountPanel({ pool });
     const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("跨源分歧"));
     expect(block.text()).toContain("无分歧");

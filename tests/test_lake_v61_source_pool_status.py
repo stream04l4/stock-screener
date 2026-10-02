@@ -113,8 +113,8 @@ def test_ready_source_pool_shape_by_source_nine_fixed(tmp_path, monkeypatch):
     sp = d["source_pool"]
     # v6.1.3：ready 态 source_pool 追加 sources（各源连通性+数据类型+配额；
     # 仅 ready 态——locked/uninitialized 无 source_pool 键，见 C 段）。
-    assert set(sp.keys()) == {"by_source", "conflict_rows", "adapters",
-                              "baostock_probe", "stale", "sources"}, \
+    assert set(sp.keys()) == {"by_source", "conflict_rows", "conflict_codes",
+                              "adapters", "baostock_probe", "stale", "sources"}, \
         f"source_pool 键集: {sorted(sp)}"
     # by_source：9 表键恒定（无数据={}，形状稳定）
     assert list(sp["by_source"].keys()) == NINE_TABLES, \
@@ -269,17 +269,17 @@ def test_source_pool_cache_ttl_and_mtime_invalidation(tmp_path):
             self._inner.close()
 
     ccon = _CountingCon(con)
-    b1, c1 = wapi._source_pool_cache(ccon, p)
+    b1, c1, cc1 = wapi._source_pool_cache(ccon, p)
     n_after_first = ccon.n
     assert n_after_first > 0
     # TTL 内 + mtime 未变 → 命中缓存（零新查询），返回同一对象
-    b2, c2 = wapi._source_pool_cache(ccon, p)
+    b2, c2, cc2 = wapi._source_pool_cache(ccon, p)
     assert ccon.n == n_after_first, "TTL 内二次调用不得重跑聚合查询"
-    assert b2 is b1 and c2 is c1
+    assert b2 is b1 and c2 is c1 and cc2 is cc1
     # mtime 变化（灌数写入）→ 缓存失效 → 重查
     st = os.stat(p)
     os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
-    b3, _ = wapi._source_pool_cache(ccon, p)
+    b3, _, _ = wapi._source_pool_cache(ccon, p)
     assert ccon.n > n_after_first, "mtime 变化后必须重查"
     assert b3 is not b1
     con.close()
