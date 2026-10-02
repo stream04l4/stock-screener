@@ -29,6 +29,21 @@ export const SOURCE_LABELS = {
   tdx: "通达信", adata_f10: "adata", local: "本地缓存",
 };
 
+// v6.3.3（2026-10-02）：已知 source **变体**着色（活跃源的子标记值，不占图例位）。
+// 为什么单列一张表而非塞进 SOURCE_COLORS：图例行 LEGEND_ORDER 固定 6 源（brief 逐字），
+// 变体值（sina_f10/te_local）不新增图例项、也不污染色板值域——但它们的**真实来源**
+// 应着色准确，而非落进 UNKNOWN_COLOR 被误读成"未知源"：
+//   - sina_f10：T6 前十大股东 = SinaClient.fetch_holders 抓新浪 F10（在线源，与 T2 的
+//     sina 同族）→ 新浪蓝。旧行为整条灰 → Joel 10-02 反馈"T6 一直灰色"（实为漏配）。
+//   - te_local：T9 无风险利率 = TradingEconomics 中国 10Y 现值经 cache/rf_10y_daily.csv
+//     落库（source 值 te_local，见 lake/ingest/local_cache_ingest.load_macro_rf）——
+//     **本地缓存**语义 → 灰(UNKNOWN_COLOR) 保留准确，label 中文化（防"其他·te_local"裸显）。
+// 解析优先级在 sourceMeta() 中：活跃 6 源 > SOURCE_VARIANTS > legacy 别名 > 未知兜底。
+export const SOURCE_VARIANTS = {
+  sina_f10: { color: SOURCE_COLORS.sina, label: "新浪 F10" },
+  te_local: { color: UNKNOWN_COLOR, label: "TE 本地缓存" },
+};
+
 // v6.1.5 F1：已知 legacy source 别名映射（生产库 DISTINCT source 核对结果 + brief 点名）。
 // 为什么单独一张表而非塞进 SOURCE_LABELS：图例行固定顺序只渲染当前 6 源，legacy 值
 // 不会出现在图例里；但**堆叠条 title / by_source 数字 tooltip** 会把生产库实际出现过的
@@ -53,13 +68,17 @@ export const LEGACY_SOURCE_ALIASES = {
 // 图例行固定顺序（brief 逐字：sina/tencent/baostock/tdx/adata_f10/local）。
 export const LEGEND_ORDER = ["sina", "tencent", "baostock", "tdx", "adata_f10", "local"];
 
-// source → {color, label}（v6.1.5 F1：三级解析，不再裸显英文）
+// source → {color, label}（v6.1.5 F1 三级 + v6.3.3 变体级，不再裸显英文）
 //   1) 当前活跃源 SOURCE_COLORS/SOURCE_LABELS → 固定色 + 中文名；
-//   2) 已知 legacy 别名 LEGACY_SOURCE_ALIASES → UNKNOWN_COLOR(灰) + 中文别名（可追溯）；
-//   3) 真正未知值 → UNKNOWN_COLOR(灰) + "其他·<原值>"（保留原值，不猜）。
+//   2) v6.3.3 已知变体 SOURCE_VARIANTS（sina_f10/te_local 等）→ 来源准确着色 + 中文名；
+//   3) 已知 legacy 别名 LEGACY_SOURCE_ALIASES → UNKNOWN_COLOR(灰) + 中文别名（可追溯）；
+//   4) 真正未知值 → UNKNOWN_COLOR(灰) + "其他·<原值>"（保留原值，不猜）。
 export function sourceMeta(src) {
   if (src in SOURCE_COLORS) {
     return { color: SOURCE_COLORS[src], label: SOURCE_LABELS[src] };
+  }
+  if (src in SOURCE_VARIANTS) {
+    return SOURCE_VARIANTS[src];
   }
   if (src in LEGACY_SOURCE_ALIASES) {
     return { color: UNKNOWN_COLOR, label: LEGACY_SOURCE_ALIASES[src] };

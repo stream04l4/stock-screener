@@ -23,7 +23,7 @@ vi.mock("../../../live/useLiveQuery.js", () => ({
 // sourceMeta 纯模块（F1/F2 单一事实来源）
 import {
   SOURCE_COLORS, UNKNOWN_COLOR, SOURCE_LABELS, LEGEND_ORDER,
-  LEGACY_SOURCE_ALIASES, sourceMeta,
+  LEGACY_SOURCE_ALIASES, SOURCE_VARIANTS, sourceMeta,
 } from "../sourceMeta.js";
 const SourcePoolPanel = (await import("../SourcePoolPanel.vue")).default;
 const SyncControl = (await import("../SyncControl.vue")).default;
@@ -49,17 +49,29 @@ describe("F1：sourceMeta legacy 源名中文映射", () => {
     expect(sourceMeta("lake_factors")).toEqual({ color: UNKNOWN_COLOR, label: "本地因子" });
   });
 
+  it("v6.3.3 已知变体：sina_f10→新浪蓝'新浪 F10'（T6 在线源，不再误显灰）；te_local→灰'TE 本地缓存'", () => {
+    // T6 前十大股东 = SinaClient.fetch_holders 抓新浪 F10（在线，与 sina 同族）→ 新浪蓝。
+    expect(sourceMeta("sina_f10")).toEqual({ color: "#2563eb", label: "新浪 F10" });
+    // T9 无风险利率 = TradingEconomics 现值经本地 csv 落库（source=te_local）——
+    // 本地缓存语义 → 灰保留准确，label 中文化（旧行为"其他·te_local"裸显英文）。
+    expect(sourceMeta("te_local")).toEqual({ color: UNKNOWN_COLOR, label: "TE 本地缓存" });
+  });
+
   it("真正未知值 → 灰 + '其他·<原值>'（保留可追溯性，不猜、不裸显英文）", () => {
     const m = sourceMeta("mystery_src");
     expect(m.color).toBe(UNKNOWN_COLOR);
     expect(m.label).toBe("其他·mystery_src");   // 原值保留在标签里
   });
 
-  it("LEGACY_SOURCE_ALIASES 覆盖生产库 DISTINCT source 全部实际值（F1 核对清单）", () => {
-    // 生产库 read_only 查询实际出现值 = {baostock,em_local_static,lake_factors,sina,tencent}；
-    // 当前活跃(sina/tencent/baostock)在 SOURCE_LABELS，legacy(em_local_static/lake_factors)在此表。
+  it("SOURCE_VARIANTS/LEGACY_SOURCE_ALIASES 覆盖生产库 DISTINCT source 全部实际值（F1 核对清单 + v6.3.3）", () => {
+    // 生产库 read_only 查询实际出现值 = {baostock,em_local_static,lake_factors,sina,tencent,
+    // sina_f10,te_local}；当前活跃(sina/tencent/baostock)在 SOURCE_LABELS，
+    // 变体(sina_f10/te_local)在 SOURCE_VARIANTS，legacy(em_local_static/lake_factors)在此表。
     for (const s of ["em_local_static", "lake_factors"]) {
       expect(LEGACY_SOURCE_ALIASES[s]).toBeTruthy();
+    }
+    for (const s of ["sina_f10", "te_local"]) {
+      expect(SOURCE_VARIANTS[s]).toBeTruthy();
     }
     // brief 点名的 t 也列入（生产库当前无此值，保留可追溯）
     expect(LEGACY_SOURCE_ALIASES["t"]).toBe("腾讯(legacy)");
