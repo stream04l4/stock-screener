@@ -264,6 +264,15 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
                 adapters[name] = {"available": False, "probed_at": now_s,
                                   "latency_ms": None}
                 continue
+            # v6.3.5（2026-10-02）：探测前清 available() 懒缓存，强制真网络自检。
+            # 根因：本函数在 full 多阶段（run_history/run_t2/run_incremental）各启动
+            # 时都会被调一次——同进程 adapter 单例的 available() 懒缓存已被早期阶段
+            # 预热，后探测命中缓存记 0ms，把首探的真网络延迟覆盖成假值（实测
+            # 10-02 sina/tencent/tdx/adata 4 源二次探测全 0ms，页面误显"可达·0ms"）。
+            # 方法名虽为 *_for_test，语义=清懒缓存，生产探测恰需此行为。baostock 经
+            # 其三级短路（reset 后仍复用 Q6 已探结果、零网络），无副作用。
+            if hasattr(ad, "reset_available_for_test"):
+                ad.reset_available_for_test()  # type: ignore[attr-defined]
             ok = bool(ad.available())
             adapters[name] = {"available": ok, "probed_at": now_s,
                               "latency_ms": int((time.monotonic() - t0) * 1000)}

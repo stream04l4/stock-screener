@@ -217,11 +217,11 @@ def test_status_state_daily_fresh_lagging(tmp_path, monkeypatch):
 
 
 def test_status_state_snapshot_master_dividend(tmp_path, monkeypatch):
-    """快照表：master rows>0→fresh detail='快照'；dividend rows>0→fresh +
+    """快照表：master rows>0→fresh detail='当前快照'；dividend rows>0→fresh +
     detail 用**源 as_of**（progress T4 记录 2026-09-10，优先于表内 max(ann_date)）。"""
     d, _ = _ready_status(tmp_path, monkeypatch)
     m = _table(d, "stock_master")
-    assert m["state"] == "fresh" and m["state_detail"] == "快照"
+    assert m["state"] == "fresh" and m["state_detail"] == "当前快照"
     dv = _table(d, "dividend_events")
     assert dv["state"] == "fresh"
     assert dv["state_detail"] == "快照截至2026-09-10", \
@@ -291,9 +291,11 @@ def test_status_state_p2p3_progress_views(tmp_path, monkeypatch):
     d = wapi.status()
     # T5：seed 无 fundamentals 行（0 行）→ 仍 pending（done 视图不改变 0 行判定）
     assert _table(d, "fundamentals_quarterly")["state"] == "pending"
-    # T8：2 行 + done 1/1 + as_of=today-1 → gap 1 → fresh"最新（截至…）"
+    # T8：2 行 + done 1/1 + as_of=today-1 → gap 1 → fresh"截至…"
+    # （v6.3.5：fresh 文案统一"截至{date_max}"，不再带"最新（"前缀——旧文案与
+    # 前端徽章"✅ 最新"叠加成"最新最新"）
     t8 = _table(d, "factor_snapshot")
-    assert t8["state"] == "fresh" and t8["state_detail"].startswith("最新（截至"), t8
+    assert t8["state"] == "fresh" and t8["state_detail"].startswith("截至"), t8
     # T6：0 行 → pending（0 行优先于进度视图）
     assert _table(d, "holders_snapshot")["state"] == "pending"
     # 直接单元级验证 部分完成/季度完成 分支（不依赖播种行数）
@@ -375,7 +377,7 @@ def test_classify_state_unit_four_branches():
         ("empty", "暂无数据")
     # snapshot：master / dividend（as_of 有/无）
     assert wapi._classify_state("stock_master", "snapshot", 5, None, ref, None) == \
-        ("fresh", "快照")
+        ("fresh", "当前快照")
     assert wapi._classify_state("dividend_events", "snapshot", 5, None, ref,
                                 "2026-09-10") == ("fresh", "快照截至2026-09-10")
     assert wapi._classify_state("dividend_events", "snapshot", 5, None, ref,

@@ -45,6 +45,6 @@ const active = ref("run");
   <footer class="footnote">
     数据源：BaoStock（日K / 分红 / 季报 / 行业 / 股票列表）；A股日K为 T+1 更新，筛选运行日 = 请求日期回退到的最近交易日。
     v2：稳定键增量缓存（kline_af3 + adjfactor 本地重建后复权价）+ 截面 Z-Score 多因子打分；行业 = 证监会二级分类；Piotroski S2/S3/S5/S9 为比率代理口径。
-    页面数据均读自本机 output/ · config/ · logs/ · cache/ 文件系统，无数据库。
+    页面数据读自本机 DuckDB 数据湖（data/lake/，T1-T9）+ output/ · config/ · logs/ · cache/ 文件系统。
   </footer>
 </template>

@@ -766,7 +766,9 @@ _TABLE_META = [
      "snapshot", "ts_code", "ex_date"),
     ("fundamentals_quarterly", "T5", "季度基本面", "PIT：ROE/净利同比/OCF/毛利率/负债率",
      "pending_p2", "ts_code", "pub_date"),
-    ("holders_snapshot", "T6", "前十大股东+实控人", "季度快照（controller_* 待补源）",
+    # v6.3.5：desc 文案修正——旧"controller_* 待补源"含糊（实测 263 万行 controller_*
+    # 全 NULL，是设计内暂缺而非数据缺失）；改为明示"未提供"。
+    ("holders_snapshot", "T6", "前十大股东", "季度快照（实控人字段未提供）",
      "pending_p2", "ts_code", "as_of_date"),
     ("index_daily", "T7", "指数日线", "沪深300/上证/深成/中证1000 四指数",
      "daily", "index_code", "date"),
@@ -1184,7 +1186,10 @@ def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
                     gap = (datetime.date.fromisoformat(ref_date)
                            - datetime.date.fromisoformat(date_max)).days
                     if gap <= 1:
-                        return "fresh", f"最新（截至{date_max}）"
+                        # v6.3.5：fresh 文案统一为"截至{date_max}"（与 T5/T6 分支同口径）
+                        # ——旧文案"最新（截至…）"与前端徽章"✅ 最新"叠加成"最新最新"
+                        # （前端 stateCell 去重只匹配"最新 "带空格形态，不命中"最新（"）。
+                        return "fresh", f"截至{date_max}"
                     return "lagging", f"滞后 {gap} 日（截至{date_max}）"
                 return "fresh", f"截至{date_max or '—'}"
             return "lagging", f"补齐中 {done_n}/{total_n}"
@@ -1205,7 +1210,10 @@ def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
         as_of = (dividend_as_of or "").strip()
         detail = f"快照截至{as_of}" if as_of else "全史静态导入"
         return "fresh", detail
-    return "fresh", "快照"
+    # v6.3.5：T1 主档文案精确化——"快照"→"当前快照"（主档随 T1 灌数全量刷新，
+    # 非每日增量；"当前"明示它是时点快照而非逐日更新序列，避免与 last_sync 日期
+    # 并排时"最新"的误解）。
+    return "fresh", "当前快照"
 
 
 def _build_status_details(con, prog: Dict[str, Any]) -> Dict[str, Any]:
