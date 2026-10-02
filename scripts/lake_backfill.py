@@ -570,9 +570,10 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
       按 Q1 优先级取第一个 available() 且成功的源（break）。
     - **窗口化**：p0 是"近 N 天增量"，非全史重写——``window_start = (今日北京时间 -
       (days+30) 自然日)``；对每个源 ``fetch_kline(code, start=window_start)``，取数后
-      **只 upsert 落在窗口内的行**（更早历史行丢弃，不重写旧数据）。sina adapter 忽略
-      start 恒返全史 → 取其尾部窗口即可（brief 明示可接受，不改 adapter）；tencent/tdx
-      原生支持窗口。
+      只 upsert 落在窗口内的行**（更早历史行丢弃，不重写旧数据）。v6.3.5：sina
+      adapter **服务端窗口化**（akshare start_date——不再"拉全史取尾部"，单只
+      raw 3.2s→0.8s 实测）；tencent/tdx 原生支持窗口。全源窗口合法空（停牌/
+      节假日）→ 视为完成（标 done，不每日空转重试）；真实失败 → 不标 done。
     - adj_factor：主源自带推导值优先；否则按 adj_srcs 补取（同 history）。
     - cross_check：采用 sina 主源时用 tdx 最近窗口轻量验证（close/amount/末因子，
       阈值 config 集中）→ 分歧写 conflict_src（不阻断）；单源成功 → NULL。
@@ -586,6 +587,7 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
     from lake.backfill import Task
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
+    from lake.ingest.common import EmptyWindowError
     from lake.ingest.tencent_ingest import fetch_kline_ohlcv, load_t2
     from screener.data.tencent import TencentClient
 
@@ -618,11 +620,15 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
         kl: Optional[List[Dict[str, Any]]] = None
         source = "tencent"
         adj_map: Optional[Dict[str, float]] = None
+        _any_hard_err = False   # v6.3.5：真实失败 vs 窗口合法空
         for ad in ohlcv_srcs:
             try:
-                res = ad.fetch_kline(code, start=window_start)  # 窗口（sina 忽略→全史取尾部）
+                res = ad.fetch_kline(code, start=window_start)  # v6.3.5：窗口化（sina 服务端 start）
+            except EmptyWindowError:
+                continue   # 窗口合法空（停牌/节假日）
             except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源（fallback）
                 log.warning("T2 %s source=%s 取数失败，回退下一源: %s", code, ad.name, exc)
+                _any_hard_err = True
                 continue
             if res and res.get("ohlcv"):
                 kl = res["ohlcv"]
@@ -630,6 +636,10 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
                 adj_map = res.get("adj_factor")
                 break
         if not kl:
+            # v6.3.5：全源窗口合法空（该股窗口内无新数据，源可达）→ 视为完成；
+            # 有真实失败 → 不标 done（防 done 键毒化，同 history）。
+            if not _any_hard_err and ohlcv_srcs:
+                return
             raise RuntimeError(f"T2 增量 K线所有源均失败 {code}（不标 done，下轮重试）")
 
         # 窗口化：只 upsert 落在最近 (days+30) 自然日内的行（更早历史丢弃，不重写旧数据）
@@ -1372,6 +1382,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     from lake.backfill import BackfillRunner, Task
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
+    from lake.ingest.common import EmptyWindowError
     from lake.ingest.tencent_ingest import (INDEX_CODES, fetch_kline_ohlcv,
                                             fetch_snapshot, load_t2, load_t3, load_t7)
     from screener.data.tencent import TencentClient
@@ -1415,12 +1426,16 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         kl: Optional[List[Dict[str, Any]]] = None
         source = "tencent"
         adj_map: Optional[Dict[str, float]] = None
+        _any_hard_err = False   # v6.3.5：是否有"真实失败"（区别于窗口合法空）
         for ad in ohlcv_srcs:
             try:
-                res = ad.fetch_kline(code, start=start)   # sina 忽略 start→全史取尾部窗口
+                res = ad.fetch_kline(code, start=start)   # v6.3.5：窗口化（sina 服务端 start，不再拉全史）
+            except EmptyWindowError:
+                continue   # 窗口合法空（停牌/节假日，源可达）→ 记"空"，继续下一源
             except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源（fallback）
                 log.warning("incremental T2 %s source=%s 取数失败，回退下一源: %s",
                             code, ad.name, exc)
+                _any_hard_err = True
                 continue
             if res and res.get("ohlcv"):
                 kl = res["ohlcv"]
@@ -1428,6 +1443,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                 adj_map = res.get("adj_factor")
                 break
         if kl is None:
+            if not _any_hard_err and ohlcv_srcs:
+                # 全源"窗口合法空"（停牌/节假日：各源可达但缺口无新数据）→ 视为完成
+                # （不写库、标 done，避免每日空转重试；下一交易日新运行日键自动重取）。
+                # v6.3.5 窗口化后 sina 空窗口从"返回全史→过滤空"变为 EmptyWindowError——
+                # 不区分会把每交易日数百只停牌股误判"全源失败"→不标 done→每日重试。
+                return
             raise RuntimeError(f"T2 增量 K线所有源均失败 {code}（不标 done，下轮重试）")
 
         # 窗口化：只 upsert 缺口 [start..今日] 内的行（更早历史不动）

@@ -26,7 +26,7 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional
 
-from .common import clean_date, to_float
+from .common import EmptyWindowError, clean_date, to_float
 from .source_pool import AUTHORITY, RateLimiter
 
 log = logging.getLogger("lake.ingest.easy_tdx_adapter")
@@ -204,16 +204,25 @@ class EasyTdxAdapter:
         if end:
             ohlcv = [r for r in ohlcv if r["date"] <= end]
         if not ohlcv:
+            # v6.3.5：窗口模式区分"合法空"（停牌/节假日，源可达）与真实失败——
+            # 空窗口=EmptyWindowError（worker 视为完成），全史取空=RuntimeError
+            # （上市股全史必非空，空=取数失败，回退下一源）。
+            if start is not None:
+                raise EmptyWindowError(f"tdx K线窗口空 {ts_code} start={start}（停牌/节假日）")
             raise RuntimeError(f"tdx K线取空 {ts_code}（回退下一源）")
 
-        # hfq（adj 推导；失败不阻断 raw——adj=None，view 该段 NULL）
+        # hfq（adj 推导；失败不阻断 raw——adj=None，view 该段 NULL）。
+        # v6.3.5 窗口化：raw 走窗口（count=n）时 hfq 同取窗口 N 根——此前 hfq 恒
+        # 全史 20000 根（~2s），是增量 tdx 交叉验证 ~4s/只的主因之一。全史模式
+        # （start/end 均 None）保持 20000 根不变。
         adj_map = None
         self._limiter.wait()
         try:
             client = self._get_client()
+            hfq_count = _FULL_HISTORY_COUNT if (start is None and end is None) else n
             hfq_df = fetch_with_timeout(
                 client.get_stock_kline, market, code6, Period.DAILY,
-                start=0, count=_FULL_HISTORY_COUNT, adjust=Adjust.HFQ)
+                start=0, count=hfq_count, adjust=Adjust.HFQ)
             adj_map = self._derive_adj_factor(ohlcv, self._df_to_rows(hfq_df))
         except Exception as exc:  # noqa: BLE001 - hfq 失败/超时不阻断 raw
             log.warning("tdx hfq K线失败 %s → adj_factor=None: %s", ts_code, exc)

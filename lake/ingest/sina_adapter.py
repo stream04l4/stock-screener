@@ -23,7 +23,7 @@ import logging
 import threading
 from typing import Any, Dict, List, Optional
 
-from .common import clean_date, to_float
+from .common import EmptyWindowError, clean_date, to_float
 from .source_pool import AUTHORITY, RateLimiter
 
 log = logging.getLogger("lake.ingest.sina_adapter")
@@ -66,10 +66,15 @@ class SinaKlineAdapter:
 
     # ---------- 底层：akshare stock_zh_a_daily ----------
     def _ak_daily(self, symbol6: str, adjust: str,
-                  count_recent: Optional[int] = None) -> Optional["Any"]:
+                  count_recent: Optional[int] = None,
+                  start: Optional[str] = None,
+                  end: Optional[str] = None) -> Optional["Any"]:
         """调 akshare ``stock_zh_a_daily``。symbol6=sh601398/sz000001 格式（无点）。
 
-        :param count_recent: 仅取最近 N 根（available() 自检用，省流量）；None=全史。
+        :param count_recent: 仅取最近 N 根（available() 自检用，省流量）；None=不截尾。
+        :param start: ISO 起始日（``YYYY-MM-DD``）——akshare ``start_date`` 参数服务端
+            窗口（v6.3.5：增量路径窗口化，不再拉全史再客户端丢尾）。
+        :param end: ISO 截止日；None=今日（缺省传 '21000118' 哨兵，等价不截尾）。
         :return: pandas DataFrame（列 date/open/high/low/close/volume/amount...）；
             失败/空 → None。
 
@@ -82,7 +87,10 @@ class SinaKlineAdapter:
 
         from .common import fetch_with_timeout
 
-        df = fetch_with_timeout(ak.stock_zh_a_daily, symbol=symbol6, adjust=adjust)
+        df = fetch_with_timeout(
+            ak.stock_zh_a_daily, symbol=symbol6, adjust=adjust,
+            start_date=(start or "19900101").replace("-", ""),
+            end_date=(end or "21000118").replace("-", ""))
         if df is None or len(df) == 0:
             return None
         if count_recent is not None and len(df) > count_recent:
@@ -97,27 +105,40 @@ class SinaKlineAdapter:
     # ---------- fetch_kline：raw OHLCV+amount + hfq/raw adj 推导 ----------
     def fetch_kline(self, ts_code: str, start: Optional[str] = None,
                     end: Optional[str] = None) -> Dict[str, Any]:
-        """全史 raw K线（含 amount）+ hfq÷raw 推导 adj_factor 事件值。
+        """raw K线（含 amount）+ hfq÷raw 推导 adj_factor 事件值。
 
+        :param start: 起始日（ISO）。None=全史（history 路径）；指定=**窗口取数**
+            （v6.3.5：akshare ``start_date`` 服务端窗口——增量路径只取缺口 [start..今日]，
+            不再"拉全史取尾部"，单只 raw 3.2s→0.8s 实测）。
+        :param end: 截止日（ISO）；None=不截尾。
         :return: ``{"ohlcv": [...], "adj_factor": {除权日: af}|None}``。
             ohlcv 行 volume=股、amount=元；adj_factor=**事件日→af**（load_t2 前向填充）。
         :raises RuntimeError: raw K线取空（主源失败语义——worker 应回退下一源，不 mark_done）。
+            语义边界（v6.3.5）：窗口内**合法无数据**（停牌/节假日，源可达但 0 行）也抛
+            "取空"——worker 需区分"全源失败（重试）"与"末源取空（视为完成）"。
 
         adj 推导算法（brief 已验证口径）：
           af(d) = hfq_close(d) / raw_close(d)。两次除权之间该比值恒定；除权日跳到新值。
           故扫描升序日期，比值相对前一日变化 > 1e-4 → 记为除权事件日（af=新比值）。
-          首个事件日之前 af 无定义（load_t2 前向填充给 None，hfq view 该段 NULL，预期）。
+          窗口化正确性：hfq 与 raw 同窗口取，窗口首日比值即"最近事件值"（首个可比日=
+          基准事件，与全史推导在窗口内的 af 完全一致——4 场景含"窗口首日即除权"已验证）。
         """
         sym = self._symbol6(ts_code)
         # raw（OHLCV+amount）——限速锚点（raw+hfq 共 2 次调用，间隔 ≥1s）
         self._limiter.wait()
-        raw_df = self._ak_daily(sym, adjust="")
+        raw_df = self._ak_daily(sym, adjust="", start=start, end=end)
         if raw_df is None or len(raw_df) == 0:
+            # v6.3.5：窗口模式区分"合法空"（停牌/节假日，源可达）与"取数失败"。
+            # akshare 空窗口返回空 DataFrame 无错误码——窗口模式按 EmptyWindowError
+            # 上抛（worker 视为完成），全史模式仍 RuntimeError（上市股全史必非空，
+            # 空=真实取数失败，回退下一源）。
+            if start is not None:
+                raise EmptyWindowError(f"新浪 K线窗口空 {ts_code} start={start}（停牌/节假日）")
             raise RuntimeError(f"新浪 raw K线取空 {ts_code}（主源失败，回退下一源）")
-        # hfq（后复权 close → adj 推导）
+        # hfq（后复权 close → adj 推导）——同窗口（v6.3.5：窗口化省全史 hfq 1.7s/只）
         self._limiter.wait()
         try:
-            hfq_df = self._ak_daily(sym, adjust="hfq")
+            hfq_df = self._ak_daily(sym, adjust="hfq", start=start, end=end)
         except Exception as exc:  # noqa: BLE001 - hfq 失败不阻断 raw（adj=None，view 该段 NULL）
             log.warning("新浪 hfq K线取空 %s → adj_factor=None: %s", ts_code, exc)
             hfq_df = None

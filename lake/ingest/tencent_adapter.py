@@ -25,6 +25,7 @@ from .source_pool import AUTHORITY
 # 经 ``_ti.<fn>(...)`` 的调用点同步生效（v607/v603 离线单测契约——patch 的是
 # tencent_ingest 模块属性；from-import 会绑定旧引用绕过 patch 打到真实网络）。
 from . import tencent_ingest as _ti
+from .common import EmptyWindowError
 
 log = logging.getLogger("lake.ingest.tencent_adapter")
 
@@ -101,6 +102,10 @@ class TencentKlineAdapter:
 
             rows = fetch_with_timeout(_ti.fetch_kline_ohlcv, client, ts_code, n=n)
             if not rows:
+                # v6.3.5：窗口模式区分"合法空"（停牌/节假日，源可达）与真实失败——
+                # 空窗口=EmptyWindowError（worker 视为完成），全史取空=RuntimeError。
+                if start is not None:
+                    raise EmptyWindowError(f"腾讯 K线窗口空 {ts_code} start={start}（停牌/节假日）")
                 raise RuntimeError(f"腾讯 K线取空 {ts_code}（回退下一源）")
         ohlcv = [{
             "date": r["date"],

@@ -83,6 +83,17 @@ class FetchTimeoutError(RuntimeError):
     """
 
 
+class EmptyWindowError(RuntimeError):
+    """窗口取数"可达但窗口内合法无数据"（v6.3.5 增量窗口化）。
+
+    语义（与 FetchTimeoutError/普通 RuntimeError 的区别）：**源可达**，只是
+    [start..end] 窗口内 0 行——停牌/节假日/新股未上市。worker 需据此区分：
+    全源 EmptyWindowError → 视为完成（标 done，不空转重试）；夹杂真实失败 →
+    不标 done（下轮重试）。⊂ RuntimeError——现有 except Exception 分支仍可接住
+    （保守当"该源失败"处理，仅 worker 显式 isinstance 时才走"完成"语义）。
+    """
+
+
 class _DaemonFetchPool:
     """R2 取数线程池：**显式 daemon 工作线程** + queue + concurrent.futures.Future。
 
