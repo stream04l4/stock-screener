@@ -2314,6 +2314,59 @@ def cmd_t6(args, con, db_path: str) -> int:
     return EXIT_OK
 
 
+def cmd_t9(args, con, db_path: str) -> int:
+    """t9 子命令入口（v6.3.5）：T9 macro_rf 历史回填（一次性/低频）。
+
+    为什么独立子命令（而非 full 阶段 9）：full 的 t9 阶段只抓 TE **现值**（1 行/日
+    累积，无历史）。本命令一次性用 akshare 东财中债 10Y 全史（2002-01 至今）回填
+    ``cache/rf_10y_daily.csv``（source=em_local_static，只补缺口不覆盖 TE 现值行），
+    再 ``load_macro_rf``（零网络，date PK 幂等 upsert）落库。
+
+    纪律：akshare 是 validate extra（辅助/校验源，pin 1.18.88），**不进每日主链路**
+    ——每日现值仍走 full t9 阶段的 ``fetch_rf_10y``（TE 主源 + fallback）。本命令仅
+    低频手动/回填调用。sanity 用 [0.5,10.0] 粗滤（防字段错位；不用 rf_cfg 的
+    [0.5,4.0]——2004-2014 真实峰值 5.41% 会被误杀）。
+
+    - ``--start-date YYYYMMDD``：历史起点（缺省 20020101 = 东财该序列起点）。
+    - ``--skip-fetch``：不抓网络，仅把**已落盘** csv 落库（断点/网络失败后重灌）。
+    """
+    from lake.ingest.local_cache_ingest import load_macro_rf
+    from screener.data import rf as _rf_mod
+
+    cache_dir = _cache_dir()
+    path = os.path.join(cache_dir, _rf_mod.RF_CACHE_FILE)
+
+    if getattr(args, "skip_fetch", False):
+        added, hist_n = 0, -1
+        log.info("t9 --skip-fetch：跳过网络抓取，仅用现有 csv 落库")
+    else:
+        start = getattr(args, "start_date", None) or "20020101"
+        log.info("t9 历史回填：抓 akshare 东财中债 10Y 全史（start=%s）…", start)
+        try:
+            hist = _rf_mod.fetch_rf_history_em(start_date=start)
+        except Exception as exc:  # noqa: BLE001 - 抓取失败 → 降级用现有 csv
+            log.warning("t9 历史抓取失败（降级：用现有 csv 落库，不阻断）: %s", exc)
+            hist = []
+        added = _rf_mod.merge_rf_history_into_csv(path, hist)
+        hist_n = len(hist)
+        log.info("t9 历史回填：抓取 %d 行，csv 新增 %d 行（缺口）", hist_n, added)
+
+    # 落库（零网络；date PK 幂等 upsert，source=te_local/em_local_static 按行）
+    t0 = time.monotonic()
+    rows_loaded = load_macro_rf(con, cache_dir)
+    elapsed = round(time.monotonic() - t0, 1)
+
+    n_total = con.execute("SELECT COUNT(*) FROM macro_rf").fetchone()[0]
+    d_min = con.execute("SELECT MIN(date) FROM macro_rf").fetchone()[0]
+    d_max = con.execute("SELECT MAX(date) FROM macro_rf").fetchone()[0]
+    print("===== t9 =====（macro_rf 无风险利率）")
+    if not getattr(args, "skip_fetch", False):
+        print(f"  抓取={hist_n} 行  csv新增={added} 行")
+    print(f"  落库={rows_loaded} 行  macro_rf 现共 {n_total} 行  "
+          f"{d_min} ~ {d_max}（{elapsed}s）")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # status（coverage + progress 摘要）
 # ---------------------------------------------------------------------------
@@ -2488,6 +2541,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "指定股（未给 --codes=全市场重抓，慎用）；用于空页股日后补录数据后重验")
     sp.set_defaults(func=cmd_t6)
 
+    sp = sub.add_parser(
+        "t9",
+        help="v6.3.5：T9 macro_rf 历史回填（一次性/低频）——akshare 东财中债 10Y 全史"
+             "（2002 至今）回填 cache/rf_10y_daily.csv（source=em_local_static，"
+             "只补缺口不覆盖 TE 现值行）→ load_macro_rf 零网络落库；"
+             "akshare 不进每日主链路（现值仍走 full t9 的 TE 主源）")
+    sp.add_argument("--start-date", default=None,
+                    help="历史起点 YYYYMMDD（缺省 20020101=东财该序列起点）")
+    sp.add_argument("--skip-fetch", action="store_true", default=False,
+                    help="不抓网络，仅把已落盘 csv 落库（断点/网络失败后重灌）")
+    sp.set_defaults(func=cmd_t9)
+
     sp = sub.add_parser("reconcile",
                         help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=kline_daily 全集）")
@@ -2590,7 +2655,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
     # full（v6.1.6）：同一把锁贯穿三阶段全程（brief §A"天然无竞争"）。
     # t6（v6.3.4）：独立子命令同样持写锁（run_t6 写 holders_snapshot + progress）。
-    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6")
+    # t9（v6.3.5）：历史回填持写锁（写 macro_rf）。
+    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6", "t9")
 
     if not write_cmd:
         return _run_unlocked(args)

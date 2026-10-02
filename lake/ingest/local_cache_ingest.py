@@ -127,10 +127,11 @@ def load_profit_history(con, cache_dir: str, ts_code: str,
 
 
 def load_macro_rf(con, cache_dir: str, source: str = "te_local") -> int:
-    """T9 macro_rf：读 cache/rf_10y_daily.csv（现值序列，零网络；Q7 历史缺口显式 NULL）。
+    """T9 macro_rf：读 cache/rf_10y_daily.csv（零网络；Q7 历史缺口显式 NULL）。
 
-    文件格式：哨兵 + 表头(date,yield_pct) + 数据行。全部 upsert（date PK 幂等）；
-    只灌已落盘行（现值序列起步，历史缺口不回填——Joel 已确认）。
+    文件格式：哨兵 + 表头(date,yield_pct[,source]) + 数据行。全部 upsert（date PK
+    幂等）；只灌已落盘行。source 取**行级第 3 列**（v6.3.5：T9 历史回填行带
+    em_local_static 标记）；旧 2 列行/无 source 列 → 回退 ``source`` 参数（te_local）。
     """
     path = os.path.join(cache_dir, "rf_10y_daily.csv")
     hit = _read_cache_csv(path)
@@ -143,9 +144,10 @@ def load_macro_rf(con, cache_dir: str, source: str = "te_local") -> int:
         yld = to_float(d.get("yield_pct"))
         if not date or yld is None:
             continue
+        row_src = str(d.get("source") or "").strip() or source
         con.execute(
             "INSERT OR REPLACE INTO macro_rf (date,yield_pct,source,fetched_at,"
             "data_version) VALUES (?,?,?,?,?)",
-            [date, yld, source, now_ts(), DATA_VERSION])
+            [date, yld, row_src, now_ts(), DATA_VERSION])
         n += 1
     return n

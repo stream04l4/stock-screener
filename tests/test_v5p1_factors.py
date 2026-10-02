@@ -336,7 +336,7 @@ def test_rf_fetch_fallback_and_csv(tmp_path):
     csv_p = tmp_path / rfmod.RF_CACHE_FILE
     assert csv_p.exists()
     rows = rfmod._read_rf_csv(str(csv_p))
-    assert rows == [["2026-09-10", "1.6800"]]
+    assert rows == [["2026-09-10", "1.6800", "te_local"]]   # v6.3.5：3 列（source）
     # PIT 读回（小数）
     assert abs(rfmod.load_rf_10y_asof(str(tmp_path), "2026-09-10") - 0.0168) < 1e-12
     assert rfmod.load_rf_10y_asof(str(tmp_path), "2026-09-09") is None  # run_day 之前不可见
@@ -350,8 +350,8 @@ def test_rf_fetch_fallback_and_csv(tmp_path):
 
     rf_dec2, meta2 = rfmod.fetch_rf_10y(rfc, str(tmp_path), "2026-09-11", session=_FailSession())
     assert abs(rf_dec2 - 0.02) < 1e-12 and meta2["source"] == "fallback"
-    # fallback 不污染追溯序列：仍只有 09-10 一行
-    assert rfmod._read_rf_csv(str(csv_p)) == [["2026-09-10", "1.6800"]]
+    # fallback 不污染追溯序列：仍只有 09-10 一行（v6.3.5：3 列）
+    assert rfmod._read_rf_csv(str(csv_p)) == [["2026-09-10", "1.6800", "te_local"]]
 
 
 # ---------------------------------------------------------------------------

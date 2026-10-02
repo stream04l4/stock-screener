@@ -126,9 +126,13 @@ def _atomic_write_rf_csv(path: str, rows: List[List[str]]) -> None:
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow([_RF_SENTINEL])
-        w.writerow(["date", "yield_pct"])
+        w.writerow(["date", "yield_pct", "source"])
         for r in rows:
-            w.writerow(r)
+            # v6.3.5：3 列（date,yield_pct,source）。旧 2 元素行补 te_local
+            #（向后兼容——v6.3.5 前的文件只有 2 列，行内 source 缺省 te_local）。
+            row = list(r[:2])
+            row.append(r[2] if len(r) >= 3 and r[2] else "te_local")
+            w.writerow(row)
     os.replace(tmp, path)
 
 
@@ -197,12 +201,14 @@ def fetch_rf_10y(
     if meta["source"] == "tradingeconomics":
         path = os.path.join(cache_dir, RF_CACHE_FILE)
         rows = _read_rf_csv(path) or []
-        by_date: Dict[str, str] = {}
+        by_date: Dict[str, List[str]] = {}
         for r in rows:
             if len(r) >= 2 and r[0]:
-                by_date[r[0]] = r[1]
-        by_date[meta["date"]] = f"{meta['yield_pct']:.4f}"
-        new_rows = [[d, by_date[d]] for d in sorted(by_date)]
+                # v6.3.5：保留行级 source（第 3 列；旧 2 列行默认 te_local）——
+                # 全量重写 csv 时不得抹掉 T9 历史回填行的 em_local_static 标记。
+                by_date[r[0]] = [r[1], r[2] if len(r) >= 3 and r[2] else "te_local"]
+        by_date[meta["date"]] = [f"{meta['yield_pct']:.4f}", "te_local"]
+        new_rows = [[d, by_date[d][0], by_date[d][1]] for d in sorted(by_date)]
         _atomic_write_rf_csv(path, new_rows)
         log.info("[RF] 10Y国债(TE) %s=%.4f%% 落盘 %s（累计 %d 行）",
                  meta["date"], meta["yield_pct"], path, len(new_rows))
@@ -210,6 +216,85 @@ def fetch_rf_10y(
     # PIT 语义：run_day 之前的运行日不得"看见"未来数据——本函数只返回**现值**，
     # 调用方按 run_day 使用（每日运行时 date≈run_day；历史回测场景 Phase 1 不涉及）。
     return rf_decimal, meta
+
+
+# ---------------------------------------------------------------------------
+# T9 历史回填（v6.3.5，一次性/低频）：akshare 东财中债 10Y 全史
+# ---------------------------------------------------------------------------
+# 纪律：akshare 在 pyproject 定位为**辅助/校验源**（validate extra，pin 1.18.88），
+# **不进每日主链路**——每日现值仍走 fetch_rf_10y（TE，主源）+ fallback。
+# 本函数仅被 ``lake_backfill.py t9 --backfill-history``（低频回填）调用，
+# 抓取 akshare ``bond_zh_us_rate``（东财中债 10Y 全史，2002-01 至今），
+# 合并进 rf_10y_daily.csv（只补缺口日期，不覆盖已有行——已有行是 TE 现值序列，
+# 口径同源（中债 10Y）但精度/舍入略异，保留先落盘者）。
+#
+# sanity 用 [0.5, 10.0] 粗滤（防字段错位/单位错误）——**不用** rf_cfg 的
+# [0.5, 4.0]：2004-2014 的 10Y 真实峰值 5.41%（2007-08），4.0 会误杀真实历史。
+EM_HISTORY_SANITY_PCT = [0.5, 10.0]
+
+
+def fetch_rf_history_em(start_date: str = "20020101") -> List[List[str]]:
+    """抓 akshare 东财中债 10Y 全史 → ``[[date, yield_pct, 'em_local_static'], ...]``。
+
+    :param start_date: ``YYYYMMDD``，缺省 20020101（东财该序列起点）。
+    :return: 升序 [[date_iso, '4位小数', 'em_local_static'], ...]；
+        非空 + sanity 粗滤后。抓取失败抛 RuntimeError（调用方决定降级）。
+    """
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError(
+            "akshare 未装（T9 历史回填需要；安装：uv pip install 'akshare==1.18.88'）"
+        ) from exc
+    try:
+        df = ak.bond_zh_us_rate(start_date=start_date)
+    except Exception as exc:  # noqa: BLE001 - 网络/接口失败上抛，调用方降级
+        raise RuntimeError(f"akshare bond_zh_us_rate 抓取失败: {exc}") from exc
+    date_col, yld_col = "日期", "中国国债收益率10年"
+    if date_col not in df.columns or yld_col not in df.columns:
+        raise RuntimeError(
+            f"akshare 列漂移（缺 {date_col!r}/{yld_col!r}；接口改版?）"
+        )
+    lo, hi = EM_HISTORY_SANITY_PCT
+    rows: List[List[str]] = []
+    for _, r in df.iterrows():
+        y = r.get(yld_col)
+        d = r.get(date_col)
+        if y is None or d is None:
+            continue
+        try:
+            yf = float(y)
+        except (TypeError, ValueError):
+            continue
+        if not (lo <= yf <= hi):
+            continue  # sanity 粗滤（字段错位/单位错误防御）
+        d_iso = str(d)[:10]
+        if len(d_iso) != 10:
+            continue
+        rows.append([d_iso, f"{yf:.4f}", "em_local_static"])
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
+def merge_rf_history_into_csv(path: str, history_rows: List[List[str]]) -> int:
+    """把历史行合并进 ``rf_10y_daily.csv``——**只补缺口日期，不覆盖已有行**。
+
+    已有行（TE 现值序列，source=te_local）优先保留：同一 date 已存在 → 跳过
+    （两源同口径（中债 10Y）但精度/舍入略异，先落盘者为准）。
+    :return: 新增行数。
+    """
+    rows = _read_rf_csv(path) or []
+    existing = {r[0] for r in rows if len(r) >= 1 and r[0]}
+    added = 0
+    for hr in history_rows:
+        if hr[0] in existing:
+            continue
+        rows.append(hr)
+        existing.add(hr[0])
+        added += 1
+    if added:
+        _atomic_write_rf_csv(path, sorted(rows, key=lambda x: x[0]))
+    return added
 
 
 def load_rf_10y_asof(cache_dir: str, run_day: str) -> Optional[float]:
