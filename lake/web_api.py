@@ -777,6 +777,9 @@ _TABLE_META = [
 ]
 
 # v6.0.5：P2/P3 计划内未启动表的徽章副文案（brief 逐字）。
+# v6.3.2（2026-10-02）：state 判定改数据驱动（_classify_state pending 分支）——
+# 数据已灌的表（T5 全量/T8 已重算/T9 已落库）不再恒显示"待补"；仅 0 行（真未启动）
+# 才落 pending，部分完成/落后按 lagging 显示。本 dict 仅用于 rows==0 的 pending 文案。
 _PENDING_DETAIL = {
     "fundamentals_quarterly": "P2·季度基本面待补",
     "holders_snapshot": "P2·股东+实控人待补",
@@ -1136,13 +1139,16 @@ def _table_stats(con, table: str, code_col: Optional[str],
 
 
 def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
-                    ref_date: Optional[str], dividend_as_of: Optional[str]
-                    ) -> tuple:
+                    ref_date: Optional[str], dividend_as_of: Optional[str],
+                    prog: Optional[Dict[str, Any]] = None) -> tuple:
     """state 判定（brief v6.0.5 规则，全部运行时计算、零硬编码数据值）。
 
     :return: (state, state_detail)
-    - pending：P2/P3 计划内未启动表——**即使 0 行也标 pending 而非 empty**
-      （"计划内未做" ≠ "坏了"；前端 muted 弱化、不得显示成错误）。
+    - pending：P2/P3 表 **0 行**（真未启动）——"计划内未做" ≠ "坏了"，前端 muted
+      弱化、不得显示成错误。⚠️ v6.3.2（2026-10-02）：原实现 P2/P3 **不论行数**恒
+      pending → T5/T8/T9 灌完数据后页面仍显示"待补"（Joel 反馈）。现改数据驱动：
+      0 行→pending（沿用旧文案）；有行但进度任务未完成/落后→lagging（部分完成
+      按进度显示）；已完成→按日期口径 fresh。
     - daily（kline/valuation/index）：date_max 与参考最新交易日比**天数差**
       （不比较具体日期值）：gap≤1 → fresh；>1 → lagging"滞后 N 日"。
       ⚠️ 用日历天数而非交易日数——brief 字面规则即"−1 天/落后 >1 天"，且跨周末
@@ -1151,9 +1157,38 @@ def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
       dividend_events rows>0 → fresh + detail="快照截至<源 as_of>"（as_of 拿不到
       就 "全史静态导入"）。
     - empty：其余 0 行表（当前库实况无此态，留作防御）。
+
+    :param prog: backfill_progress.json 顶层（tasks 视图）；None（单元测试/旧调用）
+        → P2/P3 有行时退化为 lagging"补齐中"（无进度可查，保守显示）。
     """
     if kind in ("pending_p2", "pending_p3"):
-        return "pending", _PENDING_DETAIL[key]
+        if rows <= 0:
+            return "pending", _PENDING_DETAIL[key]
+        # v6.3.2：数据驱动——查该表 progress tasks 视图（backfill 收尾/增量刷新所写）
+        done_n = total_n = None
+        for t in (prog or {}).get("tasks", []):
+            if isinstance(t, dict) and t.get("table") == key:
+                if isinstance(t.get("done"), int):
+                    done_n = t["done"]
+                if isinstance(t.get("total"), int):
+                    total_n = t["total"]
+                break
+        if total_n and done_n is not None:
+            if done_n >= total_n:
+                # 已完成：季度表（T5/T6）PIT 披露日天然落后最新交易日（如 Q2 年报
+                # 8 月底披露完），不做日期差——直接"截至"；日频表（T8/T9）跟踪
+                # 最新交易日，按 gap 判 fresh/lagging。
+                if key in ("fundamentals_quarterly", "holders_snapshot"):
+                    return "fresh", f"截至{date_max or '—'}"
+                if date_max and ref_date:
+                    gap = (datetime.date.fromisoformat(ref_date)
+                           - datetime.date.fromisoformat(date_max)).days
+                    if gap <= 1:
+                        return "fresh", f"最新（截至{date_max}）"
+                    return "lagging", f"滞后 {gap} 日（截至{date_max}）"
+                return "fresh", f"截至{date_max or '—'}"
+            return "lagging", f"补齐中 {done_n}/{total_n}"
+        return "lagging", "补齐中"
     if rows <= 0:
         return "empty", "暂无数据"
     if kind == "daily":
@@ -1224,7 +1259,7 @@ def _build_status_details(con, prog: Dict[str, Any]) -> Dict[str, Any]:
     for key, tier, name_cn, desc, kind, code_col, date_col in _TABLE_META:
         st = _table_stats(con, key, code_col, date_col)
         state, detail = _classify_state(key, kind, st["rows"], st["date_max"],
-                                        ref_date, div_as_of)
+                                        ref_date, div_as_of, prog)
         tables.append({
             "key": key, "tier": tier, "name_cn": name_cn, "desc": desc,
             "rows": st["rows"], "codes": st["codes"],

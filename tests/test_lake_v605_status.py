@@ -8,8 +8,9 @@
   backfill_in_progress,quota_used_today,quota_budget}``。旧字段逐字节不动。
 - **state 判定四分支**（全运行时计算、零硬编码数据值）：
   fresh（日频表 date_max ≥ 参考最新交易日−1 天；master/dividend 快照语义）/
-  lagging（>1 天 → "滞后 N 日"）/ pending（P2/P3 四张表**即使有行也标 pending**——
-  计划内未做 ≠ 坏了）/ empty（其余 0 行表，防御）。
+  lagging（>1 天 → "滞后 N 日"）/ pending（**v6.3.2 起仅 0 行的 P2/P3 表**——
+  计划内未做 ≠ 坏了；有行但 progress 未完成 → lagging"补齐中 [N/M]"，
+  done>=total 后季度表按"截至"、日频按 gap 判 fresh）/ empty（其余 0 行表，防御）。
 - **locked / uninitialized 两态响应体保持 v6.0.4 逐字节不变**（新字段只追加在
   initialized+ready 态；test_lake_v604_lock 三态契约依赖此纪律）。
 - 前端契约：index.html 区块 C 新 DOM（#lake-summary/#lake-tables/#lake-views）、
@@ -77,7 +78,8 @@ def _seed_v605_db(db_path: str) -> None:
     - valuation_daily：max=yesterday → gap=1 → fresh（边界）。
     - index_daily：max=today-5d → lagging"滞后 5 日"。
     - stock_master / dividend_events：有行 → fresh（快照语义）。
-    - factor_snapshot：**有 2 行**仍 pending（P2 计划内未做 ≠ 按行数判定）。
+    - factor_snapshot：**有 2 行**、progress 无完成记录 → lagging"补齐中"
+      （v6.3.2 数据驱动；原"有行仍 pending"语义已废）。
     - fundamentals_quarterly / holders_snapshot / macro_rf：0 行 → pending。
     """
     from lake import conn as lconn
@@ -243,21 +245,70 @@ def test_status_state_dividend_as_of_fallback_max_ann_date(tmp_path, monkeypatch
     assert _table(d, "dividend_events")["state_detail"] == "快照截至2026-08-31"
 
 
-def test_status_state_pending_p2p3_even_with_rows(tmp_path, monkeypatch):
-    """P2/P3 四张表 → pending（detail 逐字）；**factor_snapshot 有 2 行仍 pending**
-    （计划内未做 ≠ 按行数判定——brief：即使 0 行也标 pending，反之亦然）。"""
+def test_status_state_pending_p2p3_data_driven(tmp_path, monkeypatch):
+    """v6.3.2 数据驱动判定：0 行（T5/T6/T9）→ pending（detail 逐字）；
+    **有行但 progress 无完成记录（factor_snapshot 2 行）→ lagging"补齐中"**
+    （不再"不论行数恒 pending"——旧行为导致 T5/T8/T9 灌完仍显示待补）。"""
     d, _ = _ready_status(tmp_path, monkeypatch)
-    expect_detail = {
+    # 0 行三表 → pending（计划内未做 ≠ 坏了）
+    expect_pending = {
         "fundamentals_quarterly": "P2·季度基本面待补",
         "holders_snapshot": "P2·股东+实控人待补",
-        "factor_snapshot": "依赖T5/T6后计算",
         "macro_rf": "P3·rf现值序列未启动",
     }
-    for key, detail in expect_detail.items():
+    for key, detail in expect_pending.items():
         t = _table(d, key)
         assert t["state"] == "pending", f"{key} 应 pending: {t}"
         assert t["state_detail"] == detail, f"{key} detail 不符: {t}"
-    assert _table(d, "factor_snapshot")["rows"] == 2   # 有行仍 pending（前提成立）
+    # factor_snapshot 有 2 行、progress 无条目 → lagging 补齐中（保守）
+    t8 = _table(d, "factor_snapshot")
+    assert t8["rows"] == 2
+    assert t8["state"] == "lagging" and t8["state_detail"] == "补齐中", t8
+
+
+def test_status_state_p2p3_progress_views(tmp_path, monkeypatch):
+    """v6.3.2：progress tasks 视图驱动——done>=total→fresh（季度表"截至"/日频按 gap）；
+    done<total→lagging"补齐中 N/M"。"""
+    import lake.web_api as wapi
+    from lake import conn as lconn
+
+    p = str(tmp_path / "prog.duckdb")
+    _seed_v605_db(p)
+    today = dt.date.today().isoformat()
+    prog = _write_progress(tmp_path, tasks=[
+        # T5 完成（季度表 → 截至 date_max，不做日期差）
+        {"table": "fundamentals_quarterly", "tier": "P2", "total": 1, "done": 1,
+         "state": "done"},
+        # T8 完成但 as_of 落后 today-5 → 滞后 5 日
+        {"table": "factor_snapshot", "tier": "P3", "total": 1, "done": 1,
+         "state": "done"},
+        # T6 部分完成 → 补齐中 1/2
+        {"table": "holders_snapshot", "tier": "P2", "total": 2, "done": 1,
+         "state": "running"},
+    ])
+    monkeypatch.setattr(lconn, "default_db_path", lambda: p)
+    monkeypatch.setattr(lconn, "progress_path", lambda: prog)
+    d = wapi.status()
+    # T5：seed 无 fundamentals 行（0 行）→ 仍 pending（done 视图不改变 0 行判定）
+    assert _table(d, "fundamentals_quarterly")["state"] == "pending"
+    # T8：2 行 + done 1/1 + as_of=today-1 → gap 1 → fresh"最新（截至…）"
+    t8 = _table(d, "factor_snapshot")
+    assert t8["state"] == "fresh" and t8["state_detail"].startswith("最新（截至"), t8
+    # T6：0 行 → pending（0 行优先于进度视图）
+    assert _table(d, "holders_snapshot")["state"] == "pending"
+    # 直接单元级验证 部分完成/季度完成 分支（不依赖播种行数）
+    ref = today
+    assert wapi._classify_state("holders_snapshot", "pending_p2", 10, "2026-09-16",
+                                ref, None, {"tasks": [
+        {"table": "holders_snapshot", "total": 2, "done": 1}]}) == \
+        ("lagging", "补齐中 1/2")
+    assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 10,
+                                "2026-08-31", ref, None, {"tasks": [
+        {"table": "fundamentals_quarterly", "total": 1, "done": 1}]}) == \
+        ("fresh", "截至2026-08-31")   # 季度表 PIT 披露落后 → 不做日期差
+    assert wapi._classify_state("macro_rf", "pending_p3", 3, "2026-09-22", ref, None,
+                                {"tasks": [
+        {"table": "macro_rf", "total": 1, "done": 1}]})[0] == "lagging"   # 日频 gap>1
 
 
 def test_status_state_empty_defensive_branch(tmp_path, monkeypatch):
@@ -302,11 +353,23 @@ def test_classify_state_unit_four_branches():
     t2 = (today - dt.timedelta(days=2)).isoformat()
     assert wapi._classify_state("index_daily", "daily", 10, t2, ref, None) == \
         ("lagging", "滞后 2 日")
-    # pending：P2/P3 不论行数
+    # pending：P2/P3 仅 0 行（v6.3.2 数据驱动）
     assert wapi._classify_state("macro_rf", "pending_p3", 0, None, ref, None) == \
         ("pending", "P3·rf现值序列未启动")
+    # 有行但 progress 无完成记录 → lagging"补齐中"（v6.3.2：不再恒 pending）
     assert wapi._classify_state("factor_snapshot", "pending_p2", 99, "2026-01-01",
-                                ref, None)[0] == "pending"
+                                ref, None)[0] == "lagging"
+    # 有行 + progress done>=total：季度表→fresh"截至"；日频按 gap
+    assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 99,
+                                "2026-08-31", ref, None,
+                                {"tasks": [{"table": "fundamentals_quarterly",
+                                            "total": 1, "done": 1}]}) == \
+        ("fresh", "截至2026-08-31")
+    y2 = (today - dt.timedelta(days=2)).isoformat()
+    assert wapi._classify_state("macro_rf", "pending_p3", 99, y2, ref, None,
+                                {"tasks": [{"table": "macro_rf", "total": 1,
+                                            "done": 1}]}) == \
+        (f"lagging", f"滞后 2 日（截至{y2}）")
     # empty：非 pending 表 0 行
     assert wapi._classify_state("kline_daily", "daily", 0, None, ref, None) == \
         ("empty", "暂无数据")
