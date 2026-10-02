@@ -129,6 +129,35 @@ def _fnum(v: Any) -> Optional[float]:
         return None
 
 
+def _holders_page_empty_shell(html: str) -> bool:
+    """新浪 F10 股东页"合法空页"判定（v6.3.4：熔断误触根因修复）。
+
+    背景：``fetch_holders`` 原先对"解析出 0 报告期"一律 ``_note_failure`` + 抛错。
+    但部分股票（实测 601123 马矿等，约数千只）在新浪 F10 侧**确实无股东数据**——
+    页面框架完整（``CirculateShareholderTable`` 容器在、HTTP 200）只是 0 个报告期
+    锚点（无数据行）。这类"合法空页"被当成失败计数，连续 5 只即误触发 holders
+    熔断 → 其后所有股票（含 600002/000001 等页面有 80~899 行数据、解析器完全
+    能解析的）在 ``_check_breaker`` 入口被直接拒绝，根本没抓取（10-02 生产事故：
+    2913 只"失败"绝大多数是这么被误伤的）。
+
+    判别（10-02 生产页面对照实测：601123 空壳 / 601398 79 锚点 / 600002 8 锚点）：
+    - 合法空页 = 表容器标记 ``CirculateShareholderTable`` 在 + 0 个报告期锚点
+      （``<a name="YYYY-MM-DD">`` 只在表格数据区内出现——框架在而数据区为空）；
+    - 结构漂移 = 容器标记缺失（整页改版），或 锚点>0 但 0 行数据可解析
+      （锚点还在但行格式变了——真异常，仍走失败/熔断路径）。
+
+    :return: True=合法空页（接口正常、新浪确无此股数据）；False=需按失败处理。
+    """
+    has_frame = "CirculateShareholderTable" in html
+    anchors = re.search(r'<a\s+name="\d{4}-\d{2}-\d{2}"\s*></a>', html)
+    if not has_frame:
+        return False            # 连容器都没有 → 页面改版/接口异常
+    if anchors is None:
+        return True             # 框架完整、0 报告期 → 新浪无此股数据（合法空）
+    # 锚点存在 → 交给 row 解析结果裁决（fetch_holders：rows==0 仍判漂移）
+    return False
+
+
 def parse_holders_page(html: str) -> List[Dict[str, Any]]:
     """新浪 F10 流通股股东页（已 GBK→str）→ 全部报告期 + 前十大股东行。
 
@@ -353,7 +382,17 @@ class SinaClient:
 
     # ---------- F10 股东页（D3'） ----------
     def fetch_holders(self, code6: str) -> List[Dict[str, Any]]:
-        """抓单只 F10 流通股股东页 → parse_holders_page 输出（全部报告期）。"""
+        """抓单只 F10 流通股股东页 → parse_holders_page 输出（全部报告期）。
+
+        v6.3.4（10-02）：区分两类"取空"——
+        - **合法空页**（``_holders_page_empty_shell``：表框架完整但 0 报告期，
+          新浪侧确无此股数据）→ 返回 ``[]``、**不记失败**（接口正常，不得计入
+          熔断——旧行为把合法空页当失败，连续 5 只误触发熔断，把其后有数据的股
+          全挡住，10-02 生产事故根因）；调用方按"无数据"语义降级（run_t6 标 done
+          跳过、引擎该股因子 None）。
+        - **结构漂移**（容器缺失 / 锚点在但 0 行可解析）→ 仍 ``_note_failure`` +
+          抛 SinaDataError（熔断语义保留：真改版/接口故障时整类降级 D9'）。
+        """
         self._check_breaker("holders")
         url = SINA_HOLDERS_URL.format(code6=code6)
         resp = self._get(url, "holders")
@@ -366,6 +405,12 @@ class SinaClient:
         from . import rawstore as _raw
         _raw.record_response("sina", f"f10_holders_{code6}", html, meta={"periods": len(periods)})
         if not periods:
+            if _holders_page_empty_shell(html):
+                # 合法空页：HTTP 200 + 表框架完整 + 0 报告期 → 新浪无此股数据。
+                # 接口存活（证明本请求成功）→ 重置连续失败计数，不触发熔断。
+                log.info("[SINA] F10 %s 合法空页（新浪无此股股东数据）→ 返回 []", code6)
+                self._note_success("holders")
+                return []
             self._note_failure("holders")
             raise SinaDataError(f"新浪 F10 {code6} 未解析到任何股东表（页面结构漂移?）")
         # 契约监控：字段非空率 + 持股比例 sanity（warning 不静默）

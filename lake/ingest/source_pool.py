@@ -124,6 +124,14 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
          "field_group": "ohlcv_amount", "role": "主源"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
          "field_group": "adj_factor", "role": "主源(推导)"},   # hfq÷raw 推导
+        # v6.3.3（2026-10-02）：T6 前十大股东补登记。根因：本表建于 v6.1.3，
+        # 当时 sina 只管 K线；T6 是 v6.1.7 加的（SinaClient.fetch_holders 抓新浪 F10
+        # 股东研究页 vip.stock.finance.sina.com.cn vCI_CirculateStockHolder），加表
+        # 时漏回填 → 前端"数据源状态"新浪卡不显示 T6（Joel 10-02 反馈）。
+        # ⚠️ 注意：sina 卡的"可达"探测（SinaKlineAdapter.available 自检 K线接口）
+        # **不覆盖** F10 端点——T6 失败时新浪卡仍可能显示可达（两独立端点）。
+        {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
+         "field_group": "holders", "role": "主源"},
     ],
     "tencent": [
         {"table": "stock_master", "table_cn": "T1 股票主档",

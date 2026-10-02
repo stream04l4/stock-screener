@@ -1162,21 +1162,34 @@ def run_t6(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
         log.warning("T6 progress 条目升级落盘失败（不阻断）: %s", exc)
 
     client = _t6_client_factory()
+    no_data: List[str] = []   # v6.3.4：合法空页（新浪确无数据）股清单——收尾 summary 透出
 
     def worker(task: Task) -> None:
         code = task.ts_code
         # ts_code "sh.601398" → code6 "601398"（新浪 F10 URL 口径，同 screener 引擎）
         periods = client.fetch_holders(code.split(".")[1])
         if not periods:
-            # fetch_holders 契约上取空即抛 SinaDataError；双保险——绝不在无数据时
-            # mark_done（done 键毒化防线，同 history/T5 纪律）
-            raise RuntimeError(f"T6 新浪 F10 股东页取空 {code}（不标 done，下轮重试）")
+            # v6.3.4：fetch_holders 返回 [] 仅发生于**合法空页**（HTTP 200 + 表框架
+            # 完整 + 0 报告期 = 新浪侧确无此股数据；结构漂移仍抛 SinaDataError）。
+            # 语义变更（10-02 事故修复）：旧行为"取空即抛错不标 done"→ 数千只
+            # 无数据股每次 full 都重抓（空耗新浪配额 + 曾误触发熔断）。现在：
+            # 合法空页按"已确认无数据"处理 → 正常返回 → runner 标 done（T6 是
+            # 一次性全史快照，done 键 (t6, ts_code) 幂等跨天）→ 不再反复重抓。
+            # 若日后新浪补录该股数据：手工删 progress done 键中 (holders_snapshot,
+            # code, "t6") 后重跑 t6 即可（见 cmd_t6 --reset-nodata 说明）。
+            no_data.append(code)
+            log.info("T6 %s 新浪无股东数据（合法空页）→ 标 done 跳过", code)
+            return
         n = load_t6(con, code, periods)   # as_of_date=None → 全部报告期（全史快照）
         if n <= 0:
             raise RuntimeError(f"T6 load_t6 转换零行 {code}（页面结构漂移?不标 done，下轮重试）")
         time.sleep(0.3)   # 兜底小睡（SinaClient 内部 ≥1s/只限速之外的节奏余量，同 T2/T5）
 
     stats.update(runner.run(tasks, worker))
+    stats["no_data_codes"] = no_data
+    stats["no_data_count"] = len(no_data)
+    if no_data:
+        log.info("T6 合法空页（新浪无股东数据）%d 只 → 标 done 跳过（不空耗配额）", len(no_data))
     return {"table": "holders_snapshot", **stats}
 
 
@@ -2231,6 +2244,68 @@ def cmd_full(args, con, db_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# t6（v6.3.4：T6 独立子命令——只跑 holders_snapshot 阶段，不重跑 history/p3/t8/t9/t5）
+# ---------------------------------------------------------------------------
+def _make_runner(db_path: str):
+    """构造 BackfillRunner（t6 独立子命令用；与 run_full 各阶段同口径）。"""
+    from lake.backfill import BackfillRunner
+    return BackfillRunner(db_path=db_path)
+
+
+def cmd_t6(args, con, db_path: str) -> int:
+    """t6 子命令入口（v6.3.4）：单独补/重跑 T6 前十大股东。
+
+    为什么独立子命令（而非 full --no-* 组合）：full 六阶段里 history/p3 幂等快但
+    t8 全市场重算 ~6min + 全程同一把锁——只为补 T6 跑整条 full 浪费且锁窗口长。
+    t6 子命令 = 同一把 LakeLock + 只调 run_t6（复用 full 阶段 6 的全部语义：
+    done 键 (t6, ts_code) 幂等续传 / 合法空页标 done / 结构漂移熔断 / progress 视图）。
+
+    - ``--codes``：股票子集（缺省=stock_master 全集；冒烟用）。
+    - ``--reset-nodata``（v6.3.4）：跑之前从 progress done 键清除
+      ``("holders_snapshot", <code>, "t6")``——**仅限 --codes 指定股**（未给
+      --codes 时清除全部 t6 done 键 = 全市场重抓，慎用）。用途：某批"合法空页"
+      股日后新浪补录了数据，或怀疑空页误判，清除后定点重验。清除范围外的 done
+      键不动（已灌数据股不重抓、不空耗配额）。
+    """
+    from lake.backfill import load_progress, save_progress
+
+    codes = _parse_codes(args.codes)
+
+    if getattr(args, "reset_nodata", False):
+        prog = load_progress(_progress_for_db(db_path))
+        done = prog.get("done", [])
+        keep, dropped = [], 0
+        code_set = set(codes) if codes else None
+        for k in done:
+            if (isinstance(k, list) and len(k) >= 3
+                    and k[0] == "holders_snapshot" and k[2] == "t6"
+                    and (code_set is None or k[1] in code_set)):
+                dropped += 1
+            else:
+                keep.append(k)
+        prog["done"] = keep
+        save_progress(prog, _progress_for_db(db_path))
+        log.info("t6 --reset-nodata: 清除 %d 个 done 键（scope=%s）",
+                 dropped, f"{len(code_set)} 只" if code_set else "全市场")
+        print(f"--reset-nodata: 清除 {dropped} 个 t6 done 键（"
+              f"{len(code_set)} 只指定" if code_set else "全市场（慎用）")
+
+    stats = run_t6(con, db_path, codes, _make_runner(db_path))
+    print(f"===== t6 =====（holders_snapshot）")
+    print(f"  processed={stats.get('processed')}  skipped_done={stats.get('skipped_done')}  "
+          f"no_data={stats.get('no_data_count')}  errors={len(stats.get('errors', []))}")
+    if stats.get("no_data_codes"):
+        print(f"  合法空页（新浪无数据，已标 done）: {len(stats['no_data_codes'])} 只"
+              + (f"（首 10: {', '.join(stats['no_data_codes'][:10])}…）"
+                 if len(stats["no_data_codes"]) > 10 else ""))
+    for e in stats.get("errors", [])[:10]:
+        print(f"  ERROR {e}")
+    if len(stats.get("errors", [])) > 10:
+        print(f"  …共 {len(stats['errors'])} 条错误（见日志）")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # status（coverage + progress 摘要）
 # ---------------------------------------------------------------------------
 def run_status(con, db_path: str) -> Dict[str, Any]:
@@ -2393,6 +2468,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="跳过 T6 股东阶段（排障用；默认不跳）")
     sp.set_defaults(func=cmd_full)
 
+    sp = sub.add_parser(
+        "t6",
+        help="v6.3.4：只跑 T6 前十大股东（holders_snapshot）——同一把 LakeLock，"
+             "不重跑 history/p3/t8/t9/t5；done 键 (t6, ts_code) 幂等续传；"
+             "合法空页（新浪无数据）标 done 跳过；--reset-nodata 清除指定股 done 键后重验")
+    sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=stock_master 全集）")
+    sp.add_argument("--reset-nodata", action="store_true", default=False,
+                    help="跑前清除 done 键 ('holders_snapshot', <code>, 't6')——仅限 --codes "
+                         "指定股（未给 --codes=全市场重抓，慎用）；用于空页股日后补录数据后重验")
+    sp.set_defaults(func=cmd_t6)
+
     sp = sub.add_parser("reconcile",
                         help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=kline_daily 全集）")
@@ -2491,10 +2577,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from lake.conn import LakeInvalidFile, LakeUnavailable  # 延迟 import：--help 不依赖 duckdb
 
-    # B-4：写命令（init/p0/history/full/incremental/reconcile）整段包在 LakeLock(flock) 内——connect + 写入 + close
+    # B-4：写命令（init/p0/history/full/incremental/reconcile/t6）整段包在 LakeLock(flock) 内——connect + 写入 + close
     # 全持锁，使并发 writer 阻塞等锁而非在 connect 阶段互撞崩溃。status 只读不持锁。
     # full（v6.1.6）：同一把锁贯穿三阶段全程（brief §A"天然无竞争"）。
-    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile")
+    # t6（v6.3.4）：独立子命令同样持写锁（run_t6 写 holders_snapshot + progress）。
+    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6")
 
     if not write_cmd:
         return _run_unlocked(args)

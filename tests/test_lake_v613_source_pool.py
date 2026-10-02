@@ -189,6 +189,9 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     sina = by_name["sina"]["provides"]
     assert {"table": "kline_daily", "field_group": "ohlcv_amount", "role": "主源"} \
         in [ {k: p[k] for k in ("table", "field_group", "role")} for p in sina ]
+    # v6.3.3：sina 能力表含 T6 前十大股东（v6.1.7 加 T6 时漏回填，Joel 10-02 反馈补登）
+    assert {"table": "holders_snapshot", "field_group": "holders", "role": "主源"} \
+        in [ {k: p[k] for k in ("table", "field_group", "role")} for p in sina ]
     # tencent 含 T1 主档（brief provides 表）+ T3 估值主源 + T7 指数主源
     tx = by_name["tencent"]["provides"]
     tables_tx = {(p["table"], p["field_group"]) for p in tx}

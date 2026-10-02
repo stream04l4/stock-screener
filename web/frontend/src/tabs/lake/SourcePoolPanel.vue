@@ -157,9 +157,11 @@ function connWord(a) {
   return a ? "可达" : "不可达";
 }
 // 字段组 → chip 短名（brief："T2 日K线·OHLCV+amount(主源)" 形式；模板内联使用）
+// v6.3.3：补 holders（后端 SOURCE_CAPABILITIES.sina 回填 T6 后前端 chips 不再裸显英文）
 const FIELD_GROUP_CN = {
   ohlcv_amount: "OHLCV+amount", adj_factor: "复权因子", master: "主档",
   valuation: "估值", f10: "F10基本面", ohlcv: "OHLCV", amount: "amount",
+  holders: "前十大股东",
 };
 // 配额行：quota 非 null → 今日 used/budget；否则 rate_limit 文案或"无官方配额"
 function quotaText(s) {
