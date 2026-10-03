@@ -717,6 +717,110 @@ def run_t3(con, db_path: str, codes: Optional[List[str]], runner,
     return {"table": "valuation_daily", **stats}
 
 
+# ---------------------------------------------------------------------------
+# t3-history：T3 估值历史回填（v6.3.6，T3 选 A 定案）
+# ---------------------------------------------------------------------------
+def _t3_history_ckpt_path(db_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                        "t3_history_checkpoint.json")
+
+
+def _t3_history_load_ckpt(path: str) -> set:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f).get("done", []))
+    except (OSError, ValueError):
+        return set()
+
+
+def _t3_history_save_ckpt(path: str, done: set) -> None:
+    from lake.ingest.common import now_ts
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"done": sorted(done), "updated_at": now_ts()}, f)
+    os.replace(tmp, path)
+
+
+def cmd_t3_history(args, con, db_path: str) -> int:
+    """t3-history 子命令入口（v6.3.6，Joel 定案 T3 选 A：PE-TTM/PB/息率 3 列全史）。
+
+    一次性回填（**不进每日主链路**——日更当前快照仍走 p0/T3 腾讯快照）：
+    akshare 百度股市通月度估值序列（深度=各股上市日）→ 按 source=bd_static
+    条件 upsert 落 valuation_daily（不覆盖 tencent 同日快照行）→ 本地派生
+    ttm_yield_pct（T4 分红 TTM DPS ÷ T2 close，%；零网络，幂等）。
+
+    为什么月度粒度：日线级估值全史无免费可靠源（spike 2026-10-03：Tushare
+    daily_basic 1 次/分钟且 1991 年 PE/PB 为空；baidu 月度完整到上市日）。
+    估值分位按个股存续期计算，月度锚点无实质影响。
+
+    限速：~3 次调用/股 ×(2-3s 调用 + 1s sleep) ≈ 6-8s/股 → 全市场 ~9-11h。
+    断点续跑：checkpoint JSON（data/lake/t3_history_checkpoint.json）每
+    ``--ckpt-every`` 只 flush；中断后重跑自动跳过已完成股。
+    ``--reset-ckpt`` 清 checkpoint 重跑（源数据修正后重灌）。
+    """
+    from lake.ingest import baidu_valuation_adapter as bdv
+
+    codes = _parse_codes(getattr(args, "codes", None)) or _universe_codes(con)
+    limit = getattr(args, "limit", None)
+    sleep = float(getattr(args, "sleep", 1.0))
+    if limit:
+        codes = codes[:limit]
+
+    ckpt_path = _t3_history_ckpt_path(db_path)
+    if getattr(args, "reset_ckpt", False):
+        try:
+            os.remove(ckpt_path)
+        except OSError:
+            pass
+        log.info("t3-history --reset-ckpt：checkpoint 已清")
+    done = set() if getattr(args, "reset_ckpt", False) else _t3_history_load_ckpt(ckpt_path)
+    pending = [c for c in codes if c not in done]
+    log.info("t3-history：全集 %d 只，checkpoint 已完成 %d，本次待处理 %d（sleep=%.1fs）",
+             len(codes), len(codes) - len(pending), len(pending), sleep)
+
+    t0 = time.monotonic()
+    ok, failed, rows_total = 0, 0, 0
+    failed_codes: List[str] = []
+    for i, code in enumerate(pending, 1):
+        try:
+            hist = bdv.fetch_valuation_baidu(bdv.code6(code), sleep=sleep)
+            rows = bdv.merge_monthly_rows(code, hist)
+            n = bdv.load_valuation_history(con, code, rows)
+            con.commit()
+            ok += 1
+            rows_total += n
+            done.add(code)
+        except Exception as exc:  # noqa: BLE001 - 单股失败不阻断（记 failed，不标 done）
+            failed += 1
+            failed_codes.append(code)
+            log.warning("t3-history %s 失败（跳过，下轮可重试）: %s", code, exc)
+        if i % 50 == 0 or i == len(pending):
+            _t3_history_save_ckpt(ckpt_path, done)
+            el = time.monotonic() - t0
+            eta = int(el / i * (len(pending) - i)) if i else 0
+            print(f"  [{i}/{len(pending)}] ok={ok} failed={failed} rows={rows_total} "
+                  f"elapsed={int(el // 60)}m{int(el % 60)}s eta={eta // 60}m", flush=True)
+    _t3_history_save_ckpt(ckpt_path, done)
+
+    # 本地派生息率（幂等；只动 bd_static 行）
+    t1 = time.monotonic()
+    upd = bdv.derive_yield_for_rows(con)
+    con.commit()
+    n_bd = con.execute("SELECT COUNT(*) FROM valuation_daily WHERE source='bd_static'").fetchone()[0]
+    n_cov = con.execute("SELECT COUNT(DISTINCT ts_code) FROM valuation_daily WHERE source='bd_static'").fetchone()[0]
+    d_min = con.execute("SELECT MIN(date) FROM valuation_daily WHERE source='bd_static'").fetchone()[0]
+    d_max = con.execute("SELECT MAX(date) FROM valuation_daily WHERE source='bd_static'").fetchone()[0]
+
+    print("===== t3-history =====（估值历史回填，月度锚点 source=bd_static）")
+    print(f"  本次 ok={ok} failed={len(failed_codes)} 新落库={rows_total} 行")
+    if failed_codes:
+        print(f"  失败股（{len(failed_codes)}，未标 done，重跑自动重试）: "
+              f"{', '.join(failed_codes[:20])}{' …' if len(failed_codes) > 20 else ''}")
+    print(f"  息率派生 更新={upd} 行（{time.monotonic() - t1:.0f}s）")
+    print(f"  valuation_daily bd_static 现共 {n_bd} 行 / {n_cov} 只 {d_min} ~ {d_max}")
+    return EXIT_OK
+
+
 def _progress_for_db(db_path: Optional[str]) -> Optional[str]:
     """**B-2（v6.0.3）**：progress 文件与库同目录派生；缺省库回退原路径。
 
@@ -2558,6 +2662,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="不抓网络，仅把已落盘 csv 落库（断点/网络失败后重灌）")
     sp.set_defaults(func=cmd_t9)
 
+    sp = sub.add_parser(
+        "t3-history",
+        help="v6.3.6：T3 估值历史回填（一次性/低频，T3 选 A）——akshare 百度股市通"
+             "月度 PE-TTM/PB/总市值全史（深度=各股上市日）→ source=bd_static 条件"
+             "upsert（不覆盖 tencent 当前快照行）→ 本地派生 ttm_yield_pct（T4 分红"
+             "TTM÷T2 close）。akshare 不进每日主链路；断点续跑 checkpoint。")
+    sp.add_argument("--codes", default=None,
+                    help="逗号分隔股票子集（缺省=stock_master 全集）")
+    sp.add_argument("--limit", type=int, default=None,
+                    help="本次最多处理 N 只（测试/试运行用）")
+    sp.add_argument("--sleep", type=float, default=1.0,
+                    help="单指标调用间小睡秒数（缺省 1.0，防百度风控）")
+    sp.add_argument("--reset-ckpt", action="store_true", default=False,
+                    help="清 checkpoint 重跑（源数据修正后重灌）")
+    sp.set_defaults(func=cmd_t3_history)
+
     sp = sub.add_parser("reconcile",
                         help="v6.1：仅跑跨源校验补 conflict_src（不重取主源数据；tdx 次源比对）")
     sp.add_argument("--codes", default=None, help="逗号分隔股票子集（缺省=kline_daily 全集）")
@@ -2661,7 +2781,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # full（v6.1.6）：同一把锁贯穿三阶段全程（brief §A"天然无竞争"）。
     # t6（v6.3.4）：独立子命令同样持写锁（run_t6 写 holders_snapshot + progress）。
     # t9（v6.3.5）：历史回填持写锁（写 macro_rf）。
-    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6", "t9")
+    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6", "t9", "t3-history")
 
     if not write_cmd:
         return _run_unlocked(args)

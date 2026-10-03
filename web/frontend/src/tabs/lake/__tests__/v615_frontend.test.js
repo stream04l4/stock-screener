@@ -70,7 +70,7 @@ describe("F1：sourceMeta legacy 源名中文映射", () => {
     for (const s of ["em_local_static", "lake_factors"]) {
       expect(LEGACY_SOURCE_ALIASES[s]).toBeTruthy();
     }
-    for (const s of ["sina_f10", "te_local"]) {
+    for (const s of ["sina_f10", "te_local", "bd_static"]) {
       expect(SOURCE_VARIANTS[s]).toBeTruthy();
     }
     // brief 点名的 t 也列入（生产库当前无此值，保留可追溯）

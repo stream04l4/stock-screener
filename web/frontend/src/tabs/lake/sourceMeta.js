@@ -42,6 +42,9 @@ export const SOURCE_LABELS = {
 export const SOURCE_VARIANTS = {
   sina_f10: { color: SOURCE_COLORS.sina, label: "新浪 F10" },
   te_local: { color: UNKNOWN_COLOR, label: "TE 本地缓存" },
+  // v6.3.6：T3 估值历史回填 = 百度股市通月度序列一次性落库（source=bd_static，
+  // 见 lake/ingest/baidu_valuation_adapter）——本地缓存语义 → 灰 + 中文 label。
+  bd_static: { color: UNKNOWN_COLOR, label: "百度回填" },
 };
 
 // v6.1.5 F1：已知 legacy source 别名映射（生产库 DISTINCT source 核对结果 + brief 点名）。
