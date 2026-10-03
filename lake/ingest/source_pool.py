@@ -362,32 +362,38 @@ def cross_check_kline(rows_a: Sequence[Dict[str, Any]], src_a: str,
 def cross_check_adj_factor(adj_a: Dict[str, float], src_a: str,
                            adj_b: Dict[str, float], src_b: str,
                            pct: float = 0.5) -> Optional[str]:
-    """T2 adj_factor 跨源校验（末因子从严——af 误差会累积进 hfq/qfq view）。
+    """T2 adj_factor 跨源校验（v6.3.6 口径修正：**相邻事件日因子比值**，非绝对值）。
 
-    :param adj_a/adj_b: {除权日: af} 事件值（前向填充后的**逐日** af 亦可——调用方
-        统一传"可比口径"：本实现按日期交集逐点比，末因子=交集内最大日期的 af）。
+    为什么比值而非绝对值（P1-B）：sina 与 tdx 的 af 归一化基准不同——同一只
+    sh.600004 两源末因子 2.7859 vs 2.51828（恒定 ~1.106 倍），逐日**绝对值**
+    比较必然 >0.5% 误报（v6.3.5 前 3861 只 / 970 万行 conflict_src 全是此误报，
+    已清）。比值 = 相邻两个可比日 af 的变化率：非除权日两源都 ≈1，除权日 =
+    该事件调整因子——对归一化基准**不变**，才是两源可比口径。
+
+    :param adj_a/adj_b: {日期: af}（事件值或前向填充的逐日 af 均可——本实现按
+        日期交集排序取相邻点对；首日无前值无基准，跳过）。
+    :param pct: 比值相对差阈值（除权事件日两源因子变化率差 >pct% 视为真分歧）。
     :return: 分歧摘要或 None。
 
-    为什么重点看末因子：hfq view = raw × af——最新 af 错 0.5% 则**所有** hfq 价格
-    同比例偏移（累积放大），阈值从严（报告 §4.3）。
+    为什么仍从严：除权事件日的因子比值错 0.5% 会累积进 hfq/qfq view（报告 §4.3）。
     """
     common = sorted(set(adj_a) & set(adj_b))
-    if not common:
+    if len(common) < 2:
         return None
     conf: List[str] = []
-    for d in common:
-        va, vb = adj_a[d], adj_b[d]
-        if va is None or vb is None or va == 0:
+    for prev_d, d in zip(common, common[1:]):
+        vp, va = adj_a[prev_d], adj_a[d]
+        vp2, vb = adj_b[prev_d], adj_b[d]
+        if None in (vp, va, vp2, vb) or vp == 0 or vp2 == 0:
             continue
-        if _rel_diff_pct(va, vb) > pct:
-            conf.append(f"{d}:{src_a}:{_fmt_num(va)}|{src_b}:{_fmt_num(vb)}")
+        ra, rb = va / vp, vb / vp2  # 相邻日因子比值（除权事件变化率）
+        if _rel_diff_pct(ra, rb) > pct:
+            conf.append(f"{d}:{src_a}:{_fmt_num(ra)}|{src_b}:{_fmt_num(rb)}")
     if not conf:
         return None
-    # 末因子优先展示（误差累积点）+ 总分歧数
-    tail = common[-1]
-    log.warning("cross_check adj_factor 分歧 %s vs %s (%d 事件日超阈 %.2f%%) 末因子 %s",
-                src_a, src_b, len(conf), pct, tail)
-    summary = f"adj:{';'.join(conf[:4])}"
+    log.warning("cross_check adj_factor 事件比值分歧 %s vs %s (%d 事件日超阈 %.2f%%)",
+                src_a, src_b, len(conf), pct)
+    summary = f"adj_ratio:{';'.join(conf[:4])}"
     if len(conf) > 4:
         summary += f";+{len(conf) - 4}more"
     return summary[:256]

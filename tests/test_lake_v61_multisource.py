@@ -134,13 +134,32 @@ def test_cross_check_kline_no_common_dates_returns_none():
     assert cross_check_kline(a, "sina", b, "tdx") is None
 
 
-def test_cross_check_adj_factor_tail_divergence():
+def test_cross_check_adj_factor_event_ratio_divergence():
     from lake.ingest.source_pool import cross_check_adj_factor
 
-    a = {"2026-09-14": 2.5, "2026-09-15": 2.5}
-    b = {"2026-09-14": 2.5, "2026-09-15": 2.6}  # 末因子差 4% >0.5%
+    # 除权事件日：两源因子变化率差 4% >0.5% → 真分歧（比值口径仍有效）
+    a = {"2026-09-14": 2.5, "2026-09-15": 3.0}          # 变化率 1.20
+    b = {"2026-09-14": 2.5, "2026-09-15": 3.12}         # 变化率 1.248（差 4%）
     s = cross_check_adj_factor(a, "sina", b, "tdx", pct=0.5)
-    assert s is not None and s.startswith("adj:")
+    assert s is not None and s.startswith("adj_ratio:")
+
+
+def test_cross_check_adj_factor_constant_offset_no_false_positive():
+    from lake.ingest.source_pool import cross_check_adj_factor
+
+    # P1-B 回归：两源 af 归一化基准不同（恒定 ~1.106 倍，真实样本 sh.600004
+    # 2.7859 vs 2.51828）——绝对值口径逐日全误报；比值口径变化率一致 → 无分歧
+    a = {"2026-09-14": 2.7859, "2026-09-15": 2.78553, "2026-09-16": 2.78637}
+    b = {d: v / 1.10616 for d, v in a.items()}          # tdx 侧恒定 1/1.106 基准
+    assert cross_check_adj_factor(a, "sina", b, "tdx", pct=0.5) is None
+
+
+def test_cross_check_adj_factor_single_date_returns_none():
+    from lake.ingest.source_pool import cross_check_adj_factor
+
+    # 比值口径需要相邻点对：只有 1 个共同日无基准 → None
+    assert cross_check_adj_factor({"2026-09-15": 2.5}, "sina",
+                                  {"2026-09-15": 3.0}, "tdx", pct=0.5) is None
 
 
 def test_cross_check_f10_pp_threshold():

@@ -325,7 +325,8 @@ stock-screener/
 - **行业分类为证监会二级口径**（84 类），未引入申万依赖（无免费可靠源）。
 - **FCF 覆盖用 OCF 口径**：新浪财务 API 无资本开支字段，`fcf_coverage` = 经营现金流量净额 / 年度分红总额
   （比严格 FCF 略宽松，方向一致、更保守地衡量分红安全垫）；接口失败降级 `cfo_to_np/payout` 代理。
-- **rf 历史序列**：Phase 1 仅用 TE 现值算 yield_spread，不要求 rf 历史分位（div_yield_pctile 只用本地价格+分红史，与 rf 无关）。
+- **rf 历史序列**：v6.3.5 起 T9 `macro_rf` 已回填 2002-01-04 全史（东财中债 10Y，
+  6182 行，source=em_local_static）；日更现值仍走 TE 主源（akshare 按纪律不进每日主链路）。
 
 ### v5.2 后续路线（Phase 2/3）
 
@@ -335,3 +336,23 @@ stock-screener/
   （`daily`/`dividend`/`daily_basic`/`adj_factor`/`share_float` 可用；财报类接口无权限，
   提升需积分）。**决定：不追积分升级，Tushare 定位为备选日线源**——腾讯主源失效时按
   trade_date 单次全市场拉取兜底（~5500 行/1~3s），不进主链路、不做财报交叉校验。
+
+### v6.3.5/6 数据湖定案（2026-09/10，Joel 拍板）
+
+- **增量 K线窗口化**（v6.3.5）：sina/tdx/tencent 按缺口窗口取数而非拉全史——
+  sina 此前无视 start 拉全史（单只 ~7.4s），窗口化后 ~3.1s；配合
+  `EmptyWindowError` 区分"窗口可达但合法空"（停牌/节假日 → 标 done）与"源真实失败"
+  （不标 done）。每日增量全市场 ~14h 降至 ~4-5h，防 09-23 式停更。
+- **incremental 关 T2 tdx 交叉验证**（v6.3.5）：每日 cron 路径不再为每只股多一次
+  tdx 窗口取数（~4s ×5112 ≈ 5.7h，只写审计列不阻断）。p0 手动路径与 T7 指数保留
+  交叉校验（抽查入口 + index amount 补齐）。
+- **T9 macro_rf 历史回填**（v6.3.5）：东财中债 10Y 一次性回填 2002 全史
+  （`lake_backfill.py t9`，持锁，source=em_local_static）；sanity 区间 [0.5,10]
+  而非 rf 配置 [0.5,4]（2004-2014 真实峰值 5.41% 不可误杀）。
+- **P1-B adj 跨源校验口径修正 + 旧误报清除**（v6.3.6）：`cross_check_adj_factor`
+  改比**相邻事件日因子比值**（sina/tdx af 归一化基准不同，恒定倍数下绝对值比较
+  必误报——3861 只 / 970 万行旧 conflict_src 已全部清 NULL，2026-10-03）。
+- **Phase C 历史迁移完成**（2026-10-02）：累计 126359 条全命中断点缓存，
+  phase-c 每日续跑 cron 已移除（`run_phase_c.sh` 保留备查）。
+- **cron 恢复**（09-23 停更事故后）：lake-sync 11:30 UTC + screener 09:35 UTC（工作日），
+  详见 §9；湖增量与选股对 DuckDB 单文件写锁互斥，调度已错峰。
