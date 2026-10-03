@@ -1403,9 +1403,6 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # 多源池（门控同 run_t2/run_history：LAKE_MULTISOURCE=0 / 源开关全关 → [] → legacy）
     ohlcv_srcs = sp.resolve_source("kline_daily", "ohlcv_amount")
     adj_srcs = sp.resolve_source("kline_daily", "adj_factor")
-    t2_close_pct = crosscheck_threshold("t2_close_pct", 0.5)
-    t2_amount_pct = crosscheck_threshold("t2_amount_pct", 2.0)
-    t2_af_pct = crosscheck_threshold("t2_adj_factor_pct", 0.5)
 
     # ---- T2 kline_daily：每股最近缺口（date_max+1→今日；无行→近 250 日）----
     gap_starts: Dict[str, str] = {c: _kline_gap_start(con, c, 250) for c in codes}
@@ -1469,25 +1466,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     adj_map = m
                     break
 
-        # cross_check：采用 sina 主源 → tdx 缺口窗口轻量验证（不阻断，写 conflict_src）
+        # v6.3.5（Joel 拍板）：incremental **不做** tdx 交叉验证——此前每只 sina
+        # 主源股多 1 次 tdx 窗口取数 ~4s（×5112 ≈ 5.7h），只为写 conflict_src
+        # **审计列**（不进打分、不阻断）。每日 cron 路径关闭省 5.7h；
+        # 交叉校验保留在 **p0 手动路径**（run_t2 worker，抽查入口，非常态成本）。
+        # conflict_src=None → load_t2 显式写 NULL（DEF-1：本次写入不留旧值残留）。
         conflict_src: Optional[str] = None
-        if source == "sina":
-            tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
-            if tdx_ad is not None:
-                try:
-                    if tdx_ad.available():
-                        vres = tdx_ad.fetch_kline(code, start=start, end=None)
-                        vrows = (vres or {}).get("ohlcv") or []
-                        if vrows:
-                            conflict_src = sp.cross_check_kline(
-                                kl, "sina", vrows, "tdx",
-                                close_pct=t2_close_pct, amount_pct=t2_amount_pct)
-                            if adj_map and (vres or {}).get("adj_factor"):
-                                af_conf = sp.cross_check_adj_factor(
-                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
-                                conflict_src = _merge_conflict(conflict_src, af_conf)
-                except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
-                    log.warning("incremental T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
 
         load_t2(con, code, kl, adj_map=adj_map, source=source,
                 conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
