@@ -364,3 +364,30 @@ def test_batch_call_retries_on_none(monkeypatch):
     rows = ti.fetch_adj_factor_batch("2026-09-18")
     assert calls["n"] == 2, f"应重试一次: {calls}"
     assert rows == {"sh.601398": {"20260918": 1.25}}, rows
+
+
+def test_batch_call_quota_penalty_fails_fast(monkeypatch):
+    """配额耗尽（实测免费档 adj_factor/daily_basic 5 次/天 → 惩罚 1 次/小时）
+    → 立即抛错不重试（重试无意义，最多 1 次/时）→ 上层回退逐只 legacy。"""
+    import lake.ingest.tushare_ingest as ti
+
+    calls = {"n": 0}
+    sleeps = []
+
+    class FakePro:
+        def daily(self, trade_date):
+            calls["n"] += 1
+            raise Exception("抱歉，您访问接口(daily)频率超限(5次/天)，"
+                            "具体频次详情：https://tushare.pro/document/1?doc_id=108")
+
+    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
+    import time as _real_time
+
+    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
+    try:
+        ti.fetch_daily_batch("2026-09-18")
+        raise AssertionError("配额惩罚态应立即抛错")
+    except RuntimeError as exc:
+        assert "配额耗尽" in str(exc), str(exc)
+    assert calls["n"] == 1, f"不得重试: {calls}"
+    assert sleeps == [], f"不得退避等待: {sleeps}"

@@ -107,6 +107,9 @@ crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_
 （`pro.daily`/`pro.adj_factor`/`pro.daily_basic` 各 1 次/分钟限频，~2.5min），
 取代逐只 sina+腾讯（~9-10h）；多日缺口股（停牌）仍逐只多源 fallback；
 批量失败/行数异常自动回退逐只（`stats["batch"]` 记痕）。
+**配额纪律（免费 120 分实测）**：`adj_factor`/`daily_basic` 各 **5 次/天**，
+超限进 1 次/小时惩罚态（重置口径未确认）——每日批量各用 1 次，
+**手动调试/回测勿再调这两个 trade_date 端点**；`daily` 配额宽裕。
 
 ## 7. 测试
 

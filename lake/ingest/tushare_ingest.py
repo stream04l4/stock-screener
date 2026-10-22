@@ -125,8 +125,17 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
         try:
             df = getattr(pro, fn_name)(trade_date=td)
         except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            # 配额耗尽（实测免费 120 分：adj_factor/daily_basic = 5 次/天，
+            # 超限后惩罚 1 次/小时、重置口径未确认）→ 重试无意义（最多 1 次/时），
+            # 立即中止批量 → 回退逐只 legacy（不白等 8 轮退避 ~25min）。
+            # 每日批量每端点只用 1 次，正常不会触发。
+            if "次/小时" in msg or "次/天" in msg:
+                raise RuntimeError(
+                    f"tushare {fn_name} 配额耗尽（惩罚态，今日重试无意义）: {msg[:80]}"
+                    " → 批量中止") from exc
             last = exc
-            if "频率超限" in str(exc):
+            if "频率超限" in msg:
                 # 渐进退避（实测 62s 偶卡边界：服务端限频窗口与重试时刻重叠时
                 # 连续多次超限）→ 62s × 轮次。3 接口/日 × 正常 1 次命中，成本可忽。
                 _time.sleep(int(62 * (i + 1)))
