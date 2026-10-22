@@ -336,3 +336,31 @@ def test_tushare_code_conversion_edge():
     assert ti._to_lake_code("430047.BJ") is None
     assert ti._to_lake_code("000001") is None
     assert ti._to_lake_code("") is None
+
+
+def test_batch_call_retries_on_none(monkeypatch):
+    """tushare API code!=0 返回 None（不抛异常，实测 adj_factor 瞬时错误）
+    → _batch_call 退避重试，绝不把 None 当空市场。"""
+    import pandas as pd
+    import lake.ingest.tushare_ingest as ti
+
+    calls = {"n": 0}
+
+    class FakePro:
+        def adj_factor(self, trade_date):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None   # 首次瞬时错误
+            return pd.DataFrame([
+                {"ts_code": "601398.SH", "trade_date": "20260918",
+                 "adj_factor": 1.25},
+            ])
+
+    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
+    import time as _real_time
+
+    # _batch_call 内 `import time as _time` 走全局 time 模块 → patch 全局 sleep
+    monkeypatch.setattr(_real_time, "sleep", lambda s: None)
+    rows = ti.fetch_adj_factor_batch("2026-09-18")
+    assert calls["n"] == 2, f"应重试一次: {calls}"
+    assert rows == {"sh.601398": {"20260918": 1.25}}, rows

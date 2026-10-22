@@ -124,7 +124,6 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
     for i in range(max_retries):
         try:
             df = getattr(pro, fn_name)(trade_date=td)
-            break
         except Exception as exc:  # noqa: BLE001
             last = exc
             if "频率超限" in str(exc):
@@ -134,9 +133,15 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
                 continue
             raise RuntimeError(
                 f"tushare {fn_name}(trade_date={td}) 失败: {exc}") from exc
+        if df is not None:
+            break
+        # tushare API code!=0 时**返回 None 不抛异常**（实测 adj_factor 瞬时
+        # 错误）——按瞬时失败退避重试，绝不把 None 当"空市场"（防静默丢数）。
+        last = RuntimeError(f"tushare {fn_name} 返回 None（API code!=0）")
+        _time.sleep(int(62 * (i + 1)))
     if df is None:
         raise RuntimeError(
-            f"tushare {fn_name} 限频重试 {max_retries} 次仍未通过") from last
+            f"tushare {fn_name}(trade_date={td}) 重试 {max_retries} 次仍未通过") from last
     rows = _df_to_rows(df, ["ts_code"] + cols)
     out: List[Dict[str, Any]] = []
     for r in rows:
