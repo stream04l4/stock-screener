@@ -1511,9 +1511,80 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # ---- T2 kline_daily：每股最近缺口（date_max+1→今日；无行→近 250 日）----
     gap_starts: Dict[str, str] = {c: _kline_gap_start(con, c, 250) for c in codes}
 
+    # ---- v7.0.8：tushare 全市场单日批量（每日增量主轴，Joel 2026-10-22 拍板）----
+    # 背景：新浪逐只 K线+hfq + 腾讯逐只快照 ≈ 1.5 万次调用，sina 限速下每日
+    # 9-10h 不可受 → tushare trade_date 全市场单次取回（3 接口各 1 次/分钟，
+    # 含限频等待 ~2.5min）。覆盖判据：全市场同一天单日缺口（gap_start 众数
+    # ≥ batch_min_codes）→ 该股走批量缓存零网络落库；多日缺口（停牌等）仍走
+    # 逐只多源 fallback（不变）。批量失败/行数量异常（<3000）→ 全量回退逐只
+    # （stats 记痕，不静默）。
+    batch: Dict[str, Any] = {}
+    if codes:
+        from collections import Counter
+        _mode_date, _mode_n = Counter(gap_starts.values()).most_common(1)[0]
+        _min_codes = int(lake_cfg().get("batch_min_codes", 3000) or 3000)
+        if _mode_n >= _min_codes:
+            _batch_date = _mode_date   # "YYYY-MM-DD"
+            try:
+                from lake.ingest import tushare_ingest as ti
+                if ti.tushare_available():
+                    t2b = ti.fetch_daily_batch(_batch_date)
+                    if not t2b:
+                        # 空 = 非交易日（或 API 异常）——用腾讯指数最新 bar 判交易日：
+                        # 指数有当日 bar → 交易日（tushare 异常 → 回退逐只）；
+                        # 无 → 休市（全缺口无新数据 → 视为完成，不逐只空转）。
+                        from lake.ingest.tencent_ingest import fetch_kline_ohlcv as _fki
+                        _idx = _fki(tclient, "sh000001", n=10) or []
+                        if any(str(r["date"]) >= _batch_date for r in _idx):
+                            raise RuntimeError(
+                                "tushare 批量 K线空但指数 sh000001 有 >= %s bar"
+                                "（API 异常？）→ 回退逐只 legacy" % _batch_date)
+                        batch = {"date": _batch_date, "no_trade": True,
+                                 "t2": {}, "af": {}, "t3": {},
+                                 "t2_codes": 0, "t3_codes": 0}
+                        log.info("incremental 批量: %s 非交易日 → 全缺口视为完成",
+                                 _batch_date)
+                    else:
+                        _min_rows = int(lake_cfg().get("batch_min_rows", 3000) or 3000)
+                        if len(t2b) < _min_rows:
+                            raise RuntimeError(
+                                f"tushare 批量行数异常 {len(t2b)}<{_min_rows}（API 漂移？）")
+                        afb = ti.fetch_adj_factor_batch(_batch_date)
+                        t3b = ti.fetch_daily_basic_batch(_batch_date)
+                        batch = {"date": _batch_date,
+                                 "t2": {r["ts_code"]: r for r in t2b},
+                                 "af": afb,
+                                 "t3": {r["ts_code"]: r for r in t3b},
+                                 "t2_codes": len(t2b), "t3_codes": len(t3b)}
+                        log.info(
+                            "incremental 批量 (tushare %s): T2=%d T3=%d 股；"
+                            "逐只 fallback %d 股", _batch_date, len(t2b), len(t3b),
+                            sum(1 for c in codes if c not in batch["t2"]))
+                else:
+                    log.info("incremental 批量跳过：tushare 未安装（走逐只）")
+            except Exception as exc:  # noqa: BLE001 - 批量失败 → 逐只 legacy
+                log.warning("incremental 批量 (tushare) 失败 → 回退逐只 legacy: %s", exc)
+                batch = {"failed": str(exc)[:200]}
+    if batch.get("date"):
+        stats["batch"] = {"date": batch["date"], "t2_codes": batch.get("t2_codes"),
+                          "t3_codes": batch.get("t3_codes"),
+                          "no_trade": bool(batch.get("no_trade"))}
+    elif batch.get("failed"):
+        stats["batch"] = {"failed": batch["failed"]}
+
     def t2_worker(task: Task) -> None:
         code = task.ts_code
         start = gap_starts[code]
+        # v7.0.8：批量缓存命中 → 零网络落库（tushare 已换算为湖单位：股/元/亿元）；
+        # 非交易日（no_trade）且缺口=批量日 → 无新数据视为完成。
+        if batch.get("date") == start:
+            _brow = batch.get("t2", {}).get(code)
+            if _brow:
+                load_t2(con, code, [_brow], adj_map=batch.get("af", {}).get(code),
+                        source="tushare", volume_is_shares=True)
+                return
+            if batch.get("no_trade"):
+                return
         if not ohlcv_srcs and not adj_srcs:
             # legacy 单源路径（池全不可用：离线单测/新源全降级）——腾讯窗口取数
             kl = fetch_kline_ohlcv(tclient, code, n=days + 30) or []
@@ -1585,15 +1656,23 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                      period_or_date=inc_period, tier="P3") for c in codes]
     stats["t2"] = runner.run(t2_tasks, t2_worker)
 
-    # ---- T3 valuation_daily：腾讯批量快照（date=今日；滞后多少补多少）----
-    # 前置一批探测：全空 = 网络/接口故障 → 抛错中止（不标 done，防"假完成"毒化）；
-    # 个别缺失 = 停牌/单批失败 → 该只跳过（次日新运行日键自动补）。
-    probe_snaps = fetch_snapshot(tclient, codes[:50]) if codes else {}
-    if not probe_snaps:
-        raise RuntimeError("T3 估值快照全空（腾讯接口故障？）——本轮增量中止，"
-                           "不标 done（下轮重试）")
+    # ---- T3 valuation_daily：估值快照（date=今日；滞后多少补多少）----
+    # v7.0.8：批量命中股零网络（tushare daily_basic）；仅对批量未覆盖股保留
+    # 腾讯逐只路径 + 前置一批探测（全空 = 网络/接口故障 → 抛错中止，不标 done，
+    # 防"假完成"毒化；个别缺失 = 停牌/单批失败 → 该只跳过，次日新运行日键补）。
+    _t3_legacy = [c for c in codes if c not in batch.get("t3", {})]
+    if _t3_legacy:
+        probe_snaps = fetch_snapshot(tclient, _t3_legacy[:50])
+        if not probe_snaps:
+            raise RuntimeError("T3 估值快照全空（腾讯接口故障？）——本轮增量中止，"
+                               "不标 done（下轮重试）")
 
     def t3_worker(task: Task) -> None:
+        # v7.0.8：批量缓存命中 → 零网络落库（单位已换算：亿元/与湖一致列名）
+        _bsnap = batch.get("t3", {}).get(task.ts_code)
+        if _bsnap:
+            load_t3(con, task.ts_code, _bsnap, today_s, source="tushare")
+            return
         snaps = fetch_snapshot(tclient, [task.ts_code])
         snap = snaps.get(task.ts_code)
         if snap:

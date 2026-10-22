@@ -262,9 +262,9 @@ def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
             r.get("open"), r.get("high"), r.get("low"), r.get("close"),
             vol,
             r.get("amount"),          # amount：新浪/tdx/BaoStock 提供；腾讯 None→NULL
-            None,                    # pct_chg：快照口径，K线行不含 → NULL
+            r.get("pct_chg"),        # pct_chg：tushare 批量行自带（v7.0.8）；无→NULL
             int(is_st),
-            None,                    # preclose：K线行不含 → NULL
+            r.get("preclose"),       # preclose：tushare 批量行自带（v7.0.8）；无→NULL
             af_filled.get(r["date"]),
             source, now_ts(), DATA_VERSION,
         ])

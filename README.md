@@ -103,6 +103,11 @@ crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_
 数据湖每日同步，martingale 的一切查询都依赖它）。v6 的 `35 9 * * 1-5 run_cron.sh`
 （多因子日跑）已删除。
 
+**v7.0.8 增量提速**：T2 K线/T3 估值快照改 tushare 全市场单日批量
+（`pro.daily`/`pro.adj_factor`/`pro.daily_basic` 各 1 次/分钟限频，~2.5min），
+取代逐只 sina+腾讯（~9-10h）；多日缺口股（停牌）仍逐只多源 fallback；
+批量失败/行数异常自动回退逐只（`stats["batch"]` 记痕）。
+
 ## 7. 测试
 
 ```bash

@@ -28,6 +28,14 @@ from typing import Any, Dict
 _DEFAULTS: Dict[str, Any] = {
     "baostock_daily_budget": 5000,   # Q2：BaoStock 日预算默认 5,000 次/日
 
+    # v7.0.8：每日增量 tushare 批量判据——gap_start 众数 ≥ 此值才走批量（防
+    # 长假后多日缺口误触发）；测试可注入小值。默认 3000（全市场单日缺口 ~5200）。
+    "batch_min_codes": 3000,
+
+    # v7.0.8：批量 K线行数下限（低于=API 漂移/静默截断 → 回退逐只，防垃圾落库）。
+    # 测试可注入小值。默认 3000（全市场 ~5500 行）。
+    "batch_min_rows": 3000,
+
     # v6.1.8 F3：T5 交叉校验抽样比例（%）。run_t5 按此比例随机抽样做 BaoStock
     # 交叉校验（种子=日期+code 可复现；pct=0 全跳、pct=100 全量）。
     # **成本账（为什么默认 5 而非 100）**：BaoStock 判活后每轮 full，T5 交叉校验 =
