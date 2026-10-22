@@ -13,8 +13,8 @@
 3) git diff BASELINE -- lake/ 为空（lake 包相对基线零改动）。
   基线演进：8c49f71（v7.0.0 原始红线）→ b41fc5c（v7.0.7：Joel 2026-10-22
   拍板砍 T5 roe_avg/ocf + T6 controller_* 死列，lake/ 有意变更，基线前移）
-  → fba2803（v7.0.8：每日增量提速 tushare 全市场批量 T2/T3 + None 重试
-  加固，lake/ 有意变更，基线前移）。
+  → bbc55f5（v7.0.8：每日增量提速 tushare 全市场批量 T2/T3 + None 重试
+  加固 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -31,8 +31,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# v7.0.8（fba2803）：每日增量提速 tushare 全市场批量 T2/T3 + None 重试加固，lake/ 有意变更，基线前移。
-BASELINE = "fba2803"
+# v7.0.8（bbc55f5）：每日增量提速 tushare 全市场批量 T2/T3 + None 重试 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移。
+BASELINE = "bbc55f5"
 
 
 def _git(*args) -> str:
