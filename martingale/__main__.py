@@ -38,7 +38,8 @@ def _default_config_path() -> str:
 
 def _cmd_backtest(args) -> int:
     t0 = time.time()
-    sp, up = load_config(_default_config_path())
+    # 配置优先级：--config（web 层策略选择显式传入）> MARTINGALE_CONFIG 环境变量 > 默认 config/strategy.yaml
+    sp, up = load_config(args.config or _default_config_path())
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
@@ -181,6 +182,8 @@ def main(argv=None) -> int:
     bt.add_argument("--start", default=None, help="YYYY-MM-DD，默认数据起点")
     bt.add_argument("--end", default=None, help="YYYY-MM-DD，默认数据终点")
     bt.add_argument("--codes", default=None, help="逗号分隔 ts_code（默认=股票池）")
+    bt.add_argument("--config", default=None,
+                    help="策略 yaml 路径（默认 config/strategy.yaml，或 MARTINGALE_CONFIG 环境变量）")
     bt.add_argument("--out", default=DEFAULT_OUT, help="输出目录")
     bt.set_defaults(func=_cmd_backtest)
 

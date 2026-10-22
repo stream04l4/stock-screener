@@ -5,7 +5,8 @@
 // → done → GET /api/bt/results/{id}（taskStore.fetchResults，缓存 lastResults 供查询页复用）。
 // echarts = npm 依赖（锁 5.6.0），动态 import 独立 chunk。
 <script setup>
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { api } from "../api/client.js";
 import { useToastStore } from "../stores/toastStore.js";
 import { useTaskStore } from "../stores/taskStore.js";
 import SimpleTable from "../components/SimpleTable.vue";
@@ -18,10 +19,20 @@ const store = useTaskStore();
 // ---------------------------------------------------------------------------
 // 参数表单
 // ---------------------------------------------------------------------------
-const form = ref({ start: "", end: "", mode: "pool", codes: "" });
+const form = ref({ start: "", end: "", mode: "pool", codes: "", strategy: "current" });
 const starting = ref(false);
+const lastStrategy = ref("current"); // 本次运行所选策略（结果区 meta 显示）
 
 // mode: "pool"（股票池，默认）| "codes"（指定标的，逗号分隔）
+// strategy: "current"（活动策略 strategy.yaml，默认）| 策略库名（data/strategies/*.yaml）
+
+// 策略库列表（策略页"另存为"的命名快照；首次进 tab 拉一次）
+const lib = ref([]);
+const libLoaded = ref(false);
+onMounted(async () => {
+  try { lib.value = await api("/api/strategies"); } catch { lib.value = []; }
+  libLoaded.value = true;
+});
 
 async function onRun() {
   if (starting.value) return;
@@ -37,6 +48,10 @@ async function onRun() {
     } else {
       params.pool = true;
     }
+    if (form.value.strategy && form.value.strategy !== "current") {
+      params.strategy = form.value.strategy;
+    }
+    lastStrategy.value = form.value.strategy;
     await store.startBtRun(params);
   } catch (e) {
     // 409/参数 400 → taskStore 已 toast；这里不再重复
@@ -141,6 +156,7 @@ const metaText = computed(() => {
   return (
     `窗口 ${w.start || "各股数据起点"} ~ ${w.end || "数据终点"} · ` +
     `标的 ${m.n_codes ?? (d.per_stock || []).length} 只 · ` +
+    `策略 ${lastStrategy.value === "current" ? "当前策略" : lastStrategy.value} · ` +
     (m.elapsed_s != null ? `耗时 ${m.elapsed_s}s · ` : "") +
     `产物 ${d.task_id}`
   );
@@ -156,6 +172,14 @@ const metaText = computed(() => {
         窗口留空 = 各股数据起点 → 数据终点；标的默认全股票池（5 条件全链）。回测为异步子进程，进度经 SSE 实时推送。
       </p>
       <div class="bt-form-grid">
+        <label class="f-row">
+          <span>策略</span>
+          <select v-model="form.strategy" :disabled="starting || store.state === 'running'">
+            <option value="current">当前策略（strategy.yaml）</option>
+            <option v-for="s in lib" :key="s.name" :value="s.name">{{ s.name }}（{{ s.saved_at }}）</option>
+          </select>
+          <span class="muted small" v-if="libLoaded && !lib.length">策略库为空——可在策略页【另存为】创建参数快照</span>
+        </label>
         <label class="f-row">
           <span>起始日</span>
           <input type="date" v-model="form.start" :disabled="starting || store.state === 'running'">

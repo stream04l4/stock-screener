@@ -71,6 +71,12 @@ function mockApi() {
                meta: { start: null, end: null, codes: null, pool: true } };
     }
     if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
+    if (path === "/api/strategies" && (!opts.method || opts.method === "GET")) {
+      return [
+        { name: "保守_低档", saved_at: "2026-10-20 09:00:00", size_bytes: 1200 },
+        { name: "aggressive_v2", saved_at: "2026-10-21 18:30:00", size_bytes: 1180 },
+      ];
+    }
     throw new Error("unmocked: " + path + " " + (opts.method || "GET"));
   });
 }
@@ -166,6 +172,63 @@ describe("BacktestTab · 表单与触发", () => {
     await flushPromises();
     expect(toastMsg()).toContain("已有回测任务在进行中");
     expect(useTaskStore(appPinia).state).toBe(null);
+    w.unmount();
+  });
+
+  // ---- v7.0.2 策略选择（策略库快照 → --config）----
+  it("策略下拉：默认当前策略 + 策略库条目（GET /api/strategies）", async () => {
+    const w = mk();
+    await flushPromises();
+    expect(apiMock.mock.calls.some(([p]) => p === "/api/strategies")).toBe(true);
+    const sel = w.find("select");
+    expect(sel.exists()).toBe(true);
+    const opts = sel.findAll("option");
+    expect(opts.length).toBe(3); // 当前策略 + 2 条策略库
+    expect(opts[0].element.value).toBe("current");
+    expect(opts[0].text()).toContain("当前策略");
+    expect(opts[1].text()).toContain("保守_低档");
+    expect(opts[2].text()).toContain("aggressive_v2");
+    w.unmount();
+  });
+
+  it("选择策略库条目触发 → POST /api/bt/runs body 带 strategy", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("select").setValue("保守_低档");
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
+    expect(JSON.parse(call[1].body)).toEqual({ pool: true, strategy: "保守_低档" });
+    w.unmount();
+  });
+
+  it("策略库条目跑完 → 结果 meta 行显示所选策略名", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("select").setValue("aggressive_v2");
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    expect(w.text()).toContain("策略 aggressive_v2");
+    w.unmount();
+  });
+
+  it("策略库拉取失败 → 下拉仅当前策略 + 空库提示", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1" };
+      }
+      if (path === "/api/strategies") throw new Error("boom");
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    const opts = w.find("select").findAll("option");
+    expect(opts.length).toBe(1);
+    expect(w.text()).toContain("策略库为空");
     w.unmount();
   });
 });

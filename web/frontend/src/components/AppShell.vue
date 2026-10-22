@@ -1,8 +1,8 @@
-// 应用壳（v7.0 四页签）：回测 / 我的持仓 / 策略 / 数据湖。
+// 应用壳（v7.0.2 四页签）：我的持仓 / 策略 / 回测 / 数据湖。
 // - 不引入 vue-router：页签 = 应用内状态（active ref）。
 // - 非当前 tab 内容懒挂载：v-if="active === x" → 首次激活才渲染并发请求。
 //   已挂载过的 tab 用 keep-alive 保活（切回状态仍在）。
-// v7.0：v6"运行"页签（日跑+多因子回测）随策略核心移除；回测成为主工作流页签。
+// v7.0.2：页签重排——回测移到第三位（主入口=我的持仓）；回测内新增策略选择（策略库快照）。
 <script setup>
 import { ref } from "vue";
 import ToastBar from "./ToastBar.vue";
@@ -12,14 +12,14 @@ import StrategyTab from "../tabs/StrategyTab.vue";
 import LakeTab from "../tabs/LakeTab.vue";
 
 const TABS = [
-  ["backtest", "回测"],
   ["my_positions", "我的持仓"],
   ["strategy", "策略"],
+  ["backtest", "回测"],
   ["lake", "数据湖"],
 ];
 
-// 默认激活"回测"（v7 主工作流：按需回测 + 进度 + 结果）
-const active = ref("backtest");
+// 默认激活第一个页签（v7.0.2：我的持仓 = 日常主入口）
+const active = ref("my_positions");
 </script>
 
 <template>

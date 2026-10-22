@@ -294,3 +294,69 @@ def test_my_positions_lake_unavailable_degrades(tmp_positions_file, monkeypatch)
     assert out["totals"]["cost"] == 1000.0
     import json
     json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# /api/bt/runs 策略选择（v7.0.2）：strategy 参数 → --config 传递 + 400 分支
+# ---------------------------------------------------------------------------
+
+class _FakeTM:
+    """替身 TaskManager：只捕获 start 的入参，不真起子进程。"""
+
+    def __init__(self):
+        self.last_cmd = None
+        self.last_params = None
+
+    def start(self, cmd, params, done_markers, task_id=None):
+        self.last_cmd = list(cmd)
+        self.last_params = dict(params)
+        return {"task_id": task_id, "pid": 4242, "status": "running"}
+
+
+def _patch_tm(monkeypatch):
+    fake = _FakeTM()
+    monkeypatch.setattr(wapp.tm, "start", fake.start)
+    return fake
+
+
+def test_bt_run_default_uses_active_config(monkeypatch):
+    """缺省 strategy → 不带 --config，params.strategy='current'（活动策略）。"""
+    fake = _patch_tm(monkeypatch)
+    out = wapp.trigger_bt_run(wapp.BtRunRequest(pool=True))
+    assert "--config" not in fake.last_cmd
+    assert fake.last_params["strategy"] == "current"
+    assert out["out_dir"].startswith(str(wapp.BT_RUNS_DIR))
+
+
+def test_bt_run_with_library_strategy(tmp_path, monkeypatch):
+    """strategy=<库名> → --config 指向 data/strategies/<name>.yaml，params 记录库名。"""
+    fake = _patch_tm(monkeypatch)
+    lib = tmp_path / "strategies"
+    lib.mkdir()
+    (lib / "alpha.yaml").write_text("strategy: {}\n", encoding="utf-8")
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", lib)
+    out = wapp.trigger_bt_run(wapp.BtRunRequest(pool=True, strategy="alpha"))
+    i = fake.last_cmd.index("--config")
+    assert fake.last_cmd[i + 1] == str(lib / "alpha.yaml")
+    assert fake.last_params["strategy"] == "alpha"
+    assert "--out" in fake.last_cmd  # 产物目录仍在
+
+
+def test_bt_run_strategy_current_no_config(tmp_path, monkeypatch):
+    """strategy='current' 与缺省同义（不带 --config）。"""
+    fake = _patch_tm(monkeypatch)
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", tmp_path / "strategies")
+    wapp.trigger_bt_run(wapp.BtRunRequest(pool=True, strategy="current"))
+    assert "--config" not in fake.last_cmd
+    assert fake.last_params["strategy"] == "current"
+
+
+def test_bt_run_unknown_strategy_400(tmp_path, monkeypatch):
+    """strategy=<不存在的库名> → 400 strategy_not_found，且不触发子进程。"""
+    fake = _patch_tm(monkeypatch)
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", tmp_path / "strategies")
+    with pytest.raises(HTTPException) as ei:
+        wapp.trigger_bt_run(wapp.BtRunRequest(pool=True, strategy="nope"))
+    assert ei.value.status_code == 400
+    assert ei.value.detail["error"] == "strategy_not_found"
+    assert fake.last_cmd is None  # 校验失败必须先于 tm.start

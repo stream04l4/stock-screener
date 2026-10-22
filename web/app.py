@@ -528,16 +528,19 @@ def _infer_terminal_state(tail: List[str], done_markers: List[str]) -> str:
 # Pydantic 模型
 # ---------------------------------------------------------------------------
 class BtRunRequest(BaseModel):
-    """POST /api/bt/runs：{start?, end?, codes? | pool}。
+    """POST /api/bt/runs：{start?, end?, codes? | pool, strategy?}。
 
     - start/end: YYYY-MM-DD（缺省 = 各股数据起点/终点）；
     - codes: 逗号分隔字符串或数组（与 pool 互斥，都不给 = 股票池）；
-    - pool: true 显式股票池（与 codes 同时给 → 400）。
+    - pool: true 显式股票池（与 codes 同时给 → 400）；
+    - strategy: 策略库名（data/strategies/<name>.yaml，策略页"另存为"的快照）；
+      缺省/"current" = 当前活动策略 config/strategy.yaml；不存在 → 400。
     """
     start: Optional[str] = None
     end: Optional[str] = None
     codes: Optional[Any] = None   # str 或 list[str]
     pool: Optional[bool] = None
+    strategy: Optional[str] = None
 
 
 class ImportStrategyRequest(BaseModel):
@@ -595,11 +598,23 @@ def _normalize_codes(codes: Any) -> List[str]:
 # ---------------------------------------------------------------------------
 @app.post("/api/bt/runs")
 def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
-    """触发一次按需回测（子进程 python -m martingale backtest，SSE 推进度）。"""
+    """触发一次按需回测（子进程 python -m martingale backtest，SSE 推进度）。
+
+    strategy 语义（策略选择）：缺省/"current" = 活动策略 config/strategy.yaml；
+    策略库名 → 解析 data/strategies/<name>.yaml 并以 --config 传给引擎（不存在 → 400）。
+    """
     _validate_bt_dates(req.start, req.end)
     codes = _normalize_codes(req.codes)
     if codes and req.pool:
         raise HTTPException(status_code=400, detail="codes 与 pool 互斥（codes 优先，请二选一）")
+
+    strategy = (req.strategy or "").strip()
+    cfg_arg: Optional[str] = None
+    if strategy and strategy != "current":
+        cfg_path = _strategy_path(_sanitize_strategy_name(strategy))
+        if not cfg_path.is_file():
+            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy})
+        cfg_arg = str(cfg_path)
 
     cmd = [str(VENV_PYTHON), "-m", "martingale", "backtest"]
     if req.start:
@@ -608,6 +623,8 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
         cmd += ["--end", req.end]
     if codes:
         cmd += ["--codes", ",".join(codes)]
+    if cfg_arg:
+        cmd += ["--config", cfg_arg]
     # 无 --codes = 默认股票池（pool=true 显式同义）
     if not VENV_PYTHON.exists():
         raise HTTPException(status_code=500, detail=f"找不到 venv python: {VENV_PYTHON}")
@@ -616,7 +633,8 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     task_id = "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
     cmd += ["--out", str(BT_RUNS_DIR / task_id)]
     res = tm.start(cmd, {"start": req.start, "end": req.end,
-                         "codes": codes or None, "pool": bool(req.pool) or not codes},
+                         "codes": codes or None, "pool": bool(req.pool) or not codes,
+                         "strategy": strategy or "current"},
                    ["回测完成"], task_id=task_id)
     res["out_dir"] = str(BT_RUNS_DIR / task_id)
     return res
