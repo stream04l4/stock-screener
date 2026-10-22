@@ -26,7 +26,16 @@ echo "[$(date -u)] 湖锁空窗，120s 缓冲后执行迁移" | tee -a "$LOG"
 sleep 120
 cd "$REPO"
 if .venv/bin/python scripts/lake_migrate_v707.py 2>&1 | tee -a "$LOG"; then
-  echo "[$(date -u)] 迁移完成（exit 0）" | tee -a "$LOG"
+  echo "[$(date -u)] 迁移完成（exit 0）——重启 web 服务加载新代码（旧进程内存中
+  仍是查 roe_avg/ocf/controller_* 的旧 SQL，列已砍必须重启）" | tee -a "$LOG"
+  systemctl --user restart stock-screener-web.service
+  sleep 5
+  if curl -sf http://127.0.0.1:9090/api/health >/dev/null 2>&1; then
+    echo "[$(date -u)] web 服务已重启，health OK" | tee -a "$LOG"
+  else
+    echo "[$(date -u)] ⚠️ web 服务重启后 health 失败——需人工介入" | tee -a "$LOG"
+    exit 1
+  fi
 else
   echo "[$(date -u)] 迁移失败（非零退出）——需人工介入" | tee -a "$LOG"
   exit 1
