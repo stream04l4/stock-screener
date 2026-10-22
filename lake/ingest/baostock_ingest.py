@@ -181,21 +181,21 @@ def load_t2_adj_factor(con, ts_code: str, adj_rows: List[List[str]],
 def load_t5(con, ts_code: str, period: str, pub_date: Optional[str],
             profit: Optional[Dict[str, Any]], growth: Optional[Dict[str, Any]],
             balance: Optional[Dict[str, Any]],
-            ocf: Optional[float] = None, roe_weighted: Optional[float] = None,
+            roe_weighted: Optional[float] = None,
             source: str = "baostock") -> int:
     """T5 upsert：单股单季基本面（PIT：pub_date 必存）。
 
-    :param period: YYYYQn。ocf/roe_weighted 由新浪侧传入（None → 列 NULL，待补）。
+    :param period: YYYYQn。v7.0.7：roe_avg/ocf 列已砍（源无可靠口径、策略零引用）。
     """
     p = profit or {}
     row = [
         ts_code, period, pub_date,
-        p.get("roeAvg"), roe_weighted,
-        (growth or {}).get("YOYPNI"), p.get("netProfit"), ocf,
+        roe_weighted,
+        (growth or {}).get("YOYPNI"), p.get("netProfit"),
         p.get("gpMargin"), (balance or {}).get("liabilityToAsset"),
         source, now_ts(), DATA_VERSION,
     ]
     return upsert(con, "fundamentals_quarterly", [
-        "ts_code", "period", "pub_date", "roe_avg", "roe_weighted", "yoy_pni",
-        "npi", "ocf", "gross_margin", "liability_pct",
+        "ts_code", "period", "pub_date", "roe_weighted", "yoy_pni",
+        "npi", "gross_margin", "liability_pct",
         "source", "fetched_at", "data_version"], [row])

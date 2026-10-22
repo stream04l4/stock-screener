@@ -253,7 +253,7 @@ def test_status_state_pending_p2p3_data_driven(tmp_path, monkeypatch):
     # 0 行三表 → pending（计划内未做 ≠ 坏了）
     expect_pending = {
         "fundamentals_quarterly": "P2·季度基本面待补",
-        "holders_snapshot": "P2·股东+实控人待补",
+        "holders_snapshot": "P2·前十大股东待补",
         "macro_rf": "P3·rf现值序列未启动",
     }
     for key, detail in expect_pending.items():

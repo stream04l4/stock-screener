@@ -156,7 +156,6 @@ watch(stockQ.error, (e) => {
       <div v-else class="lake-base-grid">
         <div class="lake-kv"><div class="k">报告期</div><div class="v">{{ f.period || "—" }}</div></div>
         <div class="lake-kv"><div class="k">披露日</div><div class="v">{{ f.pub_date || "—" }}</div></div>
-        <div class="lake-kv"><div class="k">ROE(平均)</div><div class="v">{{ lakeFmt(f.roe_avg, "pct") }}</div></div>
         <div class="lake-kv"><div class="k">ROE(加权)</div><div class="v">{{ lakeFmt(f.roe_weighted, "pct") }}</div></div>
         <div class="lake-kv"><div class="k">净利同比</div><div class="v">{{ lakeFmt(f.yoy_pni, "pct") }}</div></div>
         <div class="lake-kv"><div class="k">毛利率</div><div class="v">{{ lakeFmt(f.gross_margin, "pct") }}</div></div>

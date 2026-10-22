@@ -148,7 +148,7 @@ def test_cross_check_f10_dual_source_aligned_after_fix(monkeypatch):
     # adata F10 主源（百分数口径，浦发 gross_margin~18 / liability~92）
     adata_recs = [{"period": "2026Q2", "pub_date": "2026-04-30", "roe_weighted": 5.0,
                    "gross_margin": 18.1436, "liability_pct": 91.9207, "yoy_pni": 8.12,
-                   "npi": 1e9, "ocf": None}]
+                   "npi": 1e9}]
     # BaoStock 侧：原始小数 → fetch_f10 ×100（同 test_fetch_f10_ratio_fields_x100）
     monkeypatch.setattr(bsi, "fetch_profit",
                         lambda client, code, y, q: {"pubDate": f"{y}-0{q}-31",
@@ -517,7 +517,7 @@ def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
         def fetch_f10(self, c):
             return [{"period": "2026Q1", "pub_date": "2026-04-30", "roe_weighted": 5.0,
                      "gross_margin": 30.0, "liability_pct": 40.0, "yoy_pni": 8.0,
-                     "npi": 1e9, "ocf": None}]
+                     "npi": 1e9}]
 
     class _Sina:
         def __init__(self, *a, **k):

@@ -43,15 +43,17 @@ DDL_STATEMENTS = [
   ts_code VARCHAR, ex_date DATE, ann_date DATE, period VARCHAR, cash_dps DOUBLE, stk_div DOUBLE,
   source VARCHAR, fetched_at TIMESTAMP, data_version VARCHAR, conflict_src VARCHAR)""",   # v6.1：conflict_src（Q5）；cash_dps=元/股(em dps_pretax 已/10)；stk_div 暂无源→NULL
     # T5 PIT：pub_date 必存
+    # v7.0.7（2026-10-22 Joel 拍板）：砍 roe_avg/ocf 死角列——源无可靠口径（adata 无
+    # 简单平均 ROE；ocf 只有每股值），当前 martingale 策略零引用，不留死字段。
     """CREATE TABLE IF NOT EXISTS fundamentals_quarterly(
   ts_code VARCHAR, period VARCHAR,    -- period=YYYYQn（对齐 BaoStock Q4 基准）
-  pub_date DATE, roe_avg DOUBLE, roe_weighted DOUBLE, yoy_pni DOUBLE, npi DOUBLE, ocf DOUBLE,
+  pub_date DATE, roe_weighted DOUBLE, yoy_pni DOUBLE, npi DOUBLE,
   gross_margin DOUBLE, liability_pct DOUBLE, source VARCHAR, fetched_at TIMESTAMP, data_version VARCHAR,
   conflict_src VARCHAR, PRIMARY KEY(ts_code, period))""",   # v6.1：conflict_src（Q5）
-    # T6 季度；controller_* 暂 NULL（§6-Q1：本期无源，待补源）
+    # T6 季度；v7.0.7 砍 controller_*（sina F10 无实控人数据，恒 NULL 死列）
     """CREATE TABLE IF NOT EXISTS holders_snapshot(
   ts_code VARCHAR, as_of_date DATE, holder_rank TINYINT, holder_name VARCHAR, hold_ratio DOUBLE,
-  share_nature VARCHAR, controller_name VARCHAR, controller_type VARCHAR, controller_ratio DOUBLE,
+  share_nature VARCHAR,
   source VARCHAR, fetched_at TIMESTAMP, data_version VARCHAR, conflict_src VARCHAR)""",   # v6.1：conflict_src（Q5）
     # T7 四指数 sh000001/sh000300/sz399001/sh000922
     """CREATE TABLE IF NOT EXISTS index_daily(

@@ -120,7 +120,7 @@ def _kl_rows():
 def _f10_recs():
     return [{"period": "2026Q1", "pub_date": "2026-04-30", "roe_weighted": 5.0,
              "gross_margin": 30.0, "liability_pct": 40.0, "yoy_pni": 8.0,
-             "npi": 1e9, "ocf": None}]
+             "npi": 1e9}]
 
 
 def _holders_periods():
@@ -753,7 +753,7 @@ def test_t6_rows_fields_and_progress_upgrade(tmp_path, monkeypatch):
             {"table": "holders_snapshot", "tier": "P3", "total": 0, "done": 0,
              "quota_used_today": 0, "quota_budget": 5000,
              "state": "no_source", "eta_min": None, "last_error": "",
-             "note": "无可用数据源（controller_* 待补源）"}],
+             "note": "无可用数据源"}],
             "coverage": {}, "done": []}, f)
 
     con = lconn.open(db)
@@ -766,19 +766,18 @@ def test_t6_rows_fields_and_progress_upgrade(tmp_path, monkeypatch):
     assert stats["processed"] == 2 and not stats.get("errors"), f"run_t6 应全成功: {stats}"
     n = con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0]
     assert n == 12, f"holders_snapshot 应 12 行: {n}"
-    # 字段：hold_ratio=circ_ratio_pct（流通股口径）、controller_* 恒 NULL（待补源）、
-    # source=sina_f10、as_of_date=报告期 end_date
+    # 字段：hold_ratio=circ_ratio_pct（流通股口径）、source=sina_f10、
+    # as_of_date=报告期 end_date（v7.0.7：controller_* 死列已砍）
     row = con.execute(
         "SELECT ts_code, as_of_date, holder_rank, holder_name, hold_ratio, share_nature, "
-        "controller_name, controller_type, controller_ratio, source "
+        "source "
         "FROM holders_snapshot WHERE ts_code='sh.600001' AND as_of_date='2026-03-31' "
         "AND holder_rank=1").fetchone()
     assert row is not None, "首行（rank=1/2026-03-31）应存在"
-    (ts_code, as_of, rank, name, ratio, nature, cn, ct, cr, source) = row
+    (ts_code, as_of, rank, name, ratio, nature, source) = row
     assert ts_code == "sh.600001" and str(as_of) == "2026-03-31" and rank == 1
     assert name == "股东A12.5" and ratio == 12.5, f"hold_ratio 应=circ_ratio_pct: {row}"
     assert nature == "国有股"
-    assert cn is None and ct is None and cr is None, "controller_* 应恒 NULL（待补源）"
     assert source == "sina_f10"
     # progress 条目升级：no_source/P3/total=0 → P2/total=universe/done==total
     prog = _read_prog()

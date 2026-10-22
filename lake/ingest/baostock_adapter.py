@@ -245,13 +245,13 @@ class BaoStockAdapter:
 
         每季 = query_profit_data + query_growth_data + query_balance_data（3 次配额）。
         :return: [{period, pub_date, roe_weighted(None→BaoStock 无加权ROE), gross_margin,
-                  liability_pct, yoy_pni, npi, ocf(None)}]；失败/空 → []。
+                  liability_pct, yoy_pni, npi}]；失败/空 → []。
 
         **字段口径（v6.1.8 F2）**：gross_margin/liability_pct/yoy_pni 已 **×100 转百分数**
         （BaoStock 原始=小数，见 :func:`_bs_to_pct`），与 adata_f10_adapter 同口径——
         cross_check_f10 按 period 对齐比 roe_weighted/gross_margin/liability_pct（绝对差
         >1pp）时两源单位一致，不再全量误报。npi=netProfit 绝对额（元），不缩放。
-        BaoStock roe_avg≠加权ROE，该字段两边都 None 时 cross_check 自动跳过，不误报分歧。
+        v7.0.7：T5 的 roe_avg/ocf 列已砍，本 adapter 不再输出这两字段。
         """
         import datetime as _dt
 
@@ -308,7 +308,6 @@ class BaoStockAdapter:
                 "liability_pct": _bs_to_pct((balance or {}).get("liabilityToAsset")),
                 "yoy_pni": _bs_to_pct((growth or {}).get("YOYPNI")),
                 "npi": (profit or {}).get("netProfit"),
-                "ocf": None,
             })
         return out
 

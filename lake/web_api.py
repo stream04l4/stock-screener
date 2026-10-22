@@ -358,9 +358,9 @@ def stock_detail(ts_code: str) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail=f"数据湖无此股: {ts_code}（T1 未灌入）")
         base = pano[0]
 
-        # T5 最近季（全部列，含 ocf/roe_weighted）
+        # T5 最近季（v7.0.7：roe_avg/ocf 列已砍）
         t5 = _rows_dicts(con,
-                         "SELECT period,pub_date,roe_avg,roe_weighted,yoy_pni,npi,ocf,"
+                         "SELECT period,pub_date,roe_weighted,yoy_pni,npi,"
                          "gross_margin,liability_pct FROM fundamentals_quarterly "
                          "WHERE ts_code=? ORDER BY period DESC LIMIT 1", [ts_code])
 
@@ -764,11 +764,10 @@ _TABLE_META = [
      "daily", "ts_code", "date"),
     ("dividend_events", "T4", "分红事件", "1991→今 全史静态快照（除权日可含未来）",
      "snapshot", "ts_code", "ex_date"),
-    ("fundamentals_quarterly", "T5", "季度基本面", "PIT：ROE/净利同比/OCF/毛利率/负债率",
+    ("fundamentals_quarterly", "T5", "季度基本面", "PIT：ROE(加权)/净利同比/毛利率/负债率",
      "pending_p2", "ts_code", "pub_date"),
-    # v6.3.5：desc 文案修正——旧"controller_* 待补源"含糊（实测 263 万行 controller_*
-    # 全 NULL，是设计内暂缺而非数据缺失）；改为明示"未提供"。
-    ("holders_snapshot", "T6", "前十大股东", "季度快照（实控人字段未提供）",
+    # v7.0.7：controller_* 死列已砍（sina F10 无实控人数据，恒 NULL；策略零引用）。
+    ("holders_snapshot", "T6", "前十大股东", "季度快照（持股占比/性质）",
      "pending_p2", "ts_code", "as_of_date"),
     ("index_daily", "T7", "指数日线", "沪深300/上证/深成/中证1000 四指数",
      "daily", "index_code", "date"),
@@ -784,7 +783,7 @@ _TABLE_META = [
 # 才落 pending，部分完成/落后按 lagging 显示。本 dict 仅用于 rows==0 的 pending 文案。
 _PENDING_DETAIL = {
     "fundamentals_quarterly": "P2·季度基本面待补",
-    "holders_snapshot": "P2·股东+实控人待补",
+    "holders_snapshot": "P2·前十大股东待补",
     "factor_snapshot": "依赖T5/T6后计算",
     "macro_rf": "P3·rf现值序列未启动",
 }

@@ -2,7 +2,8 @@
 """lake.factors —— T8 因子计算（**纯本地，读 T1-T7，零网络**；报告 §3 T8）。
 
 因子集（调研报告 §3 T8）：
-- 行业排名：roe_rank_pct / yield_rank_pct / mv_rank_pct（行业内截面分位）
+- 行业排名：yield_rank_pct / mv_rank_pct（行业内截面分位；v7.0.7 砍 roe_rank_pct——
+  T5.roe_avg 列已砍，源无可靠口径且策略零引用）
 - 低波：ann_vol_3y/5y/10y、max_drawdown_5y、beta_vs_hs300
 - 估值时机：yield_pctile_own_hist、pe_pctile / pb_pctile、drawdown_from_250d_high
 
@@ -150,31 +151,29 @@ def _valuation_pctiles(con, ts_code: str) -> Dict[str, float]:
 
 
 def compute_industry_ranks(con, as_of_date: str) -> Dict[str, Dict[str, float]]:
-    """行业截面排名（roe_rank_pct / yield_rank_pct / mv_rank_pct）。
+    """行业截面排名（yield_rank_pct / mv_rank_pct）。
 
-    读 T5 最近季 roe_avg + T3 最新 ttm_yield_pct/total_mv，按 industry_csric2 分组算分位。
+    读 T3 最新 ttm_yield_pct/total_mv，按 industry_csric2 分组算分位。
+    v7.0.7：砍 roe_rank_pct（T5.roe_avg 列已砍）。
     :return: {ts_code: {factor_name: value}}。
     """
     rows = con.execute(
-        "SELECT m.ts_code, m.industry_csric2, v.ttm_yield_pct, v.total_mv, f.roe_avg "
+        "SELECT m.ts_code, m.industry_csric2, v.ttm_yield_pct, v.total_mv "
         "FROM stock_master m "
         "LEFT JOIN valuation_daily v ON v.ts_code=m.ts_code "
-        "  AND v.date=(SELECT MAX(date) FROM valuation_daily) "
-        "LEFT JOIN fundamentals_quarterly f ON f.ts_code=m.ts_code "
-        "  AND f.period=(SELECT MAX(period) FROM fundamentals_quarterly)"
+        "  AND v.date=(SELECT MAX(date) FROM valuation_daily)"
     ).fetchall()
     # 按行业分组
     by_ind: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         ind = r[1] or "UNKNOWN"
         by_ind.setdefault(ind, []).append({
-            "ts_code": r[0], "yield": r[2], "mv": r[3], "roe": r[4]})
+            "ts_code": r[0], "yield": r[2], "mv": r[3]})
     out: Dict[str, Dict[str, float]] = {}
     for ind, group in by_ind.items():
         if len(group) < 2:
             continue
-        for metric, col in [("yield_rank_pct", "yield"), ("mv_rank_pct", "mv"),
-                            ("roe_rank_pct", "roe")]:
+        for metric, col in [("yield_rank_pct", "yield"), ("mv_rank_pct", "mv")]:
             vals = [g[col] for g in group if g[col] is not None]
             if len(vals) < 2:
                 continue

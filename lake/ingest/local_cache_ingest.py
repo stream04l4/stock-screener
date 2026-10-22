@@ -96,8 +96,8 @@ def load_profit_history(con, cache_dir: str, ts_code: str,
                         source: str = "local_cache") -> int:
     """从 profit_{code}_{y}_{q}.csv 缓存 bootstrap T5（零网络）。
 
-    扫描 cache/ 下该 code 的全部 profit 文件，逐季 upsert（roe_avg/gross_margin/npi/
-    pub_date；yoy_pni/liability_pct/ocf 留 NULL 待 growth/balance/sina 补）。
+    扫描 cache/ 下该 code 的全部 profit 文件，逐季 upsert（gross_margin/npi/
+    pub_date；其余列留 NULL 待 adata F10 主源补）。v7.0.7：roe_avg/ocf 列已砍。
     """
     n = 0
     try:
@@ -116,11 +116,11 @@ def load_profit_history(con, cache_dir: str, ts_code: str,
         period = f"{stat[:4]}Q{(int(stat[5:7]) - 1) // 3 + 1}"
         con.execute(
             "INSERT OR REPLACE INTO fundamentals_quarterly "
-            "(ts_code, period, pub_date, roe_avg, roe_weighted, yoy_pni, npi, ocf, "
+            "(ts_code, period, pub_date, roe_weighted, yoy_pni, npi, "
             " gross_margin, liability_pct, source, fetched_at, data_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [ts_code, period, clean_date(d.get("pubDate")), to_float(d.get("roeAvg")),
-             None, None, to_float(d.get("netProfit")), None, to_float(d.get("gpMargin")),
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [ts_code, period, clean_date(d.get("pubDate")), None, None,
+             to_float(d.get("netProfit")), to_float(d.get("gpMargin")),
              None, source, now_ts(), DATA_VERSION])
         n += 1
     return n

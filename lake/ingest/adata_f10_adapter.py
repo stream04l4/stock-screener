@@ -137,9 +137,6 @@ class AdataF10Adapter:
                 "liability_pct": to_float(r.get("asset_liab_ratio")),
                 "yoy_pni": to_float(r.get("net_profit_yoy_gr")),
                 "npi": to_float(r.get("net_profit_attr_sh")),
-                # ocf：adata 只有 oper_cf_ps（每股值）非绝对额 → 不映射（留 NULL，
-                # 报告 §3 T5：ocf 主源仍新浪——sina_ingest.load_t5_ocf 侧补）
-                "ocf": None,
             })
         return out
 
@@ -167,12 +164,10 @@ def load_t5(con, ts_code: str, recs: List[Dict[str, Any]],
     """T5 upsert：adata F10 全报告期（PK (ts_code, period) → INSERT OR REPLACE）。
 
     :param recs: fetch_f10 输出。pub_date 必存（fetch_f10 已过滤缺失行——PIT 语义）。
-        roe_avg/ocf=None→NULL（BaoStock 侧 roeAvg / 新浪侧 ocf 后续可补，见下注）。
     :param conflict_src: v6.1 跨源分歧摘要（adata vs BaoStock >1pp；None=NULL）。
 
-    ⚠️ 整行替换语义：upsert 会覆盖该 (ts_code, period) 全行——若此前 sina_ingest
-    .load_t5_ocf 已补 ocf/roe_weighted，本函数以 adata 值为准（Q1：T5 主源=adata；
-    ocf adata 无绝对额→NULL，需后续 load_t5_ocf 再补——worker 编排保证顺序）。
+    v7.0.7：roe_avg/ocf 列已砍（源无可靠口径、策略零引用）——本函数只灌
+    roe_weighted/yoy_pni/npi/gross_margin/liability_pct 五列。
     """
     from .common import DATA_VERSION, now_ts, upsert
 
@@ -182,11 +177,9 @@ def load_t5(con, ts_code: str, recs: List[Dict[str, Any]],
             continue  # PIT：pub_date 必存（双保险——fetch_f10 已过滤）
         rows.append([
             ts_code, r["period"], r["pub_date"],
-            None,                     # roe_avg：BaoStock 口径，adata 无 → NULL
             r.get("roe_weighted"),    # adata roe_wtd（加权ROE%）
             r.get("yoy_pni"),         # net_profit_yoy_gr
             r.get("npi"),             # net_profit_attr_sh（元）
-            r.get("ocf"),             # None（adata 无绝对额 OCF——新浪侧补）
             r.get("gross_margin"),    # adata gross_margin%
             r.get("liability_pct"),   # adata asset_liab_ratio%
             source, now_ts(), DATA_VERSION,
@@ -194,6 +187,6 @@ def load_t5(con, ts_code: str, recs: List[Dict[str, Any]],
     if not rows:
         return 0
     return upsert(con, "fundamentals_quarterly", [
-        "ts_code", "period", "pub_date", "roe_avg", "roe_weighted", "yoy_pni",
-        "npi", "ocf", "gross_margin", "liability_pct",
+        "ts_code", "period", "pub_date", "roe_weighted", "yoy_pni",
+        "npi", "gross_margin", "liability_pct",
         "source", "fetched_at", "data_version"], rows, conflict_src=conflict_src)
