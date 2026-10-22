@@ -71,6 +71,8 @@ const TASK_TABLE_CN = {
   fundamentals_quarterly: "T5 季度基本面",
   holders_snapshot: "T6 前十大股东",
   index_daily: "T7 指数日线",
+  factor_snapshot: "T8 因子快照",
+  macro_rf: "T9 利率（rf 10Y）",
 };
 function taskTableCn(t) { return TASK_TABLE_CN[t.table] || t.table; }
 
