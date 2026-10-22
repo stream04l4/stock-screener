@@ -499,6 +499,24 @@ tr.lake-row-muted .badge { opacity: .85; }
 .d-val { font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; }
 .detail-buys { margin-top: 14px; }
 
+/* ---------- v7.0.3 代码模糊搜索下拉（我的持仓录入条） ---------- */
+.code-sug-wrap { position: relative; }
+.code-sug-list {
+  position: absolute; top: calc(100% + 3px); left: 0; z-index: 30;
+  min-width: 320px; max-height: 288px; overflow-y: auto;
+  margin: 0; padding: 4px 0; list-style: none;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
+}
+.code-sug-list li {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 6px 12px; cursor: pointer; white-space: nowrap; font-size: 13px;
+}
+.code-sug-list li:hover, .code-sug-list li.hi { background: var(--accent-soft); }
+.code-sug-list .sug-code { font-family: var(--mono); width: 84px; flex: none; }
+.code-sug-list .sug-name { font-weight: 600; }
+.code-sug-list .sug-ind { margin-left: auto; padding-left: 14px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }

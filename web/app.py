@@ -1004,6 +1004,124 @@ def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 股票模糊搜索（/api/stocks/search）——「我的持仓」录入条候选下拉
+# ---------------------------------------------------------------------------
+# 数据源 = stock_master（ts_code/name/industry），进程内建拼音索引：
+# - 拼音全拼（zhongguoshenhua）+ 首字母（zgsh），pypinyin 一次性算好缓存；
+# - 缓存键 = (路径, mtime_ns, size)：lake-sync 更新 master → 下次查询自动重建。
+_STOCK_SEARCH_CACHE: Dict[str, Any] = {"key": None, "index": None}
+
+
+def _stock_search_index() -> List[Dict[str, str]]:
+    """stock_master → 内存搜索索引。湖不可用 → 抛 Lake* 异常（端点归一为 503）。"""
+    from pypinyin import lazy_pinyin
+
+    import martingale.data as mdata
+    p = Path(mdata.default_db_path())
+    try:
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        from martingale.data import LakeMissing
+        raise LakeMissing(str(p))
+    if _STOCK_SEARCH_CACHE["key"] == key and _STOCK_SEARCH_CACHE["index"] is not None:
+        return _STOCK_SEARCH_CACHE["index"]
+    from martingale.data import connect_readonly
+    con = connect_readonly(None)
+    try:
+        rows = con.execute(
+            "SELECT ts_code, name, industry_name FROM stock_master "
+            "WHERE delist_date IS NULL ORDER BY ts_code").fetchall()
+    finally:
+        con.close()
+    index: List[Dict[str, str]] = []
+    for ts_code, name, industry in rows:
+        name = name or ""
+        pys = lazy_pinyin(name) or []
+        index.append({
+            "ts_code": ts_code, "name": name, "industry": industry or "",
+            "code_digits": ts_code.split(".", 1)[1],
+            "py_full": "".join(pys).lower(),
+            "py_initials": "".join((c[0] if c else "") for c in pys).lower(),
+        })
+    _STOCK_SEARCH_CACHE["key"] = key
+    _STOCK_SEARCH_CACHE["index"] = index
+    return index
+
+
+_CODE_QUERY_RE = re.compile(r"^(?:sh|sz|bj)?\.?(\d+)$")
+
+
+def _search_stocks(q: str) -> List[Dict[str, str]]:
+    """模糊匹配：代码数字 / 中文名子串 / 拼音首字母 / 全拼子串。
+
+    评分（小=优先）：代码精确 0 → 代码前缀 1 → 代码包含 2 → 名精确 0 → 名前缀 1
+    → 名包含 2 → 首字母前缀 3 → 首字母包含 4 → 全拼前缀 5 → 全拼包含 6；
+    同分按 ts_code 排序；取前 10。
+    """
+    q = (q or "").strip().lower()
+    m = _CODE_QUERY_RE.fullmatch(q)
+    digit_mode = bool(m)
+    if digit_mode:
+        q = m.group(1)
+    out: List[Tuple[int, Dict[str, str]]] = []
+    for it in _stock_search_index():
+        score: Optional[int] = None
+        if digit_mode:
+            cd = it["code_digits"]
+            if cd == q:
+                score = 0
+            elif cd.startswith(q):
+                score = 1
+            elif q in cd:
+                score = 2
+        else:
+            name = it["name"]
+            if name == q:
+                score = 0
+            elif name.startswith(q):
+                score = 1
+            elif q in name:
+                score = 2
+            if score is None and it["py_initials"].startswith(q):
+                score = 3
+            if score is None and q in it["py_initials"]:
+                score = 4
+            if score is None and it["py_full"].startswith(q):
+                score = 5
+            if score is None and q in it["py_full"]:
+                score = 6
+        if score is not None:
+            out.append((score, it))
+    out.sort(key=lambda x: (x[0], x[1]["ts_code"]))
+    return [it for _, it in out[:10]]
+
+
+@app.get("/api/stocks/search")
+def search_stocks(q: str = "") -> Dict[str, Any]:
+    """候选股票模糊搜索（录入条下拉用）。
+
+    支持：代码数字（600036 / sh.600036，≥3 位）、中文名子串（电力）、
+    拼音首字母（zgsh）、全拼子串（shenhua）。湖被灌数进程锁定 → 503 lake_locked
+    （前端降级为手动输入代码）。
+    """
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q 为空")
+    m = _CODE_QUERY_RE.fullmatch(q.lower())
+    if m and len(m.group(1)) < 3:
+        raise HTTPException(status_code=400, detail="纯数字代码至少 3 位")
+    try:
+        results = _search_stocks(q)
+    except Exception as exc:  # noqa: BLE001 - 归一化为 503（锁/缺失/坏文件）
+        from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
+        if isinstance(exc, (LakeLocked, LakeMissing, LakeInvalidFile)):
+            raise HTTPException(status_code=503, detail={"error": "lake_locked", "message": str(exc)})
+        raise
+    return {"q": q, "results": results}
+
+
+# ---------------------------------------------------------------------------
 # 策略读写（保留 v6.2 机制；schema 换 v7 slim）
 # ---------------------------------------------------------------------------
 @app.get("/api/strategy")

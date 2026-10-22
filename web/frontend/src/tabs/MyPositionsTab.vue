@@ -45,6 +45,74 @@ const addMsg = ref("");
 const addErr = ref("");
 const CODE_RE = /^[a-z]{2}\.\d{6}$/;
 
+// ---- 代码模糊搜索（下拉候选：代码数字 / 中文名 / 拼音首字母 / 全拼）----
+const sug = ref([]);        // [{ts_code, name, industry}]
+const sugOpen = ref(false);
+const sugHi = ref(-1);      // 高亮候选（-1 = 无）
+let sugTimer = null;
+let sugSeq = 0;             // 竞态保护：只接受最后一次请求的结果
+
+function codeSearchable(v) {
+  const s = (v || "").trim();
+  if (!s) return false;
+  if (/^(?:sh|sz|bj)?\.?\d+$/i.test(s)) {   // 代码/纯数字：≥3 位才查（服务端同规则）
+    return s.replace(/^[a-z]+\.?/i, "").length >= 3;
+  }
+  return true; // 中文 / 拼音：1 位起查
+}
+
+async function onCodeInput() {
+  if (sugTimer) clearTimeout(sugTimer);
+  const q = add.code.trim();
+  if (!codeSearchable(q)) { closeSug(); return; }
+  sugTimer = setTimeout(async () => {
+    const seq = ++sugSeq;
+    try {
+      const d = await api("/api/stocks/search?q=" + encodeURIComponent(q));
+      if (seq !== sugSeq) return; // 过期响应丢弃
+      sug.value = d.results || [];
+      sugHi.value = -1;
+      sugOpen.value = sug.value.length > 0;
+    } catch (e) {
+      if (seq === sugSeq) { sug.value = []; sugOpen.value = false; }
+      // 503 lake_locked / 网络错误 → 静默降级：仍可手动输入完整代码
+    }
+  }, 250);
+}
+
+function closeSug() {
+  if (sugTimer) clearTimeout(sugTimer);
+  sugSeq++;
+  sug.value = []; sugOpen.value = false; sugHi.value = -1;
+}
+
+function pickSug(r) {
+  add.code = r.ts_code;
+  closeSug();
+}
+
+function onCodeKeydown(e) {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!sugOpen.value || !sug.value.length) return;
+    e.preventDefault();
+    const n = sug.value.length;
+    sugHi.value = e.key === "ArrowDown" ? (sugHi.value + 1) % n : (sugHi.value - 1 + n) % n;
+    return;
+  }
+  if (e.key === "Enter" && sugOpen.value) {
+    // 下拉打开时 Enter = 确认高亮候选（无高亮取第一条），不触发提交
+    e.preventDefault();
+    pickSug(sugHi.value >= 0 ? sug.value[sugHi.value] : sug.value[0]);
+    return;
+  }
+  if (e.key === "Escape") closeSug();
+}
+
+function onCodeKeyup(e) {
+  if (e.key === "Enter" && sugOpen.value) return; // 已被 keydown 消费
+  if (e.key === "Enter") addNew();
+}
+
 async function putPos(code, shares, cost) {
   return api("/api/my_positions", {
     method: "PUT",
@@ -166,7 +234,18 @@ function pnlColor(v) {
         策略参考列来自状态机模拟——「下次加仓价 / 再武装价」即该跌到的触发价位。
       </p>
       <div class="add-bar">
-        <input v-model="add.code" class="inp" placeholder="代码 sh.600000" @keyup.enter="addNew" />
+        <div class="code-sug-wrap">
+          <input v-model="add.code" class="inp" placeholder="代码/拼音/中文，如 600036、zgsh、长江电力"
+                 @input="onCodeInput" @keydown="onCodeKeydown" @keyup="onCodeKeyup" @blur="closeSug" />
+          <ul v-if="sugOpen" class="code-sug-list">
+            <li v-for="(r, i) in sug" :key="r.ts_code" :class="{ hi: i === sugHi }"
+                @mousedown.prevent="pickSug(r)">
+              <span class="sug-code">{{ r.ts_code }}</span>
+              <span class="sug-name">{{ r.name }}</span>
+              <span class="muted small sug-ind">{{ r.industry }}</span>
+            </li>
+          </ul>
+        </div>
         <input v-model="add.shares" class="inp num" placeholder="股数" @keyup.enter="addNew" />
         <input v-model="add.cost" class="inp num" placeholder="成本价" @keyup.enter="addNew" />
         <button class="primary-btn" @click="addNew">保存</button>

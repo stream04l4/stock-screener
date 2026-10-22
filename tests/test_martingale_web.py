@@ -360,3 +360,72 @@ def test_bt_run_unknown_strategy_400(tmp_path, monkeypatch):
     assert ei.value.status_code == 400
     assert ei.value.detail["error"] == "strategy_not_found"
     assert fake.last_cmd is None  # 校验失败必须先于 tm.start
+
+
+# ---------------------------------------------------------------------------
+# /api/stocks/search 模糊搜索（v7.0.3）：代码/中文名/拼音首字母/全拼 + 503/400 分支
+# ---------------------------------------------------------------------------
+
+def _search(q):
+    return wapp.search_stocks(q)["results"]
+
+
+def test_stocks_search_chinese_name(bt_copy):
+    """中文名子串：'电力' → 全部命中名含'电力'，≤10 条按 ts_code 排序。"""
+    got = _search("电力")
+    assert 0 < len(got) <= 10
+    assert all("电力" in r["name"] for r in got)
+    codes = [r["ts_code"] for r in got]
+    assert codes == sorted(codes)
+
+
+def test_stocks_search_pinyin_full_exact(bt_copy):
+    """全拼精确：'changjiangdianli' → 长江电力（sh.600900）。"""
+    got = _search("changjiangdianli")
+    assert any(r["ts_code"] == "sh.600900" and r["name"] == "长江电力" for r in got)
+
+
+def test_stocks_search_pinyin_initials(bt_copy):
+    """拼音首字母：'zgsh' → 中国神华（sh.601088）。"""
+    got = _search("zgsh")
+    assert any(r["ts_code"] == "sh.601088" and r["name"] == "中国神华" for r in got)
+
+
+def test_stocks_search_pinyin_full(bt_copy):
+    """全拼子串：'shenhua' → 中国神华。"""
+    got = _search("shenhua")
+    assert any(r["ts_code"] == "sh.601088" for r in got)
+
+
+def test_stocks_search_code_digits(bt_copy):
+    """代码数字：'600900' / 'sh.600900' 精确优先；'600' 前缀多命中。"""
+    got = _search("600900")
+    assert got[0]["ts_code"] == "sh.600900"
+    got2 = _search("sh.600900")
+    assert got2[0]["ts_code"] == "sh.600900"
+    assert len(_search("600")) <= 10
+
+
+def test_stocks_search_limit_and_empty_400(bt_copy):
+    """结果上限 10；q 为空 → 400。"""
+    assert len(_search("a")) <= 10
+    with pytest.raises(HTTPException) as ei:
+        wapp.search_stocks("")
+    assert ei.value.status_code == 400
+
+
+def test_stocks_search_short_code_400(bt_copy):
+    """纯数字 <3 位 → 400（候选会爆量，无搜索意义）。"""
+    with pytest.raises(HTTPException) as ei:
+        wapp.search_stocks("60")
+    assert ei.value.status_code == 400
+
+
+def test_stocks_search_lake_missing_503(tmp_path, monkeypatch):
+    """湖文件缺失 → 503 lake_locked（前端降级手动输入）。"""
+    import martingale.data as mdata
+    monkeypatch.setattr(mdata, "default_db_path", lambda: str(tmp_path / "no_such.duckdb"))
+    with pytest.raises(HTTPException) as ei:
+        wapp.search_stocks("电力")
+    assert ei.value.status_code == 503
+    assert ei.value.detail["error"] == "lake_locked"

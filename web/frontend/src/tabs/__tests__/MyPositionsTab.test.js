@@ -40,6 +40,15 @@ function mockApi(my) {
       const body = JSON.parse(opts.body);
       return { ok: true, ts_code: body.ts_code, n: 1 };
     }
+    if (path.startsWith("/api/stocks/search")) {
+      const q = decodeURIComponent((path.split("q=")[1] || "").trim());
+      const SUG = {
+        zgsh: [{ ts_code: "sh.601088", name: "中国神华", industry: "B06煤炭开采和洗选业" }],
+        "600900": [{ ts_code: "sh.600900", name: "长江电力", industry: "D44电力、热力生产和供应业" }],
+        电力: [{ ts_code: "sh.600900", name: "长江电力", industry: "D44电力、热力生产和供应业" }],
+      };
+      return { q, results: SUG[q] || [] };
+    }
     throw new Error("unmocked: " + path);
   });
 }
@@ -125,6 +134,73 @@ describe("MyPositionsTab · 录入条", () => {
     expect(JSON.parse(puts()[0][1].body)).toEqual(
       { ts_code: "sh.601088", shares: 100, cost_price: 30 });
     expect(w.text()).toContain("已保存 sh.601088");
+    w.unmount();
+  });
+});
+
+describe("MyPositionsTab · 代码模糊搜索（v7.0.3）", () => {
+  it("输拼音首字母 → 候选下拉，点击选中回填完整代码", async () => {
+    mockApi(MY_EMPTY);
+    const w = mk();
+    await flushPromises();
+    const codeInput = w.find(".code-sug-wrap input");
+    await codeInput.setValue("zgsh");
+    await vi.waitFor(() => expect(w.find(".code-sug-list").exists()).toBe(true));
+    expect(w.text()).toContain("中国神华");
+    await w.find(".code-sug-list li").trigger("mousedown");
+    expect(codeInput.element.value).toBe("sh.601088");
+    expect(w.find(".code-sug-list").exists()).toBe(false);
+    expect(puts()).toHaveLength(0); // 选中 ≠ 提交
+    w.unmount();
+  });
+
+  it("输代码数字 → 候选出现；Enter 确认第一条候选（不发 PUT）", async () => {
+    mockApi(MY_EMPTY);
+    const w = mk();
+    await flushPromises();
+    const codeInput = w.find(".code-sug-wrap input");
+    await codeInput.setValue("600900");
+    await vi.waitFor(() => expect(w.find(".code-sug-list").exists()).toBe(true));
+    await codeInput.trigger("keydown", { key: "Enter" });
+    expect(codeInput.element.value).toBe("sh.600900");
+    expect(w.find(".code-sug-list").exists()).toBe(false);
+    expect(puts()).toHaveLength(0);
+    w.unmount();
+  });
+
+  it("无候选（空结果）→ 不下拉；搜索失败（503）→ 静默降级仍可手动输入", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/my_positions" && (!opts || !opts.method || opts.method === "GET")) {
+        return JSON.parse(JSON.stringify(MY_EMPTY));
+      }
+      if (path.startsWith("/api/stocks/search")) {
+        const e = new Error("lake locked");
+        e.status = 503;
+        throw e;
+      }
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    const codeInput = w.find(".code-sug-wrap input");
+    await codeInput.setValue("电力");
+    await new Promise((r) => setTimeout(r, 450)); // debounce + 失败返回
+    expect(w.find(".code-sug-list").exists()).toBe(false);
+    // 手动输入完整代码不受影响
+    await codeInput.setValue("sh.600036");
+    expect(codeInput.element.value).toBe("sh.600036");
+    w.unmount();
+  });
+
+  it("Esc 关闭下拉", async () => {
+    mockApi(MY_EMPTY);
+    const w = mk();
+    await flushPromises();
+    const codeInput = w.find(".code-sug-wrap input");
+    await codeInput.setValue("zgsh");
+    await vi.waitFor(() => expect(w.find(".code-sug-list").exists()).toBe(true));
+    await codeInput.trigger("keydown", { key: "Escape" });
+    expect(w.find(".code-sug-list").exists()).toBe(false);
     w.unmount();
   });
 });
