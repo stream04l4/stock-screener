@@ -50,6 +50,12 @@ def test_no_stale_multifactor_references_in_tracked_files():
     for f in tracked:
         if f.startswith("stages/") or f == "README.md":
             continue  # 历史文档（调研/任务书/删码记录）
+        if f == "tests/test_v7_guards.py":
+            # D1 修复（tester 打回第 1 轮）：commit 后本文件被 tracked，自扫描会
+            # 命中自身 4 处有意 fixture（docstring / 错误消息字面量 / gone_files
+            # 删除断言），造成确定性自命中假红。此处豁免自身；对**其余**所有
+            # tracked 文件的防回潮扫描不受影响（见 D1 轮 probe 证明）。
+            continue
         p = PROJECT_ROOT / f
         if not p.is_file() or p.stat().st_size > 2_000_000:
             continue
