@@ -1651,6 +1651,31 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                      period_or_date=inc_period, tier="P3") for ic in INDEX_CODES]
     stats["t7"] = runner.run(t7_tasks, t7_worker)
 
+    # ---- T8 factor_snapshot：全市场纯本地重算（v7.0.6 每日增量跟进）----
+    # 背景：T8 原先只在 full 阶段 3 重算 → 每日增量（cron 11:30 UTC）不含 T8，
+    # 因子快照停在上一次 full 的 as_of（2026-10-22 排查时停在 2026-09-30），
+    # 而 kline/valuation 每日在更 → 因子口径与最新行情脱节数周。
+    # T8 纯本地（读 T1-T7，零网络零配额，全市场 ~6min）→ 同一锁窗口内跟进。
+    # 纪律（同 D-1 单阶段异常）：失败不阻断增量（stats 记痕 + 日志）；
+    # progress 视图的 factor_snapshot 条目由 _refresh_incremental_task_view
+    # 按 as_of=T2 max date 的落库股数自动归位 done/pending。
+    try:
+        from lake.factors import recompute_all
+        t2_max = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+        if t2_max is None:
+            stats["t8"] = {"skipped": "T2 kline_daily 无数据"}
+        else:
+            as_of = str(t2_max)[:10]
+            t0 = time.monotonic()
+            rows8 = recompute_all(con, as_of_date=as_of, ts_codes=codes)
+            stats["t8"] = {"as_of": as_of, "rows": rows8,
+                           "elapsed_s": round(time.monotonic() - t0, 1)}
+            log.info("T8 跟进重算完成：%d 股、%d 因子行（as_of=%s，%.1fs）",
+                     len(codes), rows8, as_of, time.monotonic() - t0)
+    except Exception as exc:  # noqa: BLE001 - T8 失败不阻断增量（合成小库缺表等场景同样安全）
+        log.error("T8 因子跟进重算失败（增量不阻断）: %s", exc)
+        stats["t8_error"] = str(exc)
+
     # O2/O3：tasks 占位条目刷成真实 total/done + kline_history 完成态 + T5/T6 条目
     _refresh_incremental_task_view(runner, con, today_s)
     return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
@@ -1798,7 +1823,7 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
         # v6.3.1 R1 纵深防御：本轮新 as_of 未重算（done 重算为 0<total）时，上一轮
         # full t8 收尾的 "done" 残留也降级 pending（本轮事故 factor_snapshot 同因）。
         e8["state"] = "pending"   # 收尾态无活跃 writer，非 done 归位 pending（同 T2/T3）
-    e8["note"] = "recompute_all 全市场纯本地重算（full 阶段 3；as_of=T2 max date；零网络）"
+    e8["note"] = "recompute_all 全市场纯本地重算（每日增量跟进 + full 阶段 3；as_of=T2 max date；零网络）"
 
     # T9 macro_rf：v6.1.8 起有源（rf.fetch_rf_10y 抓 TE 现值 + load_macro_rf，full 阶段 4）。
     # total=1（单序列）、tier=P3（本地/免费取数）；done=表内已落行数（≥1 即 done）。
