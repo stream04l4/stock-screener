@@ -773,14 +773,17 @@ def _lake_or_raise() -> None:
         raise HTTPException(status_code=503, detail=f"数据湖不可用: {exc}")
 
 
-def _load_pool_ctx():
-    """配置 + 连接 + 股票池（/api/positions 与 /api/pool 共用）。"""
+def _load_pool_ctx(cfg_path: Optional[str] = None):
+    """配置 + 连接 + 股票池（/api/positions 与 /api/pool 共用）。
+
+    cfg_path 缺省 = 活动策略 config/strategy.yaml；策略库快照路径由调用方解析后传入。
+    """
     from martingale.config import load_config as mload
     from martingale.data import connect_readonly
     from martingale.universe import build_pool
 
     try:
-        sp, up = mload(str(CONFIG_PATH))
+        sp, up = mload(cfg_path or str(CONFIG_PATH))
     except Exception as exc:  # noqa: BLE001 - ConfigError → 400
         raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
     con = connect_readonly(None)
@@ -848,12 +851,24 @@ def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:
             "k_level": int(state["k_level"]),
             "entry_high": float(state["entry_high"]),
             "low_since_high": float(state["low_since_high"]),
+            # 触发价原始口径（_raw）：引擎的 next_add/next_rearm 基于 hfq 信号价，
+            # 而 last_price 是原始收盘——直接比较会因复权因子（分红股 F 可达数十倍）
+            # 产生假信号。raw = hfq / F，F = sig[-1]/exec_c[-1]（最新 bar 复权因子）。
             "next_add_price": round(float(state["next_add_price"]), 4)
                 if state["next_add_price"] is not None else None,
             "next_rearm_price": round(float(state["next_rearm_price"]), 4)
                 if state["next_rearm_price"] is not None else None,
             "end_date": str(dates[-1])[:10],
         }
+        f = float(sig[-1]) / float(exec_c[-1]) if float(exec_c[-1]) > 0 else 1.0
+        if rows[c]["next_add_price"] is not None:
+            rows[c]["next_add_price_raw"] = round(rows[c]["next_add_price"] / f, 4)
+        else:
+            rows[c]["next_add_price_raw"] = None
+        if rows[c]["next_rearm_price"] is not None:
+            rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
+        else:
+            rows[c]["next_rearm_price_raw"] = None
     return rows
 
 
@@ -907,23 +922,37 @@ def _up_write(positions: Dict[str, Any]) -> None:
 
 
 @app.get("/api/my_positions")
-def get_my_positions() -> Dict[str, Any]:
-    """我的持仓 = 用户账本（股数/成本）× 湖最新价 + 策略状态机参考（档/触发价）。
+def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
+    """我的持仓 = 用户账本（股数/成本）× 湖最新价 + 策略状态机参考（档/触发价）+ 加仓信号。
 
-    只列用户账本里的代码；策略参考对池外股同样有效（状态机不挑池）。
-    空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
+    - 只列用户账本里的代码；策略参考对池外股同样有效（状态机不挑池）。
+    - 空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
+    - strategy：策略选择（同 /api/bt/runs 语义）——缺省/"current" = 活动策略
+      config/strategy.yaml；策略库名 → data/strategies/<name>.yaml；不存在 → 400。
+    - signals：加仓提示——策略模拟持仓中（in_pos）且**现价**已跌破下一档触发价。
+      现价 = 腾讯实时行情（price_source="spot"）；行情失败回退湖最后价
+      （price_source="lake"，只漏报不误报）。状态机「触线即买」→ 湖最后 bar 处
+      湖价恒高于触发价，故必须用实时价判定。金额 = base_add_amount × growth^k。
     """
     user = _up_read()
+    strategy_name = (strategy or "current").strip() or "current"
+    cfg_path: Optional[str] = None
+    if strategy_name != "current":
+        cfg_file = _strategy_path(_sanitize_strategy_name(strategy_name))
+        if not cfg_file.is_file():
+            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy_name})
+        cfg_path = str(cfg_file)
     if not user:
-        return {"as_of": None, "n": 0, "positions": [],
+        return {"as_of": None, "n": 0, "positions": [], "signals": [], "strategy": strategy_name,
                 "totals": {"market_value": 0, "cost": 0, "pnl": 0, "pnl_pct": None}}
     # 湖锁定/缺失 → 降级：只列账本（无价格/无策略参考），前端显示灌数提示条
     from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
 
     lake_locked = False
     rows: Dict[str, Dict[str, Any]] = {}
+    _sp = None
     try:
-        _sp, _up, con, pool = _load_pool_ctx()
+        _sp, _up, con, pool = _load_pool_ctx(cfg_path)
         try:
             rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())))
         finally:
@@ -961,14 +990,57 @@ def get_my_positions() -> Dict[str, Any]:
             "k_level": s.get("k_level"),
             "next_add_price": s.get("next_add_price"),
             "next_rearm_price": s.get("next_rearm_price"),
+            "next_add_price_raw": s.get("next_add_price_raw"),
+            "next_rearm_price_raw": s.get("next_rearm_price_raw"),
             "end_date": s.get("end_date"),
         })
     has_price = any(r["market_value"] is not None for r in positions)
+    # 加仓信号（实时价口径）：
+    # 状态机在湖最后 bar「触线即买」→ 湖最后 bar 处 最新价 > 下一档触发价 恒成立，
+    # 用湖价判"已触线"永远为假。故信号用**实时价**（腾讯行情）对比触发价；
+    # 实时行情失败 → 回退湖最后价（price_source="lake"，此时信号只会漏报不会误报）。
+    spot: Dict[str, Dict[str, Any]] = {}
+    try:
+        from screener.data.tencent import TencentClient
+        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(
+            [p["ts_code"] for p in positions]) or {}
+    except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
+        spot = {}
+    price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
+    spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
+    for pos in positions:
+        p_now = (spot.get(pos["ts_code"]) or {}).get("price")
+        pos["spot_price"] = p_now
+    # 信号：in_pos 且 现价（实时优先）≤ 下一档触发价（原始口径）
+    signals: List[Dict[str, Any]] = []
+    for pos in positions:
+        price_now = pos["spot_price"] if pos["spot_price"] is not None else pos.get("last_price")
+        nap_raw = pos.get("next_add_price_raw")
+        if not (pos.get("in_pos") and price_now is not None
+                and nap_raw is not None and price_now <= nap_raw):
+            continue
+        k = pos.get("k_level") or 0
+        suggested = (_sp.base_add_amount * (_sp.growth_ratio ** k)) if _sp is not None else None
+        signals.append({
+            "ts_code": pos["ts_code"],
+            "name": pos["name"],
+            "price": price_now,
+            "next_add_price": nap_raw,
+            "k_level": k,
+            "next_level": k + 1,
+            "suggested_amount": round(suggested) if suggested is not None else None,
+            "action": "add",
+        })
+    signals.sort(key=lambda x: x["ts_code"])
     return {
         "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
         "lake_locked": lake_locked,
         "n": len(positions),
         "positions": positions,
+        "signals": signals,
+        "strategy": strategy_name,
+        "price_source": price_source,
+        "spot_time": spot_time,
         "totals": {
             "market_value": round(tot_mv, 2) if has_price else None,
             "cost": round(tot_cost, 2),

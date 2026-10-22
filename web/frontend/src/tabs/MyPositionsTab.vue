@@ -5,7 +5,7 @@
 // - 添加/更新/删除：顶部录入条 + 行点击弹层编辑，PUT 单条 upsert（shares=0 删除）。
 // 数据按需加载（useLiveQuery，非日跑）→ 手动刷新按钮 invalidate。
 <script setup>
-import { computed, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
 import { invalidate } from "../live/queryRegistry.js";
@@ -16,10 +16,24 @@ import Modal from "../components/Modal.vue";
 const store = useTaskStore();
 
 // ---------------------------------------------------------------------------
-// 数据（按需 + 手动刷新）
+// 策略选择（策略应用）：状态机参考/加仓信号按所选策略参数计算
+// ---------------------------------------------------------------------------
+const stratSel = ref("current"); // "current"（活动策略 strategy.yaml）| 策略库名
+const lib = ref([]);             // 策略库条目（策略页"另存为"的快照）
+onMounted(async () => {
+  try { lib.value = await api("/api/strategies"); } catch { lib.value = []; }
+});
+const stratLabel = computed(() => stratSel.value === "current" ? "当前策略" : stratSel.value);
+// 切换策略 → 失效缓存重拉（fetcher 闭包读 stratSel，带 ?strategy=）
+watch(stratSel, () => invalidate("my_positions"));
+
+// ---------------------------------------------------------------------------
+// 数据（按需 + 手动刷新；?strategy= 策略选择）
 // ---------------------------------------------------------------------------
 const { data: myData, loading: myLoading, error: myError } =
-  useLiveQuery("my_positions", () => api("/api/my_positions"), {});
+  useLiveQuery("my_positions",
+    () => api("/api/my_positions" + (stratSel.value !== "current"
+      ? "?strategy=" + encodeURIComponent(stratSel.value) : "")), {});
 
 function refresh() {
   invalidate("my_positions");
@@ -33,9 +47,16 @@ const MY_COLS = [
   ["shares", "股数", true], ["cost_price", "成本价", true], ["last_price", "最新价", true],
   ["market_value", "持仓市值", true], ["pnl", "浮动盈亏", true], ["pnl_pct", "盈亏%", true],
   ["k_level", "策略档", true],
-  ["next_add_price", "下次加仓价", true], ["next_rearm_price", "再武装价", true],
+  ["next_add_price_raw", "下次加仓价", true], ["next_rearm_price_raw", "再武装价", true],
+  ["signal", "信号"],
   ["end_date", "数据截至"],
 ];
+
+// 加仓信号 → 行标记（signal 列）+ 顶部提示条
+const signalSet = computed(() => new Set((myData.value?.signals || []).map((s) => s.ts_code)));
+const displayRows = computed(() => (myData.value?.positions || []).map((p) => ({
+  ...p, signal: signalSet.value.has(p.ts_code) ? "🔔 加仓" : "",
+})));
 
 // ---------------------------------------------------------------------------
 // 顶部录入条（添加/更新）
@@ -223,6 +244,13 @@ function pnlColor(v) {
   <section class="tab-panel active">
     <div class="my-toolbar">
       <h3>💼 我的持仓</h3>
+      <label class="strat-sel">
+        <span>策略应用</span>
+        <select v-model="stratSel">
+          <option value="current">当前策略</option>
+          <option v-for="s in lib" :key="s.name" :value="s.name">{{ s.name }}（{{ s.saved_at }}）</option>
+        </select>
+      </label>
       <button class="ghost-btn" @click="refresh">🔄 刷新</button>
     </div>
 
@@ -254,6 +282,22 @@ function pnlColor(v) {
       </div>
     </div>
 
+    <!-- 加仓信号提示条（所选策略状态机 in_pos + 实时价 ≤ 下一档触发价） -->
+    <div v-if="myData && myData.signals && myData.signals.length" class="signal-banner">
+      <div class="signal-title">
+        🔔 加仓提示（{{ stratLabel }}）：{{ myData.signals.length }} 只达到加仓触发价
+        <span class="muted small">
+          · 价源：{{ myData.price_source === "spot" ? `实时行情${myData.spot_time ? " " + myData.spot_time : ""}` : "最新收盘（T+1）" }}
+        </span>
+      </div>
+      <div v-for="s in myData.signals" :key="s.ts_code" class="signal-row">
+        <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
+        <span>现价 {{ s.price }} ≤ 加仓触发价 {{ s.next_add_price }}</span>
+        <span>第 {{ s.k_level }} 档 → 第 {{ s.next_level }} 档</span>
+        <span v-if="s.suggested_amount != null">建议加仓 ≈ ¥{{ (s.suggested_amount / 10000).toFixed(1) }}万</span>
+      </div>
+    </div>
+
     <!-- 我的持仓表 -->
     <div class="card">
       <h3>当前持仓（{{ myData?.n ?? 0 }} 只）</h3>
@@ -272,7 +316,7 @@ function pnlColor(v) {
           <span>浮动盈亏 <b :style="{ color: pnlColor(t.pnl) }">
             {{ fmtW(t.pnl) }}（{{ fmtPct(t.pnl_pct) }}）</b></span>
         </div>
-        <SimpleTable :rows="myData.positions" :cols="MY_COLS"
+        <SimpleTable :rows="displayRows" :cols="MY_COLS"
                      empty="（尚未录入持仓——上方输入代码/股数/成本添加）" @row-click="onRow" />
       </template>
     </div>
@@ -284,7 +328,7 @@ function pnlColor(v) {
           <div v-for="[k, label] in [
             ['ts_code', '代码'], ['in_pos', '策略持仓中'], ['strat_shares', '策略模拟股数'],
             ['k_level', '当前档位 k'],
-            ['next_add_price', '下次加仓触发价'], ['next_rearm_price', '再武装触发价'],
+            ['next_add_price_raw', '下一加仓触发价'], ['next_rearm_price_raw', '再武装触发价'],
             ['last_price', '最新价'], ['end_date', '数据截至'],
           ]" :key="k" class="d-row">
             <span class="d-key">{{ label }}</span>

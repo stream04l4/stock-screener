@@ -517,6 +517,25 @@ tr.lake-row-muted .badge { opacity: .85; }
 .code-sug-list .sug-name { font-weight: 600; }
 .code-sug-list .sug-ind { margin-left: auto; padding-left: 14px; }
 
+/* ---------- v7.0.4 我的持仓：策略应用 + 加仓信号 ---------- */
+.strat-sel { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+.strat-sel select {
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 13px; background: #fff; max-width: 280px;
+}
+.signal-banner {
+  margin: 0 0 14px; padding: 12px 16px;
+  background: #fdecea; border: 1px solid #f5c6c0; border-left: 4px solid #c62828;
+  border-radius: 10px;
+}
+.signal-title { font-weight: 700; color: #c62828; margin-bottom: 8px; }
+.signal-row {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+  padding: 5px 0; font-size: 13.5px; border-top: 1px dashed #f0b9b2;
+}
+.signal-row:first-of-type { border-top: none; }
+.signal-row b { font-size: 14px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }

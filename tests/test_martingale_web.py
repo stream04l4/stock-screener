@@ -429,3 +429,103 @@ def test_stocks_search_lake_missing_503(tmp_path, monkeypatch):
         wapp.search_stocks("电力")
     assert ei.value.status_code == 503
     assert ei.value.detail["error"] == "lake_locked"
+
+
+
+
+# ---------------------------------------------------------------------------
+# /api/my_positions 策略应用 + 加仓信号（v7.0.4）
+# ---------------------------------------------------------------------------
+
+def _mock_spot(monkeypatch, prices, exc=None):
+    """替换 TencentClient.fetch 为假行情（测试零网络）。"""
+    import screener.data.tencent as tt
+
+    def fake_fetch(self, codes, batch_size=50):
+        if exc is not None:
+            raise exc
+        return {c: {"name": None, "price": prices[c], "timestamp": "20261022150500",
+                    "pct_chg": None} for c in codes if c in prices}
+    monkeypatch.setattr(tt.TencentClient, "fetch", fake_fetch)
+
+
+def test_my_positions_strategy_unknown_400(tmp_positions_file, tmp_path, monkeypatch):
+    """strategy=<不存在的库名> → 400 strategy_not_found（先于连湖）。"""
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", tmp_path / "strategies")
+    with pytest.raises(HTTPException) as ei:
+        wapp.get_my_positions(strategy="nope")
+    assert ei.value.status_code == 400
+    assert ei.value.detail["error"] == "strategy_not_found"
+
+
+def test_my_positions_empty_ledger_strategy_echo(tmp_positions_file, tmp_path, monkeypatch):
+    """空账本：不回湖，直接返回 strategy 回显 + 空 signals。"""
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", tmp_path / "strategies")
+    out = wapp.get_my_positions(strategy="current")
+    assert out["strategy"] == "current"
+    assert out["signals"] == []
+    assert out["n"] == 0
+
+
+def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypatch):
+    """实时价跌破下一档触发线 → 加仓信号（湖价单独判定永远为假：触线即买）。
+
+    中国神华 sh.601088（活动策略：k=0，raw 触发 42.07，湖最后价 49.27）：
+    - 无实时行情 → 回退湖价 49.27 > 42.07 → 无信号，price_source=lake；
+    - 实时价 40.0 ≤ 42.07 → 信号，建议加仓 = base×growth^0 = 10000。
+    """
+    wapp._up_write({"sh.601088": {"shares": 100, "cost_price": 45.0}})
+    _mock_spot(monkeypatch, {})
+    out0 = wapp.get_my_positions()
+    assert out0["price_source"] == "lake"
+    assert out0["signals"] == []
+    p0 = out0["positions"][0]
+    assert p0["in_pos"] is True and p0["k_level"] == 0
+    assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
+
+    _mock_spot(monkeypatch, {"sh.601088": 40.0})
+    out = wapp.get_my_positions()
+    assert out["price_source"] == "spot"
+    assert out["spot_time"] == "20261022150500"
+    assert len(out["signals"]) == 1
+    s = out["signals"][0]
+    assert s["ts_code"] == "sh.601088" and s["name"] == "中国神华"
+    assert s["action"] == "add"
+    assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
+    assert s["k_level"] == 0 and s["next_level"] == 1
+    assert s["suggested_amount"] == round(10000 * 1.1 ** 0)
+    assert out["positions"][0]["spot_price"] == 40.0
+
+
+def test_my_positions_signal_spot_failure_fallback(tmp_positions_file, bt_copy, monkeypatch):
+    """实时行情请求失败 → 回退湖价（只漏报不误报），不 500。"""
+    wapp._up_write({"sh.601088": {"shares": 100, "cost_price": 45.0}})
+    _mock_spot(monkeypatch, {}, exc=ConnectionError("net down"))
+    out = wapp.get_my_positions()
+    assert out["price_source"] == "lake"
+    assert out["signals"] == []
+    assert out["positions"][0]["spot_price"] is None
+
+
+def test_my_positions_strategy_switch_changes_reference(tmp_positions_file, bt_copy, tmp_path, monkeypatch):
+    """策略应用：切到策略库快照（dd 15%→10%）→ 触发价参考随之变化；湖价回退下不误报。"""
+    import yaml as _y
+    wapp._up_write({"sh.601088": {"shares": 100, "cost_price": 45.0}})
+    _mock_spot(monkeypatch, {})  # 无实时 → 恒无信号
+    out0 = wapp.get_my_positions()
+    nap0 = out0["positions"][0]["next_add_price_raw"]
+    assert out0["signals"] == []
+    lib = tmp_path / "strategies"
+    lib.mkdir()
+    cfg = _y.safe_load(wapp.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg["strategy"]["first_drawdown_pct"] = 10
+    (lib / "loose.yaml").write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", lib)
+    out1 = wapp.get_my_positions(strategy="loose")
+    assert out1["strategy"] == "loose"
+    nap1 = out1["positions"][0]["next_add_price_raw"]
+    assert nap1 is not None and nap1 != nap0  # 策略参数不同 → 触发线不同
+    assert out1["signals"] == []
+    with pytest.raises(HTTPException) as ei:
+        wapp.get_my_positions(strategy="nope")
+    assert ei.value.status_code == 400
