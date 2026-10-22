@@ -41,10 +41,31 @@ const MY_SIGNAL = {
   ],
 };
 
+const MY_BUY = {
+  ...JSON.parse(JSON.stringify(MY)),
+  price_source: "spot",
+  spot_time: "20261022150500",
+  n: 2,
+  positions: [
+    ...JSON.parse(JSON.stringify(MY.positions)),
+    { ts_code: "sh.600941", name: "中国移动", shares: 200, cost_price: 95.0,
+      last_price: 96.59, market_value: 19318, pnl: 318, pnl_pct: 1.67,
+      updated_at: "2026-10-22T01:00:00Z",
+      in_pos: false, strat_shares: null, k_level: 0,
+      next_add_price: 72.36, next_rearm_price: null,
+      next_add_price_raw: 72.36, next_rearm_price_raw: null, end_date: "2026-10-21" },
+  ],
+  signals: [
+    { ts_code: "sh.600941", name: "中国移动", price: 70.0, next_add_price: 72.36,
+      k_level: 0, next_level: 1, suggested_amount: 100000, action: "buy" },
+  ],
+  totals: { market_value: 60000, cost: 50000, pnl: 10000, pnl_pct: 20.0 },
+};
+
 const MY_EMPTY = { as_of: null, n: 0, positions: [],
   totals: { market_value: 0, cost: 0, pnl: 0, pnl_pct: null } };
 
-function mockApi(my) {
+function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }]) {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path.startsWith("/api/my_positions") && (!opts || !opts.method || opts.method === "GET")) {
       return JSON.parse(JSON.stringify(my));
@@ -54,7 +75,7 @@ function mockApi(my) {
       return { ok: true, ts_code: body.ts_code, n: 1 };
     }
     if (path === "/api/strategies") {
-      return [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }];
+      return JSON.parse(JSON.stringify(strategies));
     }
     if (path.startsWith("/api/stocks/search")) {
       const q = decodeURIComponent((path.split("q=")[1] || "").trim());
@@ -89,6 +110,7 @@ beforeEach(() => {
   // registry 是模块级单例（会话缓存语义）→ 测试间必须清缓存，否则首个测试的
   // 数据（或空数据）会被后续测试的挂载直接命中。
   invalidate("my_positions");
+  localStorage.clear(); // 策略选择持久化 → 测试间隔离
   vi.stubGlobal("confirm", vi.fn(() => true));
 });
 
@@ -172,8 +194,9 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     const w = mk();
     await flushPromises();
     expect(w.find(".signal-banner").exists()).toBe(true);
-    expect(w.text()).toContain("加仓提示");
-    expect(w.text()).toContain("1 只达到加仓触发价");
+    expect(w.text()).toContain("信号提示");
+    expect(w.text()).toContain("1 只达到触发价位");
+    expect(w.text()).toContain("加仓"); // 信号 tag
     expect(w.text()).toContain("中国神华");
     expect(w.text()).toContain("现价 40"); // 现价（实时价，数字渲染为 40）
     expect(w.text()).toContain("42.07"); // 触发价（原始口径）
@@ -182,6 +205,49 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     expect(w.text()).toContain("¥10.0万"); // suggested_amount 100000 → 10.0万
     // 表格信号列
     expect(w.text()).toContain("🔔 加仓");
+    w.unmount();
+  });
+
+  it("买入（首仓）信号 → 提示条「买入·首仓」+ 表格信号列 🔔 买入", async () => {
+    mockApi(MY_BUY);
+    const w = mk();
+    await flushPromises();
+    expect(w.find(".signal-banner").exists()).toBe(true);
+    expect(w.text()).toContain("买入·首仓");
+    expect(w.text()).toContain("中国移动");
+    expect(w.text()).toContain("现价 70");
+    expect(w.text()).toContain("首仓（第 1 档）");
+    expect(w.text()).toContain("建议买入 ≈ ¥10.0万");
+    // 表格信号列：只有触发行有标记
+    expect(w.text()).toContain("🔔 买入");
+    expect(w.text()).not.toContain("🔔 加仓");
+    w.unmount();
+  });
+
+  it("策略选择持久化：挂载恢复 localStorage 选择 + 切换写回", async () => {
+    mockApi(MY);
+    localStorage.setItem("ss.mypos.strategy", "保守_低档");
+    const w = mk();
+    await flushPromises();
+    const sel = w.find(".strat-sel select");
+    // 恢复后请求带 ?strategy=（先 current 后切换重拉，两次都应出现）
+    await vi.waitFor(() =>
+      expect(apiMock.mock.calls.some(([p]) => p === "/api/my_positions?strategy=" + encodeURIComponent("保守_低档"))).toBe(true));
+    expect(sel.element.value).toBe("保守_低档");
+    // 切回 current → localStorage 更新
+    await sel.setValue("current");
+    await flushPromises();
+    expect(localStorage.getItem("ss.mypos.strategy")).toBe("current");
+    w.unmount();
+  });
+
+  it("持久化的策略已从库删除 → 静默回退当前策略（不发 ?strategy=）", async () => {
+    mockApi(MY, []); // 策略库为空
+    localStorage.setItem("ss.mypos.strategy", "已删除的策略");
+    const w = mk();
+    await flushPromises();
+    expect(w.find(".strat-sel select").element.value).toBe("current");
+    expect(apiMock.mock.calls.some(([p]) => p.startsWith("/api/my_positions?"))).toBe(false);
     w.unmount();
   });
 

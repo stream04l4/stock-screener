@@ -40,17 +40,20 @@ describe("queryRegistry: 请求合并/去重", () => {
     expect(peek("k")).toEqual({ v: 1 });
   });
 
-  it("in-flight 期间 invalidate 不重复发请求（共享同一 Promise）", async () => {
+  it("in-flight 期间 invalidate：去重不重复发，但完成后必须补刷（竞态回归见下方 describe）", async () => {
     let calls = 0;
     const d = deferred();
-    subscribe("k", () => { calls += 1; return d.promise; }, {});
+    const d2 = deferred();
+    subscribe("k", () => { calls += 1; return calls === 1 ? d.promise : d2.promise; }, {});
     await vi.advanceTimersByTimeAsync(0); // fetcher 已执行（in-flight）
-    invalidate("k"); // in-flight 中失效：at=null，但 refresh 看到 inFlight → 复用
-    expect(calls).toBe(1);
+    invalidate("k"); // in-flight 中失效：at=null，refresh 复用 in-flight + 打 dirty
+    expect(calls).toBe(1); // 去重：此刻不重复发
     d.resolve("x");
     await vi.advanceTimersByTimeAsync(0);
-    expect(calls).toBe(1);
-    expect(peek("k")).toBe("x");
+    expect(calls).toBe(2); // 完成 → dirty 补刷（旧实现卡死在 1，数据永久停留旧参数）
+    d2.resolve("y");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(peek("k")).toBe("y");
   });
 
   it("失败后再次订阅会重试（inFlight 已清）", async () => {
@@ -231,5 +234,59 @@ describe("queryRegistry: invalidate(prefix) 事件总线", () => {
     subscribe("k", fetcher, { ttl: 60000 }); // TTL 内（刚刷新过）→ 不重发
     await vi.advanceTimersByTimeAsync(0);
     expect(calls).toBe(2);
+  });
+});
+
+describe("queryRegistry: in-flight 期间 invalidate（竞态回归）", () => {
+  it("首载未完成时 invalidate → 在途完成后自动补一次刷新", async () => {
+    let calls = 0;
+    const d1 = deferred(), d2 = deferred();
+    const fetcher = () => {
+      calls += 1;
+      return calls === 1 ? d1.promise : d2.promise;
+    };
+    subscribe("k", fetcher, {});
+    await vi.advanceTimersByTimeAsync(0); // 首载进入 in-flight（未 resolve）
+    expect(calls).toBe(1);
+
+    invalidate("k"); // in-flight 去重 → dirty
+    d1.resolve({ v: 1 });
+    await vi.advanceTimersByTimeAsync(0); // 首载完成 → 触发补刷
+    expect(calls).toBe(2); // 补刷已发起
+    d2.resolve({ v: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(peek("k")).toEqual({ v: 2 }); // 最终数据来自补刷（新参数）
+  });
+
+  it("首载失败路径同样补刷（in-flight 期间 invalidate）", async () => {
+    let calls = 0;
+    const d1 = deferred(), d2 = deferred();
+    const fetcher = () => {
+      calls += 1;
+      return calls === 1 ? d1.promise : d2.promise;
+    };
+    subscribe("k", fetcher, {});
+    await vi.advanceTimersByTimeAsync(0);
+    invalidate("k");
+    d1.reject(new Error("boom"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(2); // 失败也补刷
+    d2.resolve({ v: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(peek("k")).toEqual({ v: 2 });
+  });
+
+  it("并发 subscribe 去重不补刷（只发一次请求，原契约不破坏）", async () => {
+    let calls = 0;
+    const d1 = deferred();
+    const fetcher = () => { calls += 1; return d1.promise; };
+    subscribe("k", fetcher, {});
+    await vi.advanceTimersByTimeAsync(0);
+    subscribe("k", fetcher, {}); // 并发订阅：去重进在途（at 仍 null）
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    d1.resolve({ v: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1); // 无补刷
   });
 });

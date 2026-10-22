@@ -929,10 +929,12 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     - 空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
     - strategy：策略选择（同 /api/bt/runs 语义）——缺省/"current" = 活动策略
       config/strategy.yaml；策略库名 → data/strategies/<name>.yaml；不存在 → 400。
-    - signals：加仓提示——策略模拟持仓中（in_pos）且**现价**已跌破下一档触发价。
+    - signals：买卖提示——现价已跌破所选策略的下一触发价位：
+      持仓中（in_pos，第 k 档）→ action="add"（加仓一档，base×growth^k）；
+      未持仓（never，k=0）→ action="buy"（首仓触发，initial_amount）。
       现价 = 腾讯实时行情（price_source="spot"）；行情失败回退湖最后价
       （price_source="lake"，只漏报不误报）。状态机「触线即买」→ 湖最后 bar 处
-      湖价恒高于触发价，故必须用实时价判定。金额 = base_add_amount × growth^k。
+      湖价恒高于触发价，故必须用实时价判定。
     """
     user = _up_read()
     strategy_name = (strategy or "current").strip() or "current"
@@ -1011,25 +1013,32 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     for pos in positions:
         p_now = (spot.get(pos["ts_code"]) or {}).get("price")
         pos["spot_price"] = p_now
-    # 信号：in_pos 且 现价（实时优先）≤ 下一档触发价（原始口径）
+    # 信号：现价（实时优先）≤ 下一档触发价（原始口径）
+    # - in_pos（持仓中，第 k 档）→ "add"：加仓到第 k+1 档，金额 = base×growth^k
+    # - 未持仓（last_status=never，k=0）→ "buy"：首仓买入触发，金额 = initial_amount
+    # （状态机「触线即买」→ 湖最后 bar 处湖价恒高于触发价，必须实时价判定）
     signals: List[Dict[str, Any]] = []
     for pos in positions:
         price_now = pos["spot_price"] if pos["spot_price"] is not None else pos.get("last_price")
         nap_raw = pos.get("next_add_price_raw")
-        if not (pos.get("in_pos") and price_now is not None
-                and nap_raw is not None and price_now <= nap_raw):
+        if not (price_now is not None and nap_raw is not None and price_now <= nap_raw):
             continue
         k = pos.get("k_level") or 0
-        suggested = (_sp.base_add_amount * (_sp.growth_ratio ** k)) if _sp is not None else None
+        if pos.get("in_pos"):
+            suggested = (_sp.base_add_amount * (_sp.growth_ratio ** k)) if _sp is not None else None
+            action, next_level = "add", k + 1
+        else:
+            suggested = _sp.initial_amount if _sp is not None else None
+            action, next_level = "buy", 1
         signals.append({
             "ts_code": pos["ts_code"],
             "name": pos["name"],
             "price": price_now,
             "next_add_price": nap_raw,
             "k_level": k,
-            "next_level": k + 1,
+            "next_level": next_level,
             "suggested_amount": round(suggested) if suggested is not None else None,
-            "action": "add",
+            "action": action,
         })
     signals.sort(key=lambda x: x["ts_code"])
     return {

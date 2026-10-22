@@ -23,11 +23,13 @@ function isStale(entry) {
 
 // 触发一次刷新（in-flight 去重：同 key 已有在途请求 → 共享同一 Promise）。
 // 失败时保留旧值与 lastError，向调用方 rethrow。
+// dirty 语义：in-flight 期间被 invalidate() 打标记 → 本次完成（成功或失败）后
+// 自动再刷一次。否则"标记过期"会被去重吞掉（完成时无条件 at=now）→
+// 订阅者数据永久停留在旧策略/旧参数。
 async function refresh(key) {
   const entry = registry.get(key);
   if (!entry) throw new Error(`queryRegistry: unknown key "${key}"`);
   if (entry.inFlight) return entry.inFlight;
-
   const p = Promise.resolve()
     .then(() => entry.fetcher())
     .then((data) => {
@@ -36,6 +38,10 @@ async function refresh(key) {
       entry.lastError = null;
       if (entry.inFlight === p) entry.inFlight = null; // 完成才清（失败路径见 catch）
       notify(entry);
+      if (entry.dirty) {
+        entry.dirty = false;
+        refresh(key).catch(() => {}); // in-flight 期间被 invalidate → 补一次刷新
+      }
       return data;
     })
     .catch((err) => {
@@ -50,6 +56,10 @@ async function refresh(key) {
       //   - SWR 后台刷新失败 → data 保留旧值、error 透出、loading 不翻转（旧值照常展示）
       // 时序与成功分支一致：先清 inFlight 再 notify（避免订阅者同步重入时去重锚点未清）。
       notify(entry);
+      if (entry.dirty) {
+        entry.dirty = false;
+        refresh(key).catch(() => {}); // in-flight 期间被 invalidate → 补一次刷新
+      }
       throw err;
     });
   entry.inFlight = p;
@@ -117,11 +127,17 @@ export function unsubscribe(key) {
 }
 
 // 事件总线：前缀失效。at=null 标记过期；refcount>0 → 立即后台刷新，否则仅清缓存。
+// in-flight 期间被 invalidate：本次刷新会去重进在途 Promise → 打 dirty 标记，
+// 在途完成后自动补一次刷新（否则 at=now 吞掉过期标记 → 数据永久停留旧参数，
+// 如"我的持仓"挂载首载未完成时切策略/恢复持久化策略的场景）。
 export function invalidate(prefix = "") {
   for (const [key, entry] of [...registry]) {
     if (!key.startsWith(prefix)) continue;
     entry.at = null;
-    if (entry.refcount > 0) refresh(key).catch(() => {});
+    if (entry.refcount > 0) {
+      if (entry.inFlight) entry.dirty = true;
+      else refresh(key).catch(() => {});
+    }
   }
 }
 

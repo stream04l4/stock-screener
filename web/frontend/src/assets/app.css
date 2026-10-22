@@ -535,6 +535,12 @@ tr.lake-row-muted .badge { opacity: .85; }
 }
 .signal-row:first-of-type { border-top: none; }
 .signal-row b { font-size: 14px; }
+.signal-tag {
+  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  font-size: 12px; font-weight: 700; white-space: nowrap;
+}
+.tag-buy { background: #ffe0b2; color: #e65100; }   /* 买入·首仓：橙 */
+.tag-add { background: #ffcdd2; color: #b71c1c; }   /* 加仓：红 */
 
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }

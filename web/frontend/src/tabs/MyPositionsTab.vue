@@ -20,12 +20,23 @@ const store = useTaskStore();
 // ---------------------------------------------------------------------------
 const stratSel = ref("current"); // "current"（活动策略 strategy.yaml）| 策略库名
 const lib = ref([]);             // 策略库条目（策略页"另存为"的快照）
+// 策略选择持久化（localStorage）：刷新/重开页面保留上次选择；
+// 先按 current 挂载（不发无效请求），lib 加载后校验再切换 → 触发重拉。
+const STRAT_LS_KEY = "ss.mypos.strategy";
 onMounted(async () => {
+  let saved = "";
+  try { saved = localStorage.getItem(STRAT_LS_KEY) || ""; } catch { saved = ""; }
   try { lib.value = await api("/api/strategies"); } catch { lib.value = []; }
+  if (saved && saved !== "current" && lib.value.some((s) => s.name === saved)) {
+    stratSel.value = saved; // 库条目已删除 → 保持 current，静默回退
+  }
 });
 const stratLabel = computed(() => stratSel.value === "current" ? "当前策略" : stratSel.value);
-// 切换策略 → 失效缓存重拉（fetcher 闭包读 stratSel，带 ?strategy=）
-watch(stratSel, () => invalidate("my_positions"));
+// 切换策略 → 失效缓存重拉（fetcher 闭包读 stratSel，带 ?strategy=）+ 记住选择
+watch(stratSel, (v) => {
+  invalidate("my_positions");
+  try { localStorage.setItem(STRAT_LS_KEY, v); } catch { /* 隐私模式等：忽略 */ }
+});
 
 // ---------------------------------------------------------------------------
 // 数据（按需 + 手动刷新；?strategy= 策略选择）
@@ -52,11 +63,12 @@ const MY_COLS = [
   ["end_date", "数据截至"],
 ];
 
-// 加仓信号 → 行标记（signal 列）+ 顶部提示条
-const signalSet = computed(() => new Set((myData.value?.signals || []).map((s) => s.ts_code)));
-const displayRows = computed(() => (myData.value?.positions || []).map((p) => ({
-  ...p, signal: signalSet.value.has(p.ts_code) ? "🔔 加仓" : "",
-})));
+// 买卖信号 → 行标记（signal 列）+ 顶部提示条
+const signalSet = computed(() => new Map((myData.value?.signals || []).map((s) => [s.ts_code, s])));
+const displayRows = computed(() => (myData.value?.positions || []).map((p) => {
+  const s = signalSet.value.get(p.ts_code);
+  return { ...p, signal: s ? (s.action === "buy" ? "🔔 买入" : "🔔 加仓") : "" };
+}));
 
 // ---------------------------------------------------------------------------
 // 顶部录入条（添加/更新）
@@ -282,19 +294,24 @@ function pnlColor(v) {
       </div>
     </div>
 
-    <!-- 加仓信号提示条（所选策略状态机 in_pos + 实时价 ≤ 下一档触发价） -->
+    <!-- 买卖信号提示条（所选策略：现价 ≤ 下一触发价位；实时价判定，价源标注） -->
     <div v-if="myData && myData.signals && myData.signals.length" class="signal-banner">
       <div class="signal-title">
-        🔔 加仓提示（{{ stratLabel }}）：{{ myData.signals.length }} 只达到加仓触发价
+        🔔 信号提示（{{ stratLabel }}）：{{ myData.signals.length }} 只达到触发价位
         <span class="muted small">
           · 价源：{{ myData.price_source === "spot" ? `实时行情${myData.spot_time ? " " + myData.spot_time : ""}` : "最新收盘（T+1）" }}
         </span>
       </div>
       <div v-for="s in myData.signals" :key="s.ts_code" class="signal-row">
+        <span class="signal-tag" :class="s.action === 'buy' ? 'tag-buy' : 'tag-add'">
+          {{ s.action === "buy" ? "买入·首仓" : "加仓" }}
+        </span>
         <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
-        <span>现价 {{ s.price }} ≤ 加仓触发价 {{ s.next_add_price }}</span>
-        <span>第 {{ s.k_level }} 档 → 第 {{ s.next_level }} 档</span>
-        <span v-if="s.suggested_amount != null">建议加仓 ≈ ¥{{ (s.suggested_amount / 10000).toFixed(1) }}万</span>
+        <span>现价 {{ s.price }} ≤ 触发价 {{ s.next_add_price }}</span>
+        <span>{{ s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档` }}</span>
+        <span v-if="s.suggested_amount != null">
+          建议{{ s.action === "buy" ? "买入" : "加仓" }} ≈ ¥{{ (s.suggested_amount / 10000).toFixed(1) }}万
+        </span>
       </div>
     </div>
 

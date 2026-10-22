@@ -529,3 +529,35 @@ def test_my_positions_strategy_switch_changes_reference(tmp_positions_file, bt_c
     with pytest.raises(HTTPException) as ei:
         wapp.get_my_positions(strategy="nope")
     assert ei.value.status_code == 400
+
+
+def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path, monkeypatch):
+    """买入（首仓）信号：所选策略下未持仓（never）→ 实时价跌破首仓触发线 → buy。
+
+    活动策略（dd=15%）下池内 101 只全部 in_pos（十年内都经历过 ≥15% 回撤）；
+    更严格变体 dd=25% 下 sh.600941 从未触线（k=0，raw 触发 72.36，湖价 96.59）。
+    策略选择因此直接改变信号集合——同一账本，不同策略，不同提示。
+    """
+    import yaml as _y
+    wapp._up_write({"sh.600941": {"shares": 100, "cost_price": 100.0}})
+    lib = tmp_path / "strategies"
+    lib.mkdir()
+    cfg = _y.safe_load(wapp.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg["strategy"]["first_drawdown_pct"] = 25
+    (lib / "strict.yaml").write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setattr(wapp, "STRATEGIES_DIR", lib)
+    _mock_spot(monkeypatch, {})  # 湖价回退：96.59 > 72.36 → 不误报
+    out0 = wapp.get_my_positions(strategy="strict")
+    p0 = out0["positions"][0]
+    assert p0["in_pos"] is False and p0["k_level"] == 0
+    assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
+    assert out0["signals"] == []
+    # 实时价 70.0 ≤ 72.36 → buy 信号，建议金额 = initial_amount = 100000
+    _mock_spot(monkeypatch, {"sh.600941": 70.0})
+    out = wapp.get_my_positions(strategy="strict")
+    assert len(out["signals"]) == 1
+    s = out["signals"][0]
+    assert s["ts_code"] == "sh.600941" and s["action"] == "buy"
+    assert s["price"] == 70.0 and s["price"] <= s["next_add_price"]
+    assert s["k_level"] == 0 and s["next_level"] == 1
+    assert s["suggested_amount"] == 100000  # initial_amount（变体 yaml 继承活动值）
