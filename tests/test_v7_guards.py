@@ -10,7 +10,9 @@
    - README.md / stages/ 为历史文档（删码记录）；
    - scripts/run_lake_sync_daily.sh 头注里的 09-23 事故说明是注释（历史）。
 2) crontab 仅剩 lake-sync 一条业务行（绝不含 run_cron）。
-3) git diff 8c49f71 -- lake/ 为空（lake 包零改动）。
+3) git diff BASELINE -- lake/ 为空（lake 包相对基线零改动）。
+   基线演进：8c49f71（v7.0.0 原始红线）→ b41fc5c（v7.0.7：Joel 2026-10-22
+   拍板砍 T5 roe_avg/ocf + T6 controller_* 死列，lake/ 有意变更，基线前移）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -27,7 +29,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-BASELINE = "8c49f71"
+# v7.0.7（b41fc5c）：lake/ 死列砍除经 Joel 拍板，基线从 v7.0.0（8c49f71）前移。
+BASELINE = "b41fc5c"
 
 
 def _git(*args) -> str:
