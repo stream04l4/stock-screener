@@ -1,0 +1,2 @@
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sz.000858,2621,1,49,43,605354.981,0.0,576613.883917832,133892.42367547052,-162633.5207576385,-28741.09708216798,-0.04747808803801348,-0.2583215907573027,2018-02-07T00:00:00.000000000,2026-06-23T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,五 粮 液

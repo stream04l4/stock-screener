@@ -1,0 +1,2 @@
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sh.600938,1090,1,21,10,200510.0,0.0,414582.0543756826,47056.40782622274,167015.64654945987,214072.0543756826,1.0676377954998884,-0.02700431506849316,2022-08-04T00:00:00.000000000,2026-06-26T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,中国海油

@@ -29,3 +29,6 @@ output/
 # Web 前端（D1 框架化重构）：构建产物与依赖不入库；package-lock.json 提交
 web/dist/
 web/frontend/node_modules/
+
+# v7：Web PUT /api/strategy 写回前的运行时备份（保留最近一份，可随时手删；不入库）
+config/strategy.yaml.bak

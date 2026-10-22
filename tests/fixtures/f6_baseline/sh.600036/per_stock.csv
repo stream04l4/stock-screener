@@ -1,0 +1,2 @@
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sh.600036,2621,1,35,22,326610.0,0.0,748168.7162999357,165479.62399222396,256079.09230771175,421558.7162999357,1.2907097648569723,-0.028921267893660552,2016-02-03T00:00:00.000000000,2026-05-22T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,招商银行

@@ -1,0 +1,2 @@
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sh.600900,2604,1,16,1,100000.0,0.0,166047.7683183183,18094.169719719717,47953.598598598575,66047.7683183183,0.660477683183183,-0.0003,2022-11-03T00:00:00.000000000,2022-11-03T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,长江电力

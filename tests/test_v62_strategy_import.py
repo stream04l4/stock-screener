@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
-"""v6.2 O3 回归测试：POST /api/strategy/import（加载策略文件）+ PUT 抽公共函数零回归。
+"""v6.2 O3 回归测试（v7 按新 schema 重写）：POST /api/strategy/import + PUT 共校验函数。
 
-纪律（brief 红线）：
+纪律（红线）：
 - strategy.yaml 是生产配置 → 所有写路径测试用 tmp 副本（monkeypatch CONFIG_PATH），绝不写生产 yaml；
 - .bak 机制保留（备份路径由 CONFIG_PATH 现算，tmp 隔离下落 tmp）；
-- PUT /api/strategy 对外行为逐字节不变（抽 _apply_strategy_write 后现有测试原样全绿 + 本文件补响应形状断言）。
+- import 与 PUT 走同一 _apply_strategy_write（_validate_strategy + martingale.config.load_config
+  双校验 → .bak → ruamel round-trip 写回）。
 
-覆盖：
+覆盖（v7 slim schema：strategy 9 键 / universe 5 键）：
 1) import 合法 yaml → 200 {ok, backup, sections}，写盘生效 + .bak 备份存在；
-2) import 非法 yaml（语法错误）→ 400 errors，不写盘；
-3) import 非 mapping（list）→ 400 errors；
-4) import 缺字段 → 400 errors（复用 PUT 同一套 _validate_strategy）；
-5) import 类型错误 → 400 errors；
-6) PUT 响应形状逐字节同旧版 {"ok": True, "backup": str}（不含 sections）。
-
-不联网、不碰 BaoStock、不碰生产 config/strategy.yaml。
+2) import no-op（原样文本）→ 逐字节还原；
+3) import 非法 yaml（语法错误）→ 400，不写盘；
+4) import 非 mapping（list）→ 400；
+5) import 缺字段（strategy.add_step_pct）→ 400 报 "缺少配置项: strategy.add_step_pct"；
+6) import 类型错误（initial_amount 改字符串）→ 400；
+7) PUT 响应形状 {"ok": True, "backup": str} + 写盘/备份；
+8) PUT 超范围（growth_ratio=-1）→ 400 {errors}，不写盘；
+9) import 与 PUT 对同一非法 payload 报同样错误列表（校验一致性）。
 """
 from __future__ import annotations
 
@@ -46,7 +48,7 @@ def _setup_tmp_config(tmp_path, monkeypatch) -> Path:
 def _valid_payload() -> dict:
     """当前生产 yaml 的合法 payload（改一个值确保写盘路径真正执行）。"""
     p = yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
-    p["scoring"]["top_n"] = 51  # 触发真实改动（原 50）
+    p["strategy"]["base_add_amount"] = int(p["strategy"]["base_add_amount"]) + 1  # 触发真实改动
     return p
 
 
@@ -57,33 +59,30 @@ def _valid_payload() -> dict:
 def test_import_valid_yaml_200_writes_and_backs_up(tmp_path, monkeypatch):
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before_hash = target.read_bytes()
+    new_val = int(yaml.safe_load(before_hash)["strategy"]["base_add_amount"]) + 1
 
     payload = _valid_payload()
     raw = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
     res = appmod.import_strategy(appmod.ImportStrategyRequest(raw=raw))
 
-    # 200 形状：{ok, backup, sections}
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
-    assert "scoring" in res["sections"] and "technical" in res["sections"]
+    assert "strategy" in res["sections"] and "universe" in res["sections"]
 
-    # 写盘生效（top_n 50→51）
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-    assert reloaded["scoring"]["top_n"] == 51
+    assert reloaded["strategy"]["base_add_amount"] == new_val
 
-    # .bak 备份存在且 = 改前内容
     bak = Path(res["backup"])
     assert bak.exists()
     assert bak.read_bytes() == before_hash
 
 
 def test_import_noop_roundtrip_byte_identical(tmp_path, monkeypatch):
-    """import 与当前文件语义相同的 yaml → round-trip 逐字节还原（D-W03 注释保留）。"""
+    """import 与当前文件语义相同的 yaml → round-trip 逐字节还原（注释保留）。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     orig_text = target.read_text(encoding="utf-8")
 
-    raw = orig_text  # 原样导入（no-op）
-    res = appmod.import_strategy(appmod.ImportStrategyRequest(raw=raw))
+    res = appmod.import_strategy(appmod.ImportStrategyRequest(raw=orig_text))
     assert res["ok"] is True
     assert target.read_text(encoding="utf-8") == orig_text, "no-op import 后文件字节变化"
 
@@ -113,61 +112,61 @@ def test_import_non_mapping_400(tmp_path, monkeypatch):
 
 
 def test_import_missing_field_400(tmp_path, monkeypatch):
-    """缺字段 → 复用 PUT 同一套 _validate_strategy 报 400。"""
+    """缺字段 → 复用 PUT 同一套校验报 400（含 martingale.config 语义校验）。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before = target.read_bytes()
     p = _valid_payload()
-    del p["dividend"]["min_yield_pct"]
+    del p["strategy"]["add_step_pct"]
     raw = yaml.safe_dump(p, allow_unicode=True, sort_keys=False)
     with pytest.raises(appmod.HTTPException) as ei:
         appmod.import_strategy(appmod.ImportStrategyRequest(raw=raw))
     assert ei.value.status_code == 400
-    assert any("dividend.min_yield_pct" in e for e in ei.value.detail["errors"])
+    assert any("strategy.add_step_pct" in e for e in ei.value.detail["errors"])
     assert target.read_bytes() == before
 
 
 def test_import_type_error_400(tmp_path, monkeypatch):
-    """类型错误（top_n 改字符串）→ 400。"""
+    """类型错误（initial_amount 改字符串）→ 400。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before = target.read_bytes()
     p = _valid_payload()
-    p["scoring"]["top_n"] = "fifty"
+    p["strategy"]["initial_amount"] = "ten-thousand"
     raw = yaml.safe_dump(p, allow_unicode=True, sort_keys=False)
     with pytest.raises(appmod.HTTPException) as ei:
         appmod.import_strategy(appmod.ImportStrategyRequest(raw=raw))
     assert ei.value.status_code == 400
-    assert any("scoring.top_n" in e for e in ei.value.detail["errors"])
+    assert any("strategy.initial_amount" in e for e in ei.value.detail["errors"])
     assert target.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------
-# PUT：抽公共函数后对外行为逐字节不变（响应形状 + 写盘/备份）
+# PUT：响应形状 + 写盘/备份
 # ---------------------------------------------------------------------------
 
-def test_put_response_shape_unchanged(tmp_path, monkeypatch):
-    """PUT 响应仍为 {"ok": True, "backup": str}（不含 sections，逐字节同旧版）。"""
+def test_put_response_shape(tmp_path, monkeypatch):
     target = _setup_tmp_config(tmp_path, monkeypatch)
+    new_val = int(yaml.safe_load(target.read_bytes())["strategy"]["base_add_amount"]) + 1
     payload = _valid_payload()
     res = appmod.put_strategy(copy.deepcopy(payload))
     assert set(res.keys()) == {"ok", "backup"}
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
-    # 写盘生效 + 备份存在
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-    assert reloaded["scoring"]["top_n"] == 51
+    assert reloaded["strategy"]["base_add_amount"] == new_val
     assert Path(res["backup"]).exists()
 
 
-def test_put_invalid_400_shape(tmp_path, monkeypatch):
-    """PUT 非法 payload → 400 {errors}（形状不变）。"""
+def test_put_out_of_range_400(tmp_path, monkeypatch):
+    """PUT 超范围（growth_ratio=-1）→ 400 {errors}，不写盘。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before = target.read_bytes()
     p = _valid_payload()
-    p["scoring"]["top_n"] = -5  # 超范围
+    p["strategy"]["growth_ratio"] = -1
     with pytest.raises(appmod.HTTPException) as ei:
         appmod.put_strategy(p)
     assert ei.value.status_code == 400
     assert "errors" in ei.value.detail
+    assert any("growth_ratio" in e for e in ei.value.detail["errors"])
     assert target.read_bytes() == before
 
 
@@ -179,7 +178,7 @@ def test_import_and_put_share_validation(tmp_path, monkeypatch):
     """同一非法 payload：import 与 PUT 都应 400 且报同样的字段错误。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     p = _valid_payload()
-    del p["hard_filter"]["st_enabled"]
+    del p["strategy"]["growth_ratio"]
 
     raw = yaml.safe_dump(p, allow_unicode=True, sort_keys=False)
     with pytest.raises(appmod.HTTPException) as ei_imp:

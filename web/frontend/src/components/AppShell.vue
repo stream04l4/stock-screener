@@ -1,32 +1,30 @@
-// 应用壳（4 页签，lake-source brief E 节：运行/结果合并为单一"运行"tab）：
-// 移植 index.html topbar/main/footnote 结构 + app.js switchTab 行为。
+// 应用壳（v7.0 四页签）：回测 / 查询 / 策略 / 数据湖。
 // - 不引入 vue-router：页签 = 应用内状态（active ref）。
-// - 非当前 tab 内容懒挂载：v-if="active === x" → 首次激活才渲染并发请求（报告 §3 / brief B0）。
-//   已挂载过的 tab 用 keep-alive 保活（旧版 .tab-panel 隐藏不销毁，切回状态仍在——行为一致）。
+// - 非当前 tab 内容懒挂载：v-if="active === x" → 首次激活才渲染并发请求。
+//   已挂载过的 tab 用 keep-alive 保活（切回状态仍在）。
+// v7.0：v6"运行"页签（日跑+多因子回测）随策略核心移除；回测成为主工作流页签。
 <script setup>
 import { ref } from "vue";
 import ToastBar from "./ToastBar.vue";
-import StrategyTab from "../tabs/StrategyTab.vue";
 import BacktestTab from "../tabs/BacktestTab.vue";
-import RunTab from "../tabs/RunTab.vue";
+import QueryTab from "../tabs/QueryTab.vue";
+import StrategyTab from "../tabs/StrategyTab.vue";
 import LakeTab from "../tabs/LakeTab.vue";
 
-const emit = defineEmits(["open-stock"]);
-
 const TABS = [
-  ["run", "运行"],
-  ["strategy", "策略"],
   ["backtest", "回测"],
+  ["query", "查询"],
+  ["strategy", "策略"],
   ["lake", "数据湖"],
 ];
 
-// lake-source brief E 节：默认激活"运行"（原结果页内容已并入其下半区）
-const active = ref("run");
+// 默认激活"回测"（v7 主工作流：按需回测 + 进度 + 结果）
+const active = ref("backtest");
 </script>
 
 <template>
   <header class="topbar">
-    <div class="brand">📈 A股四维选股 <span class="sub">技术面 · 股息率 · 行业排名 · 基本面（v2 多因子打分）</span></div>
+    <div class="brand">📉 深回撤金字塔加仓 <span class="sub">A股深回撤加仓单策略 · 高点回撤首仓 · 阶梯加仓不封顶（v7.0）</span></div>
     <nav class="tabs">
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
@@ -35,16 +33,16 @@ const active = ref("run");
 
   <main>
     <keep-alive>
-      <RunTab v-if="active === 'run'" @open-stock="(code, day) => emit('open-stock', code, day)" />
+      <BacktestTab v-if="active === 'backtest'" />
+      <QueryTab v-else-if="active === 'query'" />
       <StrategyTab v-else-if="active === 'strategy'" />
-      <BacktestTab v-else-if="active === 'backtest'" />
       <LakeTab v-else-if="active === 'lake'" />
     </keep-alive>
   </main>
 
   <footer class="footnote">
-    数据源：BaoStock（日K / 分红 / 季报 / 行业 / 股票列表）；A股日K为 T+1 更新，筛选运行日 = 请求日期回退到的最近交易日。
-    v2：稳定键增量缓存（kline_af3 + adjfactor 本地重建后复权价）+ 截面 Z-Score 多因子打分；行业 = 证监会二级分类；Piotroski S2/S3/S5/S9 为比率代理口径。
-    页面数据读自本机 DuckDB 数据湖（data/lake/，T1-T9）+ output/ · config/ · logs/ · cache/ 文件系统。
+    数据源：本机 DuckDB 数据湖（data/lake/，lake-sync 定时灌数，BaoStock T+1）；页面数据读自湖 + output/backtest_martingale/ 回测产物 + config/strategy.yaml。
+    v7.0：单一策略（深回撤金字塔加仓）——逐股独立状态机，高点回撤首仓、每再跌一档加仓一档（金额×growth 递增，上不封顶）、不卖出、无熔断；
+    信号用后复权收盘、成交按原始收盘、现金分红单列（cash 口径）。湖内无退市股（幸存者偏差），回测产物已带声明。
   </footer>
 </template>

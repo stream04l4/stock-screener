@@ -1,231 +1,213 @@
-<script setup>
-// 回测 tab（报告 §3 T-回测）：GET /api/backtest → ECharts line + metrics 行。
-// 逐字移植 app.js loadBacktest（L86-128）语义：
-// - 策略实线(width 2) + benchmarks 虚线(width 1 dashed)、dataZoom inside+slider(18)、
-//   tooltip axis、legend、grid {left:50,right:20,top:40,bottom:60}、xAxis category、yAxis value scale；
-// - metrics 行：窗口 start~end（n_days 交易日）· 全期年化/夏普/最大回撤 · 近1y 年化；
-// - 404/加载失败 → "回测产物不存在：<msg>"（旧版对所有错误同文案，原样移植）；
-// - 图表渲染失败 → "图表渲染失败：<msg>"。
-// echarts = npm 依赖（锁 5.6.0），动态 import 独立 chunk（与 StockModal 同模式）。
-// 报告 §2.1：GET /api/backtest → 按需+TTL60s（useLiveQuery refcount，切走页签即停）。
+// 回测 tab（v7.0）：参数表单（start/end/codes|池）+ 触发按钮 + TaskProgress（SSE 复用 taskStore）
+// + 结果区（个股表 + 净值曲线 ECharts + 买入时间表 + summary.md）。
 //
-// v6.2.1 S2 — 页面归属调整：backtest + reinvest 两段从 StrategyTab 移入本页。
-// - "回测参数"区复用 StrategyCards/FieldEditor 组件（groups=BACKTEST_GROUPS、lsKey 独立）；
-// - 保存模式 = 与 StrategyTab 完全相同的「load full json → 编辑子集 → PUT full」：
-//   draft 以 GET /api/strategy 的完整 JSON 深拷贝为底，FieldEditor 只改 backtest/reinvest
-//   段字段，PUT 提交**整份 payload**（保证其他段一个 key 都不丢）；
-// - 逐字段校验复用 StrategyTab onSave 同款逻辑（FIELD_TYPE 分支），任一非法 → msg-box 不提交；
-// - PUT 成功 → toast + invalidate("strategy")（StrategyTab 若挂载会同步重拉，语义一致）。
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { api } from "../api/client.js";
-import { useLiveQuery } from "../live/useLiveQuery.js";
-import { invalidate } from "../live/queryRegistry.js";
+// 链路：POST /api/bt/runs（taskStore.startBtRun；409 → toast）→ SSE /api/bt/runs/{id}/events
+// → done → GET /api/bt/results/{id}（taskStore.fetchResults，缓存 lastResults 供查询页复用）。
+// echarts = npm 依赖（锁 5.6.0），动态 import 独立 chunk。
+<script setup>
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { useToastStore } from "../stores/toastStore.js";
-import { FIELD_TYPE, BACKTEST_GROUPS } from "../data/strategyMeta.js";
-import StrategyCards from "./strategy/StrategyCards.vue";
-import { fmtNum } from "../utils/fmt.js";
+import { useTaskStore } from "../stores/taskStore.js";
+import SimpleTable from "../components/SimpleTable.vue";
+import MarkdownView from "../components/MarkdownView.vue";
+import TaskProgress from "./backtest/TaskProgress.vue";
 
 const toast = useToastStore();
+const store = useTaskStore();
 
-// ---- 回测产物（净值曲线 + metrics）----
-const { data, error } = useLiveQuery("backtest", () => api("/api/backtest"), { ttl: 60000 });
+// ---------------------------------------------------------------------------
+// 参数表单
+// ---------------------------------------------------------------------------
+const form = ref({ start: "", end: "", mode: "pool", codes: "" });
+const starting = ref(false);
 
-const chartEl = ref(null);
-let chart = null; // ECharts 实例（keep-alive 保活；unmount 时 dispose）
-const chartError = ref(""); // 图表渲染失败提示（旧版 meta.textContent = "图表渲染失败：…"）
+// mode: "pool"（股票池，默认）| "codes"（指定标的，逗号分隔）
 
-// 404/首载失败空态判定：仅"从未拿到数据"时显示（SWR 后台刷新失败 → 旧值照常展示，不串味）
-const firstLoadError = computed(() => !!(error.value && !data.value));
-
-// metrics 行（移植 loadBacktest 的 meta.textContent 拼接，字段以 API 返回为准）
-const metricsText = computed(() => {
-  const d = data.value;
-  if (!d) return "";
-  const m = d.metrics || {};
-  const f = m.full || {};
-  const s1 = (m.slices || {})["1y"] || {};
-  return (
-    `窗口 ${m.window ? m.window.start + " ~ " + m.window.end : "—"}（${m.window ? m.window.n_days : 0} 交易日）· ` +
-    `全期年化 ${fmtNum(f.annual_return_pct, 2)}% / 夏普 ${fmtNum(f.sharpe, 2)} / 最大回撤 ${fmtNum(f.max_drawdown_pct, 2)}% · ` +
-    `近1y 年化 ${fmtNum(s1.annual_return_pct, 2)}%`
-  );
-});
-
-// 图表渲染（移植 loadBacktest try 块；setOption(..., true) notMerge）
-async function renderChart(d) {
-  if (!chartEl.value) return;
-  const mod = await import("echarts");
-  // Vite/rolldown CJS-ESM interop：echarts 无 .default（init 是命名导出）→ 命名空间兜底（与 StockModal 同模式）
-  const echarts = mod.default ?? mod;
-  if (!chart) chart = echarts.init(chartEl.value);
-  const dates = d.equity_curve.map((r) => r.date);
-  const series = [{ name: "策略", type: "line", showSymbol: false, data: d.equity_curve.map((r) => r.strategy), lineStyle: { width: 2 } }];
-  for (const b of d.benchmarks || []) {
-    series.push({ name: b, type: "line", showSymbol: false, data: d.equity_curve.map((r) => r[b]), lineStyle: { width: 1, type: "dashed" } });
+async function onRun() {
+  if (starting.value) return;
+  starting.value = true;
+  try {
+    const params = {};
+    if (form.value.start) params.start = form.value.start;
+    if (form.value.end) params.end = form.value.end;
+    if (form.value.mode === "codes") {
+      const codes = form.value.codes.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!codes.length) { toast.toast("codes 为空：请输入 sh.601088,sz.000651 形式", false); return; }
+      params.codes = codes.join(",");
+    } else {
+      params.pool = true;
+    }
+    await store.startBtRun(params);
+  } catch (e) {
+    // 409/参数 400 → taskStore 已 toast；这里不再重复
+  } finally {
+    starting.value = false;
   }
-  chart.setOption({
-    tooltip: { trigger: "axis" },
-    legend: { data: series.map((s) => s.name) },
-    grid: { left: 50, right: 20, top: 40, bottom: 60 },
-    xAxis: { type: "category", data: dates },
-    yAxis: { type: "value", scale: true },
-    dataZoom: [{ type: "inside" }, { type: "slider", height: 18 }],
-    series,
-  }, true);
-  chart.resize();
 }
 
-watch(data, async (d) => {
-  if (!d || !d.equity_curve) return;
-  chartError.value = "";
-  try {
-    await renderChart(d);
-  } catch (e) {
-    // 旧版：meta.textContent = "图表渲染失败：" + e.message（数据行保留，图表区清空）
-    chartError.value = "图表渲染失败：" + e.message;
-  }
-});
-
-// ===========================================================================
-// v6.2.1 S2 — 回测参数编辑区（backtest + reinvest 两段；与 StrategyTab 同保存模式）
-//   数据源 = GET /api/strategy（完整配置 JSON）；只读态展示 + 编辑态 FieldEditor。
-//   注意：与上方 useLiveQuery("backtest")（回测**产物**）是两个不同 key，互不串味。
-// ===========================================================================
-const { data: cfgData, loading: cfgLoading } = useLiveQuery("strategy", () => api("/api/strategy"), {});
-
-const strategyJson = ref(null); // GET /api/strategy 成功后的 d.json（只读底 + PUT payload 底）
-const editing = ref(false);     // 本 tab 编辑态标志（独立于 StrategyTab；D-W02 同款纪律：
-const draft = ref(null);        // 编辑草稿（完整 JSON 深拷贝为底，FieldEditor 只改子集段）
-const saving = ref(false);      // PUT 在途
-const msg = ref({ text: "", kind: null });
-
-// D-W02 同款：唯一入口（进入/退出编辑态的所有路径都经过它，按钮状态只读绑定 editing）
-function setEditing(on) { editing.value = !!on; }
+// ---------------------------------------------------------------------------
+// 结果区（done 后拉一次 /api/bt/results/{id}）
+// ---------------------------------------------------------------------------
+const results = ref(null); // taskStore.lastResults.data
+const resultsError = ref("");
+const fetchedFor = ref(""); // 已拉取的 taskId（防重复拉取）
 
 watch(
-  () => cfgData.value,
-  (d) => {
-    if (!d || !d.json) return;
-    strategyJson.value = d.json;
-    setEditing(false); // 加载成功 → 统一回到只读态（幂等）
+  () => [store.state, store.activeTaskId],
+  async ([state, tid]) => {
+    if (state !== "done" || !tid || fetchedFor.value === tid) return;
+    fetchedFor.value = tid;
+    resultsError.value = "";
+    try {
+      results.value = await store.fetchResults(tid);
+    } catch (e) {
+      resultsError.value = "结果加载失败：" + e.message;
+    }
   },
   { immediate: true }
 );
 
-function onEdit() {
-  if (!strategyJson.value) return;
-  draft.value = JSON.parse(JSON.stringify(strategyJson.value)); // 完整深拷贝为底（PUT full 保证其他段不丢）
-  setEditing(true);
-  msg.value = { text: "", kind: null };
+// ---------------------------------------------------------------------------
+// 表格列（per_stock / buys）
+// ---------------------------------------------------------------------------
+const PER_STOCK_COLS = [
+  ["ts_code", "代码"], ["name", "名称"], ["n_bars", "bar数", true],
+  ["n_rounds", "轮次", true], ["n_rearms", "再武装", true], ["n_buys", "买入笔数", true],
+  ["total_invested", "总投入", true], ["final_assets", "期末资产", true],
+  ["dividends", "累计分红", true], ["total_pnl", "总盈亏", true],
+  ["pnl_pct", "盈亏%", true], ["min_unreal_pct", "最低浮盈%", true],
+  ["first_buy_date", "首买日"], ["last_buy_date", "末买日"],
+  ["last_status", "末状态"], ["end_date", "期末"],
+];
+
+const BUYS_COLS = [
+  ["ts_code", "代码"], ["seq", "序", true], ["date", "日期"],
+  ["price", "成交价", true], ["amount", "金额", true],
+];
+
+// ---------------------------------------------------------------------------
+// 净值曲线（equity_curve：date × open_value 组合持仓市值）
+// ---------------------------------------------------------------------------
+const chartEl = ref(null);
+let chart = null;
+const chartError = ref("");
+
+async function renderChart(rows) {
+  await nextTick(); // watch(flush pre) 触发时 v-if 结果区 DOM（含 chartEl ref）尚未挂载
+  if (!chartEl.value || !rows.length) return;
+  const mod = await import("echarts");
+  // echarts v5 ESM 同时提供 named 与 default 导出；CJS-ESM interop 兜底
+  const echarts = (mod && "default" in mod && mod.default) || mod;
+  if (!chart) chart = echarts.init(chartEl.value);
+  chart.setOption({
+    tooltip: { trigger: "axis" },
+    legend: { data: ["组合市值", "累计投入"] },
+    grid: { left: 60, right: 20, top: 40, bottom: 60 },
+    xAxis: { type: "category", data: rows.map((r) => r.date) },
+    yAxis: { type: "value", scale: true },
+    dataZoom: [{ type: "inside" }, { type: "slider", height: 18 }],
+    series: [
+      { name: "组合市值", type: "line", showSymbol: false, data: rows.map((r) => r.open_value), lineStyle: { width: 2 } },
+      { name: "累计投入", type: "line", showSymbol: false, data: rows.map((r) => r.open_cost), lineStyle: { width: 1, type: "dashed" } },
+    ],
+  }, true);
+  chart.resize();
 }
 
-// FieldEditor 变更 → 合并进 draft（与 StrategyTab onDraftUpdate 同语义）
-function onDraftUpdate(u) {
-  if (!draft.value) return;
-  draft.value[u.section] = draft.value[u.section] || {};
-  draft.value[u.section][u.field] = u.value;
-}
-
-// 保存（与 StrategyTab onSave 同款逐字段校验 → PUT full → 成功重拉 / 400 保持编辑态）
-async function onSave() {
-  if (!draft.value) return;
-  const payload = JSON.parse(JSON.stringify(draft.value)); // 深拷贝提交（完整 payload，其他段原样带回）
-  let bad = false;
-
-  for (const [section, fields] of Object.entries(payload)) {
-    if (!fields || typeof fields !== "object") continue;
-    for (const [field, value] of Object.entries(fields)) {
-      const t = FIELD_TYPE[field] || "str";
-      let v;
-      if (t === "weights_dict") {
-        for (const [dim, wv] of Object.entries(value || {})) {
-          const n = Number(wv);
-          if (isNaN(n) || n < 0 || n > 1) { setMsg(`✗ ${section}.${field}.${dim} 必须在 0–1`, "err"); bad = true; break; }
-        }
-      } else if (t === "sub_weights_dict") {
-        for (const [dim, parsed] of Object.entries(value || {})) {
-          if (!parsed) { setMsg(`✗ ${section}.${field}.${dim} 格式应为 key:值,key:值`, "err"); bad = true; break; }
-        }
-      } else if (t === "int") {
-        v = Number.isInteger(Number(value)) ? parseInt(value, 10) : NaN;
-        if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是整数`, "err"); bad = true; continue; }
-      } else if (t === "float") {
-        v = parseFloat(value);
-        if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是数值`, "err"); bad = true; continue; }
-      } else if (t === "bool") {
-        v = value === "true" || value === true;
-      } else if (t === "list") {
-        v = String(value).split(",").map((s) => s.trim()).filter(Boolean);
-        if (!v.length) { setMsg(`✗ ${section}.${field} 不能为空`, "err"); bad = true; continue; }
-      } else {
-        v = value; // str / enum2：原样（enum 值域由后端校验，400 回显）
-      }
-      if (t !== "weights_dict" && t !== "sub_weights_dict") payload[section][field] = v;
+watch(
+  () => results.value && results.value.equity_curve,
+  async (rows) => {
+    if (!rows || !rows.length) return;
+    chartError.value = "";
+    try {
+      await renderChart(rows);
+    } catch (e) {
+      chartError.value = "图表渲染失败：" + e.message;
     }
-    if (bad) break;
-  }
-  if (bad) return; // 本地校验失败 → 不提交
-
-  saving.value = true;
-  try {
-    const res = await api("/api/strategy", { method: "PUT", body: JSON.stringify(payload) });
-    setMsg(`✓ 回测参数已保存（备份: ${String(res.backup).split("/").pop()}）`, "ok");
-    setEditing(false); // 唯一入口退出编辑态
-    toast.toast("回测参数已更新");
-    invalidate("strategy"); // 事件触发重拉 GET（StrategyTab 若挂载同步刷新，语义一致）
-  } catch (e) {
-    // 400 拒绝：保持编辑态，用户可改正后重试
-    const errs = e.body && e.body.detail && e.body.detail.errors ? e.body.detail.errors.join("\n") : e.message;
-    setMsg("✗ 保存被拒绝（400）：\n" + errs, "err");
-    toast.toast("回测参数保存失败", false);
-  } finally {
-    saving.value = false;
-  }
-}
-
-// 取消（恢复工具栏 + 重拉只读视图，与 StrategyTab onCancel 同语义）
-function onCancel() {
-  setEditing(false);
-  invalidate("strategy");
-}
-
-function setMsg(text, kind) { msg.value = { text, kind }; }
-
-onMounted(() => { /* 首帧由 watch(data)/watch(cfgData) 驱动（SWR：缓存命中时挂载即有值） */ });
+  },
+  { immediate: true }
+);
 
 onUnmounted(() => {
   if (chart) { try { chart.dispose(); } catch { /* ignore */ } chart = null; }
+});
+
+// 元信息行（run_meta：窗口 / 标的数 / 耗时）
+const metaText = computed(() => {
+  const d = results.value;
+  if (!d) return "";
+  const m = d.run_meta || {};
+  const w = m.window || {};
+  return (
+    `窗口 ${w.start || "各股数据起点"} ~ ${w.end || "数据终点"} · ` +
+    `标的 ${m.n_codes ?? (d.per_stock || []).length} 只 · ` +
+    (m.elapsed_s != null ? `耗时 ${m.elapsed_s}s · ` : "") +
+    `产物 ${d.task_id}`
+  );
 });
 </script>
 
 <template>
   <section class="tab-panel active">
-    <div class="card">
-      <h3>净值曲线（策略 vs 基准）</h3>
-      <p class="muted small">数据源 output/backtest/（离线回测产物）；未跑回测时显示 404 提示。</p>
-      <div v-if="firstLoadError" id="bt-metrics" class="msg-err">回测产物不存在：{{ error.message }}</div>
-      <template v-else>
-        <div ref="chartEl" id="bt-chart" style="width:100%;height:420px;"></div>
-        <div id="bt-metrics" class="muted small">{{ chartError || metricsText }}</div>
-      </template>
+    <!-- 参数表单 + 触发 -->
+    <div class="card bt-form">
+      <h3>🧪 按需回测</h3>
+      <p class="muted small">
+        窗口留空 = 各股数据起点 → 数据终点；标的默认全股票池（5 条件全链）。回测为异步子进程，进度经 SSE 实时推送。
+      </p>
+      <div class="bt-form-grid">
+        <label class="f-row">
+          <span>起始日</span>
+          <input type="date" v-model="form.start" :disabled="starting || store.state === 'running'">
+        </label>
+        <label class="f-row">
+          <span>结束日</span>
+          <input type="date" v-model="form.end" :disabled="starting || store.state === 'running'">
+        </label>
+        <div class="f-row f-scope">
+          <span>标的</span>
+          <label class="radio"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 股票池（默认）</label>
+          <label class="radio"><input type="radio" value="codes" v-model="form.mode" :disabled="starting || store.state === 'running'"> 指定标的</label>
+        </div>
+        <label class="f-row" v-if="form.mode === 'codes'">
+          <span>代码</span>
+          <input type="text" v-model="form.codes" placeholder="sh.601088,sz.000651（逗号分隔）"
+                 :disabled="starting || store.state === 'running'">
+        </label>
+        <div class="f-row">
+          <button id="btn-bt-run" class="primary-btn" :disabled="starting || store.state === 'running'"
+                  @click="onRun">▶ 开始回测</button>
+          <span class="muted small" v-if="store.state === 'running'">回测运行中…（完成后可再次触发）</span>
+        </div>
+      </div>
     </div>
 
-    <!-- v6.2.1 S2：回测参数（backtest + reinvest 两段；从 StrategyTab 移入） -->
-    <div class="card bt-params">
-      <div class="bt-params-head">
-        <h3>🧪 回测参数（backtest / reinvest）</h3>
-        <span class="muted small">改动写入 config/strategy.yaml（PUT full，其他段不受影响；写前自动备份 .bak）</span>
+    <!-- 进度（SSE 驱动；跨页签保活） -->
+    <TaskProgress />
+
+    <!-- 结果区 -->
+    <div v-if="resultsError" class="msg-err">{{ resultsError }}</div>
+    <div v-if="results" class="bt-results">
+      <div class="card">
+        <h3>回测结果</h3>
+        <p class="muted small">{{ metaText }}</p>
+        <div ref="chartEl" id="bt-chart" style="width:100%;height:420px;"></div>
+        <div class="muted small">{{ chartError || "组合市值（cash 口径：持仓按原始收盘 × 股数 + 累计现金分红；虚线=累计投入）" }}</div>
       </div>
-      <div class="bt-params-toolbar strategy-toolbar">
-        <button id="btn-bt-edit" class="primary-btn" :class="{ hidden: editing }" @click="onEdit">✏️ 编辑模式</button>
-        <button id="btn-bt-save" class="primary-btn" :class="{ hidden: !editing }" :disabled="saving" @click="onSave">💾 保存策略</button>
-        <button id="btn-bt-cancel" class="ghost-btn" :class="{ hidden: !editing }" @click="onCancel">取消</button>
+
+      <div class="card">
+        <h3>个股汇总（per_stock）</h3>
+        <SimpleTable :rows="results.per_stock || []" :cols="PER_STOCK_COLS" empty="（无个股结果）" />
       </div>
-      <p v-if="cfgLoading && !strategyJson" class="placeholder">加载中…</p>
-      <StrategyCards v-else-if="strategyJson" :json="strategyJson" :draft="draft" :editing="editing"
-                     :groups="BACKTEST_GROUPS" ls-key="backtest_group_collapsed_v1" strict @update="onDraftUpdate" />
-      <div class="msg-box">
-        <div v-if="msg.text" :class="msg.kind === 'err' ? 'msg-err' : 'msg-ok'">{{ msg.text }}</div>
+
+      <div class="card">
+        <h3>买入时间表（buys）</h3>
+        <SimpleTable :rows="results.buys || []" :cols="BUYS_COLS" empty="（无买入记录）" />
+      </div>
+
+      <div class="card" v-if="results.summary">
+        <h3>摘要（summary.md）</h3>
+        <MarkdownView :md="results.summary" />
       </div>
     </div>
   </section>

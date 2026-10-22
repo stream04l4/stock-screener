@@ -31,7 +31,7 @@ import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
 import { invalidate } from "../live/queryRegistry.js";
 import { useToastStore } from "../stores/toastStore.js";
-import { FIELD_TYPE } from "../data/strategyMeta.js";
+import { FIELD_TYPE, EXCLUDED_SECTIONS } from "../data/strategyMeta.js";
 import Toolbar from "./strategy/Toolbar.vue";
 import StrategyCards from "./strategy/StrategyCards.vue";
 
@@ -103,38 +103,27 @@ async function onSave() {
   let bad = false;
 
   for (const [section, fields] of Object.entries(payload)) {
-    if (!fields || typeof fields !== "object") continue;
-    for (const [field, value] of Object.entries(fields)) {
-      const t = FIELD_TYPE[field] || "str";
-      let v;
-      if (t === "weights_dict") {
-        // 滑块值已在 FieldEditor 内解析为 number；0–1 校验（旧版语义原样）
-        for (const [dim, wv] of Object.entries(value || {})) {
-          const n = Number(wv);
-          if (isNaN(n) || n < 0 || n > 1) { setMsg(`✗ ${section}.${field}.${dim} 必须在 0–1`, "err"); bad = true; break; }
-        }
-      } else if (t === "sub_weights_dict") {
-        // FieldEditor 已解析（非法 → null）；null → 格式错误（旧版语义原样）
-        for (const [dim, parsed] of Object.entries(value || {})) {
-          if (!parsed) { setMsg(`✗ ${section}.${field}.${dim} 格式应为 key:值,key:值`, "err"); bad = true; break; }
-        }
-      } else if (t === "int") {
-        v = Number.isInteger(Number(value)) ? parseInt(value, 10) : NaN;
-        if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是整数`, "err"); bad = true; continue; }
-      } else if (t === "float") {
-        v = parseFloat(value);
-        if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是数值`, "err"); bad = true; continue; }
-      } else if (t === "bool") {
-        v = value === "true" || value === true;
-      } else if (t === "list") {
-        v = String(value).split(",").map((s) => s.trim()).filter(Boolean);
-        if (!v.length) { setMsg(`✗ ${section}.${field} 不能为空`, "err"); bad = true; continue; }
-      } else {
-        v = value; // str / enum2：原样（enum 值域由后端校验，400 回显）
-      }
-      if (t !== "weights_dict" && t !== "sub_weights_dict") payload[section][field] = v;
+  if (!fields || typeof fields !== "object") continue;
+  for (const [field, value] of Object.entries(fields)) {
+    const t = FIELD_TYPE[field] || "str";
+    let v;
+    if (t === "int") {
+      v = Number.isInteger(Number(value)) ? parseInt(value, 10) : NaN;
+      if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是整数`, "err"); bad = true; continue; }
+    } else if (t === "float") {
+      v = parseFloat(value);
+      if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是数值`, "err"); bad = true; continue; }
+    } else if (t === "bool") {
+      v = value === "true" || value === true;
+    } else if (t === "list") {
+      v = String(value).split(",").map((s) => s.trim()).filter(Boolean);
+      if (!v.length) { setMsg(`✗ ${section}.${field} 不能为空`, "err"); bad = true; continue; }
+    } else {
+      v = value; // str / enum2 / readonly：原样（enum 值域由后端校验，400 回显）
     }
-    if (bad) break;
+    payload[section][field] = v;
+  }
+  if (bad) break;
   }
   if (bad) return; // 本地校验失败 → 不提交（旧版语义原样）
 
@@ -285,7 +274,7 @@ onMounted(() => {
     <p v-if="error && !strategyJson" class="msg-err">加载策略失败: {{ error.message }}</p>
     <p v-else-if="loading && !strategyJson" class="placeholder">加载中…</p>
     <StrategyCards v-else :json="strategyJson" :draft="draft" :editing="editing"
-                   :exclude="['backtest', 'reinvest', 'lake']" @update="onDraftUpdate" />
+                   :exclude="EXCLUDED_SECTIONS" @update="onDraftUpdate" />
     <!-- S1：另存为小弹窗（名称输入框默认 策略_YYYYMMDD_HHMM +【保存】；Esc/遮罩关闭） -->
     <div v-if="saveAsOpen" class="modal">
       <div class="modal-mask" @click="saveAsOpen = false"></div>

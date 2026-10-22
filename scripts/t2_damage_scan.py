@@ -119,10 +119,16 @@ def _gt_af1_series(code: str):
 
     kline_af3 × adjfactor 重建（reconstruct.rebuild_kline_series），与 G1 门同源。
     无缓存 → None。只读 cache，零网络。
+
+    v7.0 注：screener.data.{cache,fetchers} 与 screener.reconstruct 随多因子管线
+    删除 → GT 重建不可用，返回 None（scan 自动走 fresh-sina 回退判据）。
     """
-    from screener.data.cache import DiskCache
-    from screener.data.fetchers import make_cache_name
-    from screener.reconstruct import rebuild_kline_series
+    try:
+        from screener.data.cache import DiskCache
+        from screener.data.fetchers import make_cache_name
+        from screener.reconstruct import rebuild_kline_series
+    except ImportError:
+        return None  # v7：GT 重建依赖已删 → 降级（fresh-sina 回退）
 
     cache = DiskCache(os.path.join(REPO, "cache"))
     kl = cache.get(make_cache_name("kline_af3", code))
@@ -143,8 +149,14 @@ def _gt_adjfactor_freshness(code: str):
     说明 BaoStock 参考在灌入后没刷新、漏了近期除权事件 → 是**参考陈旧**而非存储 T2
     损坏（stored T2 更可能是对的）。全市场实证：527 初判 damaged 中 401 只 worst_date
     落在 GT adjfactor mtime(2026-09-06/07) 之后 → 假阳性；仅 126 只分歧早于该上界 → 真损坏。
+
+    v7.0 注：screener.data.fetchers 已随多因子管线删除 → 恒 None（stale_gt 守卫失效，
+    无 GT 时该守卫本就不参与——见 scan_stock 主路径）。
     """
-    from screener.data.fetchers import make_cache_name
+    try:
+        from screener.data.fetchers import make_cache_name
+    except ImportError:
+        return None  # v7：fetchers 已删 → 新鲜度未知
     f = os.path.join(REPO, "cache", make_cache_name("adjfactor", code) + ".csv")
     if not os.path.exists(f):
         return None

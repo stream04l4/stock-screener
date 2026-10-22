@@ -79,9 +79,14 @@ def test_backfill_resume_skips_done(tmp_path, monkeypatch):
 
 def test_backfill_done_persists_across_instances(tmp_path, monkeypatch):
     """done 键落盘：新 runner 实例能读到（跨进程/重启幂等的文件基础）。"""
+    from lake import conn as lconn
     from lake.backfill import BackfillRunner, Task, load_progress
 
     monkeypatch.setattr(BackfillRunner, "_quota_state", lambda self: (False, 0))
+    # 隔离真实库：_refresh_coverage 不得打开 data/lake/lake.duckdb（测试零副作用，
+    # 与上方 test_backfill_resume_skips_done 同纪律）
+    monkeypatch.setattr(lconn, "get_conn", lambda: (_ for _ in ()).throw(
+        lconn.LakeUnavailable("test isolation")))
     prog_path = str(tmp_path / "progress.json")
     task = Task(priority=2, table="kline_daily", ts_code="sh.601398",
                 period_or_date="2026-05-13", tier="P2")

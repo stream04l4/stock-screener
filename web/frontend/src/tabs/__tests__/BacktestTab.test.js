@@ -1,75 +1,77 @@
-// v6.2.1 S2 组件回归：BacktestTab 回测参数区（backtest + reinvest 两段编辑）。
+// BacktestTab 组件回归（v7.0）：参数表单 + 触发 + SSE 进度 + 结果区。
 //
-// mock 点：api client（零网络）+ queryRegistry.invalidate（隔离计数）+ echarts（动态 import，
-// happy-dom 无 canvas → stub init/setOption/resize/dispose）。
-// 契约（brief S2"load full json → 编辑子集 → PUT full"保存模式）：
-// - "回测参数"区 = StrategyCards(groups=BACKTEST_GROUPS)：只读态展示 backtest/reinvest 两段；
-// - 【✏️ 编辑模式】→ draft = GET /api/strategy 完整 JSON 深拷贝（FieldEditor 只改子集段）；
-// - 【💾 保存策略】→ 逐字段校验 → PUT **整份 payload**（其他段原样带回，一个 key 不丢）；
-//   成功 → toast + invalidate("strategy")；400 → 保持编辑态显示 errors。
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// mock 点：api client（零网络）+ echarts（happy-dom 无 canvas）+ SSE 通道
+// （taskStore.__setUseSSEForTest 注入 fake——与 taskStore.test 同款）。
+// 契约：
+// - 表单：start/end 可选；标的 radio pool(默认)/codes；【▶ 开始回测】→ POST /api/bt/runs；
+// - 409 → toast（taskStore 语义）；codes 模式空 codes → 本地 toast 不发请求；
+// - SSE done → GET /api/bt/results/{id} → per_stock 表 / buys 表 / summary.md / 净值曲线（echarts stub）。
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
-import { createPinia } from "pinia";
+import { createPinia, setActivePinia } from "pinia";
 
 const apiMock = vi.fn();
 vi.mock("../../api/client.js", () => ({
   api: (...a) => apiMock(...a),
   isBackfillErr: (e) => !!(e && e.status === 409 && e.body && e.error === "lake_backfill_in_progress"),
 }));
-const invalidateMock = vi.fn();
-vi.mock("../../live/queryRegistry.js", async (orig) => ({
-  ...(await orig()), invalidate: (...a) => invalidateMock(...a),
-}));
-// echarts stub（动态 import("echarts")；happy-dom 无 canvas，只断言调用形状）
-vi.mock("echarts", () => ({
-  init: vi.fn(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() })),
-}));
+vi.mock("../../live/queryRegistry.js", async (orig) => ({ ...(await orig()) }));
+vi.mock("echarts", () => {
+  // 真实 echarts ESM 有 default 导出（组件内 mod.default ?? mod）；mock 同步提供
+  const m = { init: vi.fn(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() })) };
+  return { ...m, default: m };
+});
 
 const BacktestTab = (await import("../BacktestTab.vue")).default;
+const { useTaskStore, __setUseSSEForTest } = await import("../../stores/taskStore.js");
 const { useToastStore } = await import("../../stores/toastStore.js");
 
-// 完整策略 JSON（16 段全——PUT full 断言"其他段不丢"用）
-const STRATEGY_JSON = {
-  technical: { ma_period: 20, min_return_pct: 3 },
-  dividend: { window_days: 365, min_yield_pct: 4 },
-  industry: { rank_by: "roeAvg", top_pct: 30 },
-  fundamental: { roe_min_pct: 8 },
-  universe: { a_share_prefixes: ["sh.60"], listing_min_trading_days: 250 },
-  scoring: { mode: "zscore", top_n: 50, weights: { technical: 0.3, dividend: 0.2, industry: 0.1, fundamental: 0.4 } },
-  badges: { industry_top_pct: 30, fscore_min: 5 },
-  hard_filter: { st_enabled: true, min_consecutive_div_years: 3 },
-  backtest: { start: "2021-01-01", end: "2026-08-31", rebalance: "monthly", top_n: 10, risk_free_pct: 2.0 },
-  reinvest: { target_ttm_yield_pct: 4, yield_pctile_lookback_years: 5, dps_smooth_years: 3, dps_growth_years: 5 },
-  datasource: { primary: "tencent" },
-  data: { kline_calendar_days_back: 800 },
-  crosscheck: { enabled: false },
-  health: { enabled: true },
-  canonical: { enabled: true },
-  lake: { baostock_daily_budget: 20000 },
-};
+// ---- fake SSE（与 taskStore.test 同款）----
+function makeFakeSSE() {
+  const inst = { url: null, handlers: {}, closed: false };
+  const impl = (url, onEvent, opts) => {
+    inst.url = url;
+    inst.handlers = { onEvent, onDowngrade: opts && opts.onDowngrade };
+    return { failCount: { value: 0 }, alive: { value: true }, close() { inst.closed = true; } };
+  };
+  inst.message = (data) => inst.handlers.onEvent({ lastId: null, data });
+  return { inst, impl };
+}
 
-// 回测产物（/api/backtest）：最小 equity_curve（stub echarts 后只走 setOption）
-const BACKTEST = {
-  equity_curve: [
-    { date: "2026-08-31", strategy: 1.0 },
-    { date: "2026-09-30", strategy: 1.05 },
+const RESULTS = {
+  task_id: "bt_t1",
+  per_stock: [
+    { ts_code: "sh.601088", name: "中国神华", n_bars: 2600, n_rounds: 3, n_rearms: 2, n_buys: 11,
+      total_invested: 210510, final_assets: 660997.72, dividends: 51234.5, total_pnl: 450487.72,
+      pnl_pct: 2.14, min_unreal_pct: -0.1, first_buy_date: "2018-03-01", last_buy_date: "2024-02-05",
+      last_status: "open", end_date: "2026-10-21" },
+    { ts_code: "sz.000651", name: "格力电器", n_bars: 2500, n_rounds: 2, n_rearms: 1, n_buys: 21,
+      total_invested: 326102, final_assets: 540050.34, dividends: 60000, total_pnl: 213948.34,
+      pnl_pct: 0.656, min_unreal_pct: -0.05, first_buy_date: "2019-01-15", last_buy_date: "2025-01-10",
+      last_status: "open", end_date: "2026-10-21" },
   ],
-  metrics: { window: { start: "2021-01-31", end: "2026-09-30", n_days: 1400 },
-             full: { annual_return_pct: 8.5, sharpe: 0.9, max_drawdown_pct: -12.3 },
-             slices: { "1y": { annual_return_pct: 6.2 } } },
-  holdings: [], benchmarks: ["sh.000300"], report_md: "",
+  buys: [
+    { ts_code: "sh.601088", seq: 1, date: "2018-03-01", price: 20.5, amount: 100000 },
+    { ts_code: "sh.601088", seq: 2, date: "2018-05-12", price: 18.9, amount: 11000 },
+    { ts_code: "sz.000651", seq: 1, date: "2019-01-15", price: 42.1, amount: 100000 },
+  ],
+  equity_curve: [
+    { date: "2018-03-01", open_stocks: 1, open_cost: 100000, open_value: 100500, open_pnl: 500, open_pnl_pct: 0.005 },
+    { date: "2026-10-21", open_stocks: 2, open_cost: 536612, open_value: 1201048, open_pnl: 664436, open_pnl_pct: 1.238 },
+  ],
+  summary: "## 回测摘要\n- 标的 2 只\n- 窗口 2018 ~ 2026\n",
+  run_meta: { window: { start: "2018-03-01", end: "2026-10-21" }, n_codes: 2, elapsed_s: 1.2 },
 };
 
+let sse = null;
 function mockApi() {
   apiMock.mockImplementation(async (path, opts = {}) => {
-    if (path === "/api/strategy" && (!opts.method || opts.method === "GET")) {
-      return { json: JSON.parse(JSON.stringify(STRATEGY_JSON)), raw: "# raw" };
+    if (path === "/api/bt/runs" && opts.method === "POST") {
+      return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1",
+               meta: { start: null, end: null, codes: null, pool: true } };
     }
-    if (path === "/api/backtest") return JSON.parse(JSON.stringify(BACKTEST));
-    if (path === "/api/strategy" && opts.method === "PUT") {
-      return { ok: true, backup: "/tmp/config/strategy.yaml.bak" };
-    }
-    throw new Error("unmocked: " + path);
+    if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
+    throw new Error("unmocked: " + path + " " + (opts.method || "GET"));
   });
 }
 
@@ -81,111 +83,132 @@ const mk = () => {
 };
 const toastMsg = () => useToastStore(appPinia).msg;
 
-beforeEach(() => {
-  vi.stubGlobal("confirm", vi.fn(() => true));
+beforeEach(async () => {
+  setActivePinia(createPinia());
+  const f = makeFakeSSE();
+  sse = f.inst;
+  __setUseSSEForTest(f.impl);
+  vi.useFakeTimers();
   apiMock.mockReset();
-  invalidateMock.mockClear();
   mockApi();
 });
 
-describe("S2 · BacktestTab 回测参数区（backtest + reinvest）", () => {
-  it("渲染：净值曲线卡 + 回测参数卡；只读态展示 backtest/reinvest 两段值", async () => {
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("BacktestTab · 表单与触发", () => {
+  it("渲染：参数表单（start/end/标的 radio，pool 默认选中）+ 触发按钮", async () => {
     const w = mk();
     await flushPromises();
-    expect(w.find("#bt-chart").exists()).toBe(true); // 净值曲线区仍在（原功能不回归）
-    expect(w.find(".bt-params").exists()).toBe(true); // 回测参数区（S2 新增）
-    const text = w.text();
-    expect(text).toContain("历史回测");   // backtest 段卡片标题
-    expect(text).toContain("再投资参考"); // reinvest 段卡片标题
-    // 只读态值展示
-    expect(text).toContain("2021-01-01"); // backtest.start
-    expect(text).toContain("monthly");    // backtest.rebalance
-    expect(text).toContain("4");          // reinvest.target_ttm_yield_pct
+    expect(w.find('input[type="date"]').exists()).toBe(true);
+    const radios = w.findAll('input[type="radio"]');
+    expect(radios.length).toBe(2);
+    expect(radios[0].element.value).toBe("pool");
+    expect(radios[0].element.checked).toBe(true);
+    expect(w.find("#btn-bt-run").exists()).toBe(true);
     w.unmount();
   });
 
-  it("编辑态：FieldEditor 出现；改 backtest.top_n → 【💾 保存策略】→ PUT **完整 payload**（其他段不丢）", async () => {
+  it("pool 模式触发 → POST /api/bt/runs {pool:true}（start/end 留空不带）+ 状态 running", async () => {
     const w = mk();
     await flushPromises();
-    await w.find("#btn-bt-edit").trigger("click");
-    // 编辑态控件出现（backtest.top_n int → number input；rebalance enum2 → select）
-    expect(w.findAll(".bt-params input[type='number']").length).toBeGreaterThan(0);
-    // 改 backtest.top_n：10 → 15（第一个出现的 number input 顺序不保证，按 label 定位太脆——
-    // 直接遍历找 value=10 的 number input）
-    const nums = w.findAll(".bt-params input[type='number']");
-    const target = nums.find((i) => i.element.value === "10");
-    expect(target).toBeTruthy();
-    await target.setValue("15");
+    await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
-    await w.find("#btn-bt-save").trigger("click");
-    await flushPromises();
-    // PUT 被调用，payload = 完整 JSON（16 段全在）+ backtest.top_n=15
-    const putCall = apiMock.mock.calls.find(([p, o]) => p === "/api/strategy" && o.method === "PUT");
-    expect(putCall).toBeTruthy();
-    const payload = JSON.parse(putCall[1].body);
-    expect(Object.keys(payload).length).toBe(Object.keys(STRATEGY_JSON).length); // 段数不丢
-    for (const k of Object.keys(STRATEGY_JSON)) expect(payload).toHaveProperty(k);
-    expect(payload.backtest.top_n).toBe(15);
-    // 未编辑段原样带回（抽样）
-    expect(payload.technical.ma_period).toBe(20);
-    expect(payload.lake.baostock_daily_budget).toBe(20000);
-    // 成功路径：toast + invalidate("strategy") + 退出编辑态
-    expect(toastMsg()).toContain("回测参数已更新");
-    expect(invalidateMock).toHaveBeenCalledWith("strategy");
-    expect(w.find("#btn-bt-edit").classes()).not.toContain("hidden");
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
+    expect(call).toBeTruthy();
+    expect(JSON.parse(call[1].body)).toEqual({ pool: true });
+    const store = useTaskStore(appPinia);
+    expect(store.state).toBe("running");
+    expect(sse.url).toBe("/api/bt/runs/bt_t1/events");
     w.unmount();
   });
 
-  it("本地校验拦截：backtest.top_n 改非法（非整数文本）→ 不提交 PUT，msg-box 报错", async () => {
+  it("填 start/end + codes 模式 → POST 带 start/end/codes", async () => {
     const w = mk();
     await flushPromises();
-    await w.find("#btn-bt-edit").trigger("click");
-    const nums = w.findAll(".bt-params input[type='number']");
-    const target = nums.find((i) => i.element.value === "10");
-    await target.setValue("abc"); // number input 允许输入文本（type=number 的 value 可能为空）
+    await w.findAll('input[type="date"]')[0].setValue("2016-01-04");
+    await w.findAll('input[type="date"]')[1].setValue("2026-10-21");
+    await w.findAll('input[type="radio"]')[1].setValue("codes"); // 切到指定标的
     await flushPromises();
-    await w.find("#btn-bt-save").trigger("click");
+    await w.find('input[type="text"][placeholder*="sh.601088"]').setValue("sh.601088, sz.000651");
+    await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
-    expect(apiMock.mock.calls.some(([p, o]) => p === "/api/strategy" && o.method === "PUT")).toBe(false);
-    // 保持编辑态（400/本地校验失败语义：可改正后重试）
-    expect(w.find("#btn-bt-save").classes()).not.toContain("hidden");
-    w.unmount();
-  });
-
-  it("PUT 400 → 保持编辑态 + msg-box 显示 errors", async () => {
-    const w = mk();
-    await flushPromises();
-    apiMock.mockImplementation(async (path, opts = {}) => {
-      if (path === "/api/strategy" && (!opts.method || opts.method === "GET")) {
-        return { json: JSON.parse(JSON.stringify(STRATEGY_JSON)), raw: "# raw" };
-      }
-      if (path === "/api/backtest") return JSON.parse(JSON.stringify(BACKTEST));
-      if (path === "/api/strategy" && opts.method === "PUT") {
-        const e = new Error("bad"); e.status = 400;
-        e.body = { detail: { errors: ["backtest.top_n=99 超出范围 [1,50]"] } }; throw e;
-      }
-      throw new Error("unmocked: " + path);
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
+    expect(JSON.parse(call[1].body)).toEqual({
+      start: "2016-01-04", end: "2026-10-21", codes: "sh.601088,sz.000651",
     });
-    await w.find("#btn-bt-edit").trigger("click");
-    const nums = w.findAll(".bt-params input[type='number']");
-    const target = nums.find((i) => i.element.value === "10");
-    await target.setValue("99"); // 本地 int 校验通过（99 是整数），后端范围校验拒绝
-    await flushPromises();
-    await w.find("#btn-bt-save").trigger("click");
-    await flushPromises();
-    expect(w.text()).toContain("保存被拒绝（400）");
-    expect(w.text()).toContain("backtest.top_n=99 超出范围 [1,50]");
-    expect(w.find("#btn-bt-save").classes()).not.toContain("hidden"); // 保持编辑态
     w.unmount();
   });
 
-  it("取消 → 退出编辑态 + invalidate('strategy')", async () => {
+  it("codes 模式空 codes → 本地 toast、不发 POST", async () => {
     const w = mk();
     await flushPromises();
-    await w.find("#btn-bt-edit").trigger("click");
-    await w.find("#btn-bt-cancel").trigger("click");
-    expect(w.find("#btn-bt-edit").classes()).not.toContain("hidden");
-    expect(invalidateMock).toHaveBeenCalledWith("strategy");
+    await w.findAll('input[type="radio"]')[1].setValue("codes");
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    expect(apiMock.mock.calls.some(([p, o]) => p === "/api/bt/runs" && o.method === "POST")).toBe(false);
+    expect(toastMsg()).toContain("codes 为空");
+    w.unmount();
+  });
+
+  it("409 → toast「已有回测任务…」+ 状态不变", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      const e = new Error("busy");
+      e.status = 409;
+      e.body = { detail: "已有回测任务在进行中: bt_old" };
+      throw e;
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    expect(toastMsg()).toContain("已有回测任务在进行中");
+    expect(useTaskStore(appPinia).state).toBe(null);
+    w.unmount();
+  });
+});
+
+describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
+  it("done 事件 → 拉 results：per_stock 表 + buys 表 + summary + 净值曲线渲染", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "log", text: "[PROGRESS] stage=bt done=1 total=2" }));
+    sse.message(JSON.stringify({ type: "done" }));
+    // 结果链路 = 多个微任务轮（fetch → results 赋值 → 图表 watch → nextTick → 动态 import）
+    for (let i = 0; i < 8; i++) await flushPromises();
+
+    // 结果区出现
+    expect(w.text()).toContain("回测结果");
+    expect(w.text()).toContain("中国神华"); // per_stock 行
+    expect(w.text()).toContain("格力电器");
+    // buys 表
+    expect(w.text()).toContain("2018-03-01");
+    // summary（MarkdownView 渲染）
+    expect(w.text()).toContain("回测摘要");
+    // 净值曲线 echarts 已 init + setOption
+    const echarts = await import("echarts");
+    expect(echarts.init).toHaveBeenCalled();
+    const setOpt = echarts.init.mock.results[0].value.setOption;
+    expect(setOpt).toHaveBeenCalled();
+    const opt = setOpt.mock.calls[0][0];
+    expect(opt.series.map((s) => s.name)).toEqual(["组合市值", "累计投入"]);
+    // run_meta 行
+    expect(w.text()).toContain("2 只");
+    w.unmount();
+  });
+
+  it("SSE 期间 progress 事件 → 进度面板更新（TaskProgress 只读 taskStore）", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "progress", stage: "bt", done: 2, total: 101 }));
+    await flushPromises();
+    expect(w.text()).toContain("2/101");
     w.unmount();
   });
 });

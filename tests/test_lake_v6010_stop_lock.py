@@ -417,6 +417,7 @@ def test_stopping_marker_cleared_on_new_run(tmp_path, monkeypatch):
     """新 run 开始处清除上一轮残留：progress 文件预置 stopping_at + state=stopping
     （模拟上轮被强杀没走到 _finish_stop）→ run() 后标记清除、state 正常。"""
     from lake import backfill as lb
+    from lake import conn as lconn
 
     prog = str(tmp_path / "prog_stale.json")
     with open(prog, "w", encoding="utf-8") as f:
@@ -426,6 +427,10 @@ def test_stopping_marker_cleared_on_new_run(tmp_path, monkeypatch):
                               "state": "stopping", "eta_min": None, "last_error": ""}],
                    "coverage": {}, "stopping_at": "2026-09-16 07:00:00"}, f)
     monkeypatch.setattr(lb.BackfillRunner, "_quota_state", lambda self: (False, 0))
+    # 隔离真实库：_refresh_coverage 不得打开 data/lake/lake.duckdb（本文件纪律：
+    # 库一律 tmp，绝不触碰生产库；§3 子进程用例 L354 同隔离）
+    monkeypatch.setattr(lconn, "get_conn", lambda: (_ for _ in ()).throw(
+        lconn.LakeUnavailable("test isolation")))
 
     tasks = [lb.Task(priority=2, table="kline_history", ts_code=f"sh.6{i:05d}",
                      period_or_date="full_history", tier="P2") for i in range(3)]
@@ -453,6 +458,7 @@ def test_new_run_clears_residual_persisted_in_first_task_window(tmp_path, monkey
     尚未发生，恰是 DEF-1 的误报窗口；确定性无竞态。回归时该时刻文件仍是残留态
     （updated_at=None + stopping_at 非空 + state=stopping）→ 断言失败。"""
     from lake import backfill as lb
+    from lake import conn as lconn
 
     prog = str(tmp_path / "prog_def1.json")
     with open(prog, "w", encoding="utf-8") as f:
@@ -462,6 +468,9 @@ def test_new_run_clears_residual_persisted_in_first_task_window(tmp_path, monkey
                               "state": "stopping", "eta_min": None, "last_error": ""}],
                    "coverage": {}, "stopping_at": "2026-09-16 07:00:00"}, f)
     monkeypatch.setattr(lb.BackfillRunner, "_quota_state", lambda self: (False, 0))
+    # 隔离真实库（同上方用例纪律：in-process run 不得触碰生产库）
+    monkeypatch.setattr(lconn, "get_conn", lambda: (_ for _ in ()).throw(
+        lconn.LakeUnavailable("test isolation")))
 
     tasks = [lb.Task(priority=2, table="kline_history", ts_code=f"sh.6{i:05d}",
                      period_or_date="full_history", tier="P2") for i in range(3)]

@@ -1,358 +1,144 @@
-# A股选股策略程序（stock-screener）
+# stock-screener · v7.0.0（drawdown_martingale 单策略版）
 
-面向 **"攒股养老"** 场景的 A 股多因子选股器：以**高分红央国企**为核心，用
-**技术面 + 股息可持续性 + 行业内排名 + 基本面质量**四维截面 Z-Score 打分，
-输出 Top-N 榜单 `result_YYYYMMDD.csv` + 人类可读报告 `report_YYYYMMDD.md`。
+A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
+多因子选股/日跑体系，仓库只保留一条链路：
 
-投资目标：20 年陆续攒够养老股底仓，靠 4%~5% 分红率产生被动现金流。三条选股原则：
-① 分红率高且**可持续**；② 央国企、国计民生行业（长期稳定）；③ 当前处于较低估值区间（不一买就套十年）。
+```
+DuckDB 数据湖（lake/ 包维护，cron 每日同步）
+   │  read_only
+   ▼
+martingale/ 包（5 条件股票池 → 逐股状态机回测 → 产物 CSV/MD）
+   │
+   ▼
+Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
+```
 
-## 版本演进
+## 1. 策略（规格 = brief §3 + 参考实现逐行移植）
 
-| 版本 | 主题 | 关键变更 |
-|---|---|---|
-| v1 | 骨架 | BaoStock 单源 + 四维 AND 硬过滤 + CLI |
-| v2 | 打分 + Web | Z-Score 截面多因子打分（legacy 可回退）+ SSE Dashboard |
-| v3 | 回测 | 多因子策略历史回测引擎（月度/季度调仓、真实成本模型、PIT 安全） |
-| v4 | 数据源架构 | 高频日K/快照切**腾讯批量接口**，BaoStock 降为低频；除权检测 preclose 信号 |
-| **v5** | **策略重构** | **"攒股养老"因子体系**：分红五因子、央国企过滤、行业白名单、估值分位因子、再投资参考价输出（Phase 1） |
-| **v5.1** | **评审精加工** | payout 软约束区间 / reinvest 多期平滑参考价 + DPS CAGR 列 / 边界测试补全 |
-| **v5.2** | **数据源强化** | raw/canonical 本地数据层 + 多源交叉校验 v1 + 数据源健康度报告（Phase 1；Phase 2/3 见 §11） |
-| **v5.2-p2a** | **BaoStock 配额守卫** | 每日 49900 次硬上限（官网限 50000/日/IP，超限封禁 6h×年内次数），跨进程 flock 计数、超限显式失败不静默 |
-| **v5.3** | **可信度强化** | 健康度阈值告警（rf 回退 / F10 降级标的数 / 交叉校验冲突数，yaml 驱动，超阈值报告顶部标红）+ canonical `version_log.csv` 追加式数据版本日志 |
-| **v6** | **本地 DuckDB 数据湖** | 全 A 股 K 线/分红/多维基础数据统一入湖 + Web 查询页；前端切 Vue3 SPA（:9090） |
-| v6.1.1 | 灌数提速 | upsert 临时表批量冲突 + industry_csric2 自愈回填 |
-| v6.1.2 | lake 页修复 | review P0-P3 + amber total progress bar block-level |
-| v6.1.3 | 源池状态面板 | 数据源池健康度可视化 |
-| v6.1.4 | 五项优化 | market 排序 / P3 增量同步 / 进度显隐+T映射 / 源勾选+手动探测 / 统一色板 |
-| v6.1.5 | 修复轮 | legacy 源名中文 / local 色对比度 / baostock fail-fast≤20s / T5 一键启动 |
-| v6.1.6 | 同步单按钮 | 全量启动/停止合并为单按钮（signal-then-return + stopping 态） |
-| v6.1.7 | T6 股东快照 | holders_snapshot 接入 full 模式（第 4 阶段 t6） |
-| **v6.1.8** | **T8/T9 接入 + 数据质量** | full 六阶段 history→p3→t8→t9→t5→t6；t8 因子快照（as_of=T2 max date、幂等）；t9 利率更新（抓取失败回退现有 csv 不阻断）；T5 baostock 量纲 ×100 修复 + ~100× 错位交叉校验跳过不误报；交叉校验抽样（默认 5%，跨进程稳定 hash）；BaoStockClient 显式 daily_quota=lake 预算（off-by-one 消除，严格 ≤budget） |
-| **v6.2** | **策略页重做** | O1 三段分组规整（📌策略核心8/🧪回测与再投资2/⚙️数据与基础设施6，可折叠+localStorage 记忆，编辑态强制全展开）；O2 参数解释全覆盖（FIELD_DESC 84/84 顶层字段含单位/边界语义，嵌套 dict 只读摘要，desc 只读+编辑双态可见，vitest 守卫防漏）；O3 另存为/加载策略文件（Blob 下载 + POST /api/strategy/import 复用 PUT 校验，.bak 备份，PUT 对外行为逐字节不变） |
-| **v6.2.1-D1** | **409 重名 toast 文案修复** | 前端读 `e.body.detail.error`（FastAPI HTTPException detail=dict 标准包裹；detail 为对象时才取 .error），非重名 409 走通用 toast；测试 mock 对齐真实响应形状 + 补回归用例（vitest 214→215） |
+池内**每只股票**独立状态机：
 
-当前默认配置 = v5.3（`config/strategy.yaml`）。v4 原配置原样保存于 `config/strategy_v4.yaml`
-作零回归基线，任何时刻可回退对照。v5.2 回滚点：`canonical.enabled: false`
-（raw/canonical 全 no-op，主路径行为与 v5.1 逐字节一致）。
+- **信号**：后复权收盘 hfq = raw × adj_factor（隐含除权推导见 engine.py 注释）；**成交**按原始收盘价。
+- **高点 H**：初始 = 窗口首日 hfq 收盘。rearm 两模式：
+  - `bounce`（默认）：价格 ≥ 本周期低点 L × (1+rearm_pct) → 重记 H = 当前价、重置 k=0。
+    每 bar **先**更新 low_since_high **再**判反弹（创新低当日不触发）。
+  - `newhigh`：仅创新高刷新 H。
+- **首仓**：hfq ≤ H×(1−first_drawdown_pct) → 买 `initial_amount`。
+  **每股一次性、全策略仅第一次触发使用**，占用 k=0 档；此后所有轮次首买用 `base_add_amount`。
+- **加仓**：每再跌 `add_step_pct` 一档（档线 H×(1−first_dd−k×step)，k=1,2,…）穿一档买一档，
+  金额 `base_add_amount × growth_ratio^k`，上不封顶；跳空一日穿多档。
+- **不卖出、不封顶、无熔断**（无 exit/stop/max_position 参数）。
+- **分红**（cash 口径固定）：除息日前一日收盘持仓 × cash_dps 收现金，当日买入前执行；
+  送转按比例加股；停牌期除权事件顺延复牌首个 bar。
+- **成本**（引擎常量，不进配置、不进 Web）：佣金 3bps（买）；印花税 5bps（无卖出，no-op）。
+- **组合聚合**：gdates 全局轴 + 末值向前结转（停牌持仓不消失）。
+- 已知局限：湖内无退市股（幸存者偏差）→ 回测产物带此声明。
 
-## 1. 环境安装
+## 2. 股票池（universe，5 条件全链，全离线单库）
+
+`kline_daily 5556 只 → 行业白名单(csric2) → SOE(国资前十大股东) → 总市值≥200亿
+→ 上市≥250 bars → 连续分红N年 = 池`（当前 101 只：86 老股 + 15 新股；
+新股规则按 brief as-is 移植，与研究口径 94/95 的差异全部来自新股分红语义）。
+
+SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
+或名称含 soe_keywords 任一（国务院/国资委/汇金/财政部/国资）。
+
+## 3. CLI
 
 ```bash
-cd ~/stock-screener
-# 独立 venv（uv；系统 pip 太老勿依赖）
-~/.hermes/bin/uv sync --all-extras        # 创建 .venv 并装依赖
-source .venv/bin/activate
+.venv/bin/python -m martingale pool                       # 打印池 + 漏斗
+.venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21 \
+    --out /tmp/bt_out                                     # 全池回测
+.venv/bin/python -m martingale backtest --codes sh.601088,sz.000651 --out /tmp/bt2
+.venv/bin/python -m martingale status --out /tmp/bt_out   # 读产物：逐股当前状态
 ```
 
-Python 3.10；核心依赖：baostock、pandas≥2.0、PyYAML、requests、fastapi、uvicorn（dev: pytest）。
+- 窗口留空 = 各股数据起点 → 数据终点。
+- 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
+- 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
 
-### baostock + pandas≥2.0 兼容说明
+## 4. 参数（config/strategy.yaml）
 
-BaoStock 的 `get_data()` 在结果 >2000 行翻页时内部调用已被 pandas 2.x 移除的
-`DataFrame.append()` → `AttributeError`。本项目统一手动 `while rs.next(): rows.append(rs.get_row_data())`
-翻页（见 `screener/data/baostock_client.py`），与 pandas 版本无关，不钉死旧版。
+| 段 | 键 | 说明 |
+|---|---|---|
+| strategy | name | 固定 `drawdown_martingale` |
+| | initial_amount | 首仓金额（每股一次性，k=0 档） |
+| | base_add_amount | 基础加仓金额 |
+| | first_drawdown_pct | 首档回撤阈值（% → 小数） |
+| | add_step_pct | 每档加仓步长（% → 小数） |
+| | growth_ratio | 加仓金额增长比（第 k 档 = base × ratio^k） |
+| | rearm_mode | `bounce` \| `newhigh` |
+| | rearm_pct | bounce 反弹重记高点阈值（% → 小数） |
+| | accounting | 固定 `cash`（只读，Web 不可改） |
+| universe | industry_whitelist_csric2 | 行业白名单（3 位 csric2 码） |
+| | soe_keywords | 国资股东名称关键词（SOE 恒强制，无开关） |
+| | min_total_mv_yi | 总市值门槛（亿） |
+| | min_consecutive_div_years | 连续分红年数 |
+| | listing_min_trading_days | 最少上市 bar 数 |
+| lake / datasource.* | — | lake-sync / 补数专用，Web 只读不渲染 |
 
-## 2. 运行
+**首轮 k=0 占档说明（必附注）**：首仓占用 k=0 档（金额 initial_amount），
+因此**首轮的第一个实际加仓 = base_add_amount × growth_ratio^1**。
+佣金/印花税是引擎常量（comm=3bps / stamp=5bps），不在 schema 中。
+
+## 5. Web（:9090，systemd user 服务）
 
 ```bash
-cd ~/stock-screener
-python -m screener --date YYYY-MM-DD --config config/strategy.yaml
-# 可选参数：
-#   --output-dir DIR     输出目录（默认 ./output）
-#   --no-crosscheck      跳过腾讯交叉验证
+export XDG_RUNTIME_DIR=/run/user/1000
+systemctl --user status stock-screener-web     # uvicorn web.app:app
+systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改动后
 ```
 
-- `--date` 非交易日 → 自动回退到最近一个交易日（报告注明）。
-- `--date` **必须 ≤ 当前日期**：程序拒绝未来日期并报错退出（exit 1）。
-- 退出码：0 成功；1 运行失败（含未来日期被拒、数据源级失败）；2 参数错误。
-- 输出：`output/result_YYYYMMDD.csv`、`output/report_YYYYMMDD.md`、日志 `logs/run_YYYYMMDD.log`。
+四页签：**回测**（参数表单 + SSE 进度 + 结果区：per_stock 表/净值曲线/buys/summary）·
+**查询**（/api/positions 逐股状态 + /api/pool 池；行点击弹「状态+历史」）·
+**策略**（参数编辑/校验/策略库快照）· **数据湖**（v6 原样）。
 
-**耗时**：全市场 ~5200 只的日K/快照走腾讯批量接口（首跑 bootstrap 约 1~2h，之后增量秒级）；
-v5 新增的央国企股东/现金流数据对**硬过滤后的候选股**逐只取新浪 F10（数百只，约 15~30min）。
-同一天重复运行全部命中本地缓存，秒级完成、零网络。
+主要 API：`/api/health` · `/api/pool` · `/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份）·
+`/api/positions`（同步全池）· `/api/bt/runs`（POST 触发 / GET 列表 / `{id}` status /
+`{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*` · 策略库 CRUD。
+回测 = 异步子进程（单任务 409 + pidfile 锁），进度 SSE（15s 心跳，断线 3 次降级 3s 轮询）。
 
-## 3. 配置（config/strategy.yaml）
+## 6. 定时任务
 
-**所有筛选阈值都在 strategy.yaml，代码不硬编码任何阈值**
-（`tests/test_no_hardcoded_thresholds.py` 做静态检查兜底）。带 `_pct` 的字段是百分数，
-代码内部统一转小数比较。
+crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_sync_daily.sh`，
+数据湖每日同步，martingale 的一切查询都依赖它）。v6 的 `35 9 * * 1-5 run_cron.sh`
+（多因子日跑）已删除。
 
-### 四维打分权重（v5）
-
-| 维度 | 权重 | 子因子（维度内权重和=1） |
-|---|---|---|
-| technical | **0.15** | `ma_bullish` / `low_vol` / `div_yield_pctile`（股息率历史分位）/ `yield_spread`（股息率−10Y国债利差）各 0.25 |
-| dividend | **0.40** | `ttm_yield`(0.30) / `payout_ratio`(0.15，软约束 30~80%：区间外降分不剔除，v5.1) / `consecutive_div_years`(0.20) / `fcf_coverage`(0.20) / `div_stability`(0.15) |
-| industry | 0.15 | `roe_rank_pct`(0.5) / `yoy_pni_rank_pct`(0.5) |
-| fundamental | 0.30 | `roe_level`(0.3) / `roe_stability`(0.2) / `low_liability`(0.15) / `gross_margin`(0.15) / `piotroski` F-Score(0.2) |
-
-> v5 相对 v4：technical 0.25→0.15、dividend 0.30→0.40（分红可持续性是核心）；
-> technical 维度剔除趋势类 `window_return/rsi/macd`，换入**估值安全边际**因子
-> （`div_yield_pctile`/`yield_spread`）——从"追涨趋势"转向"估值分位"，匹配长期持有目标。
-> 估值因子并入 technical 维度是引擎固定 4 维的务实选择（config + 代码注释均写明）。
-
-### v5 硬过滤（打分前剔除，全部 config 驱动）
-
-| 配置项 | 默认 | 说明 |
-|---|---|---|
-| `universe.soe_required` | true | **央国企过滤**：前十大股东"股本性质=国有股" OR 名称命中关键词 → soe；否则剔除并进报告复核清单 |
-| `universe.industry_whitelist_csric2` | 12 类 | **行业白名单**（证监会二级）：煤炭/石油/燃料加工/电力/燃气/水/铁路/道路/水上/航空运输/电信/银行 |
-| `universe.min_total_mv_yi` | 200 | 总市值下限（亿元，腾讯快照 idx45），避免小市值央国企波动 |
-| `universe.soe_keywords` | 国务院/国资委/汇金/财政部/国资 | 央国企识别关键词（⚠️银行类前十大实控人标记全为 0，必须靠关键词兜住国有大行） |
-| `hard_filter.min_consecutive_div_years` | 5 | **连续分红年数**下限；IPO<7 年的新股改为"IPO 后每个完整年度均分红"（不硬砍优质次新） |
-
-### 再投资参考输出（v5，TL D8；v5.1 V1-5 多期平滑）
-
-| 配置项 | 默认 | 说明 |
-|---|---|---|
-| `reinvest.target_ttm_yield_pct` | 4.0 | 目标 TTM 股息率（%）：参考价 = **近 N 年平均 DPS / 目标股息率**（默认 N=3，窗口内无分红年按 0——断档拉低参考价）+ 当前股息率历史分位，辅助判断买入窗口 |
-| `reinvest.dps_smooth_years` | 3 | v5.1：参考价平滑窗口年数（N<1 → 单年 DPS 原行为；键缺失同义） |
-| `reinvest.dps_growth_years` | 5 | v5.1：**近 5 年 DPS CAGR** 展示列（`dps_cagr_5y_pct`，首末年均有分红才计算，否则空） |
-
-### 其他维度阈值（v1~v4 沿用）
-
-| 配置项 | 默认 | 说明 |
-|---|---|---|
-| `technical.ma_period` | 200 | 收盘价 > MA{n}（后复权日K） |
-| `dividend.min_yield_pct` | 3 | TTM 股息率 ≥ 3% |
-| `industry.top_pct` | 30 | 行业内 ROE 前 30% |
-| `fundamental.roe_min_pct` | 10 | ROE ≥ 10%（最近披露报告期，累计口径未年化） |
-| `fundamental.liability_max_pct` | 60 | 资产负债率 ≤ 60% |
-| `fundamental.gross_margin_min_pct` | 20 | 毛利率 > 20%（金融业该字段为空 → 落缺失名单） |
-| `universe.a_share_prefixes` | sh.60/68, sz.00/30 | A股前缀过滤（剔除指数/ETF/B股） |
-| `universe.listing_min_trading_days` | 250 | 上市满 N 个交易日 |
-
-## 4. 数据源架构（v4/v5/v5.2）
-
-多源分工，**单一主源失效不阻塞整体**：
-
-| 数据 | 源 | 说明 |
-|---|---|---|
-| 日K / 实时快照（高频） | **腾讯** `qt.gtimg.cn` 批量 | v4 起主源；后复权重建、除权检测（preclose 信号）、市值/股息率交叉校验 |
-| 全市场股票列表 / 行业分类 / 季度基本面 | **BaoStock**（低频） | 半封禁态有 ≤7 天陈旧池回退；`query_all_stock` 返回空时自动回退陈旧池而非伪装成空结果；**每日配额守卫 49900 次**（v5.2-p2a，防打穿官网 5 万/日/IP 限被封禁） |
-| **备选日线源**（不进主链路） | **Tushare Pro** `api.tushare.pro` | v5.2 实测定位：基础日线权限——`daily` 按 trade_date 单次全市场 ~5500 行/1~3s；财报类接口（income/balancesheet/cashflow/fina_indicator/top10_holders）无权限，**不追积分升级**，仅作腾讯失效时的日线备源。token 存 `.env`（gitignore 覆盖，绝不入库） |
-| 前十大股东（央国企识别）/ 经营现金流（FCF覆盖） | **新浪 F10** `vip.stock.finance.sina.com.cn` + `quotes.sina.cn` JSON API | v5 新增；对硬过滤后候选股逐只取，串行限速 ≥1s、WAF(456) 长退避、连续失败降级 None |
-| 10Y 国债收益率（yield_spread 的 rf） | **TradingEconomics** 页面解析 | v5 新增；每日抓现值落盘 `cache/rf_10y_daily.csv`，解析失败回退 config `2.0%` + 告警 |
-| 分红全史（连续年数/稳定性/股息率分位） | 本地缓存 `cache/em_dividend_all.csv` | 静态历史数据源（1991→今），零网络；Phase 2 用 BaoStock 对账修正 |
-| **交叉校验备源**（close/dps/roe 三字段） | **akshare**（pin `==1.18.88`，validate extra） | v5.2 新增；仅校验用途不进主路径——从最终入选股抽样 N 只（默认 20）串行限速 ≥1s 复核，失败不阻塞、连续失败该类当日降级（breaker） |
-| ~~东财 datacenter-web~~ | **已停用**（`datasource.em.enabled: false`） | 海外 IP 封禁（本机在欧洲）。代码保留不删，引擎侧 D-EM 守卫 + 单测断言零调用 |
-
-> **PIT（point-in-time）纪律**：分红事件锚 = 除权日 ≤ 运行日；股东/现金流表按公告日 ≤ 运行日取报告期。
-> 回测与实盘共用同一数据口径，无未来函数。
-
-### v5.2 本地数据层 + 交叉校验（Phase 1）
-
-在缓存之上加两层**只增量、不改主路径读写语义**的数据设施：
-
-- **raw 层** `data/raw/{source}/{date}/*.json`：append-only 原始响应信封（零数据转换、
-  文件级幂等 seq+sha256、原子写 tmp+rename）。腾讯快照 / 新浪 F10/CF 响应落盘，可追溯每个数字的出处。
-- **canonical 层** `data/canonical/{close,dps,roe}.csv`：统一 Schema 派生表，每条带
-  `source/fetched_at/data_version`；只增量不回填，可从 raw 重建（`build_from_raw`）。
-- **交叉校验 v1**（`screener/data/crosscheck.py`，纯函数）：close 腾讯 vs 新浪非除权日 |Δ|>0.1% 告警、
-  除权日改校 r_event；DPS em 静态 vs akshare-em |Δ|≥0.01 元/股告警 / >0.05 停算标"待复核"；
-  ROE BaoStock(小数,平均) vs 新浪 ROEWEIGHTED(百分数,加权) 换算后 |Δ|>1pp 告警（实测基线差 0.48pp=口径差，勿收紧 <0.5pp）。
-  阈值全部 yaml 驱动（`health:` 段），零硬编码。
-- **EmptyPayloadGuard**：市场级接口（all_stock）交易日 rows<5000 → 判数据源异常而非"无股票"。
-- **健康度双通道**：report.md「数据源健康度」固定段 + JSON sidecar（Web badge 仅异常时显示）。
-  `canonical.enabled: false` → raw/canonical/校验全 no-op，主路径输出与 v5.1 逐字节一致（已 A/B/C 验证）。
-
-### v5.3 阈值告警 + canonical 版本日志
-
-- **健康度阈值告警**（`health.alerts:` 段，yaml 驱动零硬编码）：三个关键指标超阈值时在
-  **报告顶部**渲染「⚠️ 数据源告警」块（无告警则整块不渲染、零噪音），Web badge anomalies 同步：
-  - `rf_fallback_max_per_run`（默认 0）：rf 使用 config fallback 值（TE 解析失败静默替换）→ 标红，防"rf 被换掉没人知道"；
-  - `f10_degraded_max`（默认 5）：当日新浪 F10 接口失败/熔断导致降级 None 的标的数 → 批量 WAF 触发时集体失真可见；
-  - `crosscheck_conflicts_max`（默认 2）：close/dps/roe 三字段交叉校验冲突总数。
-- **canonical 版本日志** `data/canonical/version_log.csv`：append-only，记录每次 append /
-  `build_from_raw` 的 ts_utc、trigger、data_version、source、rows_added、raw 日期范围（seq 幂等 + 原子写）。
-  回测发现某时段结果异常时可快速定位是否数据版本切换导致。
-
-## 5. 筛选逻辑（实现要点）
-
-1. **股票池**：`query_all_stock(day=...)` 显式传 day → 前缀过滤 A股 → tradeStatus=1；
-   空结果自动回退 ≤7 天陈旧池（半封禁态防护）。
-2. **ST 剔除以日K `isST=1` 为准**（名称含 ST 仅作辅助标记）。
-3. **技术面**：后复权日K `adjustflag="1"`（1=后复权,2=前复权,3=不复权，必须传字符串）。
-4. **分红可持续性五因子**：TTM 股息率、股利支付率（软约束 30%~80%，区间外降分不剔除，v5.1）、连续分红年数、
-   FCF/OCF 对分红的覆盖倍数、近 N 年 DPS 波动率（越低越好）。
-5. **估值安全边际**：当前 TTM 股息率在自身历史序列中的分位（越高=越低估）、
-   股息率 − 10Y 国债利差（越大安全垫越厚）。
-6. **央国企识别双规则**：股本性质=国有股 OR 名称关键词命中；单列"仅标记未命中关键词"复核清单。
-7. **基本面**：字段全是小数（roeAvg=0.10 即 10%），阈值用小数比较、展示 ×100；
-   "最近披露报告期"从当前季度往前逐季探测，不硬编码。Piotroski F-Score 九信号。
-8. **行业**：证监会二级（84 类）按 code left-join；白名单外剔除；组内 ROE 百分位保留前 30%；
-   不足 5 只的组跳过排名约束并在报告注明。
-9. **输出**：CSV（代码/名称/行业/收盘价/各因子值/soe判定依据/再投资参考价/综合分）；
-   报告（每层漏斗、最终入选列表、SOE 复核清单、数据时间戳与来源、缺失/异常名单）。
-
-## 6. 本地缓存（同一天重复运行不重复拉取）
-
-- 目录 `cache/`，CSV 原子写（`.tmp` + `os.replace`），首行哨兵标记防损坏文件误读。
-- 键 = (查询类型, 参数)：个股日K/分红/季报不可变 → **永不过期**；行业分类 TTL 24h；交易日历 TTL 1h。
-- `all_stock`：非空结果不可变 → 永不过期；**空结果不落盘**（防"数据尚未产生"污染真实运行）。
-- v5 新增缓存键：`em_dividend_all.csv`（分红全史）、`rf_10y_daily.csv`（国债日频）、
-  新浪股东/现金流逐只文件。独立哨兵，不改动任何 v4 缓存文件。
-
-## 7. 单元测试（离线，不联网）
+## 7. 测试
 
 ```bash
-source .venv/bin/activate
-python -m pytest -q          # 806 passed
+.venv/bin/python -m pytest tests/ -q          # 后端：纯 lake 套件 + martingale 套件 + web + 边界守卫
+cd web/frontend && npm test                   # 前端 vitest（208 用例）
+cd web/frontend && npm run build               # dist/ 供 StaticFiles 挂载
 ```
 
-覆盖：技术面指标、股息率（真实样例去重/窗口边界/无分红不报错）、基本面（小数口径/字段切换）、
-行业排名、股票池（真实样例）、缓存（命中/过期/损坏/原子写）、腾讯 GBK 解析、配置校验、
-**无硬编码阈值静态检查**、v5 新因子（连续分红年数/D1新股边界/FCF覆盖/股息率分位/soe双规则/
-每10股单位换算/同除权日去重）、**D-EM 零东财调用断言**（AST + runtime 双断言）、
-**v5.1 评审精加工**（payout 软约束区间外降分、reinvest 多期平滑参考价/DPS CAGR、
-consecutive_div_years 边界、rf fallback data_notes 回归、v4 配置零回归）、
-**v5.2 Phase 1**（rawstore 幂等/原子写、canonical 增量不回填/build_from_raw、交叉校验三分支+
-EmptyPayloadGuard 两分支、akshare breaker 降级、健康度渲染回滚逐字节一致；全离线 fixture，零网络）、
-**v5.2-p2a BaoStock 配额守卫**（QuotaGuard 计数/超限 raise/flock 并发原子性/CLI --show/--set-count，
-全离线 mock，零真实 baostock 调用）、
-**v5.3 阈值告警 + 版本日志**（alerts 三 kind 触发/不触发、summary/badge 含 alerts、报告顶部块渲染与
-无告警不渲染、version_log 追加/seq 幂等/原子写、config alerts 缺省向后兼容；全离线 fixture，零网络）。
+**f6 回归基准**：`tests/fixtures/f6_baseline/`（七股 per_stock.csv + summary.md，
+2026-10-22 Joel 验收数字逐位基准）。`tests/test_f6_regression.py` 重跑七股并与
+fixture 逐位比对（n_buys / total_invested / final_assets / pnl_pct / dividends /
+首末买日）。改 engine 后必跑。
 
-## 8. Web 前端（控制台）
+守卫：`test_lake_zero_import.py`（lake 包不得 import martingale/screener）、
+`test_no_hardcoded.py`（新包路径无硬编码）、grep 守卫（tracked 文件无
+`python -m screener` / run_cron.sh 残留）。
 
-`web/` 下 FastAPI 后端 + 无构建静态单页应用，用于查看运行结果、编辑策略阈值、触发新筛选。
-复用现有 `.venv`，不引入数据库——所有数据读自 `output/`、`config/`、`logs/` 文件系统。
-
-### 启动（systemd user service）
-
-```bash
-# unit: ~/.config/systemd/user/stock-screener-web.service
-systemctl --user daemon-reload
-systemctl --user enable --now stock-screener-web.service
-systemctl --user status stock-screener-web.service
-# 绑定 0.0.0.0:9090（访问控制由云安全组负责，应用层不加认证）
-```
-
-打开 `http://<host>:9090/`，页签：**结果**（运行列表→漏斗条形图→入选表→全量幸存者表，可搜索/排序/分页）、
-**策略**（分组卡片展示各维度阈值+说明，编辑模式改完提交 PUT）、**运行**（选日期触发筛选，轮询实时日志尾部）。
-
-### API 一览
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/health` | 健康检查（ok/time/project_root/active_task） |
-| GET | `/api/runs` | 扫描 `output/` 列出已有运行，倒序 |
-| GET | `/api/runs/{YYYYMMDD}` | 该次运行详情：漏斗、入选列表、全量 CSV(JSON)、缺失名单、报告原文 |
-| GET | `/api/strategy` | 当前 strategy.yaml 解析后 JSON + 原始文本 |
-| PUT | `/api/strategy` | 更新阈值（逐项校验，非法 400；先备份 `.bak` 再原子写回，保留注释） |
-| POST | `/api/runs` | body `{run_date}`。后台子进程执行 CLI，立即返回 task_id；同一时间只允许一个任务（已有则 409） |
-| GET | `/api/runs/{task_id}/status` | running/done/failed + 日志尾部 + 完成后指向结果 |
-
-- **只读复用** `screener/` 主代码：Web 不改动筛选逻辑，仅调用 CLI 子进程与读取产物。
-- 触发运行用**子进程**而非 uvicorn 线程内跑（首跑可能 ~1h+，不能阻塞 API）。
-- PUT 写回保留 YAML 注释（ruamel round-trip + 叶子级最小替换），NO-OP 保存字节一致。
-
-## 9. cron 部署说明
-
-服务器时区 **UTC**；A股收盘后日K约北京时间 17:30（UTC 09:30）起更新，T+1 必可取。
-建议每个交易日 **UTC 09:35**（北京 17:35）起跑，配节假日守卫避免回退重算旧数据：
-
-```cron
-# crontab -e（周一~周五 UTC）
-# ① 湖 P3 增量（kline_daily 缺口 + valuation_daily 快照 + index_daily）——先于选股
-30 11 * * 1-5 /home/ubuntu/stock-screener/scripts/run_lake_sync_daily.sh >> /home/ubuntu/stock-screener/logs/lake_sync_cron.log 2>&1 # lake-sync-daily
-# ② 选股运行（依赖①当日的 K线/快照已入湖）
-35 9 * * 1-5 /home/ubuntu/stock-screener/run_cron.sh >> /home/ubuntu/stock-screener/logs/cron.log 2>&1 # stock-screener-daily
-```
-
-`run_cron.sh` 先用交易日历判断今天是否交易日（非交易日直接 exit 0），再跑 CLI。
-进程级超时兜底（BaoStock 是 ctypes C 库，socket 超时无效，必须进程级 `timeout -k`）。
-数据源级失败（如 BaoStock 封禁）显式失败 + sidecar 标红，**不写误导性空结果**。
-
-> 注（2026-10-01 恢复）：v6 lake 切 primary 后，①的增量此前仅靠 Web「开始同步」
-> 按钮手工触发、②的选股 cron 亦缺失 → 湖 09-23 停更、选股 09-20 后无新 run。
-> 两条 cron 已恢复。①超时 16.7h（全市场增量最坏 ~14h），保证在次日 09:35 选股前
-> 释放 DuckDB 锁；incremental 断点续传（done 键 per code + 运行日），中断次日补。
-> 选股与湖增量抢锁时 read_only 连接被拒 → 显式报「backfill 灌数进行中」，不静默。
-
-## 10. 目录结构
+## 8. 目录结构
 
 ```
-stock-screener/
-├── pyproject.toml            # uv 项目定义
-├── config/
-│   ├── strategy.yaml         # v5 全部筛选阈值（唯一配置源）
-│   └── strategy_v4.yaml      # v4 原配置（零回归基线）
-├── screener/
-│   ├── __main__.py           # CLI 入口 (python -m screener)
-│   ├── config.py             # 配置加载+校验（百分数→小数换算）
-│   ├── universe.py           # 股票池（前缀/停牌/ST + v5 白名单/SOE/市值硬过滤）
-│   ├── metrics.py            # 指标纯函数（技术面/股息五因子/估值分位/基本面/行业/F-Score/soe_flag）
-│   ├── scoring.py            # Z-Score 截面打分引擎（四维固定，sub_weights 驱动）
-│   ├── screener.py           # 筛选引擎编排（硬过滤→取数→打分→报告）
-│   ├── report.py             # CSV + Markdown 报告输出（含再投资参考价/SOE复核清单）
-│   ├── runstatus.py          # 运行状态 sidecar
-│   ├── health.py             # v5.2：HealthTracker 记账 + 报告健康度段渲染 + JSON sidecar
-│   ├── migrate.py / prewarm_fundamentals.py / reconstruct.py   # 数据迁移/预热/后复权重建
-│   └── data/
-│       ├── baostock_client.py  # BaoStock 登录态/指数退避/手动翻页（pandas≥2.0 兼容）+ v5.2-p2a 每日配额守卫 QuotaGuard（flock 跨进程计数，CLI --show/--set-count）
-│       ├── cache.py            # 本地 CSV 缓存（原子写+哨兵+TTL）
-│       ├── fetchers.py         # 各接口抓取（缓存优先 + 半封禁态陈旧回退）
-│       ├── sources.py          # 数据源抽象层（腾讯主源 / BaoStock 低频）
-│       ├── tencent.py          # 腾讯批量快照/日K（GBK 转码，除权检测）
-│       ├── sina.py             # v5：新浪 F10 股东 + 财务 JSON（OCF/ROEWEIGHTED），WAF 鲁棒
-│       ├── rf.py               # v5：TradingEconomics 10Y 国债收益率
-│       ├── rawstore.py         # v5.2：append-only 原始响应层 data/raw/{source}/{date}/*.json
-│       ├── canonical.py        # v5.2：统一 Schema 派生层 data/canonical/{close,dps,roe}.csv
-│       ├── crosscheck.py       # v5.2：交叉校验 v1 纯函数 + EmptyPayloadGuard（阈值 yaml 驱动）
-│       ├── akshare_src.py      # v5.2：akshare 校验源客户端（仅校验用途，breaker+限速）
-│       └── em.py               # 东财 datacenter-web 客户端（v5 已停用，代码保留）
-├── tests/                      # 388 个离线单测 + fixtures（真实样例数据）
-├── web/                        # Web 前端（FastAPI + Vue3 SPA，端口 9090）
-│   ├── app.py                  # FastAPI 应用（API + 子进程任务管理 + 策略校验 + data_health badge）
-│   ├── frontend/               # Vue3 + Vite + Pinia 源码（统一刷新引擎 queryRegistry）
-│   └── dist/                   # `npm run build` 产物（不入库，app.py serve /assets + index.html）
-├── cache/                      # 原始数据缓存（自动生成）
-├── data/                       # v5.2：raw/（append-only 原始响应）+ canonical/（统一 Schema + v5.3 version_log.csv），已 gitignore
-├── output/                     # result_*.csv / report_*.md（自动生成，报告含数据源健康度段）
-└── logs/                       # run_*.log / web_run_*.log / cron.log
+martingale/        # v7 策略包：config/data/universe/engine/report/__main__(CLI)
+lake/              # 数据湖（v6 保留，零改动红线）
+screener/          # 退化为数据客户端库：config + data/{baostock_client,tencent,sina,rf}
+web/               # FastAPI app.py + frontend/（Vue3 + vitest；dist/ 构建产物）
+config/strategy.yaml   # strategy(9键)/universe(5键)/lake/datasource
+scripts/           # lake 运维：lake_backfill / run_lake_sync_daily.sh / lake_smoke / …
+data/lake/         # lake.duckdb（gitignore）
+tests/             # pytest（含 fixtures/f6_baseline/）
+output/            # 回测产物（gitignore；旧多因子产物保留未清）
 ```
 
-## 11. 已知限制与后续路线
+## 9. v7 变更摘要（相对 v6.3.6，git 8c49f71）
 
-- **BaoStock 半封禁态**：全市场 `query_all_stock`/基本面接口间歇性返回空或挂起，
-  已用 ≤7 天陈旧池回退 + 进程级超时兜底；每日配额守卫（49900）防打穿官网限频被封。
-  09-12 实测 login 正常但 `all_stock` 延迟波动大（22~30s，个别 >120s），低频用途需避开高峰。
-- **新浪 F10 WAF**：非官方接口，高频触发 HTTP 456，已用串行限速 ≥1s + 长退避 + 连续失败降级 None（missing_policy=neutral_renorm 兜底）。
-- **东财海外封禁**：本机在欧洲，datacenter-web 不可达；`em.py` 代码保留但 `enabled: false`，
-  分红全史改用本地静态缓存。若迁回境内服务器可重新启用做对账源。
-- **行业分类为证监会二级口径**（84 类），未引入申万依赖（无免费可靠源）。
-- **FCF 覆盖用 OCF 口径**：新浪财务 API 无资本开支字段，`fcf_coverage` = 经营现金流量净额 / 年度分红总额
-  （比严格 FCF 略宽松，方向一致、更保守地衡量分红安全垫）；接口失败降级 `cfo_to_np/payout` 代理。
-- **rf 历史序列**：v6.3.5 起 T9 `macro_rf` 已回填 2002-01-04 全史（东财中债 10Y，
-  6182 行，source=em_local_static）；日更现值仍走 TE 主源（akshare 按纪律不进每日主链路）。
-
-### v5.2 后续路线（Phase 2/3）
-
-- **Phase 2（BaoStock 对账）**：门槛 = BaoStock all_stock 连续 ≥5 个交易日 <10s 且非空。
-  probe 自 09-10 起持续 TIMEOUT，仍在观测；恢复后做分红双源对账修正 `em_dividend_all.csv`。
-- **Phase 3（Tushare Pro 备源）— 已定案（2026-09-12）**：账号仅基础日线权限
-  （`daily`/`dividend`/`daily_basic`/`adj_factor`/`share_float` 可用；财报类接口无权限，
-  提升需积分）。**决定：不追积分升级，Tushare 定位为备选日线源**——腾讯主源失效时按
-  trade_date 单次全市场拉取兜底（~5500 行/1~3s），不进主链路、不做财报交叉校验。
-
-### v6.3.5/6 数据湖定案（2026-09/10，Joel 拍板）
-
-- **增量 K线窗口化**（v6.3.5）：sina/tdx/tencent 按缺口窗口取数而非拉全史——
-  sina 此前无视 start 拉全史（单只 ~7.4s），窗口化后 ~3.1s；配合
-  `EmptyWindowError` 区分"窗口可达但合法空"（停牌/节假日 → 标 done）与"源真实失败"
-  （不标 done）。每日增量全市场 ~14h 降至 ~4-5h，防 09-23 式停更。
-- **incremental 关 T2 tdx 交叉验证**（v6.3.5）：每日 cron 路径不再为每只股多一次
-  tdx 窗口取数（~4s ×5112 ≈ 5.7h，只写审计列不阻断）。p0 手动路径与 T7 指数保留
-  交叉校验（抽查入口 + index amount 补齐）。
-- **T9 macro_rf 历史回填**（v6.3.5）：东财中债 10Y 一次性回填 2002 全史
-  （`lake_backfill.py t9`，持锁，source=em_local_static）；sanity 区间 [0.5,10]
-  而非 rf 配置 [0.5,4]（2004-2014 真实峰值 5.41% 不可误杀）。
-- **P1-B adj 跨源校验口径修正 + 旧误报清除**（v6.3.6）：`cross_check_adj_factor`
-  改比**相邻事件日因子比值**（sina/tdx af 归一化基准不同，恒定倍数下绝对值比较
-  必误报——3861 只 / 970 万行旧 conflict_src 已全部清 NULL，2026-10-03）。
-- **Phase C 历史迁移完成**（2026-10-02）：累计 126359 条全命中断点缓存，
-  phase-c 每日续跑 cron 已移除（`run_phase_c.sh` 保留备查）。
-- **cron 恢复**（09-23 停更事故后）：lake-sync 11:30 UTC + screener 09:35 UTC（工作日），
-  详见 §9；湖增量与选股对 DuckDB 单文件写锁互斥，调度已错峰。
+- 删：多因子选股/打分/徽章/回测引擎（screener 主体、backtest/、run_cron.sh、
+  5 个多因子 scripts）、Web「运行」页签与 /api/runs、/api/backtest 族、45 个测试。
+- 增：`martingale/` 包（状态机自 scripts/backtest_martingale.py 逐行移植，f6 七股
+  逐位对齐后删参考脚本）、`/api/bt/runs` 族（SSE）、前端回测/查询页签。
+- 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
+- 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。

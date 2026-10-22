@@ -11,7 +11,7 @@
 // SECTION_META/SECTION_DESC/FIELD_DESC/FIELD_TYPE 来自 src/data/strategyMeta.js。
 <script setup>
 import { computed, ref } from "vue";
-import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, displayValue } from "../../data/strategyMeta.js";
+import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, HIDDEN_FIELDS, displayValue } from "../../data/strategyMeta.js";
 import FieldEditor from "./FieldEditor.vue";
 
 const props = defineProps({
@@ -72,7 +72,7 @@ const ungrouped = computed(() => {
           <div v-if="(json || {})[section] && typeof (json || {})[section] === 'object'" class="s-card">
             <h4><span class="s-icon">{{ (SECTION_META[section] || { icon: "🔧" }).icon }}</span>{{ (SECTION_META[section] || { title: section }).title }}</h4>
             <p v-if="SECTION_DESC[section]" class="s-sec-desc">{{ SECTION_DESC[section] }}</p>
-            <div v-for="[field, value] in Object.entries((json || {})[section])" :key="field" class="s-field">
+            <div v-for="[field, value] in Object.entries((json || {})[section]).filter(([f]) => !HIDDEN_FIELDS.has(section + '.' + f))" :key="field" class="s-field">
               <div class="s-field-head">
                 <span class="s-key">{{ field }}</span>
                 <span v-if="!editing" class="s-val">{{ displayValue(section, field, value) }}</span>

@@ -1,0 +1,140 @@
+# -*- coding: utf-8 -*-
+"""v7 验收红线守卫（grep 型，防回潮）。
+
+1) tracked 文件无「已删多因子主 CLI / run_cron」活动引用：
+   - 裸 `python -m screener`（后随空格/行尾 = 已删的 screener/__main__ 主 CLI）；
+   - run_cron.sh 的**执行**引用（非注释行）。
+   白名单语义：
+   - screener/data/baostock_client.py 的 `python -m screener.data.baostock_client`
+     是保留的 baostock 配额维护工具自身用法（调研 ① 保留清单），不是主 CLI 残留；
+   - README.md / stages/ 为历史文档（删码记录）；
+   - scripts/run_lake_sync_daily.sh 头注里的 09-23 事故说明是注释（历史）。
+2) crontab 仅剩 lake-sync 一条业务行（绝不含 run_cron）。
+3) git diff 8c49f71 -- lake/ 为空（lake 包零改动）。
+4) pyproject：version 7.0.0 + packages 三包。
+5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+BASELINE = "8c49f71"
+
+
+def _git(*args) -> str:
+    r = subprocess.run(["git", *args], cwd=PROJECT_ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, f"git {' '.join(args)} 失败: {r.stderr}"
+    return r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 1) 残留引用扫描
+# ---------------------------------------------------------------------------
+
+_BARE_CLI = re.compile(r"python -m screener(\s|$)")          # 裸主 CLI（非 .data.* 子模块）
+_RUNCORN_EXEC = re.compile(r"(?<![#\w])run_cron\.sh")          # 非注释上下文执行引用
+
+
+def test_no_stale_multifactor_references_in_tracked_files():
+    tracked = _git("ls-files").splitlines()
+    bad = []
+    for f in tracked:
+        if f.startswith("stages/") or f == "README.md":
+            continue  # 历史文档（调研/任务书/删码记录）
+        p = PROJECT_ROOT / f
+        if not p.is_file() or p.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), start=1):
+            if _BARE_CLI.search(line):
+                bad.append(f"{f}:{i}: 裸 python -m screener 引用: {line.strip()}")
+            stripped = line.strip()
+            if _RUNCORN_EXEC.search(line) and not stripped.startswith("#") \
+                    and not stripped.startswith("//"):
+                bad.append(f"{f}:{i}: run_cron.sh 活动引用: {line.strip()}")
+    assert not bad, "残留引用:\n" + "\n".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 2) crontab
+# ---------------------------------------------------------------------------
+
+def test_crontab_only_lake_sync_business_line():
+    """stock-screener 的 crontab 业务行恰为 1 条 lake-sync（团队基础设施行
+    ——hermes memory-backup/pipeline-watchdog——不属本项目，按路径过滤）。"""
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("无 crontab 条目（非部署环境）")
+    proj = [l for l in r.stdout.splitlines()
+            if l.strip() and not l.strip().startswith("#") and "stock-screener" in l]
+    assert len(proj) == 1, f"stock-screener crontab 业务行应恰为 1（lake-sync），实际 {len(proj)}: {proj}"
+    assert "run_lake_sync_daily.sh" in proj[0]
+    assert "run_cron" not in r.stdout, "crontab 不得含 run_cron（含注释外任何形态）"
+
+
+# ---------------------------------------------------------------------------
+# 3) lake/ 零改动
+# ---------------------------------------------------------------------------
+
+def test_lake_zero_diff_vs_baseline():
+    out = _git("diff", BASELINE, "--", "lake/")
+    assert out.strip() == "", f"lake/ 相对基线 {BASELINE} 有改动:\n{out[:2000]}"
+
+
+# ---------------------------------------------------------------------------
+# 4) pyproject
+# ---------------------------------------------------------------------------
+
+def test_pyproject_v7_shape():
+    text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'version = "7.0.0"' in text
+    assert "martingale" in text
+    assert re.search(r'packages\s*=\s*\[[^\]]*"martingale"[^\]]*\]', text)
+    assert 'lake"' in text and '"screener"' in text
+
+
+# ---------------------------------------------------------------------------
+# 5) strategy.yaml schema 形状
+# ---------------------------------------------------------------------------
+
+def test_strategy_yaml_v7_schema_shape():
+    cfg = yaml.safe_load((PROJECT_ROOT / "config" / "strategy.yaml").read_text(encoding="utf-8"))
+    strat = set(cfg["strategy"].keys())
+    assert strat == {"name", "initial_amount", "base_add_amount", "first_drawdown_pct",
+                     "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"}
+    assert set(cfg["universe"].keys()) == {
+        "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
+        "min_consecutive_div_years", "listing_min_trading_days"}
+    assert "lake" in cfg and "datasource" in cfg
+    assert {"sina", "rf", "baostock"} <= set(cfg["datasource"].keys())
+    # 旧 12 段不得回潮
+    gone = {"technical", "dividend", "industry", "fundamental", "scoring", "badges",
+            "hard_filter", "data", "crosscheck", "reinvest", "canonical", "health",
+            "backtest"}
+    assert not (set(cfg.keys()) & gone), f"旧段回潮: {set(cfg.keys()) & gone}"
+
+
+# ---------------------------------------------------------------------------
+# 6) 已删模块不得回潮（文件级）
+# ---------------------------------------------------------------------------
+
+def test_deleted_artifacts_gone():
+    gone_files = [
+        "screener/__main__.py", "run_cron.sh", "backtest/", "scripts/backtest_martingale.py",
+        "tests/smoke_cron_guard.py",
+    ]
+    for g in gone_files:
+        p = PROJECT_ROOT / g
+        assert not p.exists(), f"已删文件回潮: {g}"

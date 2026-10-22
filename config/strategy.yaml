@@ -1,45 +1,37 @@
-# A股选股策略配置 —— 所有筛选阈值都在这里，代码中不硬编码任何阈值。
-# 单位约定：带 _pct 的字段是百分数（3 表示 3%）；代码内部统一转小数比较。
+# =============================================================================
+# stock-screener v7.0 策略配置（slim schema，2026-10-22）
 #
-# v5（2026-09-10，TL 拍板 D1-D9）："攒股养老"选股器重构 Phase 1。
-# v4 原配置原样保存于 config/strategy_v4.yaml（零回归基线）。
+# 结构（定案，勿增删键）：
+#   strategy:   深回撤金字塔加仓参数（9 键，含固定 name）
+#   universe:   股票池 5 条件（SOE 恒强制，不设开关）
+#   lake:       数据湖配置（lake.config.lake_cfg() 读取；lake-sync 依赖，勿删）
+#   datasource: lake-sync 数据源子段（sina/rf/baostock 必留；lake_backfill 唯一消费点）
+#
+# 纪律：所有策略阈值必须来自本文件（代码零硬编码策略阈值；佣金/印花税为引擎
+# 常量，TL 拍板不暴露——martingale/config.py 头部注释）。
+#
+# 单位约定：带 _pct 的字段存**整数百分数**（15 = 15%），config 层转小数供引擎；
+# 金额单位 = 元。
+# =============================================================================
 
-technical:
-  ma_period: 200                    # 收盘价 > MA{n}（后复权日K）
-  return_window_days: 250           # 区间收益率回看窗口（交易日）
-  min_return_pct: 0                 # 近250日区间收益率下限（%），含边界
-  max_return_pct: 100               # 近250日区间收益率上限（%），含边界
-  max_annual_volatility_pct: 45     # 年化波动率上限（%，不含边界）
+strategy:                           # 深回撤金字塔加仓（唯一策略；参数 schema 定案）
+  name: drawdown_martingale         # 策略名（固定；Web 只读展示）
+  initial_amount: 100000            # 初始投入金额（元）：一次性首仓，占用 k=0 档；
+                                    # 每股全策略仅第一次触发用（f6 验收值）
+  base_add_amount: 10000            # 加仓基准金额（元）：每轮首档(k=0)；
+                                    # 第 k 档 = base_add_amount × growth_ratio^k
+  first_drawdown_pct: 15            # 首次回撤比例（%）：hfq ≤ H×(1−15%) 建仓
+  add_step_pct: 5                   # 加仓步长（%）：档线 H×(1−first_dd−k×step)
+  growth_ratio: 1.1                 # 加仓提升比率：第 k 档 = 基准×比率^k
+  rearm_mode: bounce                # 高点再武装模式：bounce（默认）| newhigh
+  rearm_pct: 15                     # 高点刷新比例（%）：bounce 模式下价格 ≥ 本周期
+                                    # 低点×(1+15%) 时重记高点并重置 k=0
+  accounting: cash                  # 会计口径（固定只读：原始价成交+现金分红单列）
+  # —— 成本常量（引擎常量，不进本文件/Web，TL 拍板）——
+  # comm=3bps 买入 / stamp=5bps 卖出(本策略无卖出→no-op)；改 3bps 则 f6 回归必偏
 
-dividend:
-  window_days: 365                  # 股息率窗口：[运行日-365天, 运行日]
-  min_yield_pct: 3                  # 股息率下限（%），含边界
-  payout_band_pct: {min: 30, max: 80}   # v5.1 软约束区间（%）：区间外降分不剔除
-  payout_out_of_band_decay: 0.5     # v5.1 区间外衰减系数（config 驱动，禁硬编码）
-
-industry:
-  rank_by: roeAvg                   # 组内排名依据（目前仅支持最近披露报告期 ROE）
-  top_pct: 30                       # 保留行业内前 30%（按 ROE 降序）
-  min_group_size: 5                 # 行业组不足该数量 → 跳过排名约束并在报告注明
-
-fundamental:
-  roe_min_pct: 10                   # ROE 下限（%，报告期累计口径、未年化，含边界）
-  net_profit_yoy_field: YOYPNI      # 净利同比字段：YOYPNI(归母) / YOYNI(净利润)，须 > 0
-  liability_max_pct: 60             # 资产负债率上限（%，含边界）
-  gross_margin_min_pct: 20          # 毛利率下限（%，不含边界）；金融业该字段为空 → 落缺失名单
-  probe_quarters_back: 3            # "最近披露报告期"从当前季度最多回退探测的季数
-
-universe:
-  a_share_prefixes:                 # 沪深A股代码前缀（排除指数/ETF/B股）
-    - sh.60
-    - sh.68
-    - sz.00
-    - sz.30
-  listing_min_trading_days: 250     # 上市满 N 个交易日（窗口内K线行数判断）
-  st_name_keyword: ST               # 名称辅助标记（剔除以日K isST=1 为准）
-  # ---- v5 硬过滤（TL D2/D3；键缺失时 universe_cfg 回退关闭，v4 配置零回归）----
-  soe_required: true                # 央国企过滤：前十大股东关键词命中即 soe（D3）
-  industry_whitelist_csric2:        # 证监会二级行业白名单（TL D2；已逐一对照 cache/industry.csv 84 类实测存在）
+universe:                           # 股票池（全链 5 条件；漏斗 5556→347→289→125→124→~95）
+  industry_whitelist_csric2:        # ① 证监会二级行业白名单（码前缀；已逐一对照实测存在）
     - B06                           # 煤炭开采和洗选业
     - B07                           # 石油和天然气开采业
     - C25                           # 石油、煤炭及其他燃料加工业
@@ -52,190 +44,35 @@ universe:
     - G56                           # 航空运输业
     - I63                           # 电信、广播电视和卫星传输服务
     - J66                           # 货币金融服务（银行）
-  min_total_mv_yi: 200              # 总市值下限（亿元，腾讯快照 idx45；D2）
-  soe_keywords:                     # 央国企识别关键词（TL D3，config 驱动初值）
+  soe_keywords:                     # ③ 央国企识别关键词（双规则之二：股东名 LIKE %kw%）
     - 国务院
     - 国资委
     - 汇金
     - 财政部
     - 国资
-  # ⚠️实测结论：银行类前十大 IS_SJKZR 全为 0（evidence/probe20_summary.json，601398）——
-  # 纯标记规则会漏掉全部国有大行，必须靠关键词；"仅 IS_SJKZR=1 未命中关键词"单列复核清单。
+  min_total_mv_yi: 200              # ④ 总市值下限（亿元，最新估值日）
+  min_consecutive_div_years: 5      # ⑤ 连续分红年数下限（老股=最近 N 年；
+                                    # 新股=上市次年起全部年度——语义 as-is 移植 v6.x）
+  listing_min_trading_days: 250     # ②' 上市满 N 个交易日（K线行数）
+  # ② 存活+非ST（delist_date IS NULL AND is_st=0）为固定条件，不设开关
 
-scoring:                            # v5 打分模型（TL D5：权重同步切，Phase 1 因子全部就绪后一次性改）
-  mode: zscore                      # zscore(新) | legacy(旧四维AND硬过滤)
-  top_n: 50                         # 榜单输出前 N 名
-  missing_policy: neutral_renorm    # neutral_renorm | neutral | drop（缺失因子 z=0 + 按可用权重归一化）
-  normalize: cross_section          # 截面标准化集合 = 硬剔除后全体候选
-  weights:                          # 四维权重（和必须为1；代码零硬编码，全部在此）
-    technical: 0.15                 # v5：0.25→0.15（TL D5）
-    dividend: 0.40                  # v5：0.30→0.40（TL D5）
-    industry: 0.15                  # 行业（不变）
-    fundamental: 0.30               # 基本面（不变）
-  sub_weights:                      # 维度内子因子权重（每维度和必须为1；缺省=等权）
-    # v5 technical：ma_bullish/low_vol/div_yield_pctile/yield_spread 各 0.25，剔除 window_return/rsi/macd。
-    # ⚠️TL D9：估值因子（div_yield_pctile/yield_spread）并入 technical 维度是引擎 DIMENSIONS
-    # 固定 4 维的**务实选择**（允许），非语义归类——technical 维度 = 技术面 + 估值相对水平。
-    technical: {ma_bullish: 0.25, low_vol: 0.25, div_yield_pctile: 0.25, yield_spread: 0.25}
-    # v5 dividend 五因子（报告 §4 草案权重）
-    dividend: {ttm_yield: 0.30, payout_ratio: 0.15, consecutive_div_years: 0.20, fcf_coverage: 0.20, div_stability: 0.15}
-    industry: {roe_rank_pct: 0.5, yoy_pni_rank_pct: 0.5}
-    fundamental: {roe_level: 0.3, roe_stability: 0.2, low_liability: 0.15, gross_margin: 0.15, piotroski: 0.2}
-
-badges:                             # Web 主表格 badge 阈值（百分数口径，与 CSV *_pct 列同单位）
-  industry_top_pct: 10              # 行业TopN% = industry_roe_rank_pct <= 该值
-  fscore_min: 7                     # F-Score badge = piotroski_fscore >= 该值
-  # 高股息(绿) 阈值复用 dividend.min_yield_pct（brief R5：单一事实来源，不另设键）
-
-hard_filter:                        # 硬性剔除开关（v2 打分前的硬剔除，可配置）
-  st_enabled: true                  # ST 剔除（日K isST=1）
-  listing_min_trading_days: 250     # 上市未满 N 个交易日剔除（全历史K线行数判断）
-  min_consecutive_div_years: 5      # v5（TL D1）：连续分红年数下限。新股规则精确化：
-                                    # IPO 满 7 年 → 要求连续 >=5 个自然年有分红；
-                                    # IPO 不满 7 年 → IPO 年份之后每个完整年度（ceil(IPO_year)..run_year-1）
-                                    # 每年都有至少一笔 ex_date 落在该年的分红，否则剔除。
-
-backtest:                           # v3 多因子策略历史回测（报告 R5 schema，零硬编码）
-  start: "2021-09-30"               # 首调仓月(月末交易日)；5y 默认窗口(TL Q1)
-  end: "2026-09-04"                  # 末调仓月(月末交易日)
-  rebalance: monthly                # monthly | quarterly
-  top_n: 50                         # 等权持仓数
-  weights_ref: scoring.weights      # 引用 strategy.yaml scoring.weights(单一事实来源)
-  execution: t1_open                # t1_open(T+1开盘,TL Q2) | t1_close | t_close
-                                    # 注：缓存仅 23/5216 只K线含 open 列 → open 缺失自动
-                                    # close 兜底（仍 T+1 成交、PIT 安全），报告披露兜底笔数
-  costs:
-    commission_bp: 2.5              # 佣金 万2.5 双边
-    min_commission_cny: 5           # 单笔佣金下限(元)
-    initial_capital_cny: 1000000    # 初始资金(元)：佣金下限折算归一化净值用(5元/100万=5e-6)
-    stamp_tax_sell:                 # 印花税 卖出单边, 日期分段(可配)
-      - {from: "1900-01-01", to: "2023-08-27", bp: 10}   # 0.1%
-      - {from: "2023-08-28", to: "2999-12-31", bp: 5}    # 0.05%(财政部2023年第39号公告)
-    transfer_fee_bp: 0.1            # 过户费 双边 0.001%
-    slippage_bp: 5                  # 滑点(可配)
-    delisting_haircut_pct: 0        # 退市退出价打折(默认0, TL Q3 保留开关)
-  suspension: {max_defer_days: 5, on_timeout: drop_to_cash}   # R2 停牌规则
-  benchmarks: [sh.000300, sh.000905]   # + 自建全市场等权(自动); 指数K线待 Phase C 补拉
-  risk_free_pct: 2.0                # 夏普/alpha 无风险利率(年化%)
-
-data:
-  kline_calendar_days_back: 420     # 后复权窗口K线回溯日历天（覆盖250个交易日+节假日余量）
-  retry_max_attempts: 5             # BaoStock 单次查询失败重试次数（指数退避）
-  cache_dir: cache                  # 本地缓存目录（相对路径基于项目根）
-
-datasource:                         # v4 数据源架构（报告 R3 + TL 修正）：高频K线/快照切腾讯批量
-  primary: lake                     # tencent | baostock | lake（lake=本地DuckDB数据湖主源，零网络；
-                                    #   02_code 修正轮已切：G1 存储 T2 adj_factor vs BaoStock ground
-                                    #   truth 近 420 交易日窗口 PASS（sh.601688 已知损坏单列→t2_repair.md）。
-                                    #   **回退=改回 tencent**（一行；LakeDataFetcher 不实例化，零残留））
-  fallback: fail_fast               # fail_fast(推荐,TL D2) | baostock；全批失败时不自动回退 BaoStock
-  baostock:                         # v5.2-p2（TL D5）：BaoStock 每日配额守卫（防打穿配额被封禁）
-    daily_quota: 49900              # 官网限 50000/日/IP，超限封禁 6h×次数；留 100 余量
-  tencent:
-    snapshot_batch_size: 200        # 单批请求股票数（R1-a 实测上限的 40%，留 50% 余量）
-    snapshot_interval_s: 0.5        # 批间隔秒（生产 ~150 次/日，R1a 速率下零限流）
-    timeout_s: 15                   # 单请求超时
-    max_attempts: 3                 # 单批失败重试次数（指数退避）
-    kline_bars: 40                  # 新股回补/候选确认取数根数
-    kline_interval_s: 0.2           # 切换日缺口回补逐股 K线请求间隔秒（一次性 bootstrap，串行防限流）
-  exdate_detector:                  # TL 修正：preclose 信号除权检测（弃用 hfq/raw）
-    preclose_dev_threshold_pct: 0.5   # 信号 θ：|preclose_today/close_prevday - 1| > θ → 候选
-    factor_sanity_cap_pct: 30         # sanity 上界：|r_event-1|>30% 不写入、记告警（防异常昨收污染）
-    max_candidates_per_day: 200       # 日常防御：候选数超此值截断+告警
-    cutover_max_candidates: 300       # 切换日 bootstrap 截断（跨多日缺口放大误报，TL D3）
-    cutover_max_gap_backfill: 8000   # 切换日非候选缺口回补上限（TL 拍板 2026-09-09：全市场 ~5215 只一次性 bootstrap 需全覆盖；池序下真缺口股可能全部位于前 3000 之外，3000 会 100% 截断 → 提到 >全市场规模，仅防御异常放大）
-  universe:                         # 股票池/行业 BaoStock 依赖降级（半封禁态陈旧回退，fix round 2）
-    stale_max_days: 7               # all_stock 当日缓存 miss 时，可用 ≤N 天前的最近 allstock_*.csv 作陈旧池
-  factor_reconcile:                 # C 兜底：BaoStock 低频对账（本期默认关，TL D3）
-    weekly_baostock_scan: false     # 每周 ~5200 次因子精确对账 + 检测器失效安全网
-    scan_days_spread: 2             # 5200 次分几天（≤3000/日 @0.3/s）
-    skip_during_disclosure: true    # 1月/5月年度突发期暂停周扫（错峰）
-  contract:                         # 契约监控（离线可算，零额外请求）
-    pct_sample_size: 20             # 抽样 N 只校验 pct 一致性（R1-b 基线 549/549）
-    pct_tolerance_pct: 0.5          # pct 偏离容忍度（%）
-  em:                               # v5 东财 datacenter-web 客户端（TL D4；非官方接口，串行小步）
-    enabled: false                  # ⚠️Round-2（TL D-EM，最高优先级纪律）：本机在欧洲，东财 API 禁止海外
-                                    # 访问（holders 第101页起持续"服务器繁忙"=封禁表现）。**禁用所有东财
-                                    # 网络请求**；em.py 代码保留不删。enabled=false 时引擎不得 import/调用
-                                    # em.py 的 fetch 函数（引擎侧守卫 + 单测断言）。已落盘的本地静态缓存
-                                    # （em_dividend_all.csv / .em_ck_*.jsonl）不受影响：前者正常读取
-                                    # （D1' 分红历史源），检查点保留不动、不再续取。
-    page_size: 500                  # 每页行数（brief §1；enabled=false 时不生效）
-    interval_s: 1.0                 # 页间隔秒（brief 下限 >=0.5s/页；实测冷缓存全表 ~215 页
-                                    # 连续请求在 0.5s 下触发"服务器繁忙"限流 → 提到 1.0s，
-                                    # 日常增量路径只取 1-2 页，成本可忽略）
-    cooldown_every_pages: 25        # 每取 N 页插入一次长冷却（防 EM 滑动窗口限流：实测
-                                    # ~100 页连续请求后返回"服务器繁忙"，期间匀速仍会撞墙）
-    cooldown_seconds: 6.0           # 每次冷却秒数（25 页×1s≈25s 工作 + 6s 冷却 → 滑动窗口内
-                                    # 请求密度降到限流阈值之下；全表 ~113 页 ≈ +4~5 次冷却）
-    full_table_gap_seconds: 600     # 两次**全表级**取数（分红→股东）之间的间隔秒。实测 EM
-                                    # "服务器繁忙"窗口比单次退避长得多（一次 ~100+ 页全表拉取
-                                    # 后，紧随的第二次全表拉取即使带冷却也在第 100 页撞墙）→
-                                    # 两次全表之间必须留足静默期让限流窗口过期。日常增量路径
-                                    # （各 1 页）不经过此间隔，无成本。
-    timeout_s: 15                   # 单请求超时
-    max_attempts: 3                 # 重试 <=3 次（brief §1）
-    cgb10y_sanity_pct: [0.5, 4.0]   # 10Y国债 sanity 区间（越界告警不静默；字段标签系推断，防漂移）
-  sina:                             # v5 Round-2（TL D3'/D9'）：新浪非官方接口客户端
-                                    # （东财停用后的替代源；F10 股东页 + 财务 JSON）
-    interval_s: 1.0                 # 请求间隔秒（D9' 限速纪律：串行、>=1s）
-    timeout_s: 15                   # 单请求超时秒（D9'）
-    max_attempts: 2                 # 重试 <=2 次（D9'；含首次共 <=3 次尝试）
-    consecutive_fail_breaker: 5     # 某类接口连续失败 >=N 只 → 该类因子整体降级 None
-                                    # （missing_policy=neutral_renorm 兜底）+ 报告告警，不得死磕（D9'）
-    cf_reports_num: 20              # 财务 JSON 单次取回报告期数（~5 年季频，足够定位最近年报）
-    cooldown_every_n: 15            # WAF 滑动窗口：每 N 次请求插入一次长冷却（Round-2 实测 F10
-                                    # 持续 ~10-15 次后触发 HTTP 456，与东财"服务器繁忙"同类）
-    cooldown_s: 20                  # 长冷却秒数（让 WAF 滑动窗口在饱和前复位）
-    waf_backoff_s: 30               # HTTP 456 专用重试退避秒（短退避无效，WAF 需要时间复位）
-  rf:                               # v5 Round-2（TL D4'）：10Y 国债收益率源 = TradingEconomics
-    url: "https://tradingeconomics.com/china/government-bond-yield"
-    fallback_pct: 2.0               # 页面解析失败时的回退值（%）+ 告警不静默（D4'）
-    sanity_pct: [0.5, 4.0]          # sanity 区间（越界告警不静默；防页面改版漂移）
-
-reinvest:                           # v5 再投资参考输出（TL D8：按 Joel 目标定档）
-  target_ttm_yield_pct: 4.0         # 目标 TTM 股息率（%）：参考价 = 近N年平均DPS/4% + TTM 分位展示
-  yield_pctile_lookback_years: 10   # 历史股息率分位回看年数
-  dps_smooth_years: 3               # v5.1：参考价 = 近 N 年平均 DPS / 目标股息率（窗口内无分红年按 0；N<1=单年）
-  dps_growth_years: 5               # v5.1：DPS CAGR 回看年数（新增展示列 dps_cagr_5y_pct）
-
-crosscheck:                         # 腾讯 qt.gtimg.cn 交叉验证（不进主计算路径）
-  enabled: true
-  sample_size: 20                   # 从最终入选股中抽样 N 只验证收盘价
-  price_tolerance_pct: 0.5          # 收盘价偏差容忍度（%）
-  batch_size: 50                    # 腾讯接口单批请求股票数
-  ttm_tolerance_pct: 0.1            # v5（验收④）：ttm_yield vs 腾讯 idx64 偏差容忍度（百分点）
-
-# ---------------------------------------------------------------------------
-# v5.2 Phase 1（TL 拍板 2026-09-11：Q2=选项 C / Q4=只增量 / Q5=双通道）
-# ---------------------------------------------------------------------------
-canonical:                          # raw + canonical 统一 Schema 派生层（data/raw、data/canonical）
-  enabled: true                     # ⚠️回滚点：false → raw/canonical 全 no-op，主路径行为逐字节不变
-                                    # （配合删除 data/raw、data/canonical 目录 = v5.1 状态）
-  dir: data/canonical               # canonical 输出目录（相对项目根；与 cache/ 平级的独立数据层）
-  data_version: v5.2-p1             # 溯源字段：canonical 每条记录的 schema 版本
-
-health:                             # 交叉校验 v1 阈值 + EmptyPayloadGuard（报告 §4，按实测校准）
-  enabled: true                     # false → 跳过三字段交叉校验（raw/canonical 落盘不受影响）
-  sample_size: 20                   # 从最终入选股中抽样 N 只做 close/dps/roe 三字段校验（串行限速）
-  close_tolerance_pct: 0.1          # 收盘价：腾讯 vs 新浪非除权日 |Δ|>此值(%) 告警（实测基线 52/52 零偏差）
-  r_event_tolerance_pct: 1.0        # 除权日改校验 r_event 一致性（|Δ|>此值(%) 告警；不校验 close 绝对值）
-  dps_warn_at: 0.01                 # DPS：em 静态 vs akshare-em |Δ|≥此值(元/股) 告警（同源=一致性检查）
-  dps_stop_at: 0.05                 # DPS：|Δ|>此值(元/股) 停算标"待复核"（不进计算、不覆盖静态底表）
-  roe_tolerance_pp: 1.0             # ROE：BaoStock roeAvg(小数,平均) vs 新浪 ROEWEIGHTED(百分数,加权)
-                                    # 换算后 |Δ|>此值(pp) 告警。实测基线差 0.48pp=口径差非错误，
-                                    # **勿收紧到 <0.5pp**（会误报全部正常股）
-  market_min_rows: 5000             # EmptyPayloadGuard：市场级接口(all_stock)交易日 rows<此值 → 数据源异常
-  akshare_interval_s: 1.0           # akshare 校验源限速（D9' 同构：串行 >=1s；仅校验用途，失败不阻塞）
-  akshare_max_attempts: 2           # akshare 重试 <=2 次（含首次共 <=3 次尝试）
-  akshare_breaker: 5                # akshare 某类接口连续失败 >=N → 该类当日整体降级（不得死磕）
-  alerts:                           # v5.3 D1：健康度阈值告警（全部 yaml 驱动、零硬编码；HealthTracker 判定）
-    rf_fallback_max_per_run: 0      # 单次运行 rf 10Y 回退次数 > N → 告警（默认 0=一回退就告警）
-    f10_degraded_max: 5             # 当日新浪 F10 降级(接口失败/熔断取 None)标的数 > N → 告警
-    crosscheck_conflicts_max: 2     # 三字段交叉校验冲突总数 > N → 告警
-
-# ---------------------------------------------------------------------------
-# v6 数据湖（DuckDB 独立分析层，非筛选热路径；主路径零 import lake）
-# ---------------------------------------------------------------------------
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
   baostock_daily_budget: 5000       # Q2：BaoStock 日预算上限（次/日，config 可调；到顶当日停、次日续）
+
+datasource:                         # lake-sync 数据源（lake_backfill 经 sina_cfg/rf_cfg 消费；勿删）
+  baostock:                         # BaoStock 每日配额守卫（防打穿配额被封禁）
+    daily_quota: 49900              # 官网限 50000/日/IP，超限封禁 6h×次数；留 100 余量
+  sina:                             # 新浪非官方接口客户端（F10 股东页 + 财务 JSON）
+    interval_s: 1.0                 # 请求间隔秒（限速纪律：串行、>=1s）
+    timeout_s: 15                   # 单请求超时秒
+    max_attempts: 2                 # 重试 <=2 次（含首次共 <=3 次尝试）
+    consecutive_fail_breaker: 5     # 某类接口连续失败 >=N 只 → 该类因子整体降级 None
+                                    # （missing_policy=neutral_renorm 兜底）+ 报告告警，不得死磕
+    cf_reports_num: 20              # 财务 JSON 单次取回报告期数（~5 年季频，足够定位最近年报）
+    cooldown_every_n: 15            # WAF 滑动窗口：每 N 次请求插入一次长冷却
+    cooldown_s: 20                  # 长冷却秒数（让 WAF 滑动窗口在饱和前复位）
+    waf_backoff_s: 30               # HTTP 456 专用重试退避秒（短退避无效，WAF 需要时间复位）
+  rf:                               # 10Y 国债收益率源 = TradingEconomics
+    url: "https://tradingeconomics.com/china/government-bond-yield"
+    fallback_pct: 2.0               # 页面解析失败时的回退值（%）+ 告警不静默
+    sanity_pct: [0.5, 4.0]          # sanity 区间（越界告警不静默；防页面改版漂移）

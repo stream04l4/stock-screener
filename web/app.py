@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
-"""stock-screener Web 后端（FastAPI）。
+"""stock-screener v7.0 Web 后端（FastAPI）。
+
+v7.0 定位（策略核心替换后）：
+- 查询/按需回测界面：/api/bt/runs* 族（异步 TaskManager + SSE）+ /api/positions
+  + /api/pool（同步，全池 ~2s）；
+- strategy 读写/schema 校验 + 策略库（保留 v6.2 机制，schema 换 v7 slim）；
+- 数据湖页签 /api/lake/*（lake router 原样挂载）；
+- 已删除：/api/runs 族（v6 日跑）、/api/backtest（多因子回测产物）、
+  /api/stocks/{code}/detail（因子明细）、report md 解析器。
 
 设计原则：
-- 只读复用 screener 包与文件系统产物（output/、config/、logs/），不引入数据库。
-- 触发运行用「子进程」而非在 uvicorn 线程内跑（首跑可能 ~2h，不能阻塞 API）。
-- PUT /api/strategy 写回前备份 .bak，并做逐项类型/范围校验 + 复用 screener.config.load_config 兜底。
+- 触发回测用「子进程」而非 uvicorn 线程内跑（不能阻塞 API）；
+- PUT /api/strategy 写回前备份 .bak，逐项类型/范围校验 + martingale.config.
+  load_config 语义校验兜底。
 
 路径约定：PROJECT_ROOT = web/ 的上一级目录（即 ~/stock-screener）。
 """
@@ -12,19 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import io
 import json
 import os
 import re
 import shutil
-import signal
-import socket
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
-from datetime import date as _date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,27 +47,47 @@ WEB_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = WEB_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
-BAK_PATH = CONFIG_PATH.with_suffix(".yaml.bak")
-# v6.2.1 S1：本机策略库（命名快照 data/strategies/*.yaml；.gitignore 不入库——本机策略变体）。
-# 模块级常量供测试 monkeypatch（同 CONFIG_PATH 模式）；目录懒创建（仅保存时 mkdir）。
+# v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
+BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
+BT_RUNS_DIR = BT_OUT_DIR / "runs"
 STRATEGIES_DIR = PROJECT_ROOT / "data" / "strategies"
 LOGS_DIR = PROJECT_ROOT / "logs"
-DIST_DIR = WEB_DIR / "dist"   # v6 FE-D3+：Vue3+Vite 构建产物（`npm run build` @ web/frontend → ../dist，不入库）
+DIST_DIR = WEB_DIR / "dist"   # Vue3+Vite 构建产物（`npm run build` @ web/frontend → ../dist）
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+BT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="stock-screener web", version="1.0")
+app = FastAPI(title="stock-screener web", version="7.0.0")
 
 
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
 def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
-    """读 result_*.csv（utf-8-sig，含 BOM），返回 list[dict]。"""
+    """读 CSV（utf-8-sig，含 BOM），返回 list[dict]。"""
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         return [dict(r) for r in csv.DictReader(f)]
+
+
+def _read_csv_rows_floats(path: Path) -> List[Dict[str, Any]]:
+    """读 CSV 并把可解析的数值列转 float（回测结果 JSON 化；NaN → None）。"""
+    out: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            row: Dict[str, Any] = {}
+            for k, v in r.items():
+                if v is None or v == "":
+                    row[k] = None
+                    continue
+                try:
+                    fv = float(v)
+                    row[k] = None if fv != fv else fv  # NaN → None
+                except ValueError:
+                    row[k] = v
+            out.append(row)
+    return out
 
 
 def _mtime_iso(p: Path) -> str:
@@ -71,328 +96,11 @@ def _mtime_iso(p: Path) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# 报告 markdown 解析（漏斗 / 缺失名单 / 跳过行业组）
-# ---------------------------------------------------------------------------
-def _split_sections(md: str) -> Dict[str, str]:
-    """按 '## ' / '### ' 标题切分，返回 {标题文本: 正文}。"""
-    out: Dict[str, str] = {}
-    cur_key = "__head__"
-    buf: List[str] = []
-    for line in md.splitlines():
-        m = re.match(r"^(#{2,3})\s+(.*)$", line)
-        if m:
-            out[cur_key] = "\n".join(buf).strip()
-            cur_key = m.group(2).strip()
-            buf = []
-        else:
-            buf.append(line)
-    out[cur_key] = "\n".join(buf).strip()
-    return out
-
-
-def _extract_count(value_str: str) -> Optional[int]:
-    """从漏斗数值列提取整数：优先 **N**，否则取最后一个整数（支持负数）。"""
-    bold = re.search(r"\*\*(-?\d+)\*\*", value_str)
-    if bold:
-        return int(bold.group(1))
-    nums = re.findall(r"-?\d+", value_str)
-    return int(nums[-1]) if nums else None
-
-
-def _parse_md_table(block: str) -> List[List[str]]:
-    """解析 markdown 表格数据行（跳过表头与分隔行），返回 cells 列表。"""
-    rows: List[List[str]] = []
-    for line in block.splitlines():
-        s = line.strip()
-        if not (s.startswith("|") and s.endswith("|")):
-            continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
-        # 跳过分隔行 |---|---|
-        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
-            continue
-        rows.append(cells)
-    return rows
-
-
-def _parse_kpi_table(block: str) -> Dict[str, Any]:
-    """解析 v2 报告「一、KPI 概览」表（| 指标 | 值 |）→ dict。
-
-    键：selected / avg_ttm_yield_pct / avg_roe_pct / industry_concentration(str)。
-    值列可能含 '—'（无数据）→ None。
-    """
-    kpi: Dict[str, Any] = {
-        "selected": None,
-        "avg_ttm_yield_pct": None,
-        "avg_roe_pct": None,
-        "industry_concentration": None,
-    }
-    for cells in _parse_md_table(block):
-        if len(cells) < 2 or cells[0] == "指标":
-            continue
-        label, val = cells[0].strip(), cells[1].strip()
-        if val in ("", "—"):
-            continue
-        if label.startswith("入选数"):
-            m = re.search(r"(-?\d+)", val)
-            kpi["selected"] = int(m.group(1)) if m else None
-        elif "TTM股息率" in label:
-            m = re.search(r"-?\d+(?:\.\d+)?", val)
-            kpi["avg_ttm_yield_pct"] = float(m.group(0)) if m else None
-        elif "平均ROE" in label:
-            m = re.search(r"-?\d+(?:\.\d+)?", val)
-            kpi["avg_roe_pct"] = float(m.group(0)) if m else None
-        elif "行业集中度" in label:
-            kpi["industry_concentration"] = val
-    return kpi
-
-
-def parse_report(md: str) -> Dict[str, Any]:
-    """从 report_*.md 解析：漏斗、缺失名单、跳过行业组 + v2 KPI 概览。"""
-    sections = _split_sections(md)
-
-    # --- v2 KPI 概览：标题含「KPI」的节 ---
-    kpi: Dict[str, Any] = {
-        "selected": None,
-        "avg_ttm_yield_pct": None,
-        "avg_roe_pct": None,
-        "industry_concentration": None,
-    }
-    for key, body in sections.items():
-        if "KPI" in key:
-            kpi = _parse_kpi_table(body)
-            break
-
-    # --- 漏斗：找标题含「过滤漏斗」的节 ---
-    funnel: List[Dict[str, Any]] = []
-    for key, body in sections.items():
-        if "过滤漏斗" in key:
-            for cells in _parse_md_table(body):
-                if len(cells) < 3 or cells[0] in ("层级", ""):
-                    continue
-                label = cells[0].strip()
-                # 跳过表头行（首列是「层级」）
-                if label == "层级":
-                    continue
-                funnel.append(
-                    {
-                        "label": label,
-                        "desc": cells[1].strip(),
-                        "count": _extract_count(cells[2]),
-                    }
-                )
-            break
-
-    # --- 缺失名单：标题含「基本面数据缺失」的节 ---
-    missing: List[Dict[str, str]] = []
-    for key, body in sections.items():
-        if "基本面数据缺失" in key:
-            for cells in _parse_md_table(body):
-                if len(cells) < 3 or cells[0] == "代码":
-                    continue
-                missing.append(
-                    {"code": cells[0], "name": cells[1], "missing": cells[2]}
-                )
-            break
-
-    # --- 跳过行业组：标题含「跳过排名约束」的节，行形如 "- C13农副食品加工业: 4 只" ---
-    skipped: Dict[str, int] = {}
-    for key, body in sections.items():
-        if "跳过排名约束" in key:
-            for line in body.splitlines():
-                m = re.match(r"^\s*-\s*(.+?)\s*:\s*(\d+)\s*只", line)
-                if m:
-                    skipped[m.group(1).strip()] = int(m.group(2))
-            break
-
-    return {"funnel": funnel, "missing": missing, "skipped_groups": skipped, "kpi": kpi}
-
-
-# ---------------------------------------------------------------------------
-# 策略校验（PUT /api/strategy）
-# ---------------------------------------------------------------------------
-# 字段级 schema：{section: {field: (type, min, max, note)}}
-# type ∈ {"int","float","bool","str","enum","prefix_list","float01"}
-_STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
-    "technical": {
-        "ma_period": ("int", 20, 500),
-        "return_window_days": ("int", 60, 500),
-        "min_return_pct": ("float", -100, 100),
-        "max_return_pct": ("float", 0, 500),
-        "max_annual_volatility_pct": ("float", 1, 200),
-    },
-    "dividend": {
-        "window_days": ("int", 30, 730),
-        "min_yield_pct": ("float", 0, 50),
-    },
-    "industry": {
-        "rank_by": ("enum", "roeAvg", None),
-        "top_pct": ("float", 0.0001, 100),
-        "min_group_size": ("int", 1, 50),
-    },
-    "fundamental": {
-        "roe_min_pct": ("float", -50, 100),
-        "net_profit_yoy_field": ("enum2", "YOYPNI|YOYNI", None),
-        "liability_max_pct": ("float", 0, 100),
-        "gross_margin_min_pct": ("float", -100, 100),
-        "probe_quarters_back": ("int", 1, 8),
-    },
-    "universe": {
-        "a_share_prefixes": ("prefix_list", None, None),
-        "listing_min_trading_days": ("int", 60, 500),
-        "st_name_keyword": ("str", None, None),
-    },
-    # v2 打分模型（权重为嵌套 dict，单独校验；和≈1 由 screener.config.load_config 兜底）
-    "scoring": {
-        "mode": ("enum2", "zscore|legacy", None),
-        "top_n": ("int", 1, 500),
-        "missing_policy": ("enum2", "neutral_renorm|neutral|drop", None),
-        "weights": ("weights_dict", None, None),
-        "sub_weights": ("sub_weights_dict", None, None),
-    },
-    # v2 Web badge 阈值（百分数口径）。高股息(绿)复用 dividend.min_yield_pct，不另设键。
-    "badges": {
-        "industry_top_pct": ("float", 1, 100),
-        "fscore_min": ("int", 0, 9),
-    },
-    # v2 硬性剔除开关
-    "hard_filter": {
-        "st_enabled": ("bool", None, None),
-        "listing_min_trading_days": ("int", 60, 500),
-    },
-    "data": {
-        "kline_calendar_days_back": ("int", 250, 800),
-        "retry_max_attempts": ("int", 1, 20),
-        "cache_dir": ("str", None, None),
-    },
-    "crosscheck": {
-        "enabled": ("bool", None, None),
-        "sample_size": ("int", 0, 100),
-        "price_tolerance_pct": ("float", 0.01, 5),
-        "batch_size": ("int", 1, 200),
-    },
-}
-
-_DIMS = ("technical", "dividend", "industry", "fundamental")
-
-# 所有必须出现的 (section, field) —— 「所有 key 必须齐全」
-_REQUIRED_KEYS = [
-    (s, f) for s, fields in _STRATEGY_SCHEMA.items() for f in fields
-]
-
-
-def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
-    """返回错误列表；空列表 = 合法。"""
-    errors: List[str] = []
-
-    # 1) 顶层必须是 dict
-    if not isinstance(cfg, dict):
-        return ["strategy 顶层必须是 JSON 对象(mapping)"]
-
-    # 2) key 齐全性（允许 crosscheck 整段缺省 → 用默认，但这里要求齐全更严格）
-    for section, field in _REQUIRED_KEYS:
-        if section not in cfg or not isinstance(cfg[section], dict):
-            errors.append(f"缺少配置段: {section}")
-            continue
-        if field not in cfg[section]:
-            errors.append(f"缺少配置项: {section}.{field}")
-
-    # 3) 逐项类型 + 范围
-    for section, fields in _STRATEGY_SCHEMA.items():
-        sec = cfg.get(section)
-        if not isinstance(sec, dict):
-            continue
-        for field, (typ, lo, hi) in fields.items():
-            if field not in sec:
-                continue
-            v = sec[field]
-            if typ == "int":
-                # bool 是 int 的子类，需显式排除
-                if isinstance(v, bool) or not isinstance(v, int):
-                    errors.append(f"{section}.{field} 必须是整数")
-                    continue
-                if not (lo <= v <= hi):
-                    errors.append(f"{section}.{field}={v} 超出范围 [{lo},{hi}]")
-            elif typ == "float":
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                    errors.append(f"{section}.{field} 必须是数值")
-                    continue
-                fv = float(v)
-                if not (lo <= fv <= hi):
-                    errors.append(f"{section}.{field}={v} 超出范围 [{lo},{hi}]")
-            elif typ == "bool":
-                if not isinstance(v, bool):
-                    errors.append(f"{section}.{field} 必须是布尔值")
-            elif typ == "str":
-                if not isinstance(v, str) or not v.strip():
-                    errors.append(f"{section}.{field} 必须是非空字符串")
-            elif typ == "enum":
-                if v != lo:
-                    errors.append(f"{section}.{field} 目前只支持 {lo!r}")
-            elif typ == "enum2":
-                allowed = str(lo).split("|")
-                if v not in allowed:
-                    errors.append(f"{section}.{field} 只能是 {'/'.join(allowed)}")
-            elif typ == "prefix_list":
-                if not isinstance(v, list) or not v:
-                    errors.append(f"{section}.{field} 必须是非空字符串数组")
-                    continue
-                for p in v:
-                    if not isinstance(p, str) or not re.fullmatch(r"[a-z]{2}\.\d{2}", p):
-                        errors.append(
-                            f"{section}.{field} 项非法: {p!r}（应形如 sh.60）"
-                        )
-            elif typ == "weights_dict":
-                if not isinstance(v, dict) or set(v) != set(_DIMS):
-                    errors.append(
-                        f"scoring.weights 必须恰好含 technical/dividend/industry/fundamental"
-                    )
-                else:
-                    for d in _DIMS:
-                        wv = v[d]
-                        if isinstance(wv, bool) or not isinstance(wv, (int, float)) or wv < 0:
-                            errors.append(f"scoring.weights.{d} 必须是非负数值")
-            elif typ == "sub_weights_dict":
-                if not isinstance(v, dict):
-                    errors.append("scoring.sub_weights 必须是映射（每维度→子因子权重映射）")
-                else:
-                    for d in _DIMS:
-                        sub = v.get(d)
-                        if not isinstance(sub, dict) or not sub:
-                            errors.append(f"scoring.sub_weights.{d} 必须是非空映射")
-                            continue
-                        for k, wv in sub.items():
-                            if isinstance(wv, bool) or not isinstance(wv, (int, float)) or wv < 0:
-                                errors.append(
-                                    f"scoring.sub_weights.{d}.{k} 必须是非负数值"
-                                )
-
-    # 4) 跨字段语义（与 screener.config.load_config 保持一致，提前给出友好报错）
-    tech = cfg.get("technical", {})
-    if all(k in tech for k in ("min_return_pct", "max_return_pct")):
-        try:
-            if float(tech["min_return_pct"]) > float(tech["max_return_pct"]):
-                errors.append("technical.min_return_pct 必须 <= max_return_pct")
-        except (TypeError, ValueError):
-            pass
-
-    return errors
-
-
-def _atomic_write_yaml(path: Path, data: Dict[str, Any]) -> None:
-    """原子写：先写同目录临时文件，再 os.replace。"""
-    text = yaml.safe_dump(
-        data, allow_unicode=True, sort_keys=False, default_flow_style=False
-    )
-    _atomic_write_text(path, text)
-
-
 def _atomic_write_text(path: Path, text: str) -> None:
     """原子写文本：先写同目录临时文件，再 os.replace。
 
     mkstemp 创建的临时文件权限固定为 0600，os.replace 会沿用该权限——若不在替换前
-    恢复原文件 mode，每次保存都会把 config/strategy.yaml 从 644 悄悄改成 600（仓库外
-    的可观测状态漂移）。这里在 replace 前把临时文件 chmod 回原文件的 mode。
+    恢复原文件 mode，每次保存都会把 config/strategy.yaml 从 644 悄悄改成 600。
     """
     try:
         mode = path.stat().st_mode & 0o777
@@ -411,34 +119,40 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _ruamel_yaml() -> YAML:
-    """构造保留注释/引号的 round-trip YAML 实例。
-
-    indent(mapping=2, sequence=4, offset=2) 与 config/strategy.yaml 的既有排版一致：
-    映射缩进 2、序列项在父键之下多缩进 2（即 "key:\\n    - item"），
-    这样「未改动的行」dump 后逐字节不变，git diff 只出现真正修改的行。
-    """
+    """构造保留注释/引号的 round-trip YAML 实例（排版与 strategy.yaml 一致）。"""
     yml = YAML()
     yml.preserve_quotes = True
-    # D1（v2 round 1）：必须设足够大的行宽。ruamel 默认 width=80 会把 strategy.yaml
-    # 里的长 flow-style 行（sub_weights 的 {technical: {...}, dividend: {...}}）折成
-    # 多行 → _write_strategy_preserving_comments 自检 1（round-trip 逐字节还原）恒失败
-    # → 每次保存都退回 safe_dump，注释全丢（v1 D-W03 回归）。4096 覆盖当前最长行
-    # （~120 字符），保证 flow-style 原样输出。
     yml.width = 4096
     yml.indent(mapping=2, sequence=4, offset=2)
     return yml
 
 
-def _new_scalar_like(old, v):
-    """新值沿用旧节点的字面风格（D1，v2 round 1）。
+def _float_style_renders_canonical(node, v) -> bool:
+    """旧节点的字面格式能否按 **canonical 字面**（str(v)）精确表达新值。
 
-    ruamel round-trip 解析时把数字的原始字面量信息记在 ScalarFloat/ScalarInt
-    子类的 _width/_prec 等属性上（"0.30" → width=4, prec=2），dump 时据此还原
-    尾零。直接赋 plain float 会丢失这些信息（"0.30"→"0.3"）；替换节点时把旧
-    节点的元数据拷给新值，改完再恢复原值即可逐字节还原（brief 判据：PUT 恢复
-    后 git diff HEAD 为空）。同数字位数的改动/恢复完全保真；位数变化（0.30→0.5）
-    后恢复只能恢复到相同精度风格（"0.3"），属表示层固有限制，注释与排版不受影响。
+    represent_scalar_float 用节点上的 _width/_prec/_exp（加载期捕获的**当前文件
+    字面量**格式）渲染——
+    - 把 1.1 的格式套到 1.15 上会渲染成 "1.1"（静默改值，D1 测试抓到的真 bug）；
+    - 把 1.15 的格式套回 1.1 上会渲染成 "1.10"（值对但字面风格漂移，改→恢复
+      不再逐字节还原）。
+    两种都不沿用旧格式，退回裸值（canonical 渲染）。
     """
+    import io
+
+    from ruamel.yaml import YAML
+
+    probe = YAML()
+    buf = io.StringIO()
+    probe.dump({"v": node}, buf)
+    try:
+        rendered = buf.getvalue().split(":", 1)[1].strip()
+        return rendered == str(v)
+    except Exception:  # noqa: BLE001 - 渲染异常视同不可精确表达
+        return False
+
+
+def _new_scalar_like(old, v):
+    """新值沿用旧节点的字面风格（ruamel 表示层保真），但仅限格式可 canonical 表达新值。"""
     from ruamel.yaml.scalarfloat import ScalarFloat
     from ruamel.yaml.scalarint import ScalarInt
 
@@ -446,32 +160,22 @@ def _new_scalar_like(old, v):
         node = ScalarFloat(v)
         for a in ("_width", "_prec", "_m_sign", "_m_lead0", "_exp", "_e_width", "_e_sign"):
             setattr(node, a, getattr(old, a, None))
-        return node
+        if _float_style_renders_canonical(node, v):
+            return node
+        return v  # 旧格式装不下/会漂移新值 → canonical 渲染（宁可丢风格不可改值/漂字面）
     if isinstance(old, ScalarInt) and isinstance(v, int) and not isinstance(v, bool):
         node = ScalarInt(v)
-        # 与 ruamel 内部一致：_width 是动态属性（pyright 不识别，用 setattr）
         setattr(node, "_width", getattr(old, "_width", None))
+        # 十进制整数的 _width 只影响 0o/0x 前缀分支（独立 representer），
+        # 普通整数按 str(value) 渲染，宽度不足也截不掉位 → 安全沿用
         return node
     return v
 
 
 def _apply_payload(old_map, new_dict) -> None:
-    """把 payload 递归应用到 ruamel round-trip 节点上（D1，v2 round 1）。
+    """把 payload 递归应用到 ruamel round-trip 节点上（叶子级最小替换）。
 
-    只替换**真正变化**的叶子值；未变化的键保留原 CommentedBase 节点。原因：
-    用 plain Python 标量整体覆盖会丢失 ruamel 记录在原节点上的表示信息——
-    `0.30` 变 `0.3`（plain 风格）、flow mapping `{a: 1, b: 2}` 被重排成块样式、
-    行尾注释错位——即使值语义未变，dump 也会产生噪声 diff。保留原节点则
-    no-op 保存逐字节还原（git diff 为空），改一个权重只动那一行。
-
-    比较规则：
-    - 嵌套 dict → 递归进原 CommentedMap（保持 flow/块样式与内部注释）。
-    - 其余（标量/序列）按**值**相等跳过。注意 ruamel round-trip 的数值是
-      ScalarFloat 子类（保留 "0.30" 这类原始字面风格），与 plain float 类型不同
-      但值相等 → 必须按值比较，不能用 type() 精确匹配，否则所有浮点行都会
-      被误判为"已变化"而丢失字面风格。
-    - bool 单独设防：Python 的 True==1 会把 `true`/`1` 互判为未变，
-      bool↔数值跨界时仍走替换（由调用方自检 2 兜底语义）。
+    只替换**真正变化**的叶子值；未变化的键保留原节点（no-op 保存逐字节还原）。
     """
     from ruamel.yaml.comments import CommentedMap
 
@@ -479,9 +183,9 @@ def _apply_payload(old_map, new_dict) -> None:
         old = old_map.get(k)
         if isinstance(v, dict):
             if isinstance(old, CommentedMap):
-                _apply_payload(old, v)  # 递归：未变子键的原节点不动
+                _apply_payload(old, v)
             else:
-                old_map[k] = v          # 原值不是 mapping → 整体替换（自检2兜底）
+                old_map[k] = v
             continue
         if (
             old is not None
@@ -489,22 +193,16 @@ def _apply_payload(old_map, new_dict) -> None:
             and not isinstance(old, bool)
             and not isinstance(v, bool)
         ):
-            continue  # 值未变 → 原节点（含标量风格/flow 表示/行尾注释）零改动
-        # 值变了：_new_scalar_like 按旧节点类型沿用字面风格（非数值原样返回 v）
+            continue
         old_map[k] = _new_scalar_like(old, v)
 
 
 def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
-    """把校验过的 payload 写回 config/strategy.yaml，保留原文件注释与排版（D-W03）。
+    """把校验过的 payload 写回 config/strategy.yaml，保留原文件注释与排版。
 
-    步骤：ruamel round-trip 读入原文件 → 按字段覆盖为 payload 值
-    （_validate_strategy 已保证 key 集合与 schema 完全一致，无孤儿键）→ dump。
-    写回前自检：round-trip 原文件必须能逐字节还原（排版假设成立），且 dump 结果
-    语义等于 payload；任一不满足则退回 safe_dump（丢注释但数据正确），
-    绝不把格式错乱的文件写进仓库。
-
-    D1（v2 round 1）：覆盖逻辑改为 _apply_payload 的叶子级最小替换——
-    no-op 保存逐字节还原，真实改动只产生被修改行的 diff（行尾注释保留）。
+    步骤：ruamel round-trip 读入原文件 → 按字段覆盖为 payload 值 → dump。
+    自检：round-trip 原文件必须能逐字节还原，且 dump 结果语义等于 payload；
+    任一不满足则退回 safe_dump（丢注释但数据正确）。
     """
     import io
 
@@ -517,7 +215,6 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
     try:
         yml = _ruamel_yaml()
         data = yml.load(orig)
-        # 自检 1：原文件 round-trip 必须逐字节还原（注释/排版可被 ruamel 完整表示）
         probe_buf = io.StringIO()
         yml.dump(yml.load(orig), probe_buf)
         if probe_buf.getvalue() != orig:
@@ -527,7 +224,6 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
             buf = io.StringIO()
             yml.dump(data, buf)
             text = buf.getvalue()
-            # 自检 2：dump 结果语义必须等于 payload（防止 ruamel 表示层丢值）
             if yaml.safe_load(text) != payload:
                 text = _safe_dump_text()
     except Exception:  # noqa: BLE001 - round-trip 失败时退回语义正确但丢注释的 dump
@@ -536,18 +232,125 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 运行任务管理（子进程）
+# 策略校验（PUT /api/strategy）—— v7 slim schema
+# ---------------------------------------------------------------------------
+# 字段级 schema：{section: {field: (type, min/enum, max)}}
+# type ∈ {"int","float","str","enum","enum2","code_list","str_list"}
+_STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
+    "strategy": {
+        "name": ("enum", "drawdown_martingale", None),
+        "initial_amount": ("float", 1, 1e9),
+        "base_add_amount": ("float", 1, 1e9),
+        "first_drawdown_pct": ("float", 1, 90),
+        "add_step_pct": ("float", 0.1, 50),
+        "growth_ratio": ("float", 1.0, 10),
+        "rearm_mode": ("enum2", "bounce|newhigh", None),
+        "rearm_pct": ("float", 1, 100),
+        "accounting": ("enum", "cash", None),   # 固定 cash（只读；传其他值 → 400）
+    },
+    "universe": {
+        "industry_whitelist_csric2": ("code_list", None, None),
+        "soe_keywords": ("str_list", None, None),
+        "min_total_mv_yi": ("float", 1, 1e5),
+        "min_consecutive_div_years": ("int", 1, 20),
+        "listing_min_trading_days": ("int", 20, 1200),
+    },
+}
+
+# 所有必须出现的 (section, field) —— 「所有 key 必须齐全」
+_REQUIRED_KEYS = [
+    (s, f) for s, fields in _STRATEGY_SCHEMA.items() for f in fields
+]
+
+
+def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
+    """返回错误列表；空列表 = 合法。"""
+    errors: List[str] = []
+
+    if not isinstance(cfg, dict):
+        return ["strategy 顶层必须是 JSON 对象(mapping)"]
+
+    # 1) key 齐全性
+    for section, fields in _STRATEGY_SCHEMA.items():
+        if section not in cfg or not isinstance(cfg[section], dict):
+            errors.append(f"缺少配置段: {section}")
+            continue
+        for field in fields:
+            if field not in cfg[section]:
+                errors.append(f"缺少配置项: {section}.{field}")
+
+    # 2) 逐项类型 + 范围
+    for section, fields in _STRATEGY_SCHEMA.items():
+        sec = cfg.get(section)
+        if not isinstance(sec, dict):
+            continue
+        for field, (typ, lo, hi) in fields.items():
+            if field not in sec:
+                continue
+            v = sec[field]
+            if typ == "int":
+                if isinstance(v, bool) or not isinstance(v, int):
+                    errors.append(f"{section}.{field} 必须是整数")
+                    continue
+                if not (lo <= v <= hi):
+                    errors.append(f"{section}.{field}={v} 超出范围 [{lo},{hi}]")
+            elif typ == "float":
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    errors.append(f"{section}.{field} 必须是数值")
+                    continue
+                fv = float(v)
+                if not (lo <= fv <= hi):
+                    errors.append(f"{section}.{field}={v} 超出范围 [{lo},{hi}]")
+            elif typ == "str":
+                if not isinstance(v, str) or not v.strip():
+                    errors.append(f"{section}.{field} 必须是非空字符串")
+            elif typ == "enum":
+                if v != lo:
+                    errors.append(f"{section}.{field} 目前只支持 {lo!r}")
+            elif typ == "enum2":
+                allowed = str(lo).split("|")
+                if v not in allowed:
+                    errors.append(f"{section}.{field} 只能是 {'/'.join(allowed)}")
+            elif typ == "code_list":
+                if not isinstance(v, list) or not v:
+                    errors.append(f"{section}.{field} 必须是非空字符串数组")
+                    continue
+                for p in v:
+                    if not isinstance(p, str) or not re.fullmatch(r"[A-Z]\d{2}", p):
+                        errors.append(f"{section}.{field} 项非法: {p!r}（应形如 B06）")
+            elif typ == "str_list":
+                if not isinstance(v, list) or not v:
+                    errors.append(f"{section}.{field} 必须是非空字符串数组")
+                    continue
+                for p in v:
+                    if not isinstance(p, str) or not p.strip():
+                        errors.append(f"{section}.{field} 项非法: {p!r}（应是非空字符串）")
+
+    # 3) 跨字段语义
+    st = cfg.get("strategy", {})
+    if all(k in st for k in ("first_drawdown_pct", "add_step_pct")):
+        try:
+            if float(st["first_drawdown_pct"]) + float(st["add_step_pct"]) >= 100:
+                errors.append("strategy.first_drawdown_pct + add_step_pct 必须 < 100")
+        except (TypeError, ValueError):
+            pass
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# 回测任务管理（子进程；cmd + 完成标记参数化）
 # ---------------------------------------------------------------------------
 class TaskManager:
-    """跟踪后台筛选子进程。
+    """跟踪后台回测子进程（409 单任务 + pidfile 锁）。
 
     - 内存里保留 Popen，便于拿 returncode；
-    - 另写 pidfile（logs/.web_run.lock），服务重启后仍能判断「是否已有运行」。
+    - 另写 pidfile（logs/.web_bt_run.lock），服务重启后仍能判断「是否已有运行」。
     """
 
     def __init__(self) -> None:
         self.tasks: Dict[str, Dict[str, Any]] = {}
-        self._lock_path = LOGS_DIR / ".web_run.lock"
+        self._lock_path = LOGS_DIR / ".web_bt_run.lock"
 
     # -- pidfile 辅助 --
     def _write_lock(self, task_id: str, pid: int) -> None:
@@ -586,7 +389,6 @@ class TaskManager:
             p = t.get("popen")
             if p is not None and p.poll() is None:
                 return tid
-            # 无 popen（重启后）用 pid 判断
             if p is None and self._pid_alive(t["pid"]):
                 return tid
         cur = self._read_lock()
@@ -594,21 +396,24 @@ class TaskManager:
             return cur[0]
         return None
 
-    def start(self, run_date: str) -> Dict[str, Any]:
+    def start(self, cmd: List[str], meta: Dict[str, Any],
+              done_markers: List[str], task_id: Optional[str] = None) -> Dict[str, Any]:
+        """启动一个后台任务（cmd = 完整 argv；meta 存任务上下文）。
+
+        :param task_id: 调用方可预生成（Web 回测需要 task_id 拼产物目录）；
+            缺省则自动生成。
+        """
         existing = self.active_task_id()
         if existing:
             raise HTTPException(
                 status_code=409,
-                detail=f"已有运行任务在进行中: {existing}",
+                detail=f"已有回测任务在进行中: {existing}",
             )
 
-        task_id = "web_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
-        log_path = LOGS_DIR / f"web_run_{task_id}.log"
-        cmd = [
-            str(VENV_PYTHON), "-m", "screener",
-            "--date", run_date,
-            "--config", "config/strategy.yaml",
-        ]
+        task_id = task_id or (
+            "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
+        )
+        log_path = LOGS_DIR / f"web_bt_{task_id}.log"
         logf = open(log_path, "ab")
         logf.write(
             f"\n===== 启动 {datetime.now(timezone.utc).isoformat()} cmd={' '.join(cmd)} =====\n".encode()
@@ -622,7 +427,6 @@ class TaskManager:
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                # 独立进程组：便于整组管理；服务停止时由 systemd 清理
                 start_new_session=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -632,14 +436,14 @@ class TaskManager:
         self.tasks[task_id] = {
             "pid": proc.pid,
             "popen": proc,
-            "date": run_date,
+            "meta": meta,
+            "done_markers": done_markers,
             "log_path": str(log_path),
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         self._write_lock(task_id, proc.pid)
         return {
             "task_id": task_id,
-            "date": run_date,
             "status": "running",
             "pid": proc.pid,
             "log_path": str(log_path),
@@ -649,15 +453,16 @@ class TaskManager:
         t = self.tasks.get(task_id)
         # 重启后内存里没有，但 pidfile/日志还在 → 从文件系统重建最小信息
         if t is None:
-            log_path = LOGS_DIR / f"web_run_{task_id}.log"
+            log_path = LOGS_DIR / f"web_bt_{task_id}.log"
             if not log_path.exists():
                 raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
             cur = self._read_lock()
             pid = cur[1] if (cur and cur[0] == task_id) else None
-            t = {"pid": pid, "popen": None, "log_path": str(log_path), "date": ""}
+            t = {"pid": pid, "popen": None, "log_path": str(log_path), "meta": {}}
 
         log_path = Path(t["log_path"])
         tail = _tail_lines(log_path, 20) if log_path.exists() else []
+        markers: List[str] = t.get("done_markers") or ["回测完成"]
 
         # 判定状态
         p = t.get("popen")
@@ -671,27 +476,18 @@ class TaskManager:
             if self._pid_alive(t["pid"]):
                 state = "running"
             else:
-                # 已结束：用日志尾部 + 产物判断 done/failed
-                state = _infer_terminal_state(tail, t)
+                state = _infer_terminal_state(tail, markers)
         else:
-            state = _infer_terminal_state(tail, t)
+            state = _infer_terminal_state(tail, markers)
 
         out: Dict[str, Any] = {
             "task_id": task_id,
             "status": state,
-            "date": t.get("date", ""),
+            "meta": t.get("meta") or {},
             "log_tail": tail,
         }
         if state in ("done", "failed"):
-            run_day = _result_day_for(t.get("date") or "", log_path)
-            # 对外统一 ISO；_result_day_for 内部返回紧凑 YYYYMMDD（用于拼文件路径）
-            out["result_date"] = (
-                f"{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}" if run_day else None
-            )
-            out["api"] = (
-                f"/api/runs/{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}" if run_day else None
-            )
-            # 清理锁（仅当是本任务）
+            out["results_api"] = f"/api/bt/results/{task_id}" if state == "done" else None
             self._clear_lock(task_id)
         return out
 
@@ -713,77 +509,42 @@ def _tail_lines(path: Path, n: int) -> List[str]:
         return []
 
 
-def _infer_terminal_state(tail: List[str], t: Dict[str, Any]) -> str:
-    """无 Popen 时（服务重启后）依据日志尾部与产物推断 done/failed。"""
-    joined = "\n".join(tail)
-    if "筛选完成" in joined:
-        return "done"
-    if re.search(r"错误|Traceback|Error", joined):
-        # 有报错但可能只是中途告警；若日志里有最终「筛选完成」才算 done（上面已判）
-        last = tail[-1] if tail else ""
-        if "运行失败" in last or "Traceback" in joined:
-            return "failed"
-    # 兜底：看产物是否生成且晚于任务启动
-    date_s = t.get("date") or ""
-    if date_s:
-        day = date_s.replace("-", "")
-        csv_p = OUTPUT_DIR / f"result_{day}.csv"
-        if csv_p.exists():
-            return "done"
-    return "failed"
+def _infer_terminal_state(tail: List[str], done_markers: List[str]) -> str:
+    """无 Popen 时（服务重启后）依据日志尾部推断 done/failed。
 
-
-def _result_day_for(date_s: str, log_path) -> Optional[str]:
-    """把请求日期映射到实际结果文件（处理非交易日回退）：找 output/result_*.csv 中最新且 mtime 晚于任务启动的。
-
-    D2（v2 round 1）：log_path 可为 Path（status 端点）、日志行 list
-    （SSE done 事件补全字段用——流式端点拿不到 TaskManager 上下文，只能
-    从已读日志尾部抓 run_day）或 None。
-
-    无请求日期分支只信**本任务自己的日志证据**（「运行日」行 → 产物路径行），
-    不做 output/ 最新文件兜底：对 live 运行那是上一次运行的产物，对旧任务重放
-    可能是后来新运行的产物——宁缺毋错。output/ 兜底只保留在有请求日期分支
-    （status 端点语义：任务刚结束，最新文件 = 本任务产物）。
+    日志尾部 8KB 恒含末行 → 正常结束的任务必有完成标记；否则按 failed 兜底
+    （前端显示失败 + 日志尾部，用户可查因——宁严勿松）。
     """
-    if not date_s:
-        # 无请求日期时只能从日志尾部抓 run_day；log_path=None（调用方无上下文）→ 直接 None
-        if isinstance(log_path, Path):
-            tail_lines = _tail_lines(log_path, 200)
-        elif log_path is None:
-            return None
-        else:
-            tail_lines = list(log_path)[-200:]
-        # 从日志里抓 run_day
-        m = re.search(r"run_day=(\d{8})|运行日 (\d{4}-\d{2}-\d{2})", "\n".join(tail_lines))
-        if m:
-            raw = m.group(1) or m.group(2)
-            # 契约：恒返回紧凑 YYYYMMDD（调用方按 [4:6] 切片拼 ISO）。
-            # 原实现 len==8 才去横线，group(2) 的带横线日期会原样漏出 → 拼出 "2026--09-04"。
-            return raw.replace("-", "")
-        # 次选：日志里的产物路径行（引擎在最终「筛选完成 · 运行日」行之前先打印
-        # 「CSV: .../result_YYYYMMDD.csv」「报告: .../report_YYYYMMDD.md」）——
-        # 绑定到本任务自己的产物，比"output/ 最新文件"更准（旧任务重放时不会
-        # 误拿后来新运行的日期）。
-        m = re.search(r"(?:result|report)_(\d{8})\.(?:csv|md)", "\n".join(tail_lines))
-        if m:
-            return m.group(1)
-        return None
-    day = date_s.replace("-", "")
-    # 直接命中
-    if (OUTPUT_DIR / f"result_{day}.csv").exists():
-        return day
-    # 回退：找 output/ 里最新的 result_*.csv（运行刚结束，取最新即可）
-    cands = sorted(OUTPUT_DIR.glob("result_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if cands:
-        return cands[0].stem.replace("result_", "")
-    return None
+    joined = "\n".join(tail)
+    if any(m in joined for m in done_markers):
+        return "done"
+    return "failed"
 
 
 # ---------------------------------------------------------------------------
 # Pydantic 模型
 # ---------------------------------------------------------------------------
-class RunRequest(BaseModel):
-    date: Optional[str] = None
+class BtRunRequest(BaseModel):
+    """POST /api/bt/runs：{start?, end?, codes? | pool}。
+
+    - start/end: YYYY-MM-DD（缺省 = 各股数据起点/终点）；
+    - codes: 逗号分隔字符串或数组（与 pool 互斥，都不给 = 股票池）；
+    - pool: true 显式股票池（与 codes 同时给 → 400）。
+    """
+    start: Optional[str] = None
+    end: Optional[str] = None
+    codes: Optional[Any] = None   # str 或 list[str]
+    pool: Optional[bool] = None
+
+
+class ImportStrategyRequest(BaseModel):
+    """POST /api/strategy/import 请求体 {raw: <yaml 文本>}。"""
+    raw: str
+
+
+class SaveStrategyRequest(BaseModel):
+    """POST /api/strategies 请求体 {name}（可缺省 → 默认名带时间戳）。"""
+    name: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -791,566 +552,146 @@ class RunRequest(BaseModel):
 # ---------------------------------------------------------------------------
 tm = TaskManager()
 
+_CODE_RE = re.compile(r"^(?:sh|sz)\.\d{6}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-@app.get("/api/runs")
-def list_runs() -> Dict[str, Any]:
-    from screener import runstatus  # 数据源失败 sidecar 读取（与 screener 包同源）
 
-    runs: List[Dict[str, Any]] = []
-    success_days = set()
-    for csv_p in sorted(OUTPUT_DIR.glob("result_*.csv")):
-        m = re.match(r"result_(\d{8})\.csv$", csv_p.name)
-        if not m:
+def _validate_bt_dates(start: Optional[str], end: Optional[str]) -> None:
+    for label, v in (("start", start), ("end", end)):
+        if v is None:
             continue
-        day = m.group(1)
-        success_days.add(day)
-        date_iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+        if not _DATE_RE.fullmatch(str(v)):
+            raise HTTPException(status_code=400, detail=f"{label} 应为 YYYY-MM-DD（收到 {v!r}）")
         try:
-            rows = _read_csv_rows(csv_p)
-        except Exception:  # noqa: BLE001
-            rows = []
-        selected = sum(1 for r in rows if (r.get("top_n_selected") or "").strip() == "1")
-        if not selected:  # legacy 报告无 top_n_selected 列 → 回退 pass_all
-            selected = sum(1 for r in rows if (r.get("pass_all") or "").strip() == "是")
-        report_p = OUTPUT_DIR / f"report_{day}.md"
-        # v2 KPI（从报告「一、KPI 概览」解析；旧报告 → None）
-        kpi: Dict[str, Any] = {}
-        if report_p.exists():
-            try:
-                kpi = parse_report(report_p.read_text(encoding="utf-8")).get("kpi", {})
-            except Exception:  # noqa: BLE001
-                kpi = {}
-        runs.append(
-            {
-                "date": date_iso,
-                "status": "ok",
-                "selected_count": selected,
-                "total_candidates": len(rows),
-                "generated_at": _mtime_iso(csv_p),
-                "has_report": report_p.exists(),
-                "avg_ttm_yield_pct": kpi.get("avg_ttm_yield_pct"),
-                "avg_roe_pct": kpi.get("avg_roe_pct"),
-            }
-        )
-
-    # 失败运行（生产路径失败守卫）：扫描 run_status_*.json sidecar，status=failed
-    # 且无对应 result_*.csv 的日 = 数据源级失败。与成功 run 并列展示并标红，
-    # 绝不与"0 只入选"的正常空结果混同（那种有 result CSV → status=ok）。
-    for sc_p in sorted(OUTPUT_DIR.glob("run_status_*.json")):
-        m = re.match(r"run_status_(\d{8})\.json$", sc_p.name)
-        if not m:
-            continue
-        day = m.group(1)
-        if day in success_days:
-            continue  # 有 result CSV = 成功重跑已取代失败 → 不重复标红
-        sc = runstatus.read_sidecar(str(OUTPUT_DIR), day)
-        if not sc or sc.get("status") != "failed":
-            continue
-        date_iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
-        runs.append(
-            {
-                "date": date_iso,
-                "status": "failed",
-                "selected_count": None,
-                "total_candidates": None,
-                "generated_at": sc.get("failed_at") or _mtime_iso(sc_p),
-                "has_report": False,
-                "error": sc.get("error"),
-                "error_type": sc.get("error_type"),
-                "reason_code": sc.get("reason_code"),
-                "avg_ttm_yield_pct": None,
-                "avg_roe_pct": None,
-            }
-        )
-
-    # 倒序（最新在前）
-    runs.sort(key=lambda r: r["date"], reverse=True)
-    return {"runs": runs}
-
-
-@app.get("/api/runs/{day}")
-def run_detail(day: str) -> Dict[str, Any]:
-    # 统一对外日期格式为 ISO（YYYY-MM-DD），与列表端点/CLI 一致；
-    # 兼容旧客户端的紧凑格式 YYYYMMDD。两种格式都做真实日历校验。
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
-        compact = day.replace("-", "")
-    elif re.fullmatch(r"\d{8}", day):
-        compact = day
-    else:
-        raise HTTPException(status_code=400, detail="date 应为 YYYY-MM-DD（或兼容 YYYYMMDD）")
-    try:
-        _date(int(compact[:4]), int(compact[4:6]), int(compact[6:]))
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"非法日期: {day}")
-    csv_p = OUTPUT_DIR / f"result_{compact}.csv"
-    report_p = OUTPUT_DIR / f"report_{compact}.md"
-    if not csv_p.exists():
-        # 生产路径失败守卫：无 result CSV 但有 status=failed sidecar → 该日是数据源级
-        # 失败（BaoStock 封禁/空池等）。返回 200 + status=failed + 错误摘要，前端标红
-        # "运行失败"，而不是 404"无结果"（后者会让用户以为只是没有数据）。
-        from screener import runstatus
-
-        sc = runstatus.read_sidecar(str(OUTPUT_DIR), compact)
-        if sc and sc.get("status") == "failed":
-            return {
-                "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
-                "status": "failed",
-                "generated_at": sc.get("failed_at"),
-                "error": sc.get("error"),
-                "error_type": sc.get("error_type"),
-                "reason_code": sc.get("reason_code"),
-                "funnel": [],
-                "kpi": {},
-                "badges": {},
-                "selected": [],
-                "survivors": [],
-                "missing_fundamental": [],
-                "skipped_groups": {},
-                "report_md": "",
-            }
-        raise HTTPException(status_code=404, detail=f"无该日运行结果: {day}")
-
-    rows = _read_csv_rows(csv_p)
-    # v2(zscore) 入选 = top_n_selected==1；legacy 入选 = pass_all=="是"。
-    # 优先按 top_n_selected（v2 列），为空再回退 legacy 语义，保证两种模式都正确。
-    selected = [r for r in rows if (r.get("top_n_selected") or "").strip() == "1"]
-    if not selected:
-        selected = [r for r in rows if (r.get("pass_all") or "").strip() == "是"]
-
-    # v5.2 Phase 1：数据源健康度（Q5 双通道之 Web 侧）——**仅异常时返回非空 payload**，
-    # 前端据此显示 badge；正常日/旧运行 → None（badge 不渲染，零视觉回归）。
-    # 直接读 JSON sidecar（不 import screener 包——web 是独立进程，避免 sys.path 依赖）。
-    data_health: Dict[str, Any] | None = None
-    try:
-        dh_path = OUTPUT_DIR / f"data_health_{compact}.json"
-        if dh_path.exists():
-            with open(dh_path, encoding="utf-8") as _f:
-                _dh = json.load(_f)
-            if isinstance(_dh, dict) and _dh.get("has_anomaly"):
-                data_health = _dh
-    except Exception:  # noqa: BLE001 — 健康度读取失败不影响运行详情
-        data_health = None
-
-    md = ""
-    parsed: Dict[str, Any] = {"funnel": [], "missing": [], "skipped_groups": {}, "kpi": {}}
-    if report_p.exists():
-        md = report_p.read_text(encoding="utf-8")
-        parsed = parse_report(md)
-
-    # badge 阈值全部来自 config（前端不得硬编码）。
-    # 高股息(绿) 阈值 = dividend.min_yield_pct（brief R5 指定，单一事实来源）；
-    # 行业TopN% / F-Score 来自 badges 段。
-    try:
-        _cfg_doc = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-        _badges_cfg = _cfg_doc.get("badges", {}) or {}
-        _div_cfg = _cfg_doc.get("dividend", {}) or {}
-    except Exception:  # noqa: BLE001
-        _badges_cfg, _div_cfg = {}, {}
-
-    return {
-        "date": f"{compact[:4]}-{compact[4:6]}-{compact[6:]}",
-        "status": "ok",
-        "generated_at": _mtime_iso(csv_p),
-        "funnel": parsed["funnel"],
-        "kpi": parsed.get("kpi", {}),
-        "badges": {
-            "high_dividend_pct": float(_div_cfg.get("min_yield_pct", 0)),
-            "industry_top_pct": float(_badges_cfg.get("industry_top_pct", 10)),
-            "fscore_min": int(_badges_cfg.get("fscore_min", 7)),
-        },
-        "selected": selected,
-        "survivors": rows,  # v2 CSV 全量列（zscore 模式=全体打分候选）
-        "missing_fundamental": parsed["missing"],
-        "skipped_groups": parsed["skipped_groups"],
-        "data_health": data_health,  # v5.2：仅异常时非空（前端 badge 判据）
-        "report_md": md,
-    }
-
-
-@app.get("/api/strategy")
-def get_strategy() -> Dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
-    raw = CONFIG_PATH.read_text(encoding="utf-8")
-    data = yaml.safe_load(raw)
-    return {"json": data, "raw": raw}
-
-
-# ---------------------------------------------------------------------------
-# v3 回测（读 output/backtest/*.csv → 结构化 JSON；前端 ECharts 画净值曲线）
-# ---------------------------------------------------------------------------
-BACKTEST_DIR = PROJECT_ROOT / "output" / "backtest"
-
-
-@app.get("/api/backtest")
-def get_backtest() -> Dict[str, Any]:
-    """回测三件套 → {equity_curve:[{date,strategy,<bench...>}], metrics:{...}, holdings:[...]}。
-
-    指标由 backtest.metrics_bt.summarize 从 equity_curve.csv 现算（与 report.md 同口径）。
-    产物不存在 → 404（提示先跑 .venv/bin/python -m backtest.engine）。
-    """
-    eq_p = BACKTEST_DIR / "equity_curve.csv"
-    mh_p = BACKTEST_DIR / "monthly_holdings.csv"
-    rp_p = BACKTEST_DIR / "report.md"
-    if not eq_p.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="output/backtest/ 产物不存在（先离线跑回测：.venv/bin/python -m backtest.engine）")
-
-    with open(eq_p, encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader, None) or []
-        rows = [r for r in reader if r]
-    if not header or len(rows) < 2:
-        raise HTTPException(status_code=404, detail="equity_curve.csv 为空")
-
-    bench_cols = [c for c in header[1:] if c != "strategy_nav"]
-    equity_curve: List[Dict[str, Any]] = []
-    dates: List[str] = []
-    navs: List[float] = []
-    bench_series: Dict[str, Tuple[List[str], List[float]]] = {c: ([], []) for c in bench_cols}
-    for r in rows:
-        if len(r) < 2:
-            continue
-        d = r[0].strip()
-        try:
-            v = float(r[1])
+            datetime.strptime(str(v), "%Y-%m-%d")
         except ValueError:
-            continue
-        dates.append(d)
-        navs.append(v)
-        item: Dict[str, Any] = {"date": d, "strategy": round(v, 6)}
-        for j, c in enumerate(bench_cols):
-            cell = r[2 + j].strip() if len(r) > 2 + j else ""
-            item[c] = round(float(cell), 6) if cell else None
-            if cell:
-                bench_series[c][0].append(d)
-                bench_series[c][1].append(float(cell))
-        equity_curve.append(item)
-
-    # 指标（全窗口 + 1y/3y/5y 切片；基准取第一个可用序列）
-    from backtest.metrics_bt import slice_window, summarize
-    bt_cfg = (yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}).get("backtest") or {}
-    rf = float(bt_cfg.get("risk_free_pct", 2.0))
-    bd, bn = ([], [])
-    for c in bench_cols:
-        if len(bench_series[c][1]) >= 2:
-            bd, bn = bench_series[c]
-            break
-    full = summarize(dates, navs, rf, bench_dates=bd or None, bench_navs=bn or None)
-
-    def _win(days: int) -> Dict[str, Any]:
-        sd, sn = slice_window(dates, navs, days)
-        s = summarize(sd, sn, rf, bench_dates=bd or None, bench_navs=bn or None)
-        return {"start": s.start, "end": s.end,
-                "total_return_pct": _r2(s.total_return_pct),
-                "annual_return_pct": _r2(s.annual_return_pct),
-                "sharpe": _r2(s.sharpe), "max_drawdown_pct": _r2(s.max_drawdown_pct)}
-
-    metrics = {
-        "window": {"start": full.start, "end": full.end, "n_days": full.n_days},
-        "full": _win(10**9),
-        "slices": {"1y": _win(250), "3y": _win(750), "5y": _win(1250)},
-        "monthly_win_rate_pct": _r2(full.monthly_win_rate_pct),
-        "calmar": _r2(full.calmar), "beta": _r2(full.beta),
-        "alpha_annual_pct": _r2(full.alpha_annual_pct),
-        "info_ratio": _r2(full.info_ratio),
-    }
-
-    holdings: List[Dict[str, Any]] = []
-    if mh_p.exists():
-        with open(mh_p, encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                holdings.append({
-                    "date": r.get("date", ""), "code": r.get("code", ""),
-                    "name": r.get("name", ""),
-                    "weight": float(r["weight"]) if r.get("weight") else None,
-                    "entry_price": float(r["entry_price"]) if r.get("entry_price") else None,
-                    "total_score": float(r["total_score"]) if r.get("total_score") else None,
-                })
-
-    report_md = rp_p.read_text(encoding="utf-8") if rp_p.exists() else ""
-    return {"equity_curve": equity_curve, "metrics": metrics,
-            "holdings": holdings, "benchmarks": bench_cols, "report_md": report_md}
+            raise HTTPException(status_code=400, detail=f"非法日期: {label}={v!r}")
 
 
-def _r2(v: Optional[float]) -> Optional[float]:
-    return None if v is None else round(float(v), 4)
-
-
-def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
-    """PUT /api/strategy 与 POST /api/strategy/import 共用的「校验 → 备份 → 写盘」路径。
-
-    v6.2 O3：从 put_strategy 抽出（**PUT 对外行为逐字节不变**——PUT 改调本函数，现有测试原样全绿）：
-    1) _validate_strategy 逐项类型/范围校验；
-    2) screener.config.load_config 最终结构/语义校验（写临时文件）；
-    3) .bak 备份（保留最近一份，shutil.copy2 保留 mtime）；
-    4) D-W03：ruamel round-trip 保留注释与排版写回（失败退回 safe_dump）。
-    返回 (backup_path_str, sections)——PUT 只取 backup（响应不含 sections，逐字节同旧版），
-    import 额外带 sections。
-
-    备份路径用 CONFIG_PATH.with_suffix(".yaml.bak") **现算**（与模块级 BAK_PATH 同式）：
-    生产环境两者恒等；import/测试 monkeypatch CONFIG_PATH 到 tmp 时备份随之落 tmp，绝不碰生产 .bak。
-    """
-    if not isinstance(payload, dict):
-        # PUT 侧由 FastAPI Dict[str, Any] 类型约束拦截；import 侧 yaml.safe_load 可能解出
-        # list/标量 → 在这里统一拦成 400（与 _validate_strategy 顶层报错同语义）。
-        raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
-
-    errors = _validate_strategy(payload)
-    if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors})
-
-    # 复用 screener.config.load_config 做最终结构/语义校验（写临时文件）
-    try:
-        from screener import config as cfgmod
-        fd, tmp = tempfile.mkstemp(suffix=".yaml")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
-        try:
-            cfgmod.load_config(tmp)
-        finally:
-            os.unlink(tmp)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail={"errors": [f"配置校验失败: {exc}"]})
-
-    # 备份（保留最近一份）
-    bak_path = CONFIG_PATH.with_suffix(".yaml.bak")
-    if CONFIG_PATH.exists():
-        shutil.copy2(CONFIG_PATH, bak_path)
-
-    # D-W03：写回时保留原文件注释与排版（ruamel round-trip，失败退回 safe_dump）
-    _write_strategy_preserving_comments(payload)
-    return str(bak_path), list(payload.keys())
-
-
-@app.put("/api/strategy")
-def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # v6.2 O3：校验/备份/写盘抽公共函数（与 import 共用同一套校验）。
-    # **对外行为逐字节不变**：响应仍为 {"ok": True, "backup": str}（不含 sections）。
-    backup, _ = _apply_strategy_write(payload)
-    return {"ok": True, "backup": backup}
-
-
-class ImportStrategyRequest(BaseModel):
-    """v6.2 O3：POST /api/strategy/import 请求体 {raw: <yaml 文本>}。"""
-    raw: str
-
-
-@app.post("/api/strategy/import")
-def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
-    """v6.2 O3：加载策略文件——body={raw}（yaml 文本），服务端 safe_load → 复用 PUT 同一套
-    校验函数（_apply_strategy_write）→ 通过则 .bak 备份 + 写盘（与 PUT 同路径逻辑）。
-
-    - 200 {ok, backup, sections}：加载成功（前端 invalidate("strategy") 重拉 + msg-box 显示备份名）；
-    - 400 {errors}：yaml 解析失败 / 非 mapping / 校验不过（与 PUT 400 同 UI，前端保持现状）。
-    """
-    try:
-        data = yaml.safe_load(req.raw)
-    except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
-        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
-    backup, sections = _apply_strategy_write(data)
-    return {"ok": True, "backup": backup, "sections": sections}
-
-
-# ---------------------------------------------------------------------------
-# v6.2.1 S1 — 策略库：本机命名保存 + 下拉加载 + 删除（data/strategies/*.yaml）
-#   存储 = config/strategy.yaml 原文快照（读盘直存，保留注释/排版）。
-#   加载 = safe_load → **复用 PUT 同一套 _apply_strategy_write**（校验→.bak→写盘，
-#   行为逐字节同 PUT/import），保证"策略库加载"与"文件导入"走完全相同的写路径。
-#   测试隔离：CONFIG_PATH / STRATEGIES_DIR 均为模块级常量，monkeypatch 到 tmp 即可
-#   全离线可测（生产 config/ 与 data/strategies/ 零触碰）。
-# ---------------------------------------------------------------------------
-def _sanitize_strategy_name(name: str) -> str:
-    """策略名 → 安全文件名。
-
-    规则（brief S1）：去路径分隔符 / \\ 与 ..、首尾空白；空格→下划线；
-    保留 CJK/字母数字/-_（Linux UTF-8 文件名，中文名直接可用）。
-    其余字符一律剔除（防控制字符/特殊符号落盘）。
-    """
-    s = str(name or "").strip()
-    s = s.replace("/", "_").replace("\\", "_")
-    s = s.replace("..", "")
-    s = s.replace(" ", "_")  # 空格→下划线（brief S1；必须在字符过滤前做，否则空格会被当非法字符剔除）
-    out = "".join(ch for ch in s if ch.isalnum() or ch in "-_" or "\u4e00" <= ch <= "\u9fff")
-    return out
-
-
-def _strategy_path(name: str) -> Path:
-    """策略名 → data/strategies/<name>.yaml（调用方保证 name 已 sanitize 且非空）。"""
-    return STRATEGIES_DIR / f"{name}.yaml"
-
-
-class SaveStrategyRequest(BaseModel):
-    """v6.2.1 S1：POST /api/strategies 请求体 {name}（可缺省 → 默认名带时间戳）。"""
-    name: Optional[str] = None
-
-
-def _default_strategy_name() -> str:
-    """缺省策略名：策略_YYYYMMDD_HHMM（本地时间，与前端 defaultExportName 同口径）。"""
-    return "策略_" + datetime.now().strftime("%Y%m%d_%H%M")
-
-
-@app.post("/api/strategies", status_code=201)
-def save_strategy(req: SaveStrategyRequest) -> Dict[str, Any]:
-    """命名保存当前 config/strategy.yaml 原文 → data/strategies/<name>.yaml。
-
-    - name 为空/缺省 → 默认名 策略_YYYYMMDD_HHMM；sanitize 后仍为空 → 400 {error:"invalid_name"}；
-    - 重名（文件已存在）→ 409 {"detail": {"error": "strategy_exists", "name": <name>}}
-      （FastAPI HTTPException(detail=dict) 标准包裹；前端读 e.body.detail.error，v6.2.1-D1）；
-    - 成功 → 201 {name, path, saved_at}。
-    """
-    if not CONFIG_PATH.exists():
-        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
-    name = _sanitize_strategy_name(req.name) if req.name else ""
-    if not name:
-        name = _default_strategy_name()
-    path = _strategy_path(name)
-    if path.exists():
-        raise HTTPException(status_code=409, detail={"error": "strategy_exists", "name": name})
-    STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
-    # 原文快照（读盘直存，保留注释/排版——与 GET /api/strategy 的 raw 同义）
-    _atomic_write_text(path, CONFIG_PATH.read_text(encoding="utf-8"))
-    return {
-        "name": name,
-        "path": str(path),
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-@app.get("/api/strategies")
-def list_strategies() -> List[Dict[str, Any]]:
-    """策略库列表 [{name, saved_at, size_bytes}]，按 saved_at 降序；目录不存在 → []。"""
-    if not STRATEGIES_DIR.is_dir():
+def _normalize_codes(codes: Any) -> List[str]:
+    if codes is None:
         return []
-    out: List[Dict[str, Any]] = []
-    for p in STRATEGIES_DIR.glob("*.yaml"):
-        if not p.is_file():
-            continue
-        st = p.stat()
-        out.append({
-            "name": p.stem,
-            "saved_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            "size_bytes": st.st_size,
-        })
-    out.sort(key=lambda x: x["saved_at"], reverse=True)  # saved_at 降序（brief S1）
-    return out
+    if isinstance(codes, str):
+        items = [c.strip() for c in codes.split(",")]
+    elif isinstance(codes, list):
+        items = [str(c).strip() for c in codes]
+    else:
+        raise HTTPException(status_code=400, detail="codes 应为逗号分隔字符串或数组")
+    items = [c for c in items if c]
+    if not items:
+        return []
+    for c in items:
+        if not _CODE_RE.fullmatch(c):
+            raise HTTPException(status_code=400, detail=f"非法 ts_code: {c!r}（应形如 sh.601088）")
+    # 去重保序
+    return list(dict.fromkeys(items))
 
 
-@app.delete("/api/strategies/{name}", status_code=204)
-def delete_strategy(name: str) -> Response:
-    """删除策略库中指定快照 → 204；不存在 → 404。"""
-    path = _strategy_path(_sanitize_strategy_name(name))
-    if not (path.is_file()):
-        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
-    path.unlink()
-    return Response(status_code=204)
+# ---------------------------------------------------------------------------
+# 回测任务（/api/bt/runs 族）
+# ---------------------------------------------------------------------------
+@app.post("/api/bt/runs")
+def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
+    """触发一次按需回测（子进程 python -m martingale backtest，SSE 推进度）。"""
+    _validate_bt_dates(req.start, req.end)
+    codes = _normalize_codes(req.codes)
+    if codes and req.pool:
+        raise HTTPException(status_code=400, detail="codes 与 pool 互斥（codes 优先，请二选一）")
 
-
-@app.post("/api/strategies/{name}/load")
-def load_strategy(name: str) -> Dict[str, Any]:
-    """加载策略库快照 → 复用 PUT 同一套 _apply_strategy_write（校验→.bak→写盘）。
-
-    - 200 {ok, backup}：加载成功（前端 invalidate("strategy") 重拉 + toast 显示备份名）；
-    - 400 {errors}：yaml 解析失败 / 非 mapping / 校验不过（与 PUT/import 400 同语义）；
-    - 404：快照不存在。
-    """
-    path = _strategy_path(_sanitize_strategy_name(name))
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
-        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
-    backup, _ = _apply_strategy_write(data)
-    return {"ok": True, "backup": backup}
-
-
-@app.post("/api/runs")
-def trigger_run(req: RunRequest) -> Dict[str, Any]:
-    run_date = req.date or datetime.now().strftime("%Y-%m-%d")
-    # 日期格式校验
-    try:
-        datetime.strptime(run_date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"date 格式应为 YYYY-MM-DD，收到 {run_date!r}")
+    cmd = [str(VENV_PYTHON), "-m", "martingale", "backtest"]
+    if req.start:
+        cmd += ["--start", req.start]
+    if req.end:
+        cmd += ["--end", req.end]
+    if codes:
+        cmd += ["--codes", ",".join(codes)]
+    # 无 --codes = 默认股票池（pool=true 显式同义）
     if not VENV_PYTHON.exists():
         raise HTTPException(status_code=500, detail=f"找不到 venv python: {VENV_PYTHON}")
-    return tm.start(run_date)
+
+    # task_id 预生成（产物目录 output/backtest_martingale/runs/<task_id> 与之一致）
+    task_id = "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
+    cmd += ["--out", str(BT_RUNS_DIR / task_id)]
+    res = tm.start(cmd, {"start": req.start, "end": req.end,
+                         "codes": codes or None, "pool": bool(req.pool) or not codes},
+                   ["回测完成"], task_id=task_id)
+    res["out_dir"] = str(BT_RUNS_DIR / task_id)
+    return res
 
 
-@app.get("/api/runs/{task_id}/status")
-def run_status(task_id: str) -> Dict[str, Any]:
-    if not re.fullmatch(r"web_[A-Za-z0-9_]+", task_id):
+@app.get("/api/bt/runs/{task_id}/status")
+def bt_run_status(task_id: str) -> Dict[str, Any]:
+    if not re.fullmatch(r"bt_[A-Za-z0-9_]+", task_id):
         raise HTTPException(status_code=400, detail="非法 task_id")
     return tm.status(task_id)
 
 
-# ---------------------------------------------------------------------------
-# SSE 实时日志（R5：tail logs/web_run_{task_id}.log，按字节偏移增量推）
-# ---------------------------------------------------------------------------
-def _classify_log_line(line: str, task_date: str = "", tail_lines: Optional[List[str]] = None) -> Dict[str, Any]:
-    """把一行运行日志分类为 SSE 事件（报告 R5 classify()）。
+@app.get("/api/bt/results/{task_id}")
+def bt_results(task_id: str) -> Dict[str, Any]:
+    """回测产物 → JSON（per_stock / buys / equity_curve / summary / status）。"""
+    if not re.fullmatch(r"bt_[A-Za-z0-9_]+", task_id):
+        raise HTTPException(status_code=400, detail="非法 task_id")
+    out_dir = BT_RUNS_DIR / task_id
+    if not out_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"回测产物不存在: {task_id}")
+    res: Dict[str, Any] = {"task_id": task_id}
+    ps = out_dir / "per_stock.csv"
+    res["per_stock"] = _read_csv_rows_floats(ps) if ps.exists() else []
+    buys = out_dir / "buys.csv"
+    res["buys"] = _read_csv_rows_floats(buys) if buys.exists() else []
+    eq = out_dir / "equity_curve.csv"
+    if eq.exists():
+        rows = _read_csv_rows_floats(eq)
+        res["equity_curve"] = rows[-5000:]   # 截尾（前端画曲线够用；完整 CSV 在盘上）
+        res["equity_curve_truncated"] = len(rows) > 5000
+    else:
+        res["equity_curve"] = []
+    sm = out_dir / "summary.md"
+    res["summary"] = sm.read_text(encoding="utf-8") if sm.exists() else ""
+    sj = out_dir / "status.json"
+    if sj.exists():
+        try:
+            res["run_meta"] = json.loads(sj.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            res["run_meta"] = None
+    return res
 
-    - [PROGRESS] stage=... done=N total=M → progress（结构化进度标记，v2 新增）
-    - 「筛选完成」→ done；「运行失败」/Traceback/Error → error；其余 → log。
 
-    D2（v2 round 1）：done 事件按 R5 规格补全 result_date/api 两字段。
-    解析优先级（都是"实际运行日"的证据，越靠前越精确）：
-    1. tail_lines 里的「运行日 YYYY-MM-DD」（done 行自带 = 回退后的交易日）；
-    2. tail_lines 里的产物路径 result_YYYYMMDD.csv / report_YYYYMMDD.md
-       （CLI 在最终运行日行之前打印，绑定本任务自己的产物）；
-    3. task_date（内存任务日期或日志启动横幅 --date）——仅当上面都还没有时
-       用：引擎的「筛选完成: mode=...」行先于 CLI 的运行日/产物行出现，第一条
-       done 事件到达时只有请求日期可用；非交易日回退场景下后续 done 行会带着
-       真实运行日覆盖语义（两条 done 事件各自独立解析）。
+# ---------------------------------------------------------------------------
+# SSE 实时日志（回测任务）
+# ---------------------------------------------------------------------------
+def _classify_log_line(line: str, done_markers: List[str]) -> Dict[str, Any]:
+    """把一行运行日志分类为 SSE 事件。
+
+    - [PROGRESS] stage=... done=N total=M → progress（结构化进度标记）
+    - 完成标记（"回测完成"）→ done；"错误:"/Traceback → error；其余 → log。
     """
     m = re.search(r"\[PROGRESS\]\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)", line)
     if m:
         return {"type": "progress", "stage": m.group(1),
                 "done": int(m.group(2)), "total": int(m.group(3))}
-    if "筛选完成" in line:
-        ev: Dict[str, Any] = {"type": "done"}
-        run_day = _result_day_for("", tail_lines or []) or _result_day_for(task_date, None)
-        if run_day:
-            iso = f"{run_day[:4]}-{run_day[4:6]}-{run_day[6:]}"
-            ev["result_date"] = iso
-            ev["api"] = f"/api/runs/{iso}"
-        return ev
-    if "运行失败" in line or "Traceback" in line or re.search(r"\bError\b", line):
+    if any(mk in line for mk in done_markers):
+        return {"type": "done"}
+    if "Traceback" in line or "错误:" in line or re.search(r"\bError\b", line):
         return {"type": "error"}
     return {"type": "log", "text": line}
 
 
-@app.get("/api/runs/{task_id}/events")
-async def run_events(task_id: str, request: Request) -> StreamingResponse:
-    """SSE 事件流：log / progress / done / error + 15s 心跳。
+@app.get("/api/bt/runs/{task_id}/events")
+async def bt_run_events(task_id: str, request: Request) -> StreamingResponse:
+    """SSE 事件流：log / progress / done / error + ~15s 心跳。
 
-    - `id: <offset>` = 已推送到该字节偏移；断线重连带 Last-Event-ID 从该偏移续读
-      （自动补发断连期间错过的日志）。无 offset → 从头补发全量历史。
+    - `id: <offset>` = 已推送到该字节偏移；断线重连带 Last-Event-ID 从该偏移续读。
     - 子进程结束且日志读完 → 发送终态事件后关闭流（前端据此停止轮询兜底）。
-    - X-Accel-Buffering:no：禁止代理缓冲（内网 nginx/uvicorn 场景，报告 R5）。
     """
-    if not re.fullmatch(r"web_[A-Za-z0-9_]+", task_id):
+    if not re.fullmatch(r"bt_[A-Za-z0-9_]+", task_id):
         raise HTTPException(status_code=400, detail="非法 task_id")
-    log_path = LOGS_DIR / f"web_run_{task_id}.log"
+    log_path = LOGS_DIR / f"web_bt_{task_id}.log"
     if not log_path.exists():
         raise HTTPException(status_code=404, detail=f"任务日志不存在: {task_id}")
 
-    # D2：done 事件补全 result_date/api 需要任务上下文（请求日期 + 已读日志尾部）。
-    # 内存里有该任务 → 用其 date；重启后内存为空 → 从日志首行启动横幅抓请求日期
-    # （cmd=... --date YYYY-MM-DD），再由 classify 的「运行日」/产物逻辑处理非交易日回退。
     task = tm.tasks.get(task_id)
-    task_date = (task or {}).get("date") or ""
-    if not task_date:
-        try:
-            with open(log_path, "rb") as f:
-                head = f.read(2048).decode("utf-8", errors="replace")
-            m = re.search(r"--date (\d{4}-\d{2}-\d{2})", head)
-            task_date = m.group(1) if m else ""
-        except OSError:
-            pass
+    markers = (task or {}).get("done_markers") or ["回测完成"]
 
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id")
@@ -1363,9 +704,7 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
         sent_terminal = False
         idle_ticks = 0
         offset = start_offset
-        seen_lines: List[str] = []  # 本流已推送的日志行（供 done 事件抓「运行日」）
         while True:
-            # 客户端断开 → 尽快退出，不空转
             if await request.is_disconnected():
                 break
             try:
@@ -1379,9 +718,8 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
                     offset = size
                 for line in chunk.decode("utf-8", errors="replace").splitlines():
                     if not line.strip():
-                        continue  # 空行（TaskManager 启动横幅前的换行）不推
-                    seen_lines.append(line)  # 先入上下文：done 行自带「运行日」，classify 需要它
-                    ev = _classify_log_line(line, task_date=task_date, tail_lines=seen_lines)
+                        continue
+                    ev = _classify_log_line(line, markers)
                     sent_terminal = sent_terminal or ev["type"] in ("done", "error")
                     yield f"id: {offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 idle_ticks = 0
@@ -1402,104 +740,274 @@ async def run_events(task_id: str, request: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
-# 个股明细（R5：本地稳定键缓存重建 af1 + MA，只读文件、离线可用）
+# 持仓状态 / 股票池（同步；全池 ~2s，调研实测 CONFIRMED）
 # ---------------------------------------------------------------------------
-@app.get("/api/stocks/{code}/detail")
-def stock_detail(code: str, run_day: str) -> Dict[str, Any]:
-    """GET /api/stocks/{code}/detail?run_day=YYYY-MM-DD
-
-    响应 schema（报告 R5）：
-    {code, name, industry, factors:{...四维原始因子值...}, scores:{z_*, score_*},
-     kline:{dates:[], close_af1:[], close_af3:[], ma20:[], ma60:[]}}
-
-    K线数据源 = 本地 `kline_af3_{code}` + `adjfactor_{code}` 稳定键缓存重建 af=1
-    （不拉 BaoStock）；MA20/60 由 close_af1 计算。截断到 run_day（含）为止。
-    """
-    if not re.fullmatch(r"(sh|sz)\.\d{6}", code):
-        raise HTTPException(status_code=400, detail=f"非法代码: {code}")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_day):
-        raise HTTPException(status_code=400, detail="run_day 应为 YYYY-MM-DD")
-
-    # 1) factors/scores：从该 run_day 的 result CSV 取（若存在）
-    compact = run_day.replace("-", "")
-    csv_p = OUTPUT_DIR / f"result_{compact}.csv"
-    row: Optional[Dict[str, str]] = None
-    if csv_p.exists():
-        for r in _read_csv_rows(csv_p):
-            if r.get("code") == code:
-                row = r
-                break
-
-    factor_cols = [
-        "ma_bullish", "window_return_pct", "annual_vol_pct", "rsi14",
-        "macd_golden_cross", "ttm_dividend_yield_pct", "payout_ratio_pct",
-        "industry_roe_rank_pct", "industry_yoy_pni_rank_pct", "roe_pct",
-        "roe_3y_mean_pct", "roe_3y_std_pct", "liability_pct", "gross_margin_pct",
-        "piotroski_fscore", "piotroski_valid",
-    ]
-    score_cols = ["z_technical", "z_dividend", "z_industry", "z_fundamental",
-                  "score_technical", "score_dividend", "score_industry",
-                  "score_fundamental", "total_score", "rank", "top_n_selected"]
-
-    def _num(v: Optional[str]) -> Optional[float]:
-        if v is None or str(v).strip() in ("", "nan"):
-            return None
-        try:
-            f = float(v)
-            return None if f != f else f  # NaN → None
-        except (TypeError, ValueError):
-            return None
-
-    factors: Dict[str, Any] = {c: _num(row.get(c)) for c in factor_cols} if row else {}
-    scores: Dict[str, Any] = {c: _num(row.get(c)) for c in score_cols} if row else {}
-
-    # 2) kline：本地稳定键缓存重建（离线、纯文件读取，不实例化 BaoStock 客户端）
-    kline_out: Dict[str, Any] = {"dates": [], "close_af1": [],
-                                 "close_af3": [], "ma20": [], "ma60": []}
+def _lake_or_raise() -> None:
+    """数据湖不可用（缺失/损坏/锁）→ 503 带归一化中文原因。"""
     try:
-        from screener.data.cache import DiskCache, make_cache_name
-        from screener.reconstruct import moving_average, rebuild_kline_series
+        from martingale import data as mdata
+        con = mdata.connect_readonly(None)
+        con.close()
+    except Exception as exc:  # noqa: BLE001 - 归一化异常（LakeMissing/Locked/Invalid）
+        raise HTTPException(status_code=503, detail=f"数据湖不可用: {exc}")
 
-        cache = DiskCache(str(PROJECT_ROOT / "cache"))
-        kl = cache.get(make_cache_name("kline_af3", code))
-        if kl and kl["rows"]:
-            af = cache.get(make_cache_name("adjfactor", code))
-            factor_rows = list(af["rows"]) if af else []
-            rebuilt = rebuild_kline_series(kl["rows"], factor_rows, kl["columns"])
-            dates, af3, af1 = (
-                rebuilt["dates"], rebuilt["af3_close"], rebuilt["af1_close"])
-            cut = len(dates)
-            for i, d in enumerate(dates):
-                if d > run_day:
-                    cut = i
-                    break
-            ma20_full = moving_average(af1, 20)
-            ma60_full = moving_average(af1, 60)
-            kline_out = {
-                "dates": dates[:cut],
-                "close_af1": [None if v is None else round(float(v), 4) for v in af1[:cut]],
-                "close_af3": [None if v is None else round(float(v), 4) for v in af3[:cut]],
-                "ma20": [None if v is None else round(float(v), 4) for v in ma20_full[:cut]],
-                "ma60": [None if v is None else round(float(v), 4) for v in ma60_full[:cut]],
+
+def _load_pool_ctx():
+    """配置 + 连接 + 股票池（/api/positions 与 /api/pool 共用）。"""
+    from martingale.config import load_config as mload
+    from martingale.data import connect_readonly
+    from martingale.universe import build_pool
+
+    try:
+        sp, up = mload(str(CONFIG_PATH))
+    except Exception as exc:  # noqa: BLE001 - ConfigError → 400
+        raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
+    con = connect_readonly(None)
+    try:
+        pool = build_pool(con, up)
+    except Exception as exc:  # noqa: BLE001
+        con.close()
+        raise HTTPException(status_code=500, detail=f"股票池构建失败: {exc}")
+    return sp, up, con, pool
+
+
+@app.get("/api/pool")
+def get_pool() -> Dict[str, Any]:
+    """股票池：漏斗 5 条件计数 + 成员（同步；调研实测 ~1s）。"""
+    _sp, _up, con, pool = _load_pool_ctx()
+    try:
+        members = [
+            {
+                "ts_code": m.ts_code,
+                "name": m.name,
+                "industry_csric2": m.industry_csric2,
+                "soe_basis": m.soe_basis,
+                "total_mv": m.total_mv,
+                "ttm_yield_pct": m.ttm_yield_pct,
+                "n_bars": m.n_bars,
+                "list_date": m.list_date,
             }
-    except Exception as exc:  # noqa: BLE001 - 缓存缺失/损坏时仍返回 factors/scores
-        kline_out["error"] = f"本地缓存重建失败: {exc}"
-
+            for m in sorted(pool.members, key=lambda x: x.ts_code)
+        ]
+    finally:
+        con.close()
     return {
-        "code": code,
-        "name": (row or {}).get("name", ""),
-        "industry": (row or {}).get("industry", ""),
-        "run_day": run_day,
-        "factors": factors,
-        "scores": scores,
-        "kline": kline_out,
+        "funnel": pool.funnel,
+        "n_members": len(members),
+        "members": members,
     }
 
 
+@app.get("/api/positions")
+def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
+    """当前持仓状态（逐股状态机投影；同步，全池 ~2s）。
+
+    as_of=YYYY-MM-DD：把窗口截到该日（含）——默认各股数据起点→最新 bar。
+    每只股独立状态机从**该股数据起点**（或 --start 语义的数据起点）跑到 as_of。
+    """
+    if as_of is not None and not _DATE_RE.fullmatch(str(as_of)):
+        raise HTTPException(status_code=400, detail="as_of 应为 YYYY-MM-DD")
+    _sp, _up, con, pool = _load_pool_ctx()
+    from martingale.engine import load, run_stock
+
+    codes = pool.codes
+    t0 = time.time()
+    try:
+        names, data, divs = load(con, codes=codes, start=None, end=as_of)
+    finally:
+        con.close()
+    positions: List[Dict[str, Any]] = []
+    for c in sorted(codes):
+        series = data.get(c)
+        if not series or len(series[0]) < 2:
+            continue
+        dates, sig, exec_c = series
+        _stat, state, _v, _c, _f, _buys = run_stock(
+            c, dates, sig, exec_c, divs.get(c), _sp, verbose=False)
+        positions.append({
+            "ts_code": c,
+            "name": names.get(c, ""),
+            "in_pos": bool(state["in_pos"]),
+            "shares": round(float(state["shares"]), 2),
+            "avg_cost": round(float(state["avg_cost"]), 4),
+            "last_price": float(state["last_price"]),
+            "market_value": round(float(state["market_value"]), 2),
+            "cash_div": round(float(state["cash_div"]), 2),
+            "unreal_pct": round(float(state["unreal_pct"]) * 100.0, 2),
+            "k_level": int(state["k_level"]),
+            "entry_high": float(state["entry_high"]),
+            "low_since_high": float(state["low_since_high"]),
+            "next_add_price": round(float(state["next_add_price"]), 4)
+                if state["next_add_price"] is not None else None,
+            "next_rearm_price": round(float(state["next_rearm_price"]), 4)
+                if state["next_rearm_price"] is not None else None,
+            "end_date": str(dates[-1])[:10],
+        })
+    # as_of 缺省 → 取数据里最新日期
+    latest = max((str(data[c][0][-1])[:10] for c in data), default=None)
+    return {
+        "as_of": as_of or latest,
+        "n": len(positions),
+        "elapsed_s": round(time.time() - t0, 2),
+        "positions": positions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 策略读写（保留 v6.2 机制；schema 换 v7 slim）
+# ---------------------------------------------------------------------------
+@app.get("/api/strategy")
+def get_strategy() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
+    raw = CONFIG_PATH.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    return {"json": data, "raw": raw}
+
+
+def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
+    """PUT /api/strategy 与 POST /api/strategy/import 共用的「校验 → 备份 → 写盘」。
+
+    1) _validate_strategy 逐项类型/范围校验（v7 slim schema）；
+    2) martingale.config.load_config 最终结构/语义校验（写临时文件）；
+    3) .bak 备份（保留最近一份，shutil.copy2 保留 mtime）；
+    4) ruamel round-trip 保留注释与排版写回（失败退回 safe_dump）。
+    返回 (backup_path_str, sections)。
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
+
+    errors = _validate_strategy(payload)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    # martingale.config.load_config 做最终结构/语义校验（写临时文件）
+    try:
+        from martingale import config as mcfg
+        fd, tmp = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+        try:
+            mcfg.load_config(tmp)
+        finally:
+            os.unlink(tmp)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail={"errors": [f"配置校验失败: {exc}"]})
+
+    # 备份（保留最近一份）
+    bak_path = CONFIG_PATH.with_suffix(".yaml.bak")
+    if CONFIG_PATH.exists():
+        shutil.copy2(CONFIG_PATH, bak_path)
+
+    _write_strategy_preserving_comments(payload)
+    return str(bak_path), list(payload.keys())
+
+
+@app.put("/api/strategy")
+def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    backup, _ = _apply_strategy_write(payload)
+    return {"ok": True, "backup": backup}
+
+
+@app.post("/api/strategy/import")
+def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
+    """加载策略文件——body={raw}（yaml 文本），复用 PUT 同一套校验。"""
+    try:
+        data = yaml.safe_load(req.raw)
+    except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
+        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
+    backup, sections = _apply_strategy_write(data)
+    return {"ok": True, "backup": backup, "sections": sections}
+
+
+# ---------------------------------------------------------------------------
+# 策略库：本机命名保存 + 下拉加载 + 删除（data/strategies/*.yaml）
+# ---------------------------------------------------------------------------
+def _sanitize_strategy_name(name: str) -> str:
+    """策略名 → 安全文件名（去路径分隔符/..；空格→下划线；保留 CJK/字母数字/-_）。"""
+    s = str(name or "").strip()
+    s = s.replace("/", "_").replace("\\", "_")
+    s = s.replace("..", "")
+    s = s.replace(" ", "_")
+    out = "".join(ch for ch in s if ch.isalnum() or ch in "-_" or "\u4e00" <= ch <= "\u9fff")
+    return out
+
+
+def _strategy_path(name: str) -> Path:
+    return STRATEGIES_DIR / f"{name}.yaml"
+
+
+def _default_strategy_name() -> str:
+    return "策略_" + datetime.now().strftime("%Y%m%d_%H%M")
+
+
+@app.post("/api/strategies", status_code=201)
+def save_strategy(req: SaveStrategyRequest) -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
+    name = _sanitize_strategy_name(req.name) if req.name else ""
+    if not name:
+        name = _default_strategy_name()
+    path = _strategy_path(name)
+    if path.exists():
+        raise HTTPException(status_code=409, detail={"error": "strategy_exists", "name": name})
+    STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(path, CONFIG_PATH.read_text(encoding="utf-8"))
+    return {
+        "name": name,
+        "path": str(path),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/api/strategies")
+def list_strategies() -> List[Dict[str, Any]]:
+    if not STRATEGIES_DIR.is_dir():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in STRATEGIES_DIR.glob("*.yaml"):
+        if not p.is_file():
+            continue
+        st = p.stat()
+        out.append({
+            "name": p.stem,
+            "saved_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "size_bytes": st.st_size,
+        })
+    out.sort(key=lambda x: x["saved_at"], reverse=True)
+    return out
+
+
+@app.delete("/api/strategies/{name}", status_code=204)
+def delete_strategy(name: str) -> Response:
+    path = _strategy_path(_sanitize_strategy_name(name))
+    if not (path.is_file()):
+        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
+    path.unlink()
+    return Response(status_code=204)
+
+
+@app.post("/api/strategies/{name}/load")
+def load_strategy(name: str) -> Dict[str, Any]:
+    path = _strategy_path(_sanitize_strategy_name(name))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
+    backup, _ = _apply_strategy_write(data)
+    return {"ok": True, "backup": backup}
+
+
+# ---------------------------------------------------------------------------
+# 健康检查
+# ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {
         "ok": True,
+        "version": "7.0.0",
         "time": datetime.now(timezone.utc).isoformat(),
         "project_root": str(PROJECT_ROOT),
         "active_task": tm.active_task_id(),
@@ -1508,10 +1016,8 @@ def health() -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # v6 数据湖页签（独立分析层）：仅当 duckdb 可导入时挂载 /api/lake/* router；
-# 否则注册轻量 stub（/api/lake/status → installed=false），前端页签显示
-# "数据湖未安装"。零 import 保证：screener/*、backtest/* 绝不 import lake；
-# 本段是 web/app.py 唯一与 lake 相关的改动，且全部在 try/except 内——
-# duckdb/lake 缺失或损坏时主路径行为逐字节不变（只多一个 stub 状态端点）。
+# 否则注册轻量 stub。零 import 保证：martingale/* 绝不 import lake；
+# 本段是 web/app.py 唯一与 lake 相关的接线点，全部在 try/except 内。
 # ---------------------------------------------------------------------------
 _lake_router = None
 try:
@@ -1522,12 +1028,9 @@ except ImportError:
 if _duckdb_probe is not None:
     try:
         if str(PROJECT_ROOT) not in sys.path:
-            sys.path.insert(0, str(PROJECT_ROOT))  # lake 包位于仓库根（与 screener 平级）
+            sys.path.insert(0, str(PROJECT_ROOT))
         from lake import web_api as _lake_web_api
         app.include_router(_lake_web_api.router)
-        # B-1（v6.0.3）：注册库未就绪 → 409 lake_not_initialized 契约体 handler。
-        # APIRouter.exception_handler 在本版 FastAPI 不存在，只能挂 app；此调用与 router
-        # 挂载同在 duckdb 可导入的条件块内，不破坏"web/app.py 唯一 lake 接线点"边界。
         _lake_web_api.install(app)
         _lake_router = _lake_web_api.router
     except Exception:  # noqa: BLE001 - lake 包缺失/损坏 → 降级 stub，不阻断主路径
@@ -1536,13 +1039,11 @@ if _duckdb_probe is not None:
 if _lake_router is None:
     @app.get("/api/lake/status")
     def _lake_status_stub() -> Dict[str, Any]:
-        """duckdb/lake 未装时的降级端点：前端据此显示"数据湖未安装"。"""
         return {"installed": False, "detail": "数据湖未安装（uv sync --extra lake）"}
 
 
 # ---------------------------------------------------------------------------
-# 静态前端（最后挂载，避免吞掉 /api/*）——v6 FE-D3+：serve Vite 构建产物 dist/
-# （dist/index.html 引用 /assets/<hash>.js|css；无 vue-router → 单页无需 SPA fallback）
+# 静态前端（最后挂载，避免吞掉 /api/*）
 # ---------------------------------------------------------------------------
 if DIST_DIR.exists():
     assets_dir = DIST_DIR / "assets"
@@ -1556,4 +1057,4 @@ if DIST_DIR.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3080)
+    uvicorn.run(app, host="0.0.0.0", port=9090)
