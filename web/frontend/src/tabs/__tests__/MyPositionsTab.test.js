@@ -1,0 +1,197 @@
+// MyPositionsTab 组件回归（v7.0.1，原 QueryTab.test.js 重命名重写）：
+// 我的持仓 = 用户账本（/api/my_positions GET）+ 录入条/弹层编辑（PUT）+ 策略参考列 + 买入历史。
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount } from "@vue/test-utils";
+import { createPinia, setActivePinia } from "pinia";
+
+const apiMock = vi.fn();
+vi.mock("../../api/client.js", () => ({
+  api: (...a) => apiMock(...a),
+  isBackfillErr: (e) => !!(e && e.status === 409 && e.body && e.error === "lake_backfill_in_progress"),
+}));
+vi.mock("../../live/queryRegistry.js", async (orig) => ({ ...(await orig()) }));
+
+const MyPositionsTab = (await import("../MyPositionsTab.vue")).default;
+const { useTaskStore } = await import("../../stores/taskStore.js");
+const { invalidate } = await import("../../live/queryRegistry.js");
+
+const MY = {
+  as_of: "2026-10-21",
+  n: 1,
+  positions: [
+    { ts_code: "sh.601088", name: "中国神华", shares: 1200, cost_price: 25.0,
+      last_price: 33.9, market_value: 40680, pnl: 10680, pnl_pct: 36.0,
+      updated_at: "2026-10-22T01:00:00Z",
+      in_pos: true, strat_shares: 12345.67, k_level: 0,
+      next_add_price: 134.53, next_rearm_price: 179.61, end_date: "2026-10-21" },
+  ],
+  totals: { market_value: 40680, cost: 30000, pnl: 10680, pnl_pct: 35.6 },
+};
+
+const MY_EMPTY = { as_of: null, n: 0, positions: [],
+  totals: { market_value: 0, cost: 0, pnl: 0, pnl_pct: null } };
+
+function mockApi(my) {
+  apiMock.mockImplementation(async (path, opts = {}) => {
+    if (path === "/api/my_positions" && (!opts || !opts.method || opts.method === "GET")) {
+      return JSON.parse(JSON.stringify(my));
+    }
+    if (path === "/api/my_positions" && opts && opts.method === "PUT") {
+      const body = JSON.parse(opts.body);
+      return { ok: true, ts_code: body.ts_code, n: 1 };
+    }
+    throw new Error("unmocked: " + path);
+  });
+}
+
+let appPinia = null;
+const mk = () => {
+  const pinia = createPinia();
+  appPinia = pinia;
+  return mount(MyPositionsTab, { attachTo: document.body, global: { plugins: [pinia] } });
+};
+
+beforeEach(() => {
+  setActivePinia(createPinia());
+  apiMock.mockReset();
+  // registry 是模块级单例（会话缓存语义）→ 测试间必须清缓存，否则首个测试的
+  // 数据（或空数据）会被后续测试的挂载直接命中。
+  invalidate("my_positions");
+  vi.stubGlobal("confirm", vi.fn(() => true));
+});
+
+const puts = () => apiMock.mock.calls.filter((c) => c[1] && c[1].method === "PUT");
+
+describe("MyPositionsTab · 渲染", () => {
+  it("空账本：标题 + 空态提示，不发 PUT", async () => {
+    mockApi(MY_EMPTY);
+    const w = mk();
+    await flushPromises();
+    expect(w.text()).toContain("我的持仓");
+    expect(w.text()).toContain("尚未录入持仓");
+    expect(puts()).toHaveLength(0);
+    w.unmount();
+  });
+
+  it("有账本：表格行 + 汇总条（万为单位）+ 数据截至", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    expect(w.text()).toContain("中国神华");
+    expect(w.text()).toContain("sh.601088");
+    expect(w.text()).toContain("¥4.1万"); // 40680 市值
+    expect(w.text()).toContain("数据截至 2026-10-21");
+    w.unmount();
+  });
+
+  it("lake_locked（灌数持锁降级）→ 琥珀提示条 + 账本仍列出", async () => {
+    const locked = {
+      ...JSON.parse(JSON.stringify(MY)),
+      lake_locked: true,
+      as_of: null,
+      positions: [{ ...MY.positions[0], last_price: null, market_value: null, pnl: null, pnl_pct: null,
+        in_pos: null, strat_shares: null, k_level: null, next_add_price: null, next_rearm_price: null, end_date: null }],
+      totals: { market_value: null, cost: 30000, pnl: null, pnl_pct: null },
+    };
+    mockApi(locked);
+    const w = mk();
+    await flushPromises();
+    expect(w.text()).toContain("灌数");
+    expect(w.text()).toContain("中国神华"); // 账本仍可见
+    expect(w.text()).not.toContain("¥4.1万"); // 无价格 → 无市值汇总
+    w.unmount();
+  });
+});
+
+describe("MyPositionsTab · 录入条", () => {
+  it("非法代码不发 PUT；合法代码 PUT 正确 body（大写小写化）", async () => {
+    mockApi(MY_EMPTY);
+    const w = mk();
+    await flushPromises();
+    const inputs = w.findAll(".add-bar input");
+    expect(inputs).toHaveLength(3);
+    await inputs[0].setValue("601088"); // 缺 sh. 前缀
+    await inputs[1].setValue("100");
+    await inputs[2].setValue("30");
+    await w.find(".add-bar button").trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("代码应为");
+    expect(puts()).toHaveLength(0);
+
+    await inputs[0].setValue("SH.601088"); // 大写 → 组件内小写化
+    await w.find(".add-bar button").trigger("click");
+    await flushPromises();
+    expect(puts()).toHaveLength(1);
+    expect(JSON.parse(puts()[0][1].body)).toEqual(
+      { ts_code: "sh.601088", shares: 100, cost_price: 30 });
+    expect(w.text()).toContain("已保存 sh.601088");
+    w.unmount();
+  });
+});
+
+describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
+  it("行点击 → 策略参考字段 + 编辑预填 + 保存 PUT + 删除 PUT shares=0", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    expect(row).toBeTruthy();
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("下次加仓触发价");
+    expect(w.text()).toContain("134.53");
+    expect(w.text()).toContain("再武装触发价");
+    // 编辑 input 预填（股数/成本）
+    const editInputs = w.findAll(".edit-bar input");
+    expect(editInputs).toHaveLength(2);
+    expect(editInputs[0].element.value).toBe("1200");
+    expect(editInputs[1].element.value).toBe("25");
+    // 改股数 → 保存
+    await editInputs[0].setValue("1500");
+    const editBtns = w.findAll(".edit-bar button");
+    await editBtns.find((b) => b.text() === "保存").trigger("click");
+    await flushPromises();
+    expect(puts()).toHaveLength(1);
+    expect(JSON.parse(puts()[0][1].body)).toEqual(
+      { ts_code: "sh.601088", shares: 1500, cost_price: 25 });
+    // 删除（confirm stub=true）→ PUT shares=0
+    await editBtns.find((b) => b.text() === "删除").trigger("click");
+    await flushPromises();
+    expect(puts()).toHaveLength(2);
+    expect(JSON.parse(puts()[1][1].body)).toEqual(
+      { ts_code: "sh.601088", shares: 0, cost_price: 25 });
+    w.unmount();
+  });
+
+  it("有回测结果（taskStore.lastResults）→ 弹层显示该股逐笔买入历史", async () => {
+    mockApi(MY);
+    const w = mk();
+    const store = useTaskStore(appPinia);
+    store.lastResults = {
+      taskId: "bt_t9",
+      data: { buys: [
+        { ts_code: "sh.601088", seq: 1, date: "2018-03-01", price: 20.5, amount: 100000 },
+        { ts_code: "sz.000651", seq: 1, date: "2019-01-15", price: 42.1, amount: 100000 },
+      ] },
+    };
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("bt_t9");
+    expect(w.text()).toContain("2018-03-01"); // 该股的历史买入（另一股 2019-01-15 不显示）
+    expect(w.text()).not.toContain("2019-01-15");
+    w.unmount();
+  });
+
+  it("无回测结果 → 弹层提示去回测页", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("尚无回测结果");
+    w.unmount();
+  });
+});

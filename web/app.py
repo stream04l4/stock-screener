@@ -47,6 +47,9 @@ WEB_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = WEB_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
+# "我的持仓"用户持仓账本（本机状态，/data/ 已 gitignore；单用户单进程写，tmp+rename 原子落盘）
+USER_POSITIONS_PATH = PROJECT_ROOT / "data" / "user_positions.json"
+_TS_CODE_RE = re.compile(r"^[a-z]{2}\.\d{6}$")
 # v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
 BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
 BT_RUNS_DIR = BT_OUT_DIR / "runs"
@@ -798,33 +801,23 @@ def get_pool() -> Dict[str, Any]:
     }
 
 
-@app.get("/api/positions")
-def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
-    """当前持仓状态（逐股状态机投影；同步，全池 ~2s）。
+def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:
+    """对 codes 逐股跑状态机 → {code: 持仓行}（/api/positions 与 /api/my_positions 共用）。
 
-    as_of=YYYY-MM-DD：把窗口截到该日（含）——默认各股数据起点→最新 bar。
-    每只股独立状态机从**该股数据起点**（或 --start 语义的数据起点）跑到 as_of。
+    end=YYYY-MM-DD 截窗口（含）；缺省跑到各股最新 bar。湖中无数据的代码不产出行。
     """
-    if as_of is not None and not _DATE_RE.fullmatch(str(as_of)):
-        raise HTTPException(status_code=400, detail="as_of 应为 YYYY-MM-DD")
-    _sp, _up, con, pool = _load_pool_ctx()
     from martingale.engine import load, run_stock
 
-    codes = pool.codes
-    t0 = time.time()
-    try:
-        names, data, divs = load(con, codes=codes, start=None, end=as_of)
-    finally:
-        con.close()
-    positions: List[Dict[str, Any]] = []
-    for c in sorted(codes):
+    names, data, divs = load(con, codes=list(codes), start=None, end=end)
+    rows: Dict[str, Dict[str, Any]] = {}
+    for c in codes:
         series = data.get(c)
         if not series or len(series[0]) < 2:
             continue
         dates, sig, exec_c = series
         _stat, state, _v, _c, _f, _buys = run_stock(
-            c, dates, sig, exec_c, divs.get(c), _sp, verbose=False)
-        positions.append({
+            c, dates, sig, exec_c, divs.get(c), sp, verbose=False)
+        rows[c] = {
             "ts_code": c,
             "name": names.get(c, ""),
             "in_pos": bool(state["in_pos"]),
@@ -842,15 +835,154 @@ def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
             "next_rearm_price": round(float(state["next_rearm_price"]), 4)
                 if state["next_rearm_price"] is not None else None,
             "end_date": str(dates[-1])[:10],
-        })
-    # as_of 缺省 → 取数据里最新日期
-    latest = max((str(data[c][0][-1])[:10] for c in data), default=None)
+        }
+    return rows
+
+
+@app.get("/api/positions")
+def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
+    """当前持仓状态（逐股状态机投影；同步，全池 ~2s）。
+
+    as_of=YYYY-MM-DD：把窗口截到该日（含）——默认各股数据起点→最新 bar。
+    每只股独立状态机从**该股数据起点**（或 --start 语义的数据起点）跑到 as_of。
+    """
+    if as_of is not None and not _DATE_RE.fullmatch(str(as_of)):
+        raise HTTPException(status_code=400, detail="as_of 应为 YYYY-MM-DD")
+    _sp, _up, con, pool = _load_pool_ctx()
+    t0 = time.time()
+    try:
+        rows = _strategy_state_rows(_sp, con, pool.codes, end=as_of)
+    finally:
+        con.close()
+    positions = [rows[c] for c in sorted(rows)]
+    latest = max((r["end_date"] for r in positions), default=None)
     return {
         "as_of": as_of or latest,
         "n": len(positions),
         "elapsed_s": round(time.time() - t0, 2),
         "positions": positions,
     }
+
+
+# ---------------------------------------------------------------------------
+# 我的持仓（用户实际持仓账本 + 策略状态机参考）
+# ---------------------------------------------------------------------------
+def _up_read() -> Dict[str, Any]:
+    """读用户持仓账本 → {code: {shares, cost_price, updated_at}}；缺省/损坏 → {}。"""
+    if not USER_POSITIONS_PATH.exists():
+        return {}
+    try:
+        d = json.loads(USER_POSITIONS_PATH.read_text(encoding="utf-8"))
+        pos = d.get("positions", {})
+        return pos if isinstance(pos, dict) else {}
+    except Exception:  # noqa: BLE001 - 账本损坏不 500，按空账本 + 提示
+        return {}
+
+
+def _up_write(positions: Dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    USER_POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"updated_at": now, "positions": positions}
+    tmp = USER_POSITIONS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, USER_POSITIONS_PATH)  # 原子替换，防半截账本
+
+
+@app.get("/api/my_positions")
+def get_my_positions() -> Dict[str, Any]:
+    """我的持仓 = 用户账本（股数/成本）× 湖最新价 + 策略状态机参考（档/触发价）。
+
+    只列用户账本里的代码；策略参考对池外股同样有效（状态机不挑池）。
+    空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
+    """
+    user = _up_read()
+    if not user:
+        return {"as_of": None, "n": 0, "positions": [],
+                "totals": {"market_value": 0, "cost": 0, "pnl": 0, "pnl_pct": None}}
+    # 湖锁定/缺失 → 降级：只列账本（无价格/无策略参考），前端显示灌数提示条
+    from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
+
+    lake_locked = False
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        _sp, _up, con, pool = _load_pool_ctx()
+        try:
+            rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())))
+        finally:
+            con.close()
+    except (LakeLocked, LakeMissing, LakeInvalidFile):
+        lake_locked = True
+        rows = {}
+    positions: List[Dict[str, Any]] = []
+    tot_mv = tot_cost = 0.0
+    for c in sorted(user):
+        u = user[c] if isinstance(user[c], dict) else {}
+        s = rows.get(c, {})
+        shares = float(u.get("shares") or 0)
+        cost = float(u.get("cost_price") or 0)
+        last = s.get("last_price")
+        mv = shares * last if last is not None else None
+        cost_total = shares * cost
+        pnl = (mv - cost_total) if mv is not None else None
+        if mv is not None:
+            tot_mv += mv
+        tot_cost += cost_total
+        positions.append({
+            "ts_code": c,
+            "name": s.get("name") or c,
+            "shares": shares,
+            "cost_price": cost,
+            "last_price": last,
+            "market_value": round(mv, 2) if mv is not None else None,
+            "pnl": round(pnl, 2) if pnl is not None else None,
+            "pnl_pct": round(pnl / cost_total * 100.0, 2) if (pnl is not None and cost_total > 0) else None,
+            "updated_at": u.get("updated_at"),
+            # 策略状态机参考（池外股/湖中无数据时字段为 None）
+            "in_pos": s.get("in_pos"),
+            "strat_shares": s.get("shares"),
+            "k_level": s.get("k_level"),
+            "next_add_price": s.get("next_add_price"),
+            "next_rearm_price": s.get("next_rearm_price"),
+            "end_date": s.get("end_date"),
+        })
+    has_price = any(r["market_value"] is not None for r in positions)
+    return {
+        "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
+        "lake_locked": lake_locked,
+        "n": len(positions),
+        "positions": positions,
+        "totals": {
+            "market_value": round(tot_mv, 2) if has_price else None,
+            "cost": round(tot_cost, 2),
+            "pnl": round(tot_mv - tot_cost, 2) if has_price else None,
+            "pnl_pct": round((tot_mv - tot_cost) / tot_cost * 100.0, 2) if (has_price and tot_cost > 0) else None,
+        },
+    }
+
+
+@app.put("/api/my_positions")
+def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """upsert 单只持仓：shares=0 为删除。"""
+    code = str(payload.get("ts_code", "")).strip()
+    if not _TS_CODE_RE.fullmatch(code):
+        raise HTTPException(status_code=400, detail="ts_code 应为 sh.600000 / sz.000001 形式")
+    shares = payload.get("shares")
+    cost = payload.get("cost_price")
+    try:
+        shares_f = float(shares) if shares is not None else -1.0
+        cost_f = float(cost) if cost is not None else 0.0
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="shares/cost_price 应为数字")
+    if shares_f < 0 or cost_f < 0:
+        raise HTTPException(status_code=400, detail="shares/cost_price 不能为负")
+    positions = _up_read()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if shares_f == 0:
+        positions.pop(code, None)
+    else:
+        positions[code] = {"shares": shares_f, "cost_price": cost_f, "updated_at": now}
+    _up_write(positions)
+    return {"ok": True, "ts_code": code, "n": len(positions)}
 
 
 # ---------------------------------------------------------------------------

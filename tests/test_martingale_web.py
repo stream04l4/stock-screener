@@ -186,3 +186,111 @@ def test_lake_router_mounted_when_duckdb_available():
     paths = set(wapp.app.openapi()["paths"].keys())
     assert "/api/lake/status" in paths
     assert "/api/lake/search" in paths
+
+
+# ---------------------------------------------------------------------------
+# 我的持仓（/api/my_positions 读写 + 用户账本文件）
+# ---------------------------------------------------------------------------
+@pytest.fixture()
+def tmp_positions_file(tmp_path, monkeypatch):
+    dst = tmp_path / "user_positions.json"
+    monkeypatch.setattr(wapp, "USER_POSITIONS_PATH", dst)
+    return dst
+
+
+@pytest.fixture()
+def bt_copy(monkeypatch):
+    """湖被灌数持锁时，非空账本 GET 走 /tmp 回测副本（数据至 2026-10-21）。"""
+    p = Path("/tmp/lake_bt_20261022.duckdb")
+    if not p.exists():
+        pytest.skip("回测湖副本不存在")
+    import martingale.data as mdata
+    monkeypatch.setattr(mdata, "default_db_path", lambda: p)
+    return p
+
+
+def test_my_positions_empty_ledger(tmp_positions_file):
+    out = wapp.get_my_positions()
+    assert out["n"] == 0
+    assert out["positions"] == []
+    assert out["totals"]["market_value"] == 0
+
+
+def test_my_positions_put_get_roundtrip(tmp_positions_file, bt_copy):
+    out = wapp.put_my_positions(
+        {"ts_code": "sh.600036", "shares": 1000, "cost_price": 40.5})
+    assert out["ok"] is True and out["n"] == 1
+    # 账本落盘
+    import json as _json
+    disk = _json.loads(tmp_positions_file.read_text(encoding="utf-8"))
+    assert disk["positions"]["sh.600036"]["shares"] == 1000
+    assert disk["positions"]["sh.600036"]["cost_price"] == 40.5
+    # GET 合并：账本 × 湖最新价 × 策略参考
+    got = wapp.get_my_positions()
+    assert got["n"] == 1
+    p0 = got["positions"][0]
+    assert p0["ts_code"] == "sh.600036"
+    assert p0["shares"] == 1000.0 and p0["cost_price"] == 40.5
+    assert p0["last_price"] is not None
+    assert p0["market_value"] == round(1000 * p0["last_price"], 2)
+    assert p0["pnl"] == round(p0["market_value"] - 1000 * 40.5, 2)
+    # 策略参考字段在（600036 在池内 → 状态机有行）
+    assert {"k_level", "next_add_price", "next_rearm_price", "in_pos"} <= set(p0.keys())
+    # totals 自洽
+    assert got["totals"]["market_value"] == p0["market_value"]
+    assert got["totals"]["cost"] == round(1000 * 40.5, 2)
+    import json
+    json.dumps(got)  # 无 numpy 泄漏
+
+
+def test_my_positions_update_and_delete(tmp_positions_file, bt_copy):
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
+    out = wapp.put_my_positions({"ts_code": "sh.600036", "shares": 800, "cost_price": 12.0})
+    assert out["n"] == 1  # upsert 非新增
+    assert wapp.get_my_positions()["positions"][0]["shares"] == 800.0
+    out = wapp.put_my_positions({"ts_code": "sh.600036", "shares": 0, "cost_price": 12.0})
+    assert out["n"] == 0
+    assert wapp.get_my_positions()["n"] == 0
+
+
+def test_my_positions_rejects_bad_code(tmp_positions_file):
+    for bad in ("600036", "sh.12345", "SH.600036", "sh.600036x", ""):
+        with pytest.raises(HTTPException) as e:
+            wapp.put_my_positions({"ts_code": bad, "shares": 1, "cost_price": 1})
+        assert e.value.status_code == 400
+
+
+def test_my_positions_rejects_bad_numbers(tmp_positions_file):
+    for payload in (
+        {"ts_code": "sh.600036", "shares": -5, "cost_price": 1.0},
+        {"ts_code": "sh.600036", "shares": 1, "cost_price": -1.0},
+        {"ts_code": "sh.600036", "shares": "abc", "cost_price": 1.0},
+    ):
+        with pytest.raises(HTTPException) as e:
+            wapp.put_my_positions(payload)
+        assert e.value.status_code == 400
+    assert wapp.get_my_positions()["n"] == 0  # 非法写不落盘
+
+
+def test_my_positions_corrupt_ledger_treated_as_empty(tmp_positions_file):
+    tmp_positions_file.write_text("{not json", encoding="utf-8")
+    out = wapp.get_my_positions()
+    assert out["n"] == 0
+
+
+def test_my_positions_lake_unavailable_degrades(tmp_positions_file, monkeypatch):
+    """湖锁定/缺失 → 不 500：账本仍列出，无价格字段，lake_locked=True。"""
+    import martingale.data as mdata
+    monkeypatch.setattr(mdata, "default_db_path", lambda: Path("/tmp/nonexistent_lake_xyz.duckdb"))
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 100, "cost_price": 10.0})
+    out = wapp.get_my_positions()
+    assert out["lake_locked"] is True
+    assert out["n"] == 1
+    p0 = out["positions"][0]
+    assert p0["last_price"] is None
+    assert p0["market_value"] is None and p0["pnl"] is None
+    assert p0["next_add_price"] is None  # 策略参考整体缺省
+    assert out["totals"]["market_value"] is None
+    assert out["totals"]["cost"] == 1000.0
+    import json
+    json.dumps(out)

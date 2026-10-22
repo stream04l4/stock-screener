@@ -478,6 +478,27 @@ tr.lake-row-muted .badge { opacity: .85; }
 /* 市场表工具栏 count（与 .tbl-toolbar .count 同视觉） */
 .lake-toolbar .count { font-size: 12px; color: var(--muted); margin-left: auto; }
 
+/* ---------- v7.0.1 我的持仓页签 ---------- */
+.my-toolbar { display: flex; gap: 10px; align-items: baseline; margin-bottom: 14px; flex-wrap: wrap; }
+.my-toolbar h3 { margin: 0; }
+.inp {
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px;
+  font-family: var(--mono); background: #fff;
+}
+.inp:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.inp.num { width: 110px; text-align: right; }
+.add-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.add-bar .inp:first-child { font-family: var(--mono); width: 160px; }
+.totals-bar { display: flex; gap: 22px; flex-wrap: wrap; margin: 6px 0 12px; font-size: 13.5px; }
+.totals-bar b { font-family: var(--mono); }
+.edit-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0; padding: 12px; background: var(--accent-soft); border-radius: 10px; }
+.edit-field { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; margin-bottom: 10px; }
+.d-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed var(--line); }
+.d-key { color: var(--muted); font-size: 13px; }
+.d-val { font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; }
+.detail-buys { margin-top: 14px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }

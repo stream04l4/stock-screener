@@ -1,4 +1,4 @@
-// 应用壳（v7.0 四页签）：回测 / 查询 / 策略 / 数据湖。
+// 应用壳（v7.0 四页签）：回测 / 我的持仓 / 策略 / 数据湖。
 // - 不引入 vue-router：页签 = 应用内状态（active ref）。
 // - 非当前 tab 内容懒挂载：v-if="active === x" → 首次激活才渲染并发请求。
 //   已挂载过的 tab 用 keep-alive 保活（切回状态仍在）。
@@ -7,13 +7,13 @@
 import { ref } from "vue";
 import ToastBar from "./ToastBar.vue";
 import BacktestTab from "../tabs/BacktestTab.vue";
-import QueryTab from "../tabs/QueryTab.vue";
+import MyPositionsTab from "../tabs/MyPositionsTab.vue";
 import StrategyTab from "../tabs/StrategyTab.vue";
 import LakeTab from "../tabs/LakeTab.vue";
 
 const TABS = [
   ["backtest", "回测"],
-  ["query", "查询"],
+  ["my_positions", "我的持仓"],
   ["strategy", "策略"],
   ["lake", "数据湖"],
 ];
@@ -34,7 +34,7 @@ const active = ref("backtest");
   <main>
     <keep-alive>
       <BacktestTab v-if="active === 'backtest'" />
-      <QueryTab v-else-if="active === 'query'" />
+      <MyPositionsTab v-else-if="active === 'my_positions'" />
       <StrategyTab v-else-if="active === 'strategy'" />
       <LakeTab v-else-if="active === 'lake'" />
     </keep-alive>
