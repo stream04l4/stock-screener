@@ -88,6 +88,7 @@ const ungrouped = computed(() => {
           <div v-if="(json || {})[section] && typeof (json || {})[section] === 'object'" class="s-card">
             <h4><span class="s-icon">{{ (SECTION_META[section] || { icon: "🔧" }).icon }}</span>{{ (SECTION_META[section] || { title: section }).title }}</h4>
             <p v-if="SECTION_DESC[section]" class="s-sec-desc">{{ SECTION_DESC[section] }}</p>
+            <div class="s-fields-grid">
             <div v-for="[field, value] in Object.entries((json || {})[section]).filter(([f]) => !HIDDEN_FIELDS.has(section + '.' + f))" :key="field" class="s-field">
               <div class="s-field-head">
                 <span class="s-key" :title="field">{{ fieldLabel(section, field) }}</span>
@@ -96,6 +97,7 @@ const ungrouped = computed(() => {
               <FieldEditor v-if="editing" :section="section" :field="field" :value="(draft?.[section] || {})[field]" @update="(u) => emit('update', u)" />
               <!-- O2：desc 只读态与编辑态都显示（编辑态 = 控件下方 muted small） -->
               <div v-if="FIELD_DESC[section + '.' + field]" class="s-desc">{{ FIELD_DESC[section + '.' + field] }}</div>
+            </div>
             </div>
           </div>
         </template>

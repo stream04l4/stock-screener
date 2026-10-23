@@ -170,7 +170,7 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 .s-field:first-of-type { border-top: 0; }
 .s-field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
 .s-key { font-family: var(--mono); font-size: 12.5px; color: #374151; }
-.s-val { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--accent); text-align: right; word-break: break-all; }
+.s-val { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--accent); text-align: right; overflow-wrap: anywhere; }
 .s-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .s-field input[type="number"], .s-field input[type="text"], .s-field select {
   width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
@@ -188,6 +188,16 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 .s-group-icon { font-size: 16px; }
 .s-group-count { font-weight: 400; font-size: 12px; }
 .s-group .cards { padding: 14px; }
+/* 2026-10-23 排版（Joel："排版都集中在左侧，很不协调"）：
+   分组内只剩 1 张卡片，.cards 的 auto-fill 网格让单卡只占第一列 → 左侧窄条+右侧大片空白。
+   改：分组内卡片撑满；字段行在 ≥900px 下两列排布（窄屏/手机回退单列）。 */
+.s-group .cards { grid-template-columns: 1fr; }
+.s-fields-grid { display: grid; grid-template-columns: 1fr; column-gap: 28px; align-items: start; }
+@media (min-width: 900px) {
+  .s-fields-grid { grid-template-columns: 1fr 1fr; }
+  /* 两列首行第 2 项去掉虚线（与第 1 项对齐） */
+  .s-fields-grid .s-field:nth-child(2) { border-top: 0; }
+}
 .s-sec-desc { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
 /* O2：编辑态 desc（控件下方 muted small）——只读态位置保留，共用 .s-desc */
 .s-field .s-desc { margin-top: 4px; }
