@@ -122,29 +122,40 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
     expect(groups[1].text()).toContain("股票池");
     const fields = w.findAll(".s-field");
     expect(fields.length).toBe(13);
+    // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
+      "首仓金额（元）", "加仓基准金额（元）", "首次建仓回撤（%）", "加仓步长（%）",
+      "加仓递增比率", "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
+      "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
+      "连续分红年数下限", "最少上市交易日",
+    ]);
+    // 原始字段名保留为 hover 提示（排查用）
+    expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
       "initial_amount", "base_add_amount", "first_drawdown_pct", "add_step_pct",
       "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
     ]);
     // name（策略标识）不作为字段行
-    expect(keys).not.toContain("name");
+    expect(keys).not.toContain("策略标识");
     // lake/datasource 段不渲染（yaml-only）
     const all = w.text();
     expect(all).not.toContain("baostock_daily_budget");
     expect(all).not.toContain("daily_quota");
     // 必附注在 strategy 段说明
     expect(all).toContain("k=0");
+    // enum 值只读态显示通俗短名（bounce → 反弹重置），不是裸值
+    const rearmRow = fields.find((f) => f.find(".s-key").attributes("title") === "rearm_mode");
+    expect(rearmRow.find(".s-val").text()).toBe("反弹重置");
     w.unmount();
   });
 
   it("只读态：accounting 显示 cash；编辑态：6 个 number input（int×2+float×4），accounting 仍只读", async () => {
     const w = mk();
     await flushPromises();
-    // 只读态 accounting 值
-    const acctRow = w.findAll(".s-field").find((f) => f.find(".s-key").text() === "accounting");
+    // 只读态 accounting 值（按 title=原始字段名定位）
+    const acctRow = w.findAll(".s-field").find((f) => f.find(".s-key").attributes("title") === "accounting");
     expect(acctRow.find(".s-val").text()).toBe("cash");
     // 进入编辑态
     await w.find("#btn-strategy-edit").trigger("click");
@@ -152,7 +163,7 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
     // strategy 6（int×2 + float×4）+ universe 3（min_total_mv_yi float + 2×int）= 9
     expect(w.findAll('input[type="number"]').length).toBe(9);
     // accounting 编辑态仍是只读展示（无 input，有 .s-readonly）
-    const acctRowEdit = w.findAll(".s-field").find((f) => f.find(".s-key").text() === "accounting");
+    const acctRowEdit = w.findAll(".s-field").find((f) => f.find(".s-key").attributes("title") === "accounting");
     expect(acctRowEdit.find("input").exists()).toBe(false);
     expect(acctRowEdit.find(".s-readonly").text()).toBe("cash");
     w.unmount();

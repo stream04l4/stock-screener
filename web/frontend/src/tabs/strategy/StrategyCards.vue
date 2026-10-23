@@ -2,16 +2,19 @@
 // - 只读态：字段值 displayValue() 格式化展示 + FIELD_DESC 说明；
 // - 编辑态：FieldEditor 控件，draft 值下行、变更上行（emit update → 父组件合并进 draft）；
 //   **desc 两种态都显示**（O2：编辑态控件下方 muted small，只读态位置保留）。
+// - 2026-10-23 文案通俗化（Joel："无用提示太多，字段名不通俗易懂"）：
+//   字段行主显示 = FIELD_LABELS 通俗名（原始 yaml 字段名降为 hover 提示，:title）；
+//   enum 值只读态显示通俗选项名（取括号前短名），不再是裸 bounce/newhigh。
 // - v6.2.1 S2：分组表参数化——groups prop（默认 SECTION_GROUPS=StrategyTab 的 8 核心段+高级配置；
 //   BacktestTab 传 BACKTEST_GROUPS=backtest/reinvest）+ lsKey prop（折叠状态 localStorage 键，
 //   两页签各记各的、互不串味）。组件本身不区分页面，渲染逻辑不变。
 //   exclude = 永不渲染的段（S2：StrategyTab 排除 backtest/reinvest→BacktestTab、lake→yaml-only）；
 //   strict = true 时只渲染 groups 内的段（BacktestTab：其他段一律不进本页）。
 //   折叠/展开状态存 localStorage；**编辑态强制全部展开防漏改**。
-// SECTION_META/SECTION_DESC/FIELD_DESC/FIELD_TYPE 来自 src/data/strategyMeta.js。
+// SECTION_META/SECTION_DESC/FIELD_DESC/FIELD_TYPE/FIELD_LABELS/ENUM_OPTIONS 来自 src/data/strategyMeta.js。
 <script setup>
 import { computed, ref } from "vue";
-import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, HIDDEN_FIELDS, displayValue } from "../../data/strategyMeta.js";
+import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, FIELD_LABELS, ENUM_OPTIONS, FIELD_TYPE, HIDDEN_FIELDS, displayValue } from "../../data/strategyMeta.js";
 import FieldEditor from "./FieldEditor.vue";
 
 const props = defineProps({
@@ -24,6 +27,19 @@ const props = defineProps({
   strict: Boolean, // v6.2.1 S2：true = 只渲染 groups 内的段（无 ungrouped 兜底）
 });
 const emit = defineEmits(["update"]);
+
+// 2026-10-23 通俗化：字段行主显示 = 通俗名；原始 yaml 字段名只留 hover（:title）。
+function fieldLabel(section, field) {
+  return FIELD_LABELS[`${section}.${field}`] || field;
+}
+// enum 值只读显示 = 通俗选项短名（取"（"前），如 bounce → 反弹重置；其余走 displayValue。
+function shownValue(section, field, value) {
+  if (FIELD_TYPE[field] === "enum2") {
+    const opt = (ENUM_OPTIONS[`${section}.${field}`] || []).find(([v]) => v === value);
+    if (opt) return opt[1].split("（")[0];
+  }
+  return displayValue(section, field, value);
+}
 
 // ---------------------------------------------------------------------------
 // 分组折叠状态（O1：localStorage 记忆；编辑态强制全部展开防漏改）
@@ -74,8 +90,8 @@ const ungrouped = computed(() => {
             <p v-if="SECTION_DESC[section]" class="s-sec-desc">{{ SECTION_DESC[section] }}</p>
             <div v-for="[field, value] in Object.entries((json || {})[section]).filter(([f]) => !HIDDEN_FIELDS.has(section + '.' + f))" :key="field" class="s-field">
               <div class="s-field-head">
-                <span class="s-key">{{ field }}</span>
-                <span v-if="!editing" class="s-val">{{ displayValue(section, field, value) }}</span>
+                <span class="s-key" :title="field">{{ fieldLabel(section, field) }}</span>
+                <span v-if="!editing" class="s-val">{{ shownValue(section, field, value) }}</span>
               </div>
               <FieldEditor v-if="editing" :section="section" :field="field" :value="(draft?.[section] || {})[field]" @update="(u) => emit('update', u)" />
               <!-- O2：desc 只读态与编辑态都显示（编辑态 = 控件下方 muted small） -->

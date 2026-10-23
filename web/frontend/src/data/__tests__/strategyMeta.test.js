@@ -7,7 +7,7 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  SECTION_META, SECTION_GROUPS, EXCLUDED_SECTIONS, SECTION_DESC, FIELD_DESC,
+  SECTION_META, SECTION_GROUPS, EXCLUDED_SECTIONS, SECTION_DESC, FIELD_DESC, FIELD_LABELS,
   FIELD_TYPE, ENUM_OPTIONS, HIDDEN_FIELDS, displayValue, readableValue, compactJson,
 } from "../strategyMeta.js";
 
@@ -128,6 +128,19 @@ describe("strategyMeta · FIELD_DESC/FIELD_TYPE 全字段守卫（防未来加�
     expect(FIELD_DESC["strategy.initial_amount"]).toContain("k=0");
     expect(FIELD_DESC["strategy.accounting"]).toContain("只读");
     expect(FIELD_DESC["universe.min_total_mv_yi"]).toContain("总市值");
+  });
+
+  it("FIELD_LABELS 覆盖渲染段 yaml 全部字段（通俗名非空；条数=FIELD_TYPE；防未来加字段漏改名）", () => {
+    const cfg = loadStrategyFields();
+    const rendered = new Set(SECTION_GROUPS.flatMap((g) => g.sections));
+    for (const [section, fields] of Object.entries(cfg)) {
+      if (!rendered.has(section)) continue;
+      for (const field of fields) {
+        expect(FIELD_LABELS[`${section}.${field}`], `${section}.${field} 缺通俗名`).toBeTruthy();
+      }
+    }
+    for (const k of Object.keys(FIELD_LABELS)) expect(rendered.has(k.split(".")[0])).toBe(true);
+    expect(Object.keys(FIELD_LABELS).length).toBe(Object.keys(FIELD_TYPE).length);
   });
 });
 

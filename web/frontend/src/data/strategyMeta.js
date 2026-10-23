@@ -1,7 +1,12 @@
 // 策略页元数据 —— v7.0（策略核心替换：深回撤金字塔加仓，多因子已删）。
 //
 // 只描述**结构**（字段类型/选项/说明文案），不含业务阈值——数值一律来自 /api/strategy。
-// 字段说明文案 = 调研报告 ③ 参数说明文档草稿原文（含"首轮 k=0 占档"必附注）。
+//
+// 文案口径（2026-10-23 Joel："无用提示太多，字段名不通俗易懂"）：
+// - FIELD_LABELS = 通俗字段名（页面主显示）；原始 yaml 字段名保留为 hover 提示，
+//   只给排查用，不占视觉。
+// - FIELD_DESC 一律一行口语说明，删掉公式堆砌/内部附注（k=0 占档等**行为差异**保留，
+//   因为直接影响首仓后第一个加仓的金额）。
 //
 // 页面渲染 13 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
 // + universe 5。accounting 固定 cash（只读，FIELD_TYPE="readonly"）。
@@ -11,7 +16,7 @@
 
 export const SECTION_META = {
   strategy: { title: "策略参数（深回撤金字塔加仓）", icon: "📉" },
-  universe: { title: "股票池（5 条件全链）", icon: "🗂️" },
+  universe: { title: "股票池（5 个条件）", icon: "🗂️" },
 };
 
 // 分组（有序）。group.id 用于 localStorage 折叠记忆键。
@@ -23,47 +28,66 @@ export const SECTION_GROUPS = [
 // 不渲染的段（lake/datasource = yaml-only，lake-sync 专用，Web 只读不改）。
 export const EXCLUDED_SECTIONS = ["lake", "datasource"];
 
-// section 级说明（卡片头显示）。strategy 段附"首轮 k=0 占档"必附注 + Joel 口语映射。
+// section 级说明（卡片头显示）：只说"这个策略在干什么"，公式细节下沉到字段行。
 export const SECTION_DESC = {
   strategy:
-    "逐股独立状态机：高点回撤触发首仓，之后每再跌一档加仓一档，金额按 growth_ratio 递增，上不封顶、不卖出、无熔断。" +
-    "【必附注】首轮初始仓占用 k=0 档 → 首轮第一个实际加仓 = base_add_amount×growth_ratio（11,000 元）；" +
-    "再武装后的新轮从 base_add_amount（10,000 元）起。" +
-    "（口语映射：初始投入金额→initial_amount；首次回撤加仓金额→首轮首个加仓（派生值）；后续加仓金额→base_add_amount。）",
+    "每只股票独立运作：从高点跌够「首次建仓回撤」建首仓，之后每再跌「加仓步长」加一档，" +
+    "金额按 base_add_amount×growth_ratio 阶梯递增，上不封顶、不卖出、无熔断。" +
+    "注意：首轮首仓占 k=0 档，所以首轮第一个加仓 = base_add_amount×growth_ratio；再武装后的新轮从 base_add_amount 起。",
   universe:
-    "全链 5 条件（白名单 ∩ 央国企 ∩ 市值≥200亿 ∩ 上市≥250交易日 ∩ 连续分红），SOE 恒强制不设开关；全离线读 lake 单库。",
+    "同时满足 5 个条件才入池：行业白名单、央国企、总市值下限、上市天数、连续分红（具体阈值见下方字段）。",
 };
 
 // ---------------------------------------------------------------------------
-// 字段说明（调研 ③ 草稿原文）。
+// 通俗字段名（页面主显示；原始 yaml 字段名保留为 hover 提示，见 StrategyCards）。
+// ---------------------------------------------------------------------------
+export const FIELD_LABELS = {
+  "strategy.name": "策略标识",
+  "strategy.initial_amount": "首仓金额（元）",
+  "strategy.base_add_amount": "加仓基准金额（元）",
+  "strategy.first_drawdown_pct": "首次建仓回撤（%）",
+  "strategy.add_step_pct": "加仓步长（%）",
+  "strategy.growth_ratio": "加仓递增比率",
+  "strategy.rearm_mode": "高点再武装方式",
+  "strategy.rearm_pct": "再武装反弹幅度（%）",
+  "strategy.accounting": "成交口径（固定）",
+  "universe.industry_whitelist_csric2": "行业白名单（证监会二级代码）",
+  "universe.soe_keywords": "央国企识别关键词",
+  "universe.min_total_mv_yi": "总市值下限（亿元）",
+  "universe.min_consecutive_div_years": "连续分红年数下限",
+  "universe.listing_min_trading_days": "最少上市交易日",
+};
+
+// ---------------------------------------------------------------------------
+// 字段说明：一行口语，只讲"填了之后会发生什么"。
 // ---------------------------------------------------------------------------
 export const FIELD_DESC = {
   // ---- strategy ----
-  "strategy.name": "策略标识（固定 drawdown_martingale，不可改）",
+  "strategy.name": "固定标识，不可改。",
   "strategy.initial_amount":
-    "初始投入金额（元）：首仓一次性金额；**每股**仅第一轮首买（k=0 档）使用，此后所有轮次首买用 base_add_amount",
+    "首仓一次性投入的金额；它占掉 k=0 档，所以首轮第一个加仓是 基准×比率（不是基准本身）",
   "strategy.base_add_amount":
-    "加仓基准金额（元）：阶梯首档（k=0）金额；第 k 档 = 基准×growth_ratio^k",
+    "加仓的基准金额：第 k 档 = 基准×比率^k；再武装后的新轮从它开始加",
   "strategy.first_drawdown_pct":
-    "首次回撤比例（%）：hfq 收盘 ≤ 高点×(1−比例/100) 时建仓",
+    "股价从高点回落这个比例，就建首仓（按前复权收盘价判断）",
   "strategy.add_step_pct":
-    "后续加仓回撤比例（%）：以高点为基准每再跌 比例% 加一档（档线=H×(1−first_drawdown_pct/100−k×比例/100)），跳空可一日穿多档",
+    "建首仓后，每再跌这个比例加一档；跳空缺口一天可以连穿多档",
   "strategy.growth_ratio":
-    "加仓提升比率：第 k 档 = base_add_amount×比率^k（1.1 → 1万/1.1万/1.21万…上不封顶）",
+    "每档金额乘这个数：1.1 就是 1万 → 1.1万 → 1.21万……上不封顶",
   "strategy.rearm_mode":
-    "高点刷新方式：bounce=较本周期低点反弹 rearm_pct 即重新记录高点（新高可低于旧高）并重置档位 k=0；newhigh=仅创新高刷新",
+    "什么时候把「高点」刷新、档位从头数：反弹重置=低点弹够幅度就刷新（新高可低于旧高）；仅创新高=必须创出新高才刷新",
   "strategy.rearm_pct":
-    "高点刷新比例（%）：bounce 模式下较低点反弹该比例触发再武装（newhigh 模式不生效）",
-  "strategy.accounting": "会计口径固定 cash（原始收盘成交+现金分红单列，不卖出）——只读，不可改",
-  // ---- universe（沿用现 84 字段 desc 对应 5 键）----
+    "较低点反弹这个比例就算「再武装」，之后重新记高点、档位归零；仅「仅创新高」方式下不生效",
+  "strategy.accounting": "只读固定：按前复权收盘价成交、现金分红单列、只买不卖",
+  // ---- universe ----
   "universe.industry_whitelist_csric2":
-    "证监会二级行业白名单（代码如 B06/C25/D44）：仅保留白名单内行业；空列表=不过滤",
+    "只保留白名单内的行业（代码如 B06/C25/D44）；留空 = 不按行业过滤",
   "universe.soe_keywords":
-    "央国企识别关键词（config 驱动初值）：前十大股东任一 share_nature=国有股 或股东名称含任一关键词 → SOE；SOE 恒强制",
-  "universe.min_total_mv_yi": "总市值下限（亿元，lake valuation_daily 最新 date）：低于剔除",
+    "前十大股东含「国有股」性质、或股东名称含这些关键词 → 判定为央国企（该条件恒强制，无开关）",
+  "universe.min_total_mv_yi": "总市值低于这个数（取数据湖最新一日）→ 剔除",
   "universe.min_consecutive_div_years":
-    "连续分红年数下限：IPO 满7年→连续≥N个自然年有分红；不满7年→IPO后每个完整年度都有分红，否则剔除",
-  "universe.listing_min_trading_days": "上市满 N 个交易日（lake kline_daily 行数判断）",
+    "要连续这么多年的完整年度都有分红：上市满 7 年 → 看最近 N 年；不满 7 年 → 上市以来每个完整年度都要有",
+  "universe.listing_min_trading_days": "上市交易天数没满这个数 → 剔除",
 };
 
 // ---------------------------------------------------------------------------
@@ -92,11 +116,11 @@ export const FIELD_TYPE = {
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。
 export const HIDDEN_FIELDS = new Set(["strategy.name"]);
 
-// enum2 选项（按 section.field）。
+// enum2 选项（按 section.field）：选项文案通俗化（2026-10-23）。
 export const ENUM_OPTIONS = {
   "strategy.rearm_mode": [
-    ["bounce", "bounce（较低点反弹 rearm_pct 重记高点，默认）"],
-    ["newhigh", "newhigh（仅创新高刷新）"],
+    ["bounce", "反弹重置（较低点弹够幅度即重新记高点，默认）"],
+    ["newhigh", "仅创新高（必须创出新高才重新记高点）"],
   ],
 };
 

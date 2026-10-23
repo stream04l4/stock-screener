@@ -31,7 +31,7 @@ import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
 import { invalidate } from "../live/queryRegistry.js";
 import { useToastStore } from "../stores/toastStore.js";
-import { FIELD_TYPE, EXCLUDED_SECTIONS } from "../data/strategyMeta.js";
+import { FIELD_TYPE, FIELD_LABELS, EXCLUDED_SECTIONS } from "../data/strategyMeta.js";
 import Toolbar from "./strategy/Toolbar.vue";
 import StrategyCards from "./strategy/StrategyCards.vue";
 
@@ -106,18 +106,19 @@ async function onSave() {
   if (!fields || typeof fields !== "object") continue;
   for (const [field, value] of Object.entries(fields)) {
     const t = FIELD_TYPE[field] || "str";
+    const label = FIELD_LABELS[`${section}.${field}`] || field; // 报错用通俗名（原始名排查时仍看 yaml）
     let v;
     if (t === "int") {
       v = Number.isInteger(Number(value)) ? parseInt(value, 10) : NaN;
-      if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是整数`, "err"); bad = true; continue; }
+      if (isNaN(v)) { setMsg(`✗ ${label} 必须是整数`, "err"); bad = true; continue; }
     } else if (t === "float") {
       v = parseFloat(value);
-      if (isNaN(v)) { setMsg(`✗ ${section}.${field} 必须是数值`, "err"); bad = true; continue; }
+      if (isNaN(v)) { setMsg(`✗ ${label} 必须是数值`, "err"); bad = true; continue; }
     } else if (t === "bool") {
       v = value === "true" || value === true;
     } else if (t === "list") {
       v = String(value).split(",").map((s) => s.trim()).filter(Boolean);
-      if (!v.length) { setMsg(`✗ ${section}.${field} 不能为空`, "err"); bad = true; continue; }
+      if (!v.length) { setMsg(`✗ ${label} 不能为空`, "err"); bad = true; continue; }
     } else {
       v = value; // str / enum2 / readonly：原样（enum 值域由后端校验，400 回显）
     }
