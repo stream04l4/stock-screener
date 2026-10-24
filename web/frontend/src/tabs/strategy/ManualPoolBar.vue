@@ -18,7 +18,10 @@ const { data, loading, error } = useLiveQuery(
 const visible = computed(() =>
   !error.value && data.value && typeof data.value === "object");
 
-function refresh() { invalidate("manual_pool"); }
+function refresh() {
+  invalidate("manual_pool");
+  invalidate("pool"); // 候选列表同步刷新（手动股进出）
+}
 
 // ---------------------------------------------------------------------------
 // 搜索下拉（/api/stocks/search；与我的持仓录入条同口径）

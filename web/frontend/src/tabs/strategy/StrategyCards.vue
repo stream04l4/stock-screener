@@ -17,6 +17,7 @@ import { computed, ref } from "vue";
 import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, FIELD_LABELS, ENUM_OPTIONS, FIELD_TYPE, HIDDEN_FIELDS, displayValue } from "../../data/strategyMeta.js";
 import FieldEditor from "./FieldEditor.vue";
 import ManualPoolBar from "./ManualPoolBar.vue";
+import PoolMembers from "./PoolMembers.vue";
 
 const props = defineProps({
   json: Object, // GET /api/strategy 返回的 d.json（只读态数据源）
@@ -100,7 +101,8 @@ const ungrouped = computed(() => {
               <div v-if="FIELD_DESC[section + '.' + field]" class="s-desc">{{ FIELD_DESC[section + '.' + field] }}</div>
             </div>
             </div>
-            <!-- v7.0.12：股票池卡片底部 = 手动池录入条（候选池 ∪ 手动添加） -->
+            <!-- v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条） -->
+            <PoolMembers v-if="section === 'universe'" />
             <ManualPoolBar v-if="section === 'universe'" />
           </div>
         </template>

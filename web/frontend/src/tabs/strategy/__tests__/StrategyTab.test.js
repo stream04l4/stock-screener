@@ -68,6 +68,23 @@ function mockApi() {
     if (path === "/api/pool/manual" && (!opts.method || opts.method === "GET")) {
       return { n_manual: 0, stocks: {} };
     }
+    if (path === "/api/pool" && (!opts.method || opts.method === "GET")) {
+      return {
+        funnel: { total: 100, whitelist: 40, soe: 30, mv: 20, listing: 12, div: 5,
+                  backtest: 2, yield: 2, price: 1, final: 2, manual: 1 },
+        n_members: 2,
+        members: [
+          { ts_code: "sh.601088", name: "中国神华", industry_csric2: "B06",
+            soe_basis: "x", total_mv: 10000, ttm_yield_pct: 3.8, n_bars: 2400,
+            list_date: "2007-10-19", bt_pnl_pct: 218.5, bt_n_buys: 5,
+            price_latest: 50.2, is_manual: false },
+          { ts_code: "sh.600900", name: "长江电力", industry_csric2: "D44",
+            soe_basis: "手动添加", total_mv: 7000, ttm_yield_pct: 3.5, n_bars: 2400,
+            list_date: "2003-11-18", bt_pnl_pct: 90.0, bt_n_buys: 3,
+            price_latest: 28.0, is_manual: true },
+        ],
+      };
+    }
     if (path === "/api/strategy" && opts.method === "PUT") {
       if (putHandler) return putHandler(opts);
       return { ok: true, backup: "/tmp/config/strategy.yaml.bak" };
@@ -160,7 +177,10 @@ describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；la
     // enum 值只读态显示通俗短名（bounce → 反弹重置），不是裸值
     const rearmRow = fields.find((f) => f.find(".s-key").attributes("title") === "rearm_mode");
     expect(rearmRow.find(".s-val").text()).toBe("反弹重置");
-    // v7.0.12：股票池卡片底部 = 手动池录入条（GET /api/pool/manual → 暂无手动添加）
+    // v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条）
+    expect(groups[1].text()).toContain("候选股票");
+    expect(groups[1].text()).toContain("中国神华");   // 自动成员
+    expect(groups[1].text()).toContain("长江电力");   // 手动成员
     expect(groups[1].text()).toContain("手动添加");
     expect(groups[1].text()).toContain("（暂无手动添加）");
     w.unmount();
