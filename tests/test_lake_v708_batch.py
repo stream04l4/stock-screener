@@ -57,6 +57,16 @@ def _isolate(tmp_path, monkeypatch):
                         lambda: str(tmp_path / "prog" / "backfill_progress.json"))
     monkeypatch.setattr(lconn, "progress_path",
                         lambda: str(tmp_path / "prog" / "backfill_progress.json"))
+    # v7.0.10 T9 跟进隔离：TE 现值抓取 + csv 入库走离线替身（零网络、不碰真实 cache）
+    import lake.ingest.local_cache_ingest as _lci
+    import screener.data.rf as _rf_mod
+
+    monkeypatch.setattr(_rf_mod, "fetch_rf_10y",
+                        lambda rf_cfg, cache_dir, run_day, session=None: (
+                            0.0164, {"date": run_day, "yield_pct": 1.64,
+                                     "source": "tradingeconomics"}))
+    monkeypatch.setattr(_lci, "load_macro_rf",
+                        lambda con, cache_dir, source="te_local": 7)
     yield
 
 
@@ -584,4 +594,93 @@ def test_precheck_partial_only_sweeps_missing(tmp_path, monkeypatch):
     assert con.execute(
         "SELECT COUNT(*) FROM valuation_daily WHERE ts_code='sh.600002' "
         "AND date='2026-09-18'").fetchone()[0] == 1
+    con.close()
+
+
+# ---------------------------------------------------------------------------
+# v7.0.10：T9 macro_rf 每日跟进（"T9 好像还不是最新的"——2026-10-24）
+# ---------------------------------------------------------------------------
+def _t9_setup(tmp_path, monkeypatch, drop_codes_t3=("sh.600002",)):
+    """T2/T7/T8 齐、T3 缺 1 只 → 不早退 → 走到 T9 跟进（公共播种+fake）。"""
+    db = str(tmp_path / "t9.duckdb")
+    codes = ["sh.600001", "sh.600002"]
+    _seed(db, codes, last_date="2026-09-17")
+    _seed_all_tables(db, codes, "2026-09-17", drop_codes_t3=drop_codes_t3)
+    con = lconn.open(db)
+
+    import lake.ingest.tencent_ingest as tix
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv",
+                        lambda client, ts_code, n:
+                        ([{"date": "2026-09-17", "open": 1, "high": 1, "low": 1,
+                           "close": 1, "volume": 1}]
+                         if ts_code == "sh000001" else []))
+    monkeypatch.setattr(tix, "fetch_snapshot",
+                        lambda client, ts_codes:
+                        ({c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0,
+                              "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0}
+                          for c in ts_codes if c in codes}))
+    from lake.ingest import source_pool as sp
+    ad = sp.get_adapter("tdx")
+    if ad is not None:
+        monkeypatch.setattr(ad, "available", lambda: False)
+    _fake_batch(monkeypatch, t2_rows=[])
+    return db, codes, con
+
+
+def test_incremental_t9_followup_fetch_and_load(tmp_path, monkeypatch):
+    """v7.0.10：增量 T9 跟进 = TE 现值抓取 1 次 + csv 全量 upsert → stats.t9 记痕。
+
+    2026-10-24 根因：macro_rf 只在 full 阶段 4/手动 t9 落库，每日增量不碰 →
+    表停 09-30、csv 已到 10-20。修复后每次增量 macro_rf 恒为最新。
+    """
+    db, codes, con = _t9_setup(tmp_path, monkeypatch)
+
+    import lake.ingest.local_cache_ingest as _lci
+    import screener.data.rf as _rf_mod
+
+    calls = {"fetch": 0, "load": 0}
+
+    def fake_fetch(rf_cfg, cache_dir, run_day, session=None):
+        calls["fetch"] += 1
+        return 0.0164, {"date": run_day, "yield_pct": 1.64,
+                        "source": "tradingeconomics"}
+
+    def fake_load(con2, cache_dir, source="te_local"):
+        calls["load"] += 1
+        return 3
+
+    monkeypatch.setattr(_rf_mod, "fetch_rf_10y", fake_fetch)
+    monkeypatch.setattr(_lci, "load_macro_rf", fake_load)
+
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert r["precheck"].get("result") != "all_up_to_date"   # 不早退 → 走到 T9
+    assert r["t9"] == {"rows": 3, "source": "tradingeconomics"}, r.get("t9")
+    assert "t9_error" not in r
+    assert calls == {"fetch": 1, "load": 1}, calls       # 各恰好一次
+    con.close()
+
+
+def test_incremental_t9_fetch_failure_nonblocking(tmp_path, monkeypatch):
+    """v7.0.10：TE 抓取失败 → 用现有 csv 继续（D4' 语义）、不阻断增量。"""
+    db, codes, con = _t9_setup(tmp_path, monkeypatch)
+
+    import screener.data.rf as _rf_mod
+
+    calls = {"fetch": 0}
+
+    def fake_fetch_fail(rf_cfg, cache_dir, run_day, session=None):
+        calls["fetch"] += 1
+        raise RuntimeError("TE 页面不可达（测试注入）")
+
+    monkeypatch.setattr(_rf_mod, "fetch_rf_10y", fake_fetch_fail)
+    # load_macro_rf 用 fixture 替身（返回 7）
+
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert calls["fetch"] == 1
+    assert r["t9"]["source"] == "fetch_failed_use_existing", r.get("t9")
+    assert r["t9"]["rows"] == 7                            # 现有 csv 照常入库
+    assert "t9_error" not in r, r                          # 不阻断
+    # 增量主体不受 T9 故障影响
+    assert r["t3"]["processed"] == 1
     con.close()

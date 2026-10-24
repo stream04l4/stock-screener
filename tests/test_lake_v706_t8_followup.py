@@ -57,6 +57,16 @@ def _isolate(tmp_path, monkeypatch):
                         lambda: str(tmp_path / "prog" / "backfill_progress.json"))
     monkeypatch.setattr(lconn, "progress_path",
                         lambda: str(tmp_path / "prog" / "backfill_progress.json"))
+    # v7.0.10 T9 跟进隔离：TE 现值抓取 + csv 入库走离线替身（零网络、不碰真实 cache）
+    import lake.ingest.local_cache_ingest as _lci
+    import screener.data.rf as _rf_mod
+
+    monkeypatch.setattr(_rf_mod, "fetch_rf_10y",
+                        lambda rf_cfg, cache_dir, run_day, session=None: (
+                            0.0164, {"date": run_day, "yield_pct": 1.64,
+                                     "source": "tradingeconomics"}))
+    monkeypatch.setattr(_lci, "load_macro_rf",
+                        lambda con, cache_dir, source="te_local": 0)
     yield
 
 

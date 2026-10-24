@@ -242,6 +242,11 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
     monkeypatch.setattr(_rf_mod, "fetch_rf_10y",
                         lambda cfg, cache_dir, run_day, session=None: (0.025,
                                                                        {"source": "fake"}))
+    # v7.0.10：incremental 内 T9 跟进的 csv 入库替身（零网络、不碰真实 cache）
+    import lake.ingest.local_cache_ingest as _lci
+
+    monkeypatch.setattr(_lci, "load_macro_rf",
+                        lambda con, cache_dir, source="te_local": 0)
     _set_registry(monkeypatch, {"adata_f10": adata})
     counter["f10"] = 0   # 占位（真实计数在 adata.f10_calls）
     return counter

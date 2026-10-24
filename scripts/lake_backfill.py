@@ -1890,6 +1890,35 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
             log.error("T8 因子跟进重算失败（增量不阻断）: %s", exc)
             stats["t8_error"] = str(exc)
 
+    # ---- T9 macro_rf 跟进（v7.0.10）----
+    # 2026-10-24 实锤（Joel："T9 好像还不是最新的"）：macro_rf 只在 full 阶段 4 /
+    # 手动 t9 落库，每日增量不碰 → 表停 09-30，而 cache csv 已被每日 screener 的
+    # fetch_rf_10y 追加到 10-20（追加≠入库）。两步跟进：① TE 现值抓取（1 次免费
+    # 调用；失败 → 用现有 csv 继续，D4' 语义不阻断）② csv 全量 upsert（零网络，
+    # date PK 幂等）。此后每次 19:30 增量 macro_rf 恒为最新。
+    try:
+        from lake.ingest.local_cache_ingest import load_macro_rf
+        from screener.config import load_config, rf_cfg as _rf_cfg_fn
+
+        _cache9 = _cache_dir()
+        _rf_meta9: Dict[str, Any] = {"source": "existing_cache"}
+        try:
+            from screener.data import rf as _rf_mod9
+
+            _cfg9 = load_config(os.path.join(_project_root(), "config", "strategy.yaml"))
+            _dec9, _rf_meta9 = _rf_mod9.fetch_rf_10y(
+                _rf_cfg_fn(_cfg9), _cache9, _today_beijing())
+        except Exception as exc:  # noqa: BLE001 - TE 抓取失败 → 用现有 csv 继续（D4'，不阻断）
+            log.warning("incremental T9: TE 10Y 抓取失败（用现有 csv 继续，不阻断）: %s", exc)
+            _rf_meta9 = {"source": "fetch_failed_use_existing"}
+        _rows9 = load_macro_rf(con, _cache9)
+        stats["t9"] = {"rows": _rows9, "source": _rf_meta9.get("source")}
+        log.info("incremental T9: macro_rf 落库 %d 行（source=%s）", _rows9,
+                 _rf_meta9.get("source"))
+    except Exception as exc:  # noqa: BLE001 - T9 失败不阻断增量（同 T8 纪律）
+        log.error("T9 macro_rf 跟进失败（增量不阻断）: %s", exc)
+        stats["t9_error"] = str(exc)
+
     # O2/O3：tasks 占位条目刷成真实 total/done + kline_history 完成态 + T5/T6 条目
     _refresh_incremental_task_view(runner, con, today_s)
     # v7.0.9：预检判"已齐"的表按 done 键计数为 0 → _refresh 会误显 0/total pending，
