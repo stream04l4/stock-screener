@@ -8,15 +8,16 @@
 // - FIELD_DESC 一律一行口语说明，删掉公式堆砌/内部附注（k=0 占档等**行为差异**保留，
 //   因为直接影响首仓后第一个加仓的金额）。
 //
-// 页面渲染 13 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
-// + universe 5。accounting 固定 cash（只读，FIELD_TYPE="readonly"）。
+// 页面渲染 18 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
+// + universe 10（v7.0.12：基础 5 条件 + 候选池选股门槛 5 键）。
+// accounting 固定 cash（只读，FIELD_TYPE="readonly"）。
 //
 // FIELD_TYPE 约定（沿用旧版）：**按裸字段名**索引（非 section.field）；
 // FieldEditor 用 FIELD_TYPE[field] 取类型，未注册 → 回退 "str"。
 
 export const SECTION_META = {
   strategy: { title: "策略参数（深回撤金字塔加仓）", icon: "📉" },
-  universe: { title: "股票池（5 个条件）", icon: "🗂️" },
+  universe: { title: "股票池（候选池：基础 5 条件 + 选股 3 门槛）", icon: "🗂️" },
 };
 
 // 分组（有序）。group.id 用于 localStorage 折叠记忆键。

@@ -1,4 +1,4 @@
-// StrategyTab 组件回归（v7.0）：策略库（另存为/加载/删除）+ 13 字段页渲染 + 本地保存校验。
+// StrategyTab 组件回归（v7.0）：策略库（另存为/加载/删除）+ 18 字段页渲染 + 本地保存校验。
 //
 // mock 点：api client（零网络）+ queryRegistry.invalidate（隔离计数）。
 // useLiveQuery 走真实实现（happy-dom），"strategy"/"strategies" key 由 apiMock 按 path 分发。
@@ -25,7 +25,7 @@ vi.mock("../../../live/queryRegistry.js", async (orig) => ({
 const StrategyTab = (await import("../../StrategyTab.vue")).default;
 const { useToastStore } = await import("../../../stores/toastStore.js");
 
-// v7 slim 策略 JSON（strategy 9 键 + universe 5 键 + lake + datasource）
+// v7 slim 策略 JSON（strategy 9 键 + universe 10 键 + lake + datasource）
 const STRATEGY_JSON = {
   strategy: {
     name: "drawdown_martingale",
@@ -44,6 +44,11 @@ const STRATEGY_JSON = {
     min_total_mv_yi: 200,
     min_consecutive_div_years: 5,
     listing_min_trading_days: 250,
+    backtest_positive: true,
+    backtest_window_years: 10,
+    min_ttm_yield_pct: 3,
+    price_min_yuan: 3,
+    price_max_yuan: 100,
   },
   lake: { baostock_daily_budget: 5000 },
   datasource: { baostock: { daily_quota: 49900 } },
@@ -59,6 +64,9 @@ function mockApi() {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path === "/api/strategy" && (!opts.method || opts.method === "GET")) {
       return { json: JSON.parse(JSON.stringify(STRATEGY_JSON)), raw: "# raw" };
+    }
+    if (path === "/api/pool/manual" && (!opts.method || opts.method === "GET")) {
+      return { n_manual: 0, stocks: {} };
     }
     if (path === "/api/strategy" && opts.method === "PUT") {
       if (putHandler) return putHandler(opts);
@@ -112,8 +120,8 @@ beforeEach(() => {
   mockApi();
 });
 
-describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lake/datasource 不渲染）", () => {
-  it("渲染 2 组（策略参数/股票池）；字段行 = 13；name 不出现为字段行", async () => {
+describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；lake/datasource 不渲染）", () => {
+  it("渲染 2 组（策略参数/股票池）；字段行 = 18；name 不出现为字段行", async () => {
     const w = mk();
     await flushPromises();
     const groups = w.findAll(".s-group");
@@ -121,7 +129,7 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
     expect(groups[0].text()).toContain("策略参数");
     expect(groups[1].text()).toContain("股票池");
     const fields = w.findAll(".s-field");
-    expect(fields.length).toBe(13);
+    expect(fields.length).toBe(18);
     // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
@@ -129,6 +137,8 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
       "加仓递增比率", "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
       "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
       "连续分红年数下限", "最少上市交易日",
+      // v7.0.12 候选池选股门槛
+      "十年回测必须为正", "回测窗口（年）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
@@ -136,6 +146,8 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
       "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
+      "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
+      "price_min_yuan", "price_max_yuan",
     ]);
     // name（策略标识）不作为字段行
     expect(keys).not.toContain("策略标识");
@@ -148,10 +160,13 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
     // enum 值只读态显示通俗短名（bounce → 反弹重置），不是裸值
     const rearmRow = fields.find((f) => f.find(".s-key").attributes("title") === "rearm_mode");
     expect(rearmRow.find(".s-val").text()).toBe("反弹重置");
+    // v7.0.12：股票池卡片底部 = 手动池录入条（GET /api/pool/manual → 暂无手动添加）
+    expect(groups[1].text()).toContain("手动添加");
+    expect(groups[1].text()).toContain("（暂无手动添加）");
     w.unmount();
   });
 
-  it("只读态：accounting 显示 cash；编辑态：6 个 number input（int×2+float×4），accounting 仍只读", async () => {
+  it("只读态：accounting 显示 cash；编辑态：13 个 number input（strategy 6 + universe 7），accounting 仍只读", async () => {
     const w = mk();
     await flushPromises();
     // 只读态 accounting 值（按 title=原始字段名定位）
@@ -160,8 +175,10 @@ describe("v7 · 13 字段页渲染（strategy 8 + universe 5；name 隐藏；lak
     // 进入编辑态
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    // strategy 6（int×2 + float×4）+ universe 3（min_total_mv_yi float + 2×int）= 9
-    expect(w.findAll('input[type="number"]').length).toBe(9);
+    // strategy 6（int×2 + float×4）+ universe 7（v7.0.12：mv float + 3×int + 3×float）= 13
+    expect(w.findAll('input[type="number"]').length).toBe(13);
+    // backtest_positive 是 bool select（不是 number input）
+    expect(w.findAll(".s-field select").length).toBeGreaterThanOrEqual(1);
     // accounting 编辑态仍是只读展示（无 input，有 .s-readonly）
     const acctRowEdit = w.findAll(".s-field").find((f) => f.find(".s-key").attributes("title") === "accounting");
     expect(acctRowEdit.find("input").exists()).toBe(false);
@@ -221,7 +238,7 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     // PUT full：lake/datasource/universe 段完整带回
     expect(captured.lake).toEqual({ baostock_daily_budget: 5000 });
     expect(captured.datasource).toEqual({ baostock: { daily_quota: 49900 } });
-    expect(Object.keys(captured.universe)).toHaveLength(5);
+    expect(Object.keys(captured.universe)).toHaveLength(10); // v7.0.12：基础 5 + 门槛 5
     expect(toastMsg()).toContain("策略已更新");
     expect(invalidateMock).toHaveBeenCalledWith("strategy");
     expect(w.find("#btn-strategy-save").classes()).toContain("hidden"); // 退出编辑态

@@ -1,21 +1,19 @@
-// 应用壳（v7.0.12 五页签）：我的持仓 / 候选池 / 策略 / 回测 / 数据湖。
+// 应用壳（v7.0.2 四页签）：我的持仓 / 策略 / 回测 / 数据湖。
 // - 不引入 vue-router：页签 = 应用内状态（active ref）。
 // - 非当前 tab 内容懒挂载：v-if="active === x" → 首次激活才渲染并发请求。
 //   已挂载过的 tab 用 keep-alive 保活（切回状态仍在）。
 // v7.0.2：页签重排——回测移到第三位（主入口=我的持仓）；回测内新增策略选择（策略库快照）。
-// v7.0.12：新增「候选池」页签（低波红利央国企候选股票池 + 手动添加入口）。
+// v7.0.12：候选池不设独立页签——池即策略页签「股票池」卡片（含选股门槛 + 手动池录入条）。
 <script setup>
 import { ref } from "vue";
 import ToastBar from "./ToastBar.vue";
 import BacktestTab from "../tabs/BacktestTab.vue";
 import MyPositionsTab from "../tabs/MyPositionsTab.vue";
-import PoolTab from "../tabs/PoolTab.vue";
 import StrategyTab from "../tabs/StrategyTab.vue";
 import LakeTab from "../tabs/LakeTab.vue";
 
 const TABS = [
   ["my_positions", "我的持仓"],
-  ["pool", "候选池"],
   ["strategy", "策略"],
   ["backtest", "回测"],
   ["lake", "数据湖"],
@@ -38,7 +36,6 @@ const active = ref("my_positions");
     <keep-alive>
       <BacktestTab v-if="active === 'backtest'" />
       <MyPositionsTab v-else-if="active === 'my_positions'" />
-      <PoolTab v-else-if="active === 'pool'" />
       <StrategyTab v-else-if="active === 'strategy'" />
       <LakeTab v-else-if="active === 'lake'" />
     </keep-alive>

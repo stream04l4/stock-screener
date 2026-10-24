@@ -851,8 +851,22 @@ def get_pool() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 候选池手动添加（POST/DELETE /api/pool/manual → data/manual_pool.json）
+# 候选池手动添加（GET/POST/DELETE /api/pool/manual → data/manual_pool.json）
 # ---------------------------------------------------------------------------
+@app.get("/api/pool/manual")
+def get_pool_manual() -> Dict[str, Any]:
+    """读手动池（策略页签股票池卡片的手动录入条用；零湖访问，只读 json）。"""
+    from martingale.selection import load_manual_pool
+    stocks = load_manual_pool()
+    return {
+        "n_manual": len(stocks),
+        "stocks": {
+            code: {"name": e.get("name", ""), "added_at": e.get("added_at", "")}
+            for code, e in sorted(stocks.items())
+        },
+    }
+
+
 @app.post("/api/pool/manual")
 def add_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
     """手动加入候选池（绕过回测/股息率/价格门槛；存在且未退市才允许）。"""

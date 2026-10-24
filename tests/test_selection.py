@@ -313,6 +313,10 @@ def test_web_add_and_remove_manual(web_fake):
 
     out = wapp.add_pool_manual({"ts_code": "600000"})
     assert out["ok"] is True and out["entry"]["name"] == "浦发银行"
+    # GET：策略页签手动录入条数据源（加入后可见）
+    g = wapp.get_pool_manual()
+    assert g["n_manual"] == 1
+    assert g["stocks"]["sh.600000"]["name"] == "浦发银行"
     # 幂等再添加
     out2 = wapp.add_pool_manual({"ts_code": "sh.600000"})
     assert out2["entry"] == out["entry"]
@@ -323,6 +327,7 @@ def test_web_add_and_remove_manual(web_fake):
 
     d = wapp.remove_pool_manual({"ts_code": "600000"})
     assert d["ok"] is True
+    assert wapp.get_pool_manual()["n_manual"] == 0
     d2 = wapp.remove_pool_manual({"ts_code": "600000"})
     assert d2["ok"] is False
     with pytest.raises(HTTPException) as e2:

@@ -43,8 +43,9 @@ Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
 选股门槛（v7.0.12，Joel 2026-10-24 拍板；波动率门槛经讨论不加）：
 ⑦ **十年滚动回测为正**（≥1 次触发且净利>0，含分红扣佣金；预计算表 `selection_backtest_10y`，
 fail-closed：缺行不入选）→ ⑧ **TTM 股息率≥3%** → ⑨ **价格 3~100 元**。
-**手动添加**：`data/manual_pool.json`（Web 页签入口 / `POST/DELETE /api/pool/manual`）
-绕过 ⑦⑧⑨ 恒在候选池；退市自动剔除；与自动入选重叠时保留自动版并标记 `is_manual`。
+**手动添加**：`data/manual_pool.json`（策略页签股票池卡片内的手动录入条 /
+`GET/POST/DELETE /api/pool/manual`）绕过 ⑦⑧⑨ 恒在候选池；退市自动剔除；
+与自动入选重叠时保留自动版并标记 `is_manual`。
 生产首跑（2026-10-24，as_of 10-23）：98 → 82(⑦) → 60(⑧) → **59 只**。
 
 SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
@@ -104,13 +105,13 @@ systemctl --user status stock-screener-web     # uvicorn web.app:app
 systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改动后
 ```
 
-五页签（v7.0.12 新增**候选池**）：**我的持仓**（录入/信号/提醒状态）·
-**候选池**（全漏斗 + 成员：10年回测%/股息率/最新价/来源；手动添加录入条 + 手动行点行移除）·
-**策略**（参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
-**数据湖**（v6 原样）。
+四页签：**我的持仓**（录入/信号/提醒状态）·
+**策略**（参数编辑/校验/策略库快照；**股票池卡片** = 候选池：基础 5 条件 +
+选股门槛字段 + 手动添加录入条）· **回测**（参数表单 + SSE 进度 + 结果区）·
+**数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
 
 主要 API：`/api/health` · `/api/pool`（候选池：漏斗 + 成员，读预计算表 O(1)）·
-`/api/pool/manual`（POST 手动加入 / DELETE 移除，写 `data/manual_pool.json`）·
+`/api/pool/manual`（GET 读手动池 / POST 加入 / DELETE 移除，写 `data/manual_pool.json`）·
 `/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份）·
 `/api/positions`（同步全池）· `/api/bt/runs`（POST 触发 / GET 列表 / `{id}` status /
 `{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*` · 策略库 CRUD。
