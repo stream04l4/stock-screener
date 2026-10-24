@@ -111,7 +111,7 @@ h3 { margin: 0 0 10px; font-size: 15px; }
 .run-failed-card { border: 1px solid #fecaca; background: var(--bad-soft); }
 
 .funnel-box { margin-bottom: 18px; }
-.funnel-row { display: grid; grid-template-columns: 150px 1fr 90px; gap: 10px; align-items: center; margin-bottom: 7px; }
+.funnel-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 90px; gap: 10px; align-items: center; margin-bottom: 7px; }
 .funnel-label { font-size: 13px; text-align: right; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .funnel-bar-track { background: #edf1f7; border-radius: 6px; height: 20px; position: relative; overflow: hidden; }
 .funnel-bar {
@@ -169,8 +169,19 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 .s-field { padding: 9px 0; border-top: 1px dashed var(--line); }
 .s-field:first-of-type { border-top: 0; }
 .s-field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
-.s-key { font-family: var(--mono); font-size: 12.5px; color: #374151; }
-.s-val { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--accent); text-align: right; overflow-wrap: anywhere; }
+/* 2026-10-25 移动端修正（Joel 截图反馈：字体大小不一致 + 白名单值右溢）：
+   1) 字段名是纯中文 → 去掉 monospace（monospace 无 CJK 字形，Android/iOS 回退字体
+      字形偏大偏宽，与说明文字的 sans 不一致，看起来"字号不对齐"）；
+      值保留 monospace（数字/代码等宽）。
+   2) 字号统一两档：字段名/值 13px，说明 12px。
+   3) 值显式 min-width:0（flex 项默认 min-width:auto，个别浏览器下长串不收缩不换行 → 右溢）。
+   4) 窄屏（≤640px）字段名与值上下堆叠：值占整行可多行换行，消除同行挤压。 */
+.s-key { font-size: 13px; color: #374151; }
+.s-val { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--accent); text-align: right; overflow-wrap: anywhere; min-width: 0; }
+@media (max-width: 640px) {
+  .s-field-head { flex-direction: column; align-items: flex-start; gap: 3px; }
+  .s-val { text-align: left; }
+}
 .s-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .s-field input[type="number"], .s-field input[type="text"], .s-field select {
   width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
@@ -191,10 +202,15 @@ table.data td.num, table.data th.num { text-align: right; font-family: var(--mon
 /* 2026-10-23 排版（Joel："排版都集中在左侧，很不协调"）：
    分组内只剩 1 张卡片，.cards 的 auto-fill 网格让单卡只占第一列 → 左侧窄条+右侧大片空白。
    改：分组内卡片撑满；字段行在 ≥900px 下两列排布（窄屏/手机回退单列）。 */
-.s-group .cards { grid-template-columns: 1fr; }
-.s-fields-grid { display: grid; grid-template-columns: 1fr; column-gap: 28px; align-items: start; }
+/* 2026-10-25 移动端修正（Joel 手机截图：卡片被长值撑宽 497px > 390 视口，右缘裁切）：
+   根因 = `1fr` 轨道最小尺寸是 auto（内容 min-content）；overflow-wrap:anywhere
+   按规范不缩小 min-content → 58 字符等宽白名单串(~452px)把轨道/卡片顶宽。
+   修法 = minmax(0, 1fr)（轨道可缩到 0，宽度由视口决定）+ 值上 overflow-wrap 换行。 */
+.s-group .cards { grid-template-columns: minmax(0, 1fr); }
+.s-fields-grid { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 28px; align-items: start; }
+.s-field { min-width: 0; }
 @media (min-width: 900px) {
-  .s-fields-grid { grid-template-columns: 1fr 1fr; }
+  .s-fields-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   /* 两列首行第 2 项去掉虚线（与第 1 项对齐） */
   .s-fields-grid .s-field:nth-child(2) { border-top: 0; }
 }
