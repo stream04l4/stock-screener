@@ -31,8 +31,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# v7.0.8（bbc55f5）：每日增量提速 tushare 全市场批量 T2/T3 + None 重试 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移。
-BASELINE = "bbc55f5"
+# v7.0.8 批量日期修复（d44c2c7）：trade_date wire 格式 → 湖格式，lake/ 有意变更，基线前移。
+BASELINE = "d44c2c7"
 
 
 def _git(*args) -> str:
