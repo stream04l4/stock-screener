@@ -161,6 +161,21 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
     return out
 
 
+def _ymd(s: Any) -> str:
+    """tushare trade_date 'YYYYMMDD' → 湖 'YYYY-MM-DD'（已是横线格式则原样）。
+
+    2026-10-24 生产事故：批量行把 tushare wire 格式日期直接写湖 → 全市场
+    DuckDB Conversion Error。当时离线测试用横线格式 fake 数据掩盖了问题——
+    测试 fake 必须用 tushare 真实 wire 格式（'20261023'），防再次漂移。
+    """
+    if not isinstance(s, str):
+        return str(s)
+    s = s.strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
 def fetch_daily_batch(trade_date: str) -> List[Dict[str, Any]]:
     """T2 全市场单日 K线（v7.0.8 每日增量主源）。
 
@@ -177,7 +192,7 @@ def fetch_daily_batch(trade_date: str) -> List[Dict[str, Any]]:
         vol = r.pop("vol")
         amt = r.pop("amount")
         out.append({
-            "ts_code": r["ts_code"], "date": r["trade_date"],
+            "ts_code": r["ts_code"], "date": _ymd(r["trade_date"]),
             "open": r["open"], "high": r["high"], "low": r["low"],
             "close": r["close"], "preclose": r.get("pre_close"),
             "pct_chg": r.get("pct_chg"),
@@ -198,7 +213,7 @@ def fetch_adj_factor_batch(trade_date: str) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for r in rows:
         if r.get("adj_factor") is not None:
-            out.setdefault(r["ts_code"], {})[r["trade_date"]] = r["adj_factor"]
+            out.setdefault(r["ts_code"], {})[_ymd(r["trade_date"])] = r["adj_factor"]
     return out
 
 
@@ -217,7 +232,7 @@ def fetch_daily_basic_batch(trade_date: str) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
         out.append({
-            "ts_code": r["ts_code"], "date": r["trade_date"],
+            "ts_code": r["ts_code"], "date": _ymd(r["trade_date"]),
             "total_mv_yi": (r["total_mv"] / 10000.0
                             if r.get("total_mv") is not None else None),
             "float_mv_yi": (r["float_mv"] / 10000.0

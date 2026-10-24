@@ -315,12 +315,16 @@ def test_tushare_batch_unit_conversions(monkeypatch):
     assert len(rows) == 1, rows          # BJ 丢弃
     r = rows[0]
     assert r["ts_code"] == "sh.601398"   # 代码转换
+    assert r["date"] == "2026-09-18"     # wire 格式 20260918 → 湖 YYYY-MM-DD
     assert r["volume"] == 12300         # 手→股 ×100
     assert r["amount"] == 4567000.0     # 千元→元 ×1000
     assert r["pct_chg"] == 7.14 and r["preclose"] == 1.4
     af = ti.fetch_adj_factor_batch("2026-09-18")
-    assert af == {"sh.601398": {"20260918": 1.25}}, af
+    # af 键 = 湖日期格式（2026-10-24 事故前此处断言 wire 格式 "20260918"，
+    # 与 load_t2 按湖日期查 adj_map 的口径不一致 → 静默丢 af；一并固化修复）
+    assert af == {"sh.601398": {"2026-09-18": 1.25}}, af
     b = ti.fetch_daily_basic_batch("2026-09-18")
+    assert b[0]["date"] == "2026-09-18"
     assert b[0]["total_mv_yi"] == pytest.approx(12345.6)   # 万元→亿元 ÷10000
     assert b[0]["float_mv_yi"] == pytest.approx(10000.0)
     assert b[0]["pe_ttm"] == 8.5 and b[0]["turnover"] == 0.3
@@ -363,7 +367,7 @@ def test_batch_call_retries_on_none(monkeypatch):
     monkeypatch.setattr(_real_time, "sleep", lambda s: None)
     rows = ti.fetch_adj_factor_batch("2026-09-18")
     assert calls["n"] == 2, f"应重试一次: {calls}"
-    assert rows == {"sh.601398": {"20260918": 1.25}}, rows
+    assert rows == {"sh.601398": {"2026-09-18": 1.25}}, rows
 
 
 def test_batch_call_quota_penalty_fails_fast(monkeypatch):
