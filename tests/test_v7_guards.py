@@ -14,7 +14,9 @@
   基线演进：8c49f71（v7.0.0 原始红线）→ b41fc5c（v7.0.7：Joel 2026-10-22
   拍板砍 T5 roe_avg/ocf + T6 controller_* 死列，lake/ 有意变更，基线前移）
   → bbc55f5（v7.0.8：每日增量提速 tushare 全市场批量 T2/T3 + None 重试
-  加固 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移）。
+  加固 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移）
+  → 4c8e0a9（v7.0.9：表级完整性预检 + 退出 CHECKPOINT + 进度簿记批量化，
+  lake/ 有意变更，基线前移）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -31,8 +33,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# v7.0.8 批量日期修复（d44c2c7）：trade_date wire 格式 → 湖格式，lake/ 有意变更，基线前移。
-BASELINE = "d44c2c7"
+# v7.0.9 增量检测机制（4c8e0a9）：表级完整性预检 + 退出 CHECKPOINT + 进度簿记
+# 批量化，lake/ 有意变更，基线前移。
+BASELINE = "4c8e0a9"
 
 
 def _git(*args) -> str:
