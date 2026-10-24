@@ -47,7 +47,7 @@ def test_get_strategy_four_sections():
     # v7 slim：strategy/universe/lake/datasource 四段（lake + datasource 必须保留）
     assert {"strategy", "universe", "lake", "datasource"} <= keys
     assert len(out["json"]["strategy"]) == 9
-    assert len(out["json"]["universe"]) == 5
+    assert len(out["json"]["universe"]) == 10  # v7.0.12：5 基础条件 + 5 候选池门槛
     assert {"sina", "rf", "baostock"} <= set(out["json"]["datasource"].keys())
 
 
@@ -134,6 +134,19 @@ def test_validate_strategy_error_messages():
     assert wapp._validate_strategy(p)
 
 
+def test_validate_strategy_v7012_universe_gates():
+    # v7.0.12：候选池门槛字段也进 PUT 校验
+    p = _valid_payload()
+    p["universe"]["backtest_positive"] = "yes"  # 非布尔
+    errs = wapp._validate_strategy(p)
+    assert any("backtest_positive" in e for e in errs)
+    p = _valid_payload()
+    p["universe"]["price_min_yuan"] = 200
+    p["universe"]["price_max_yuan"] = 3         # 下限 > 上限
+    errs = wapp._validate_strategy(p)
+    assert any("price_min_yuan" in e for e in errs)
+
+
 # ---------------------------------------------------------------------------
 # pool / positions（生产湖；无湖则跳过）
 # ---------------------------------------------------------------------------
@@ -141,20 +154,30 @@ def test_validate_strategy_error_messages():
 @pytest.mark.skipif(not HAS_LAKE, reason="生产湖不存在")
 def test_get_pool_funnel_and_members():
     out = wapp.get_pool()
-    assert out["n_members"] >= 90
+    # v7.0.12：候选池 = 基础 5 条件 ∩ 十年回测为正 ∩ 股息率≥3% ∩ 价格 3~100 元 ∪ 手动
+    # （2026-10-24 生产首跑 = 59 只；留漂移余量）
+    assert out["n_members"] >= 40
     f = out["funnel"]
-    keys = ["total", "whitelist", "soe", "mv", "listing", "div", "final"]
+    keys = ["total", "whitelist", "soe", "mv", "listing", "div",
+            "backtest", "yield", "price", "final", "manual"]
     assert all(k in f for k in keys)
     assert f["final"] == out["n_members"]
+    assert f["backtest"] >= f["yield"] >= f["price"]  # 漏斗逐级收窄
+    assert f["final"] >= f["price"]  # final = 自动 + 纯手动
     assert isinstance(out["members"], list) and out["members"]
     m0 = out["members"][0]
-    assert {"ts_code", "name", "total_mv"} <= set(m0.keys())
+    assert {"ts_code", "name", "total_mv", "bt_pnl_pct", "ttm_yield_pct",
+            "price_latest", "is_manual"} <= set(m0.keys())
+    # 排序契约：自动成员按十年回测收益降序（无值殿后）
+    auto = [m["bt_pnl_pct"] for m in out["members"] if not m["is_manual"]]
+    with_val = [x for x in auto if x is not None]
+    assert with_val == sorted(with_val, reverse=True)
 
 
 @pytest.mark.skipif(not HAS_LAKE, reason="生产湖不存在")
 def test_get_positions_shape():
     out = wapp.get_positions()
-    assert out["n"] >= 90
+    assert out["n"] >= 40  # v7.0.12：候选池 59 只（2026-10-24 首跑）
     assert out["as_of"]
     p0 = out["positions"][0]
     assert {"ts_code", "in_pos", "shares", "avg_cost", "next_add_price",

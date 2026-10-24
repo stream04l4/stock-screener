@@ -32,7 +32,11 @@ from .config import UniverseParams
 
 @dataclass(frozen=True)
 class Member:
-    """池成员（/api/pool 与 CLI pool 的输出单元）。"""
+    """池成员（/api/pool 与 CLI pool 的输出单元）。
+
+    v7.0.12 起为候选池成员：新增 bt_*/price_latest/is_manual（选股门槛预计算
+    展示字段；非候选池路径（旧语义调用）保持缺省 None/False）。
+    """
     ts_code: str
     name: str
     industry_csric2: str
@@ -41,6 +45,11 @@ class Member:
     ttm_yield_pct: Optional[float]  # 最新估值日股息率 TTM（%，展示用，不作门槛）
     n_bars: int                 # 上市以来交易日数
     list_date: Optional[str]    # YYYY-MM-DD
+    # —— v7.0.12 候选池扩展（selection.build_candidate_pool 填充）——
+    bt_pnl_pct: Optional[float] = None    # 十年回测净收益率（% 小数，None=未触发）
+    bt_n_buys: Optional[int] = None       # 十年回测买入次数
+    price_latest: Optional[float] = None  # 最新收盘价（元）
+    is_manual: bool = False               # 手动添加（绕过 G7~G9）
 
 
 @dataclass(frozen=True)

@@ -149,27 +149,55 @@ def _cmd_pool(args) -> int:
     sp, up = load_config(_default_config_path())
     con = connect_readonly(None)
     try:
-        from .universe import build_pool
-        pool = build_pool(con, up)
+        from .selection import build_candidate_pool, load_manual_pool
+        pool = build_candidate_pool(con, up, manual=load_manual_pool())
     finally:
         con.close()
     fu = pool.funnel
-    print("股票池漏斗（全链 5 条件）：")
+    print("候选池漏斗（基础 5 条件 + 选股门槛；候选池 ≠ 买入信号，买不买看价格）：")
     print(f"  全市场: {fu['total']}")
     print(f"  ∩行业白名单+存活+非ST: {fu['whitelist']}")
     print(f"  ∩央国企(SOE双规则): {fu['soe']}")
     print(f"  ∩总市值≥{up.min_total_mv_yi:g}亿: {fu['mv']}")
     print(f"  ∩上市≥{up.listing_min_trading_days}交易日: {fu['listing']}")
     print(f"  ∩连续分红≥{up.min_consecutive_div_years}年: {fu['div']}")
-    print(f"  最终池: {fu['final']}")
+    print(f"  ∩{up.backtest_window_years}年回测为正: {fu['backtest']}")
+    print(f"  ∩股息率≥{up.min_ttm_yield_pct:g}%: {fu['yield']}")
+    print(f"  ∩价格{up.price_min_yuan:g}~{up.price_max_yuan:g}元: {fu['price']}")
+    print(f"  候选池: {fu['final']}（含手动添加 {fu['manual']}）")
     print()
-    print(f"{'ts_code':<12} {'name':<10} {'industry':<8} {'soe_basis':<8} "
-          f"{'total_mv':>10} {'ttm_yield%':>10} {'n_bars':>7} {'list_date':<12}")
-    for m in sorted(pool.members, key=lambda x: x.ts_code):
-        print(f"{m.ts_code:<12} {m.name:<10} {m.industry_csric2:<8} {m.soe_basis:<8} "
-              f"{(f'{m.total_mv:,.0f}' if m.total_mv is not None else '-'):>10} "
-              f"{(f'{m.ttm_yield_pct:.2f}' if m.ttm_yield_pct is not None else '-'):>10} "
-              f"{m.n_bars:>7} {(m.list_date or '-'):<12}")
+    print(f"{'ts_code':<12} {'name':<10} {'10y回测%':>9} {'股息%':>6} "
+          f"{'价':>8} {'total_mv':>9} {'来源':<6}")
+    for m in pool.members:
+        bt = f"{m.bt_pnl_pct * 100:+.1f}" if m.bt_pnl_pct is not None else "未触发"
+        src = "手动" if m.is_manual else "自动"
+        print(f"{m.ts_code:<12} {m.name:<10} {bt:>9} "
+              f"{(f'{m.ttm_yield_pct:.2f}' if m.ttm_yield_pct is not None else '-'):>6} "
+              f"{(f'{m.price_latest:.2f}' if m.price_latest is not None else '-'):>8} "
+              f"{(f'{m.total_mv:,.0f}' if m.total_mv is not None else '-'):>9} {src:<6}")
+    return 0
+
+
+def _cmd_selection(args) -> int:
+    """候选池选股预计算：基础池逐股十年滚动回测 → 湖表 selection_backtest_10y。"""
+    import duckdb
+
+    from .data import default_db_path
+    from .selection import refresh_selection
+
+    sp, up = load_config(_default_config_path())
+    p = default_db_path()
+    if not os.path.exists(p):
+        print(f"数据湖不存在: {p}", file=sys.stderr)
+        return 3
+    con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（与 Web 读并发安全窗口外）
+    try:
+        out = refresh_selection(con, sp, up, verbose=True)
+    finally:
+        con.close()
+    print(f"selection 完成 · as_of={out['as_of']} · 写入 {out['n_written']}/{out['n_codes']} "
+          f"（回测为正 {out['n_positive']}）· 耗时 {out['elapsed_s']}s")
+    print("提示：候选池立即生效（Web/CLI 读预计算表）")
     return 0
 
 
@@ -192,8 +220,12 @@ def main(argv=None) -> int:
     st.add_argument("--codes", default=None, help="逗号分隔 ts_code（默认=股票池）")
     st.set_defaults(func=_cmd_status)
 
-    po = sub.add_parser("pool", help="股票池（漏斗+成员）")
+    po = sub.add_parser("pool", help="候选池（漏斗+成员；含选股门槛与手动添加）")
     po.set_defaults(func=_cmd_pool)
+
+    se = sub.add_parser("selection",
+                        help="候选池选股预计算（基础池十年滚动回测→湖表；湖增量后自动跑）")
+    se.set_defaults(func=_cmd_selection)
 
     args = ap.parse_args(argv)
     try:

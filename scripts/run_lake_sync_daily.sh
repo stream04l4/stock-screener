@@ -26,4 +26,13 @@ echo "[$(date -u +%FT%TZ)] 湖增量开始 → $LOG"
 timeout -k 60 36000 .venv/bin/python scripts/lake_backfill.py incremental >> "$LOG" 2>&1
 RC=$?
 echo "[$(date -u +%FT%TZ)] 湖增量退出 rc=$RC（0=完成；非0=部分失败，断点续传次日补）"
+
+# v7.0.12：候选池选股预计算（基础池十年滚动回测 → selection_backtest_10y）。
+# 纯湖内计算零网络；增量持锁已结束，此处独占写连接安全。
+# 失败不阻断：Web 候选池 G7 读旧快照（fail-closed：缺行不入选），次日自动重算。
+timeout -k 30 600 .venv/bin/python -m martingale selection >> "$LOG" 2>&1
+SRC=$?
+if [ "$SRC" -ne 0 ]; then
+  echo "[$(date -u +%FT%TZ)] 候选池选股失败 rc=$SRC（Web 回退旧快照，日志见 $LOG 尾部）"
+fi
 exit "$RC"

@@ -238,7 +238,7 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
 # 策略校验（PUT /api/strategy）—— v7 slim schema
 # ---------------------------------------------------------------------------
 # 字段级 schema：{section: {field: (type, min/enum, max)}}
-# type ∈ {"int","float","str","enum","enum2","code_list","str_list"}
+# type ∈ {"int","float","str","bool","enum","enum2","code_list","str_list"}
 _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
     "strategy": {
         "name": ("enum", "drawdown_martingale", None),
@@ -257,6 +257,12 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "min_total_mv_yi": ("float", 1, 1e5),
         "min_consecutive_div_years": ("int", 1, 20),
         "listing_min_trading_days": ("int", 20, 1200),
+        # v7.0.12 候选池选股门槛
+        "backtest_positive": ("bool", None, None),
+        "backtest_window_years": ("int", 1, 30),
+        "min_ttm_yield_pct": ("float", 0, 100),
+        "price_min_yuan": ("float", 0, 1e4),
+        "price_max_yuan": ("float", 0, 1e5),
     },
 }
 
@@ -307,6 +313,9 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
             elif typ == "str":
                 if not isinstance(v, str) or not v.strip():
                     errors.append(f"{section}.{field} 必须是非空字符串")
+            elif typ == "bool":
+                if not isinstance(v, bool):
+                    errors.append(f"{section}.{field} 必须是布尔（true/false）")
             elif typ == "enum":
                 if v != lo:
                     errors.append(f"{section}.{field} 目前只支持 {lo!r}")
@@ -335,6 +344,13 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
         try:
             if float(st["first_drawdown_pct"]) + float(st["add_step_pct"]) >= 100:
                 errors.append("strategy.first_drawdown_pct + add_step_pct 必须 < 100")
+        except (TypeError, ValueError):
+            pass
+    un = cfg.get("universe", {})
+    if isinstance(un, dict) and all(k in un for k in ("price_min_yuan", "price_max_yuan")):
+        try:
+            if float(un["price_min_yuan"]) > float(un["price_max_yuan"]):
+                errors.append("universe.price_min_yuan 不能大于 price_max_yuan")
         except (TypeError, ValueError):
             pass
 
@@ -774,13 +790,15 @@ def _lake_or_raise() -> None:
 
 
 def _load_pool_ctx(cfg_path: Optional[str] = None):
-    """配置 + 连接 + 股票池（/api/positions 与 /api/pool 共用）。
+    """配置 + 连接 + 候选池（/api/positions 与 /api/pool 共用）。
 
     cfg_path 缺省 = 活动策略 config/strategy.yaml；策略库快照路径由调用方解析后传入。
+    v7.0.12：build_pool（基础 5 条件）→ build_candidate_pool（∩ 十年回测为正
+    ∩ 股息率 ∩ 价格区间 ∪ 手动添加；G7 读预计算表 O(1)，请求路径零回测）。
     """
     from martingale.config import load_config as mload
     from martingale.data import connect_readonly
-    from martingale.universe import build_pool
+    from martingale.selection import build_candidate_pool, load_manual_pool
 
     try:
         sp, up = mload(cfg_path or str(CONFIG_PATH))
@@ -788,16 +806,21 @@ def _load_pool_ctx(cfg_path: Optional[str] = None):
         raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
     con = connect_readonly(None)
     try:
-        pool = build_pool(con, up)
+        manual = load_manual_pool()
+        pool = build_candidate_pool(con, up, manual=manual)
     except Exception as exc:  # noqa: BLE001
         con.close()
-        raise HTTPException(status_code=500, detail=f"股票池构建失败: {exc}")
+        raise HTTPException(status_code=500, detail=f"候选池构建失败: {exc}")
     return sp, up, con, pool
 
 
 @app.get("/api/pool")
 def get_pool() -> Dict[str, Any]:
-    """股票池：漏斗 5 条件计数 + 成员（同步；调研实测 ~1s）。"""
+    """候选池：漏斗计数 + 成员（含十年回测/股息率/价格/手动标记；同步 ~1s）。
+
+    候选池 ≠ 买入信号：入选只代表进入策略候选；买不买看价格是否到策略触发线
+    （「我的持仓」页信号 / 微信提醒，同口径）。
+    """
     _sp, _up, con, pool = _load_pool_ctx()
     try:
         members = [
@@ -810,8 +833,13 @@ def get_pool() -> Dict[str, Any]:
                 "ttm_yield_pct": m.ttm_yield_pct,
                 "n_bars": m.n_bars,
                 "list_date": m.list_date,
+                "bt_pnl_pct": (round(m.bt_pnl_pct * 100.0, 2)
+                               if m.bt_pnl_pct is not None else None),
+                "bt_n_buys": m.bt_n_buys,
+                "price_latest": m.price_latest,
+                "is_manual": m.is_manual,
             }
-            for m in sorted(pool.members, key=lambda x: x.ts_code)
+            for m in pool.members
         ]
     finally:
         con.close()
@@ -820,6 +848,39 @@ def get_pool() -> Dict[str, Any]:
         "n_members": len(members),
         "members": members,
     }
+
+
+# ---------------------------------------------------------------------------
+# 候选池手动添加（POST/DELETE /api/pool/manual → data/manual_pool.json）
+# ---------------------------------------------------------------------------
+@app.post("/api/pool/manual")
+def add_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """手动加入候选池（绕过回测/股息率/价格门槛；存在且未退市才允许）。"""
+    from martingale.data import connect_readonly
+    from martingale.selection import add_manual_code
+
+    con = connect_readonly(None)
+    try:
+        try:
+            entry = add_manual_code(con, str(payload.get("ts_code", "")))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        con.close()
+    return {"ok": True, "entry": entry}
+
+
+@app.delete("/api/pool/manual")
+def remove_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """手动移出候选池（幂等：不在池 → ok=False）。"""
+    from martingale.selection import normalize_ts_code, remove_manual_code
+
+    try:
+        code = normalize_ts_code(str(payload.get("ts_code", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    removed = remove_manual_code(code)
+    return {"ok": removed, "ts_code": code}
 
 
 def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:

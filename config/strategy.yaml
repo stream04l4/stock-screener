@@ -1,9 +1,9 @@
 # =============================================================================
-# stock-screener v7.0 策略配置（slim schema，2026-10-22）
+# stock-screener v7.0 策略配置（slim schema，2026-10-22；v7.0.12 扩展 universe 选股门槛）
 #
-# 结构（定案，勿增删键）：
+# 结构：
 #   strategy:   深回撤金字塔加仓参数（9 键，含固定 name）
-#   universe:   股票池 5 条件（SOE 恒强制，不设开关）
+#   universe:   股票池 5 条件 + 候选池选股门槛 5 键（v7.0.12；SOE 恒强制，不设开关）
 #   lake:       数据湖配置（lake.config.lake_cfg() 读取；lake-sync 依赖，勿删）
 #   datasource: lake-sync 数据源子段（sina/rf/baostock 必留；lake_backfill 唯一消费点）
 #
@@ -52,9 +52,19 @@ universe:                           # 股票池（全链 5 条件；漏斗 5556�
     - 国资
   min_total_mv_yi: 200              # ④ 总市值下限（亿元，最新估值日）
   min_consecutive_div_years: 5      # ⑤ 连续分红年数下限（老股=最近 N 年；
-                                    # 新股=上市次年起全部年度——语义 as-is 移植 v6.x）
+                                    #   新股=上市次年起全部年度——语义 as-is 移植 v6.x）
   listing_min_trading_days: 250     # ②' 上市满 N 个交易日（K线行数）
   # ② 存活+非ST（delist_date IS NULL AND is_st=0）为固定条件，不设开关
+  # —— v7.0.12 候选池选股门槛（Joel 2026-10-24 拍板；波动率门槛经讨论明确不加）——
+  # 股票池 = 候选池：入选 ≠ 买入信号；买不买看价格是否到策略触发线（我的持仓页）。
+  # ⑦⑧⑨ 在 ①~⑤ 基础漏斗之上逐层过滤；手动添加（data/manual_pool.json）绕过 ⑦⑧⑨。
+  backtest_positive: true           # ⑦ 十年回测必须为正（≥1 次触发 且 净利>0，
+                                    #   含现金分红、扣 3bps 佣金；从未触发=不入选）
+  backtest_window_years: 10         # ⑦ 回测窗口（滚动，截至最新 K线日；预计算见
+                                    #   lake 表 selection_backtest_10y）
+  min_ttm_yield_pct: 3              # ⑧ TTM 股息率下限（%，最新估值日 valuation_daily）
+  price_min_yuan: 3                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
+  price_max_yuan: 100               # ⑨ 股价区间上限（元；保证 1 万加仓档 ≥1 手粒度）
 
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
   baostock_daily_budget: 5000       # Q2：BaoStock 日预算上限（次/日，config 可调；到顶当日停、次日续）

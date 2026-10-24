@@ -35,7 +35,9 @@ export const SECTION_DESC = {
     "金额按 base_add_amount×growth_ratio 阶梯递增，上不封顶、不卖出、无熔断。" +
     "注意：首轮首仓占 k=0 档，所以首轮第一个加仓 = base_add_amount×growth_ratio；再武装后的新轮从 base_add_amount 起。",
   universe:
-    "同时满足 5 个条件才入池：行业白名单、央国企、总市值下限、上市天数、连续分红（具体阈值见下方字段）。",
+    "候选池门槛 = 基础 5 条件（行业白名单、央国企、总市值下限、上市天数、连续分红）" +
+    "叠加 3 道选股门槛（十年回测为正、股息率下限、股价区间）；入选 ≠ 买入信号，" +
+    "买不买看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。",
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,11 @@ export const FIELD_LABELS = {
   "universe.min_total_mv_yi": "总市值下限（亿元）",
   "universe.min_consecutive_div_years": "连续分红年数下限",
   "universe.listing_min_trading_days": "最少上市交易日",
+  "universe.backtest_positive": "十年回测必须为正",
+  "universe.backtest_window_years": "回测窗口（年）",
+  "universe.min_ttm_yield_pct": "股息率下限 TTM（%）",
+  "universe.price_min_yuan": "股价下限（元）",
+  "universe.price_max_yuan": "股价上限（元）",
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +95,14 @@ export const FIELD_DESC = {
   "universe.min_consecutive_div_years":
     "要连续这么多年的完整年度都有分红：上市满 7 年 → 看最近 N 年；不满 7 年 → 上市以来每个完整年度都要有",
   "universe.listing_min_trading_days": "上市交易天数没满这个数 → 剔除",
+  // v7.0.12 候选池选股门槛
+  "universe.backtest_positive":
+    "开关：十年滚动回测（含分红、扣佣金）净利为正且至少触发过一次策略的股票才有资格进候选池；关掉则跳过这道门槛",
+  "universe.backtest_window_years":
+    "从最新 K线日往回数 N 年作为回测窗口（滚动，每日刷新）",
+  "universe.min_ttm_yield_pct": "最新估值日 TTM 股息率低于这个数 → 剔除",
+  "universe.price_min_yuan": "最新收盘价低于这个价 → 剔除（远离退市风险区）",
+  "universe.price_max_yuan": "最新收盘价高于这个价 → 剔除（保证加仓档位整手可行）",
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +126,11 @@ export const FIELD_TYPE = {
   min_total_mv_yi: "float",
   min_consecutive_div_years: "int",
   listing_min_trading_days: "int",
+  backtest_positive: "bool",
+  backtest_window_years: "int",
+  min_ttm_yield_pct: "float",
+  price_min_yuan: "float",
+  price_max_yuan: "float",
 };
 
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。

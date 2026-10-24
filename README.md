@@ -33,11 +33,19 @@ Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
 - **组合聚合**：gdates 全局轴 + 末值向前结转（停牌持仓不消失）。
 - 已知局限：湖内无退市股（幸存者偏差）→ 回测产物带此声明。
 
-## 2. 股票池（universe，5 条件全链，全离线单库）
+## 2. 股票池 = 候选池（v7.0.12，基础 5 条件 + 选股门槛 ∪ 手动添加）
 
-`kline_daily 5556 只 → 行业白名单(csric2) → SOE(国资前十大股东) → 总市值≥200亿
-→ 上市≥250 bars → 连续分红N年 = 池`（当前 101 只：86 老股 + 15 新股；
-新股规则按 brief as-is 移植，与研究口径 94/95 的差异全部来自新股分红语义）。
+**候选池 ≠ 买入信号**：入选只代表进入策略候选名单；是否买入看价格是否到策略触发线
+（Web「我的持仓」页信号 / 微信 PushPlus 提醒，同一口径，`martingale/signals.py`）。
+
+基础 5 条件（`build_pool`）：`kline_daily 5556 只 → 行业白名单(csric2) → SOE(国资前十大股东)
+→ 总市值≥200亿 → 上市≥250 bars → 连续分红N年`。
+选股门槛（v7.0.12，Joel 2026-10-24 拍板；波动率门槛经讨论不加）：
+⑦ **十年滚动回测为正**（≥1 次触发且净利>0，含分红扣佣金；预计算表 `selection_backtest_10y`，
+fail-closed：缺行不入选）→ ⑧ **TTM 股息率≥3%** → ⑨ **价格 3~100 元**。
+**手动添加**：`data/manual_pool.json`（Web 页签入口 / `POST/DELETE /api/pool/manual`）
+绕过 ⑦⑧⑨ 恒在候选池；退市自动剔除；与自动入选重叠时保留自动版并标记 `is_manual`。
+生产首跑（2026-10-24，as_of 10-23）：98 → 82(⑦) → 60(⑧) → **59 只**。
 
 SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
 或名称含 soe_keywords 任一（国务院/国资委/汇金/财政部/国资）。
@@ -45,7 +53,8 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 ## 3. CLI
 
 ```bash
-.venv/bin/python -m martingale pool                       # 打印池 + 漏斗
+.venv/bin/python -m martingale pool                       # 打印候选池 + 全漏斗
+.venv/bin/python -m martingale selection                  # 候选池选股预计算（湖表刷新）
 .venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21 \
     --out /tmp/bt_out                                     # 全池回测
 .venv/bin/python -m martingale backtest --codes sh.601088,sz.000651 --out /tmp/bt2
@@ -53,6 +62,9 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 ```
 
 - 窗口留空 = 各股数据起点 → 数据终点。
+- `selection` = 基础池逐股十年滚动回测 → 整表刷新湖表 `selection_backtest_10y`
+  （98 只 ~2s，纯湖内计算零网络零配额）；每日作业在湖增量后自动追加执行，
+  失败不阻断（Web 候选池 ⑦ 读旧快照 fail-closed，次日重算）。
 - 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
 - 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
 
@@ -74,6 +86,10 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | min_total_mv_yi | 总市值门槛（亿） |
 | | min_consecutive_div_years | 连续分红年数 |
 | | listing_min_trading_days | 最少上市 bar 数 |
+| | backtest_positive | ⑦ 十年回测为正开关（v7.0.12） |
+| | backtest_window_years | ⑦ 回测窗口年数（滚动） |
+| | min_ttm_yield_pct | ⑧ TTM 股息率下限（%） |
+| | price_min_yuan / price_max_yuan | ⑨ 最新价区间（元） |
 | lake / datasource.* | — | lake-sync / 补数专用，Web 只读不渲染 |
 
 **首轮 k=0 占档说明（必附注）**：首仓占用 k=0 档（金额 initial_amount），
@@ -88,11 +104,14 @@ systemctl --user status stock-screener-web     # uvicorn web.app:app
 systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改动后
 ```
 
-四页签：**回测**（参数表单 + SSE 进度 + 结果区：per_stock 表/净值曲线/buys/summary）·
-**查询**（/api/positions 逐股状态 + /api/pool 池；行点击弹「状态+历史」）·
-**策略**（参数编辑/校验/策略库快照）· **数据湖**（v6 原样）。
+五页签（v7.0.12 新增**候选池**）：**我的持仓**（录入/信号/提醒状态）·
+**候选池**（全漏斗 + 成员：10年回测%/股息率/最新价/来源；手动添加录入条 + 手动行点行移除）·
+**策略**（参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
+**数据湖**（v6 原样）。
 
-主要 API：`/api/health` · `/api/pool` · `/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份）·
+主要 API：`/api/health` · `/api/pool`（候选池：漏斗 + 成员，读预计算表 O(1)）·
+`/api/pool/manual`（POST 手动加入 / DELETE 移除，写 `data/manual_pool.json`）·
+`/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份）·
 `/api/positions`（同步全池）· `/api/bt/runs`（POST 触发 / GET 列表 / `{id}` status /
 `{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*` · 策略库 CRUD。
 回测 = 异步子进程（单任务 409 + pidfile 锁），进度 SSE（15s 心跳，断线 3 次降级 3s 轮询）。
@@ -102,6 +121,9 @@ systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改
 crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_sync_daily.sh`，
 数据湖每日同步，martingale 的一切查询都依赖它）。v6 的 `35 9 * * 1-5 run_cron.sh`
 （多因子日跑）已删除。
+
+**v7.0.12**：lake-sync 脚本在湖增量结束后自动追加 `python -m martingale selection`
+（候选池选股预计算，~2s，纯湖内计算；失败不阻断，exit 仍取湖增量 RC）。
 
 **v7.0.8 增量提速**：T2 K线/T3 估值快照改 tushare 全市场单日批量
 （`pro.daily`/`pro.adj_factor`/`pro.daily_basic` 各 1 次/分钟限频，~2.5min），

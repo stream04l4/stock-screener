@@ -130,7 +130,10 @@ def test_strategy_yaml_v7_schema_shape():
                      "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"}
     assert set(cfg["universe"].keys()) == {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
-        "min_consecutive_div_years", "listing_min_trading_days"}
+        "min_consecutive_div_years", "listing_min_trading_days",
+        # v7.0.12 候选池选股门槛
+        "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
+        "price_min_yuan", "price_max_yuan"}
     assert "lake" in cfg and "datasource" in cfg
     assert {"sina", "rf", "baostock"} <= set(cfg["datasource"].keys())
     # 旧 12 段不得回潮
