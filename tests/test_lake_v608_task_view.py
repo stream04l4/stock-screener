@@ -83,8 +83,9 @@ def test_fresh_run_view_midrun_progress_and_eta(tmp_path, monkeypatch):
 
     def worker(task):
         time.sleep(0.01)  # 让 ETA 有真实耗时样本（非零）
-        # mark_done 之后、_update_task_view 之前文件未落盘；这里读的是**上一任务
-        # 收尾**写入的进度——第 2/3 个任务时 = 1/3、2/3（首个任务时文件尚不存在）
+        # 读的是**上一任务收尾**写入的进度——第 2/3 个任务时 = 1/3、2/3
+        # （v7.0.9：视图落盘 10s 节流 + done 批量落盘 → 本测试用虚拟时钟
+        # 让节流恒命中、_MARK_FLUSH_BATCH=1 让逐任务立即可见，语义同 v6.0.8）
         try:
             e = _view_entry(_read_prog(prog_path), "kline_history", "P2")
         except FileNotFoundError:
@@ -92,7 +93,17 @@ def test_fresh_run_view_midrun_progress_and_eta(tmp_path, monkeypatch):
         if e is not None:
             seen_done.append((e["done"], e["total"]))
 
+    import lake.backfill as lb
+
+    clock = [0.0]
+
+    def _fast_clock():
+        clock[0] += 11.0   # 每次调用虚拟时钟 +11s → 视图 ≥10s 节流恒命中
+        return clock[0]
+
+    monkeypatch.setattr(lb.time, "monotonic", _fast_clock)
     r = BackfillRunner(budget_per_day=5000, progress_path=prog_path)
+    r._MARK_FLUSH_BATCH = 1   # v7.0.9：本测试要求逐任务文件可见 → 关闭批量
     r.run(tasks, worker)
     # 首个任务读文件时尚无 entry（None 被跳过）；第 2/3 个任务读到 1/3、2/3
     assert seen_done == [(1, 3), (2, 3)], f"中途 done 应逐任务增长: {seen_done}"
@@ -231,6 +242,7 @@ def test_mark_done_idempotent_unchanged(tmp_path, monkeypatch):
     task = Task(priority=2, table="kline_history", ts_code="sh.601398",
                 period_or_date="full_history", tier="P2")
     r = BackfillRunner(budget_per_day=5000, progress_path=prog_path)
+    r._MARK_FLUSH_BATCH = 1   # v7.0.9：批量落盘 → 本测试置 1 保持"即写即可见"语义
     r.mark_done(task)
     r.mark_done(task)   # 重复标记（幂等）
     prog = _read_prog(prog_path)

@@ -296,10 +296,11 @@ def test_full_three_phases_sequential_and_data_landed(tmp_path, monkeypatch, cap
     # 阶段 4 T6（v6.1.7）：holders_snapshot（fake 2 期×3 股东/股 → 每股 6 行）
     n_t6 = con.execute("SELECT COUNT(*) FROM holders_snapshot").fetchone()[0]
     assert n_t6 == 2 * 6, f"holders_snapshot 应 12 行（2 股×2 期×3 股东）: {n_t6}"
-    # 取数计数：history 每股 1 次全史；P3 T2/T7 用窗口 K线（T2 2 股 + T7 4 指数）；
-    # T6 每股 1 次 fetch_holders（code6 口径）
+    # 取数计数：history 每股 1 次全史；P3 T2 被 v7.0.9 预检跳过（history 阶段已落
+    # 当日 K线，窗口重取冗余）；kline 计数 = 1（data_date 指数探测）+ 4 指数
     assert counter["full_history"] == 2, f"history 应每股一次全史: {counter}"
-    assert counter["kline"] == 2 + len(INDEX_CODES), f"P3 T2/T7 窗口取数: {counter}"
+    assert counter["kline"] == 1 + len(INDEX_CODES), \
+        f"P3 预检跳 T2 + T7 窗口取数: {counter}"
     assert counter["holders"] == {"600001": 1, "000002": 1}, \
         f"T6 应每股一次 fetch_holders（code6）: {counter['holders']}"
     # 段标日志（stdout）：六阶段开始/结束成对、顺序正确（耗时值不硬断言——计时非契约）
@@ -343,11 +344,13 @@ def test_full_idempotent_rerun_all_skipped(tmp_path, monkeypatch):
     # history：done 键 full_history 全跳过（零重取）
     assert r2["phases"]["history"]["skipped_done"] == 1
     assert r2["phases"]["history"]["processed"] == 0
-    # P3：kline_daily/valuation_daily/index_daily done 键 inc:<今日> 全跳过
+    # P3：同日重跑 → v7.0.9 预检判已齐 → 零任务/零取数（比"done 键全跳过"更强；
+    # 全齐时早退 → 子键可能不存在，用 .get 容两种形态）
     p3 = r2["phases"]["p3"]
-    assert p3["t2"]["skipped_done"] == 1 and p3["t2"]["processed"] == 0
-    assert p3["t3"]["skipped_done"] == 1 and p3["t3"]["processed"] == 0
-    assert p3["t7"]["skipped_done"] == len(INDEX_CODES) and p3["t7"]["processed"] == 0
+    for _sub in ("t2", "t3", "t7"):
+        _s = p3.get(_sub) or {}
+        assert _s.get("processed", 0) == 0, f"Run2 P3 {_sub} 应零处理: {_s}"
+        assert not _s.get("errors"), f"Run2 P3 {_sub} 应无错: {_s}"
     # T5：f10_full done 键全跳过 → adata 零重取
     assert r2["phases"]["t5"]["skipped_done"] == 1
     assert r2["phases"]["t5"]["processed"] == 0
@@ -355,7 +358,7 @@ def test_full_idempotent_rerun_all_skipped(tmp_path, monkeypatch):
     assert r2["phases"]["t6"]["skipped_done"] == 1
     assert r2["phases"]["t6"]["processed"] == 0
     assert counter["full_history"] == 0, f"Run2 history 应零全史重取: {counter}"
-    assert counter["kline"] == 0, f"Run2 P3 应零窗口重取: {counter}"
+    assert counter["kline"] == 1, f"Run2 P3 仅 data_date 指数探测: {counter}"
     assert counter["holders"] == {}, f"Run2 T6 应零 fetch_holders 重取: {counter['holders']}"
     # upsert 幂等：行数不翻倍（T6 load_t6 先删后插——重灌也不翻倍）
     assert con.execute("SELECT COUNT(*) FROM kline_daily").fetchone()[0] == 3
@@ -420,10 +423,12 @@ def test_full_t5_phase_exception_marks_error_and_survives_view_refresh(tmp_path,
     summary = drv.run_full(con, db, codes, "1990-01-01", FIXED_TODAY, days=3)
 
     # T5 阶段记 error、不抛；history/p3 照常 ok
+    # （P3 T2 被 v7.0.9 预检跳过——history 阶段已落当日 K线 → processed=0 也 ok）
     assert summary["phases"]["t5"]["ok"] is False
     assert "T5 阶段故障" in summary["phases"]["t5"]["error"]
     assert summary["phases"]["history"]["ok"] is True
-    assert summary["phases"]["p3"]["t2"]["processed"] == 1
+    assert summary["phases"]["p3"]["ok"] is True
+    assert (summary["phases"]["p3"].get("t2") or {}).get("processed", 0) == 0
     assert summary["all_ok"] is False
 
     # progress：fundamentals_quarterly state=error + last_error（收尾刷新后仍 error）

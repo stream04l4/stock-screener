@@ -246,6 +246,11 @@ class BackfillRunner:
         # v6.0.9：SIGTERM 优雅停止标志（Web"停止同步"按钮 → sync_control.stop_sync
         # killpg/kill SIGTERM）。run() 注册 handler 置位；主循环**任务间**检查 break。
         self._stop_requested = False
+        # v7.0.9：mark_done 批量落盘计数 + 视图落盘节流时间戳（见 mark_done /
+        # _update_task_view——原来每任务 2 次 12MB 原子写 ≈ 1-3s/任务纯簿记，
+        # 5219 只 ≈ 2-3h，是"15 分钟增量"承诺的隐形杀手）。
+        self._pending_marks = 0
+        self._last_view_save = 0.0
         # v6.0.10：SIGTERM handler 置 _stop_requested 时同步落盘的"停止收尾中"标记
         # （progress 顶层 stopping_at，Web /status 读 progress 文件得 stopping=true——
         # 跨进程可观测的唯一载体是库目录下的 JSON 文件）。run() 开始处清除。
@@ -256,17 +261,33 @@ class BackfillRunner:
         """从进度文件读 done 明细（self.progress['done'] = [key,...]）。"""
         self._done = set(tuple(k) for k in self.progress.get("done", []))
 
+    # v7.0.9：done 明细批量落盘间隔（条）。原实现每次 mark_done 重建 159K 条
+    # done 集合 + 排序 + 重写 12.1MB 进度文件（1-2s/任务）；批量后 5219 只的
+    # 簿记开销从 ~2.2h 降到 ~30s。崩溃窗口 = 至多丢一批标记 → 对应股票下轮
+    # 重处理（worker 全部幂等 upsert/no-op，安全）。
+    _MARK_FLUSH_BATCH: int = 200
+
     def mark_done(self, task: Task) -> None:
-        """落盘即标记 done（幂等：重复标记无副作用；写进度文件）。"""
+        """标记 done（幂等：重复标记无副作用）。
+
+        v7.0.9：内存集合即时生效（is_done 立即可见），进度文件按
+        ``_MARK_FLUSH_BATCH`` 批量落盘；run() 收尾与优雅停止收尾处强制终刷。
+        """
         key = task_key(task)
         if key not in self._done:
             self._done.add(key)
-            self.progress.setdefault("done", [])
-            # 去重后写回（list of [table, ts_code, period]）
-            existing = set(tuple(x) for x in self.progress["done"])
-            existing.add(key)
-            self.progress["done"] = [list(k) for k in sorted(existing)]
-            save_progress(self.progress, self.progress_path)
+            self._pending_marks += 1
+            if self._pending_marks >= self._MARK_FLUSH_BATCH:
+                self._flush_done_marks()
+
+    def _flush_done_marks(self) -> None:
+        """把内存 done 集合整体刷到进度文件（去重排序；save_progress 原子写）。"""
+        if not self._pending_marks:
+            return
+        self.progress.setdefault("done", [])
+        self.progress["done"] = [list(k) for k in sorted(self._done)]
+        save_progress(self.progress, self.progress_path)
+        self._pending_marks = 0
 
     def is_done(self, task: Task) -> bool:
         return task_key(task) in self._done
@@ -330,12 +351,16 @@ class BackfillRunner:
         handler 仍保持最简：不碰 DuckDB/网络（信号可能到达于任意指令之间）；只改内存
         标志 + 一次纯 JSON 文件写（save_progress 是 tmp+rename 原子写，无事务风险）。
 
-        DEFECT-HANG-1（R4）：启动"快速退出兜底"线程——若主线程 15s 内未走完收尾
+        DEFECT-HANG-1（R4）：启动"快速退出兜底"线程——若主线程 30s 内未走完收尾
         （worker 卡在无法打断的 C 层阻塞 / 异常路径漏了 break），daemon 线程 os._exit(0)
         强制退出。为什么安全：SIGTERM 到达时**没有进行中的 DuckDB 写事务**（flock +
-        单连接，语句原子性兜底）；进度文件已在每次 mark_done/_update_task_view 落盘，
-        done 键完整 → 下次续传无损。os._exit 跳过 atexit/DuckDB close——flock 与文件
-        fd 由 OS 在进程退出时自动释放（R4：≤20s 退出 + fuser clean）。
+        单连接，语句原子性兜底）；进度文件已批量落盘（v7.0.9，至多丢一批幂等标记）
+        → 下次续传无损。os._exit 跳过 atexit/DuckDB close——flock 与文件
+        fd 由 OS 在进程退出时自动释放（R4：≤40s 退出 + fuser clean）。
+        v7.0.9：15s → 30s——driver 收尾新增 CHECKPOINT（正常 1-5s、慢盘 ~16s），
+        15s 窗口会把 CHECKPOINT 拦腰杀掉（WAL 未落盘 → 行组统计损坏复发，
+        见 2026-10-24 事故）；CHECKPOINT 中断也只会退回"WAL 待重放"的原状态，
+        不会更坏（DuckDB 仅在 checkpoint 完整完成后才截断 WAL）。
         """
         self._stop_requested = True
         set_stop_requested()   # v6.0.10：模块级标志（重试循环提前中断）
@@ -348,8 +373,8 @@ class BackfillRunner:
             import os as _os
             import time as _time
 
-            _time.sleep(15.0)   # 给主循环收尾留足窗口（任务边界 break + summary 落盘）
-            log.warning("SIGTERM 后 15s 主线程仍未退出 → os._exit(0) 强制收尾"
+            _time.sleep(30.0)   # 给主循环收尾留足窗口（任务边界 break + CHECKPOINT + summary 落盘）
+            log.warning("SIGTERM 后 30s 主线程仍未退出 → os._exit(0) 强制收尾"
                         "（flock/进度文件随进程退出释放，done 键已落盘可续传）")
             _os._exit(0)
 
@@ -407,6 +432,7 @@ class BackfillRunner:
         done_total = sum(
             g["done_at_start"] + g["done_in_run"] for g in self._view_groups.values())
         self._refresh_task_view()
+        self._flush_done_marks()   # v7.0.9：停止收尾前把最后一批标记落盘（续传无损）
         for entry in self.progress.get("tasks", []):
             if isinstance(entry, dict):
                 entry["state"] = "stopped_by_signal"
@@ -527,6 +553,7 @@ class BackfillRunner:
         self._refresh_task_view()
         # 收尾：写 coverage（各表行数/代码数/年份范围）
         self._refresh_coverage()
+        self._flush_done_marks()   # v7.0.9：终刷——最后一批标记随最终文件落盘
         save_progress(self.progress, self.progress_path)
         return stats
 
@@ -594,10 +621,13 @@ class BackfillRunner:
             entry["total"] = g["total"]
             entry["done"] = self._view_done_count(task.table, tier)
         entry["eta_min"] = self._eta_min()
-        # v6.0.8：立即落盘——长跑灌数期间 Web 3s 轮询 /status，若只改内存、
-        # run 收尾才 save_progress，中途读到的仍是旧值（total/done 恒 0/0 的
-        # 第二层根因）。mark_done 每任务已落盘一次，此处同频不增额外开销。
-        save_progress(self.progress, self.progress_path)
+        # v7.0.9：节流落盘——原实现**每任务** save_progress 一次（12MB 原子写，
+        # 与 mark_done 叠加 = 双份簿记）；改为 ≥10s 间隔落盘（Web /status 3s 轮询
+        # 读文件，10s 粒度足够），run() 收尾与 mark 批量刷保证终态必落盘。
+        _now = time.monotonic()
+        if _now - self._last_view_save >= 10.0:
+            self._last_view_save = _now
+            save_progress(self.progress, self.progress_path)
 
     def _coverage_conn(self):
         """**B-2（v6.0.3）**：返回 coverage 统计所用的连接。

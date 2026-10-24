@@ -297,16 +297,14 @@ def test_o2_incremental_full_run_and_idempotent_rerun(tmp_path):
     n_i = con.execute("SELECT COUNT(*) FROM index_daily").fetchone()[0]
     assert n_i == len(INDEX_CODES) * 3
 
-    # ---- Run 2：同日重跑 → 全跳过、零重复取数 ----
+    # ---- Run 2：同日重跑 → 预检判全齐 → 提前返回（v7.0.9：比"全跳过"更强——
+    # 零任务零取数；kline 计数 = 1 是 data_date 指数探测，snapshot = 0）----
     counter["kline"] = 0
     counter["snapshot"] = 0
     r2 = drv.run_incremental(con, db, codes, days=3)
-    assert r2["t2"]["skipped_done"] == 3 and r2["t2"]["processed"] == 0
-    assert r2["t3"]["skipped_done"] == 3 and r2["t3"]["processed"] == 0
-    assert r2["t7"]["skipped_done"] == len(INDEX_CODES) and r2["t7"]["processed"] == 0
-    # T2/T7 零重取；T3 仅前置探测 1 次（worker 全跳过）
-    assert counter["kline"] == 0, f"Run2 T2/T7 应零取数: {counter}"
-    assert counter["snapshot"] == 1, f"Run2 T3 仅前置探测: {counter}"
+    assert r2["precheck"]["result"] == "all_up_to_date", r2.get("precheck")
+    assert counter["kline"] == 1, f"Run2 仅 data_date 指数探测: {counter}"
+    assert counter["snapshot"] == 0, f"Run2 T3 应零取数: {counter}"
     # upsert 幂等：行数不翻倍
     assert con.execute("SELECT COUNT(*) FROM kline_daily").fetchone()[0] == n_kl
     assert con.execute("SELECT COUNT(*) FROM index_daily").fetchone()[0] == n_i

@@ -1564,7 +1564,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     if _no_trade:
                         batch = {"date": _batch_date, "no_trade": True,
                                  "t2": {}, "af": {}, "t3": {},
-                                 "t2_codes": 0, "t3_codes": 0}
+                                 "t2_codes": 0, "t3_codes": 0,
+                                 # 指数 bar 日期供 v7.0.9 预检定 data_date
+                                 # （no_trade 场景 = 缺口日前最近交易日；
+                                 # 缺了这里预检会重探一次指数，多 1 次网络）
+                                 "refetch": _refetched,
+                                 "idx_dates": _idx_dates}
                         log.info("incremental 批量: %s 非交易日 → 全缺口视为完成",
                                  _batch_date)
                     elif t2b:
@@ -1599,6 +1604,63 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                           "no_trade": bool(batch.get("no_trade"))}
     elif batch.get("failed"):
         stats["batch"] = {"failed": batch["failed"]}
+
+    # ---- v7.0.9 表级完整性预检（Joel 2026-10-24："不需要更新的数据就不要更新"）----
+    # 每表 1 条等值过滤 SQL（~0.5-2s）判定"数据日全市场是否已齐"：
+    #   已齐 → 跳过该表逐只扫描（不建任务：无 worker、无网络、无 mark_done 空转）；
+    #   全齐 → 提前返回（周末/非交易日不再空转 5219 个 no-op 任务 2h+——2026-10-24
+    #   实锤：K线早完整，进度条却从 0/5219 爬到 5219/5219，纯 12MB 进度文件
+    #   重写的簿记开销）。
+    # 口径安全性（对 2026-10-24 行组统计过期免疫）：等值过滤 date=? 只会被过期
+    # zone map 多扫（假"不完整"→ 多走逐只、幂等安全），不会少扫到假"完整"
+    # （被跳过的行组 stale max < data_date → 逐只 MAX 同样误读 → 数据真缺时
+    # 逐只路径会补）。残留风险：中途空洞（有 data_date 行但缺口窗口更早日期缺）
+    # 不在此预检覆盖——kill/超时遗留的缺口必然表现为"最新日缺"，恒被本检查抓住。
+    data_date: Optional[str] = None
+    if batch.get("date") and batch.get("t2"):
+        data_date = batch["date"]            # 常态交易日：批量日=数据日
+    elif batch.get("no_trade"):
+        _below = [d for d in batch.get("idx_dates", ()) if d < batch["date"]]
+        data_date = max(_below) if _below else None   # no_trade：数据日=缺口日前最近交易日
+    if data_date is None and not batch.get("failed"):
+        # 批量未触发/未执行（缺口分散、tushare 不可用等）→ 指数最新 bar 定数据日
+        try:
+            _idx_probe = fetch_kline_ohlcv(tclient, "sh000001", n=10) or []
+            data_date = max((str(r["date"]) for r in _idx_probe), default=None)
+        except Exception:  # noqa: BLE001 - 探测失败 → 不预检（fail-open 全扫）
+            data_date = None
+    precheck: Dict[str, Any] = {"data_date": data_date, "t2": False, "t3": False,
+                                "t7": False, "t8": False}
+    if data_date:
+        try:
+            precheck["t2"] = con.execute(
+                "SELECT COUNT(DISTINCT ts_code) FROM kline_daily WHERE date=?",
+                [data_date]).fetchone()[0] >= len(codes)
+            precheck["t3"] = con.execute(
+                "SELECT COUNT(DISTINCT ts_code) FROM valuation_daily "
+                "WHERE date IN (?, ?)", [data_date, today_s]).fetchone()[0] >= len(codes)
+            precheck["t7"] = con.execute(
+                "SELECT COUNT(DISTINCT index_code) FROM index_daily WHERE date=?",
+                [data_date]).fetchone()[0] >= len(INDEX_CODES)
+            _t8_max = con.execute(
+                "SELECT MAX(as_of_date) FROM factor_snapshot").fetchone()[0]
+            precheck["t8"] = _t8_max is not None and str(_t8_max)[:10] == data_date
+        except Exception as exc:  # noqa: BLE001 - 预检 SQL 失败 → 回退全扫（fail-open）
+            log.warning("incremental 预检 SQL 失败（回退全扫）: %s", exc)
+            precheck["t2"] = precheck["t3"] = precheck["t7"] = precheck["t8"] = False
+    stats["precheck"] = precheck
+    log.info("incremental 预检 (data_date=%s): K线=%s 估值=%s 指数=%s 因子=%s",
+             data_date, precheck["t2"], precheck["t3"], precheck["t7"], precheck["t8"])
+
+    if precheck["t2"] and precheck["t3"] and precheck["t7"] and precheck["t8"]:
+        precheck["result"] = "all_up_to_date"
+        log.info("incremental 预检: 全部表 %s 已齐 → 无需灌数（提前返回）", data_date)
+        _mark_precheck_done_views(db_path, precheck, len(codes))
+        return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
+                "baostock_probe": probe_res, "source_health": health_res,
+                "multisource": bool(ohlcv_srcs or adj_srcs),
+                "ohlcv_sources": [a.name for a in ohlcv_srcs],
+                "adj_sources": [a.name for a in adj_srcs]}
 
     def t2_worker(task: Task) -> None:
         code = task.ts_code
@@ -1692,15 +1754,41 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                 conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
         time.sleep(0.3)   # 限速纪律（adapter RateLimiter 之外的兜底小睡，同 run_t2）
 
+    # v7.0.9：预检不齐 → 只扫"真缺 data_date 行"的股票（NOT EXISTS 等值过滤，
+    # 对行组统计过期免疫，同预检口径）；常态交易日无人有当日行 → 集合=全集，
+    # 语义与原先全扫一致；预检齐 → 不建任务。
+    if precheck["t2"]:
+        t2_codes: List[str] = []
+    elif data_date:
+        _m2 = {r[0] for r in con.execute(
+            "SELECT m.ts_code FROM stock_master m WHERE NOT EXISTS "
+            "(SELECT 1 FROM kline_daily k WHERE k.ts_code = m.ts_code "
+            "AND k.date = ?)", [data_date]).fetchall()}
+        t2_codes = [c for c in codes if c in _m2]
+    else:
+        t2_codes = list(codes)   # data_date 未知 → 全扫（fail-open）
+        log.warning("incremental T2: data_date 未知 → 全量逐只扫描（fail-open）")
     t2_tasks = [Task(priority=3, table="kline_daily", ts_code=c,
-                     period_or_date=inc_period, tier="P3") for c in codes]
+                     period_or_date=inc_period, tier="P3") for c in t2_codes]
     stats["t2"] = runner.run(t2_tasks, t2_worker)
 
     # ---- T3 valuation_daily：估值快照（date=今日；滞后多少补多少）----
     # v7.0.8：批量命中股零网络（tushare daily_basic）；仅对批量未覆盖股保留
     # 腾讯逐只路径 + 前置一批探测（全空 = 网络/接口故障 → 抛错中止，不标 done，
     # 防"假完成"毒化；个别缺失 = 停牌/单批失败 → 该只跳过，次日新运行日键补）。
-    _t3_legacy = [c for c in codes if c not in batch.get("t3", {})]
+    # v7.0.9：已有 data_date/今日行且不在批量缓存的股跳过（非交易日快照值不变，
+    # 重刷无意义）；批量命中股仍建任务（worker 走批量零网络落库）。
+    if precheck["t3"]:
+        t3_codes: List[str] = []
+    elif data_date:
+        _have3 = {r[0] for r in con.execute(
+            "SELECT DISTINCT ts_code FROM valuation_daily WHERE date IN (?, ?)",
+            [data_date, today_s]).fetchall()}
+        t3_codes = [c for c in codes
+                    if c in batch.get("t3", {}) or c not in _have3]
+    else:
+        t3_codes = [c for c in codes if c not in batch.get("t3", {})]
+    _t3_legacy = [c for c in t3_codes if c not in batch.get("t3", {})]
     if _t3_legacy:
         probe_snaps = fetch_snapshot(tclient, _t3_legacy[:50])
         if not probe_snaps:
@@ -1721,7 +1809,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         time.sleep(0.3)
 
     t3_tasks = [Task(priority=3, table="valuation_daily", ts_code=c,
-                     period_or_date=today_s, tier="P3") for c in codes]
+                     period_or_date=today_s, tier="P3") for c in t3_codes]
     stats["t3"] = runner.run(t3_tasks, t3_worker)
 
     # ---- T7 index_daily：四指数腾讯主源近 N 日 upsert（同 run_t7 取数口径）----
@@ -1767,7 +1855,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         time.sleep(0.3)   # 指数间小睡（同 run_t7）
 
     t7_tasks = [Task(priority=3, table="index_daily", ts_code=ic,
-                     period_or_date=inc_period, tier="P3") for ic in INDEX_CODES]
+                     period_or_date=inc_period, tier="P3") for ic in INDEX_CODES
+                ] if not precheck["t7"] else []
     stats["t7"] = runner.run(t7_tasks, t7_worker)
 
     # ---- T8 factor_snapshot：全市场纯本地重算（v7.0.6 每日增量跟进）----
@@ -1778,30 +1867,75 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # 纪律（同 D-1 单阶段异常）：失败不阻断增量（stats 记痕 + 日志）；
     # progress 视图的 factor_snapshot 条目由 _refresh_incremental_task_view
     # 按 as_of=T2 max date 的落库股数自动归位 done/pending。
-    try:
-        from lake.factors import recompute_all
-        t2_max = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
-        if t2_max is None:
-            stats["t8"] = {"skipped": "T2 kline_daily 无数据"}
-        else:
-            as_of = str(t2_max)[:10]
-            t0 = time.monotonic()
-            rows8 = recompute_all(con, as_of_date=as_of, ts_codes=codes)
-            stats["t8"] = {"as_of": as_of, "rows": rows8,
-                           "elapsed_s": round(time.monotonic() - t0, 1)}
-            log.info("T8 跟进重算完成：%d 股、%d 因子行（as_of=%s，%.1fs）",
-                     len(codes), rows8, as_of, time.monotonic() - t0)
-    except Exception as exc:  # noqa: BLE001 - T8 失败不阻断增量（合成小库缺表等场景同样安全）
-        log.error("T8 因子跟进重算失败（增量不阻断）: %s", exc)
-        stats["t8_error"] = str(exc)
+    if precheck.get("t8"):
+        stats["t8"] = {"skipped": f"预检: as_of={data_date} 已齐"}
+        log.info("T8 预检: factor_snapshot as_of=%s 已齐 → 跳过重算", data_date)
+    elif getattr(runner, "_stop_requested", False):
+        stats["t8"] = {"skipped": "SIGTERM 优雅停止 → 跳过因子重算（下轮跟进）"}
+    else:
+        try:
+            from lake.factors import recompute_all
+            t2_max = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+            if t2_max is None:
+                stats["t8"] = {"skipped": "T2 kline_daily 无数据"}
+            else:
+                as_of = str(t2_max)[:10]
+                t0 = time.monotonic()
+                rows8 = recompute_all(con, as_of_date=as_of, ts_codes=codes)
+                stats["t8"] = {"as_of": as_of, "rows": rows8,
+                               "elapsed_s": round(time.monotonic() - t0, 1)}
+                log.info("T8 跟进重算完成：%d 股、%d 因子行（as_of=%s，%.1fs）",
+                         len(codes), rows8, as_of, time.monotonic() - t0)
+        except Exception as exc:  # noqa: BLE001 - T8 失败不阻断增量（合成小库缺表等场景同样安全）
+            log.error("T8 因子跟进重算失败（增量不阻断）: %s", exc)
+            stats["t8_error"] = str(exc)
 
     # O2/O3：tasks 占位条目刷成真实 total/done + kline_history 完成态 + T5/T6 条目
     _refresh_incremental_task_view(runner, con, today_s)
+    # v7.0.9：预检判"已齐"的表按 done 键计数为 0 → _refresh 会误显 0/total pending，
+    # 这里覆盖为真实态（done=total+备注）。factor_snapshot 无 _refresh 重算路径
+    #（entry 由 precheck 标记直接落盘），无需覆盖。
+    _mark_precheck_done_views(db_path, precheck, len(codes))
     return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
             "baostock_probe": probe_res, "source_health": health_res,
             "multisource": bool(ohlcv_srcs or adj_srcs),
             "ohlcv_sources": [a.name for a in ohlcv_srcs],
             "adj_sources": [a.name for a in adj_srcs]}
+
+
+def _mark_precheck_done_views(db_path: str, precheck: Dict[str, Any],
+                              codes_n: int) -> None:
+    """v7.0.9：预检判"已齐"的表在 tasks 视图置 done=total+备注（幂等、可建条目）。
+
+    为什么必须单独重标：_refresh_incremental_task_view 按 inc:<运行日> done 键
+    重算 done——预检跳过的表零任务 → 无 done 键 → 会被误显 0/total pending。
+    调用点：① run_incremental 早退前 ② run_incremental 收尾（refresh 之后）
+    ③ run_full 收尾兜底 refresh 之后（fresh runner 重算会把 ①② 冲掉）。
+    """
+    from lake.backfill import BackfillRunner, save_progress
+    from lake.ingest.tencent_ingest import INDEX_CODES
+    runner = BackfillRunner(db_path=db_path)
+    data_date = precheck.get("data_date") or "?"
+    marked = False
+    for table, flag, total in (("kline_daily", precheck.get("t2"), codes_n),
+                               ("valuation_daily", precheck.get("t3"), codes_n),
+                               ("index_daily", precheck.get("t7"), len(INDEX_CODES))):
+        if not flag:
+            continue
+        e = next((t for t in runner.progress.get("tasks", [])
+                  if t.get("table") == table), None)
+        if e is None:
+            e = {"table": table, "tier": "P3", "total": total, "done": total,
+                 "quota_used_today": 0, "quota_budget": runner.budget_per_day,
+                 "state": "done", "eta_min": None, "last_error": ""}
+            runner.progress.setdefault("tasks", []).append(e)
+        e["total"] = total
+        e["done"] = total
+        e["state"] = "done"
+        e["note"] = f"预检: {data_date} 已齐 → 跳过扫描"
+        marked = True
+    if marked:
+        save_progress(runner.progress, runner.progress_path)
 
 
 def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
@@ -2465,6 +2599,15 @@ def run_full(con, db_path: str, codes: Optional[List[str]],
                                        _today_beijing())
     except Exception as exc:  # noqa: BLE001 - 视图刷新失败不阻断（summary 已含各阶段结果）
         log.warning("full 收尾 tasks 视图刷新失败（不阻断）: %s", exc)
+    # v7.0.9：预检"已齐"态刚被上面的 refresh 重算成 0/total pending（预检跳过的表
+    # 零任务 → 无 done 键）→ 用 p3 阶段返回的 precheck 重标（幂等）。
+    try:
+        _p3pre = (summary["phases"].get("p3") or {}).get("precheck") or {}
+        if any(_p3pre.get(k) for k in ("t2", "t3", "t7")):
+            # total 与 _refresh 同口径=全集（codes 参数可能为 None 透传）
+            _mark_precheck_done_views(db_path, _p3pre, len(_universe_codes(con)))
+    except Exception as exc:  # noqa: BLE001 - 重标失败不阻断（日志已记录）
+        log.warning("full 收尾预检视图重标失败（不阻断）: %s", exc)
     # ⚠️ _refresh_incremental_task_view 会**无条件覆盖** fundamentals_quarterly/T2/T3
     # entry 的 state（done==total→done / 否则 pending）——上面刚标的 phase error 会被
     # 冲掉。视图刷新后对失败阶段**重标** error（幂等；brief"该任务 state=error"以最终
@@ -2967,6 +3110,17 @@ def _run_unlocked(args) -> int:
         print(f"错误: 数据湖不可用 —— {exc}", file=sys.stderr)
         return EXIT_LAKE_UNAVAILABLE
     finally:
+        try:
+            # v7.0.9：退出前 CHECKPOINT——行组统计持久化 + WAL 并入主文件。
+            # 2026-10-24 事故：灌数被 SIGTERM 杀（os._exit 兜底跳过 close）后
+            # 行组 zone-map 统计过期 → 次日按代码 MAX(date) 误读（10-23 读成
+            # 10-22）→ 增量缺口全错、全市场逐只空转。干净退出（含优雅停止）
+            # 必经此处 CHECKPOINT 消除该故障类；read-only 命令 CHECKPOINT 抛错
+            # 被下方捕获，不影响返回码。
+            con.execute("CHECKPOINT")
+            log.info("lake 退出: CHECKPOINT 完成（行组统计已持久化）")
+        except Exception:  # noqa: BLE001 - checkpoint 失败不改返回码（read-only 等）
+            pass
         try:
             con.close()
         except Exception:  # noqa: BLE001

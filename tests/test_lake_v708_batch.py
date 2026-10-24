@@ -459,3 +459,129 @@ def test_batch_call_quota_penalty_fails_fast(monkeypatch):
         assert "配额耗尽" in str(exc), str(exc)
     assert calls["n"] == 1, f"不得重试: {calls}"
     assert sleeps == [], f"不得退避等待: {sleeps}"
+
+
+# ---------------------------------------------------------------------------
+# v7.0.9：表级完整性预检（"不需要更新的数据就不要更新"）
+# ---------------------------------------------------------------------------
+def _seed_all_tables(db: str, codes, data_date: str,
+                     drop_codes_t3: tuple = ()) -> None:
+    """在 data_date 补齐 T3/T7/T8（T2 由 _seed 提供）；drop_codes_t3 = 挖掉的估值股。"""
+    con = lconn.open(db)
+    con.executemany(
+        "INSERT INTO valuation_daily (ts_code,date,total_mv,float_mv,pe_ttm,pb,"
+        "turnover_pct,source,fetched_at,data_version) VALUES (?,?,?,?,?,?,?,'t',"
+        "'2026-09-15 09:00:00','v6.1')",
+        [(c, data_date, 100.0, 80.0, 5.0, 0.8, 1.0)
+         for c in codes if c not in drop_codes_t3])
+    con.executemany(
+        "INSERT INTO index_daily (index_code,date,open,high,low,\"close\",volume,"
+        "source,fetched_at,data_version) VALUES (?,?,1,1,1,1,1,'t',"
+        "'2026-09-15 09:00:00','v6.1')",
+        [(ic, data_date) for ic in INDEX_CODES])
+    con.executemany(
+        "INSERT INTO factor_snapshot (ts_code,as_of_date,factor_name,value,"
+        "source,fetched_at,data_version) VALUES (?,?,?,1.0,'t',"
+        "'2026-09-15 09:00:00','v6.1')",
+        [(c, data_date, "mom_1m") for c in codes])
+    con.close()
+
+
+def test_precheck_all_up_to_date_early_exit(tmp_path, monkeypatch):
+    """全表 data_date 已齐 + 今日非交易日 → 预检提前返回：零逐只任务、零快照、
+    K线只被指数探测调用 1 次（2026-10-24：周末空转 5219 个 no-op 的根治）。"""
+    db = str(tmp_path / "pc1.duckdb")
+    codes = ["sh.600001", "sh.600002"]
+    _seed(db, codes, last_date="2026-09-17")      # K线止于 09-17 → gap=09-18
+    _seed_all_tables(db, codes, "2026-09-17")     # T3/T7/T8 全部 09-17 已齐
+    con = lconn.open(db)
+
+    import lake.ingest.tencent_ingest as tix
+
+    counter = {"kline": 0, "snapshot": 0}
+
+    def fake_kline(client, ts_code, n):
+        counter["kline"] += 1
+        if ts_code == "sh000001":
+            return [{"date": "2026-09-16", "open": 1, "high": 1, "low": 1,
+                     "close": 1, "volume": 1},
+                    {"date": "2026-09-17", "open": 1, "high": 1, "low": 1,
+                     "close": 1, "volume": 1}]
+        return []
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv", fake_kline)
+    monkeypatch.setattr(tix, "fetch_snapshot",
+                        lambda client, ts_codes:
+                        ({c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0,
+                              "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0}
+                          for c in ts_codes if c in codes}))
+    from lake.ingest import source_pool as sp
+    ad = sp.get_adapter("tdx")
+    if ad is not None:
+        monkeypatch.setattr(ad, "available", lambda: False)
+    _fake_batch(monkeypatch, t2_rows=[])          # 09-18 批量空 → no_trade 判定
+
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert r["precheck"]["data_date"] == "2026-09-17", r["precheck"]
+    assert r["precheck"]["result"] == "all_up_to_date", r["precheck"]
+    # 零逐只任务：早退发生在建队列之前 → T2/T3/T7/T8 均无 stats 键
+    assert r.get("t2") is None and r.get("t3") is None
+    assert r.get("t7") is None and r.get("t8") is None
+    # 网络：K线仅指数探测 1 次；快照 0 次
+    assert counter["kline"] == 1, counter
+    assert counter["snapshot"] == 0, counter
+    # 无新写入
+    assert con.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-18'").fetchone()[0] == 0
+    con.close()
+
+
+def test_precheck_partial_only_sweeps_missing(tmp_path, monkeypatch):
+    """T2/T7/T8 齐、T3 缺 1 只 → 只扫那 1 只（T2/T7 零任务、T8 跳过）。"""
+    db = str(tmp_path / "pc2.duckdb")
+    codes = ["sh.600001", "sh.600002"]
+    _seed(db, codes, last_date="2026-09-17")
+    _seed_all_tables(db, codes, "2026-09-17", drop_codes_t3=("sh.600002",))
+    con = lconn.open(db)
+
+    import lake.ingest.tencent_ingest as tix
+
+    counter = {"kline": 0, "snapshot": 0, "snap_calls": []}
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0,
+                "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0} for c in codes}
+
+    def fake_kline(client, ts_code, n):
+        counter["kline"] += 1
+        if ts_code == "sh000001":
+            return [{"date": "2026-09-17", "open": 1, "high": 1, "low": 1,
+                     "close": 1, "volume": 1}]
+        return []
+
+    def fake_snapshot(client, ts_codes):
+        counter["snapshot"] += 1
+        counter["snap_calls"].append(list(ts_codes))
+        return {c: dict(snap[c]) for c in ts_codes if c in snap}
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv", fake_kline)
+    monkeypatch.setattr(tix, "fetch_snapshot", fake_snapshot)
+    from lake.ingest import source_pool as sp
+    ad = sp.get_adapter("tdx")
+    if ad is not None:
+        monkeypatch.setattr(ad, "available", lambda: False)
+    _fake_batch(monkeypatch, t2_rows=[])
+
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert r["precheck"]["t2"] is True and r["precheck"]["t3"] is False
+    assert r["t2"]["total"] == 0 and r["t2"]["processed"] == 0   # K线齐 → 零任务
+    assert r["t3"]["total"] == 1 and r["t3"]["processed"] == 1, r["t3"]
+    assert r["t7"]["total"] == 0                                 # 指数齐 → 零任务
+    assert "skipped" in r["t8"], r.get("t8")                     # 因子齐 → 跳过重算
+    # 快照只探测+取数缺口那只（sh.600002），sh.600001 不碰
+    fetched = [c for call in counter["snap_calls"] for c in call]
+    assert "sh.600001" not in fetched, fetched
+    assert "sh.600002" in fetched, fetched
+    # 缺口估值落库（date=今日 09-18，快照口径）
+    assert con.execute(
+        "SELECT COUNT(*) FROM valuation_daily WHERE ts_code='sh.600002' "
+        "AND date='2026-09-18'").fetchone()[0] == 1
+    con.close()
