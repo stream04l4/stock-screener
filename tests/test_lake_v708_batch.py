@@ -240,6 +240,70 @@ def test_batch_no_trade_day_marks_done_without_write(tmp_path, monkeypatch):
     con.close()
 
 
+def test_batch_weekend_gap_refetches_index_latest_trade_day(tmp_path, monkeypatch):
+    """周一跑：众数缺口=周六（陈旧缺口）→ tushare 批量(周六)空、指数最新 bar=周一
+    → 按指数最新交易日重取批量（2026-10-24 修复：原逻辑回退逐只，周一要 2-4h）。"""
+    db = str(tmp_path / "b5.duckdb")
+    codes = ["sh.600001", "sh.600002"]
+    monkeypatch.setattr(drv, "_today_beijing", lambda: "2026-09-21")  # 周一
+    _seed(db, codes, last_date="2026-09-18")   # 缺口 = 09-19（周六）
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    # 指数 sh000001：09-18 + 09-21（周一）两根 bar；股票 K线 fake 恒空
+    import lake.ingest.tencent_ingest as tix
+
+    calls = {"kline": 0}
+
+    def fake_kline(client, ts_code, n):
+        calls["kline"] += 1
+        if ts_code == "sh000001":
+            return [{"date": "2026-09-18", "open": 1, "high": 1, "low": 1,
+                     "close": 1, "volume": 1},
+                    {"date": "2026-09-21", "open": 1, "high": 1, "low": 1,
+                     "close": 1, "volume": 1}]
+        return []
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv", fake_kline)
+    monkeypatch.setattr(tix, "fetch_snapshot",
+                        lambda client, ts_codes: {c: dict(snap[c])
+                                                  for c in ts_codes if c in snap})
+    from lake.ingest import source_pool as sp
+    ad = sp.get_adapter("tdx")
+    if ad is not None:
+        monkeypatch.setattr(ad, "available", lambda: False)
+
+    # tushare daily：周六(09-19)空 → 重取周一(09-21)有数
+    daily_calls = []
+
+    def fake_daily(trade_date):
+        daily_calls.append(trade_date)
+        if trade_date == "2026-09-19":
+            return []
+        return [{"ts_code": c, "date": trade_date, "open": 10.1, "high": 10.3,
+                 "low": 10.0, "close": 10.25, "preclose": 10.0, "pct_chg": 2.5,
+                 "volume": 123456, "amount": 1000000.0} for c in codes]
+
+    import lake.ingest.tushare_ingest as ti
+    monkeypatch.setattr(ti, "tushare_available", lambda: True)
+    monkeypatch.setattr(ti, "fetch_daily_batch", fake_daily)
+    monkeypatch.setattr(ti, "fetch_adj_factor_batch", lambda d: {})
+    monkeypatch.setattr(ti, "fetch_daily_basic_batch", lambda d: [])
+
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert r.get("batch", {}).get("date") == "2026-09-21", r.get("batch")
+    assert daily_calls == ["2026-09-19", "2026-09-21"], daily_calls
+    # 周一 bar 落库（source=tushare），周六不写
+    n = con.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-21' "
+        "AND source='tushare'").fetchone()[0]
+    assert n == 2, n
+    assert con.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-19'").fetchone()[0] == 0
+    assert r["t2"]["processed"] == 2
+    con.close()
+
+
 def test_multi_day_gap_code_falls_back_legacy(tmp_path, monkeypatch):
     """多日缺口股（停牌）不在批量单日窗口 → 逐只 legacy 补整窗（批量只补单日股）。"""
     db = str(tmp_path / "b4.duckdb")

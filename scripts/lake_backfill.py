@@ -1529,22 +1529,45 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                 from lake.ingest import tushare_ingest as ti
                 if ti.tushare_available():
                     t2b = ti.fetch_daily_batch(_batch_date)
+                    _refetched = False
+                    _idx_dates: set = set()
+                    _no_trade = False
                     if not t2b:
-                        # 空 = 非交易日（或 API 异常）——用腾讯指数最新 bar 判交易日：
-                        # 指数有当日 bar → 交易日（tushare 异常 → 回退逐只）；
-                        # 无 → 休市（全缺口无新数据 → 视为完成，不逐只空转）。
+                        # 空 = 该日非交易日（或 API 异常）——用腾讯指数最新 bar 判定：
+                        # 2026-10-24 修复：众数缺口日可能是"陈旧缺口"（周末/长假后运行日
+                        # 的众数缺口=周六，周一跑时全市场 gap 都停在周六）→ 指数最新 bar
+                        # 才是真实交易日 → 按指数最新日重取批量（原逻辑直接回退逐只，
+                        # 周一要跑 2-4h；修复后走批量 ~15min）。
+                        # 指数最新 <= 缺口日 = 真休市（缺口后无任何交易日 → no_trade）。
                         from lake.ingest.tencent_ingest import fetch_kline_ohlcv as _fki
                         _idx = _fki(tclient, "sh000001", n=10) or []
-                        if any(str(r["date"]) >= _batch_date for r in _idx):
+                        _idx_dates = {str(r["date"]) for r in _idx}
+                        _idx_max = max(_idx_dates, default=None)
+                        if _idx_max is not None and _idx_max > _batch_date:
+                            t2b = ti.fetch_daily_batch(_idx_max)
+                            if not t2b:
+                                raise RuntimeError(
+                                    "tushare 批量 %s 与 %s 均空（指数有 bar）"
+                                    "（API 异常？）→ 回退逐只 legacy"
+                                    % (_batch_date, _idx_max))
+                            log.info(
+                                "incremental 批量: %s 非交易日 → 改取指数最新交易日 %s",
+                                _batch_date, _idx_max)
+                            _batch_date = _idx_max
+                            _refetched = True
+                        elif _idx_max is not None and _idx_max >= _batch_date:
                             raise RuntimeError(
                                 "tushare 批量 K线空但指数 sh000001 有 >= %s bar"
                                 "（API 异常？）→ 回退逐只 legacy" % _batch_date)
+                        else:
+                            _no_trade = True
+                    if _no_trade:
                         batch = {"date": _batch_date, "no_trade": True,
                                  "t2": {}, "af": {}, "t3": {},
                                  "t2_codes": 0, "t3_codes": 0}
                         log.info("incremental 批量: %s 非交易日 → 全缺口视为完成",
                                  _batch_date)
-                    else:
+                    elif t2b:
                         _min_rows = int(lake_cfg().get("batch_min_rows", 3000) or 3000)
                         if len(t2b) < _min_rows:
                             raise RuntimeError(
@@ -1555,7 +1578,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                                  "t2": {r["ts_code"]: r for r in t2b},
                                  "af": afb,
                                  "t3": {r["ts_code"]: r for r in t3b},
-                                 "t2_codes": len(t2b), "t3_codes": len(t3b)}
+                                 "t2_codes": len(t2b), "t3_codes": len(t3b),
+                                 # 重取场景（缺口日=周末、批量日=指数最新交易日）：
+                                 # worker 按"缺口区间内无其他交易日（指数 bar 为空）"
+                                 # 判定批量单日行是否覆盖缺口区间（防多日缺口股漏补）。
+                                 "refetch": _refetched,
+                                 "idx_dates": _idx_dates}
                         log.info(
                             "incremental 批量 (tushare %s): T2=%d T3=%d 股；"
                             "逐只 fallback %d 股", _batch_date, len(t2b), len(t3b),
@@ -1575,16 +1603,28 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     def t2_worker(task: Task) -> None:
         code = task.ts_code
         start = gap_starts[code]
-        # v7.0.8：批量缓存命中 → 零网络落库（tushare 已换算为湖单位：股/元/亿元）；
+        # v7.0.8：批量缓存命中 → 零网络落库（tushare 已换算为湖单位：股/元/亿元）。
+        # 命中口径：缺口日=批量日（常态）；或重取场景（批量日=指数最新交易日 > 缺口日，
+        # 且缺口区间内无其他交易日——指数 bar 为空）→ 批量单日行覆盖整个区间。
         # 非交易日（no_trade）且缺口=批量日 → 无新数据视为完成。
-        if batch.get("date") == start:
-            _brow = batch.get("t2", {}).get(code)
-            if _brow:
-                load_t2(con, code, [_brow], adj_map=batch.get("af", {}).get(code),
-                        source="tushare", volume_is_shares=True)
-                return
-            if batch.get("no_trade"):
-                return
+        _bdate = batch.get("date")
+        if _bdate and start <= _bdate:
+            if start == _bdate:
+                _gap_ok = True
+            elif batch.get("refetch"):
+                _gap_ok = not any(start < _d < _bdate
+                                   for _d in batch.get("idx_dates", ()))
+            else:
+                _gap_ok = False
+            if _gap_ok:
+                _brow = batch.get("t2", {}).get(code)
+                if _brow:
+                    load_t2(con, code, [_brow],
+                            adj_map=batch.get("af", {}).get(code),
+                            source="tushare", volume_is_shares=True)
+                    return
+                if batch.get("no_trade"):
+                    return
         if not ohlcv_srcs and not adj_srcs:
             # legacy 单源路径（池全不可用：离线单测/新源全降级）——腾讯窗口取数
             kl = fetch_kline_ohlcv(tclient, code, n=days + 30) or []
