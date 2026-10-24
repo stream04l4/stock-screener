@@ -32,3 +32,4 @@ web/frontend/node_modules/
 
 # v7：Web PUT /api/strategy 写回前的运行时备份（保留最近一份，可随时手删；不入库）
 config/strategy.yaml.bak
+data/alerts/

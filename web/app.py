@@ -1017,30 +1017,11 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     # - in_pos（持仓中，第 k 档）→ "add"：加仓到第 k+1 档，金额 = base×growth^k
     # - 未持仓（last_status=never，k=0）→ "buy"：首仓买入触发，金额 = initial_amount
     # （状态机「触线即买」→ 湖最后 bar 处湖价恒高于触发价，必须实时价判定）
-    signals: List[Dict[str, Any]] = []
-    for pos in positions:
-        price_now = pos["spot_price"] if pos["spot_price"] is not None else pos.get("last_price")
-        nap_raw = pos.get("next_add_price_raw")
-        if not (price_now is not None and nap_raw is not None and price_now <= nap_raw):
-            continue
-        k = pos.get("k_level") or 0
-        if pos.get("in_pos"):
-            suggested = (_sp.base_add_amount * (_sp.growth_ratio ** k)) if _sp is not None else None
-            action, next_level = "add", k + 1
-        else:
-            suggested = _sp.initial_amount if _sp is not None else None
-            action, next_level = "buy", 1
-        signals.append({
-            "ts_code": pos["ts_code"],
-            "name": pos["name"],
-            "price": price_now,
-            "next_add_price": nap_raw,
-            "k_level": k,
-            "next_level": next_level,
-            "suggested_amount": round(suggested) if suggested is not None else None,
-            "action": action,
-        })
-    signals.sort(key=lambda x: x["ts_code"])
+    # v7.0.11：口径抽至 martingale.signals.build_signals（微信点位提醒脚本共用，
+    # 单一定义点防漂移）
+    from martingale.signals import build_signals
+
+    signals = build_signals(positions, _sp)
     return {
         "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
         "lake_locked": lake_locked,
