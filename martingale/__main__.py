@@ -39,7 +39,7 @@ def _default_config_path() -> str:
 def _cmd_backtest(args) -> int:
     t0 = time.time()
     # 配置优先级：--config（web 层策略选择显式传入）> MARTINGALE_CONFIG 环境变量 > 默认 config/strategy.yaml
-    sp, up = load_config(args.config or _default_config_path())
+    sp, up, tp = load_config(args.config or _default_config_path())
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
@@ -103,7 +103,7 @@ def _db_label() -> str:
 
 def _cmd_status(args) -> int:
     t0 = time.time()
-    sp, up = load_config(_default_config_path())
+    sp, up, tp = load_config(_default_config_path())
     con = connect_readonly(None)
     try:
         if args.codes:
@@ -146,7 +146,7 @@ def _cmd_status(args) -> int:
 
 
 def _cmd_pool(args) -> int:
-    sp, up = load_config(_default_config_path())
+    sp, up, tp = load_config(_default_config_path())
     con = connect_readonly(None)
     try:
         from .selection import build_candidate_pool, load_manual_pool
@@ -185,7 +185,7 @@ def _cmd_selection(args) -> int:
     from .data import default_db_path
     from .selection import refresh_selection
 
-    sp, up = load_config(_default_config_path())
+    sp, up, tp = load_config(_default_config_path())
     p = default_db_path()
     if not os.path.exists(p):
         print(f"数据湖不存在: {p}", file=sys.stderr)
@@ -198,6 +198,40 @@ def _cmd_selection(args) -> int:
     print(f"selection 完成 · as_of={out['as_of']} · 写入 {out['n_written']}/{out['n_codes']} "
           f"（回测为正 {out['n_positive']}）· 耗时 {out['elapsed_s']}s")
     print("提示：候选池立即生效（Web/CLI 读预计算表）")
+    return 0
+
+
+def _cmd_timing(args) -> int:
+    """选股时机预计算 + 新触发微信提醒（候选池逐股 ①价格分位 ②股息率 ③年线）。"""
+    import duckdb
+
+    from .data import default_db_path
+    from .timing import check_and_push, refresh_timing
+
+    sp, up, tp = load_config(_default_config_path())
+    p = default_db_path()
+    if not os.path.exists(p):
+        print(f"数据湖不存在: {p}", file=sys.stderr)
+        return 3
+    con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（同 selection 纪律）
+    try:
+        out = refresh_timing(con, up, tp, verbose=True)
+        if args.no_push:
+            res = {"n_new": None, "pushed": False, "error": None}
+        else:
+            res = check_and_push(con, tp, dry_run=args.dry_run, verbose=True)
+    finally:
+        con.close()
+    new_s = f"新触发 {res['n_new']} 只" if res.get("n_new") is not None else "未检查推送（--no-push）"
+    print(f"timing 完成 · as_of={out['as_of']} · 候选池 {out['n_codes']} 只 · "
+          f"今日选股 {out['n_watchlist']} · 提醒口径 {out['n_push']} · "
+          f"{new_s} · 耗时 {out['elapsed_s']}s")
+    if res.get("pushed"):
+        print("微信提醒已推送（仅新触发）")
+    elif res.get("error"):
+        print(f"推送未发生: {res['error']}", file=sys.stderr)
+        return 4
+    print("提示：页面「选股策略」卡片即时可读（湖表 selection_timing）")
     return 0
 
 
@@ -226,6 +260,13 @@ def main(argv=None) -> int:
     se = sub.add_parser("selection",
                         help="候选池选股预计算（基础池十年滚动回测→湖表；湖增量后自动跑）")
     se.set_defaults(func=_cmd_selection)
+
+    tm = sub.add_parser("timing",
+                        help="选股时机预计算+新触发微信提醒（候选池 ①价格分位 ②股息率 ③年线→湖表 selection_timing）")
+    tm.add_argument("--no-push", action="store_true", help="只算不推（不查边沿状态）")
+    tm.add_argument("--dry-run", action="store_true",
+                    help="算+打印新触发，不推送不落状态（手动验证用）")
+    tm.set_defaults(func=_cmd_timing)
 
     args = ap.parse_args(argv)
     try:

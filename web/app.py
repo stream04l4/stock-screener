@@ -264,12 +264,24 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "price_min_yuan": ("float", 0, 1e4),
         "price_max_yuan": ("float", 0, 1e5),
     },
+    # v7.0.13 选股时机（**可选段**：策略库旧快照无此段，PUT 缺省不报错）
+    "timing": {
+        "price_window_years": ("int", 1, 30),
+        "price_pctile_max": ("float", 1, 100),
+        "yield_min_pct": ("float", 0, 30),
+        "below_ma250": ("bool", None, None),
+        "ma_period": ("int", 20, 1200),
+    },
 }
 
-# 所有必须出现的 (section, field) —— 「所有 key 必须齐全」
+# 所有必须出现的 (section, field) —— 「所有 key 必须齐全」。
+# timing 段**不在必选清单**（可缺省 → martingale.config 默认值）；段存在时 5 键须齐全。
 _REQUIRED_KEYS = [
-    (s, f) for s, fields in _STRATEGY_SCHEMA.items() for f in fields
+    (s, f) for s, fields in _STRATEGY_SCHEMA.items()
+    if s in ("strategy", "universe") for f in fields
 ]
+# 可缺省的配置段（段缺失合法，段存在时字段仍须齐全 + 过类型/范围校验）。
+_OPTIONAL_SECTIONS = frozenset({"timing"})
 
 
 def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
@@ -279,10 +291,11 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
     if not isinstance(cfg, dict):
         return ["strategy 顶层必须是 JSON 对象(mapping)"]
 
-    # 1) key 齐全性
+    # 1) key 齐全性（timing 段可选：策略库旧快照/老 yaml 无此段 → 用默认值，不报错）
     for section, fields in _STRATEGY_SCHEMA.items():
         if section not in cfg or not isinstance(cfg[section], dict):
-            errors.append(f"缺少配置段: {section}")
+            if section not in _OPTIONAL_SECTIONS:
+                errors.append(f"缺少配置段: {section}")
             continue
         for field in fields:
             if field not in cfg[section]:
@@ -801,7 +814,7 @@ def _load_pool_ctx(cfg_path: Optional[str] = None):
     from martingale.selection import build_candidate_pool, load_manual_pool
 
     try:
-        sp, up = mload(cfg_path or str(CONFIG_PATH))
+        sp, up, _tp = mload(cfg_path or str(CONFIG_PATH))
     except Exception as exc:  # noqa: BLE001 - ConfigError → 400
         raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
     con = connect_readonly(None)
@@ -895,6 +908,56 @@ def remove_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
     removed = remove_manual_code(code)
     return {"ok": removed, "ts_code": code}
+
+
+# ---------------------------------------------------------------------------
+# 选股时机（v7.0.13）：GET /api/timing → 今日选股（观察口径 OR）+ 提醒口径标记
+# 读湖表 selection_timing（预计算 O(1)）；请求路径零计算、零网络。
+# ---------------------------------------------------------------------------
+@app.get("/api/timing")
+def get_timing() -> Dict[str, Any]:
+    """今日选股：候选池内已启用时机条件的 OR 命中（in_watchlist）。
+
+    - push_eligible = ①且②（③启用时叠加）——微信"新进入买入区"提醒口径；
+    - 湖表缺失（未跑过 timing 预计算）→ 空列表 + as_of=null（前端提示等待
+      每日湖更新，fail-closed 不误导）；湖持锁/缺失 → 503（灌数中）。
+    """
+    from martingale.config import load_config as mload
+    from martingale.data import connect_readonly
+    from martingale.timing import load_timing_map
+
+    try:
+        _sp, _up, tp = mload(str(CONFIG_PATH))
+    except Exception as exc:  # noqa: BLE001 - ConfigError → 400
+        raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
+    try:
+        con = connect_readonly(None)
+        try:
+            tmap = load_timing_map(con)
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失 → 503（灌数持锁中）
+        raise HTTPException(status_code=503, detail=f"数据湖不可用: {exc}")
+
+    watch = [r for r in tmap.values() if r.get("in_watchlist")]
+    # 排序：会提醒的（push_eligible）优先 → 股息率降序 → 代码
+    watch.sort(key=lambda r: (not r.get("push_eligible"),
+                              -(r.get("ttm_yield_pct") or 0.0), r["ts_code"]))
+    as_of = next((str(r["as_of_date"]) for r in tmap.values()), None)
+    return {
+        "as_of": as_of,
+        "n_pool": len(tmap),
+        "n_watchlist": len(watch),
+        "n_push": sum(1 for r in tmap.values() if r.get("push_eligible")),
+        "params": {
+            "price_window_years": tp.price_window_years,
+            "price_pctile_max": tp.price_pctile_max,
+            "yield_min_pct": tp.yield_min_pct,
+            "below_ma250": tp.below_ma250,
+            "ma_period": tp.ma_period,
+        },
+        "rows": watch,
+    }
 
 
 def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:
@@ -1267,6 +1330,12 @@ def get_strategy() -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
     raw = CONFIG_PATH.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
+    # v7.0.13：旧 yaml/策略库快照无 timing 段 → 用默认值补齐（前端选股策略卡片
+    # 恒渲染；下次 PUT 保存后 timing 段固化进 yaml）
+    if isinstance(data, dict) and "timing" not in data:
+        import dataclasses
+        from martingale.config import TimingParams
+        data["timing"] = dataclasses.asdict(TimingParams())
     return {"json": data, "raw": raw}
 
 

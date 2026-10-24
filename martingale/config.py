@@ -16,6 +16,9 @@ schema（定案，勿增删）：
 - universe: industry_whitelist_csric2 / soe_keywords / min_total_mv_yi /
   min_consecutive_div_years / listing_min_trading_days
   （SOE 恒强制，不设开关——TL 拍板；全链 5 条件保留）
+- timing: price_window_years / price_pctile_max / yield_min_pct /
+  below_ma250 / ma_period（v7.0.13 选股时机；**段可缺省**——策略库旧快照
+  无此段，缺省 = 生产默认值，load_config 返回 triple）
 
 成本参数（佣金/印花税）不在 schema 内：引擎常量（见 engine.py 头部注释，
 TL 拍板：不进配置、不进 Web；3bps 买入佣金精确对齐 f6 已验收基线）。
@@ -94,6 +97,22 @@ class UniverseParams:
     min_ttm_yield_pct: float = 3.0                 # ⑧ TTM 股息率下限（%）
     price_min_yuan: float = 3.0                    # ⑨ 股价区间下限（元；远离退市风险区）
     price_max_yuan: float = 100.0                  # ⑨ 股价区间上限（元；手数粒度约束）
+
+
+@dataclass(frozen=True)
+class TimingParams:
+    """选股时机参数（v7.0.13，Joel 2026-10-25 拍板；默认值 = 生产 yaml）。
+
+    作用域 = 候选池成员（不是全市场、不是基础池）。
+    观察口径（页面"今日选股"）= 已启用条件的 **OR**；
+    提醒口径（PushPlus 微信）= ①且②（③启用时叠加），且仅**新触发**推
+    （边沿状态 data/alerts/timing_push_state.json；持续在买区不重推）。
+    """
+    price_window_years: int = 5        # ① 价格低位窗口（年，滚动至最新 K线日）
+    price_pctile_max: float = 40.0     # ① 当前价处于近 N 年收盘分位 ≤ P%
+    yield_min_pct: float = 4.5         # ② TTM 股息率 ≥ Y%
+    below_ma250: bool = False          # ③ 年线条件开关（默认关）
+    ma_period: int = 250               # ③ 均线窗口（交易日）
 
 
 def _require(cfg: Dict[str, Any], dotted: str) -> Any:
@@ -203,10 +222,33 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
     )
 
 
-def load_config(path: str) -> Tuple[StrategyParams, UniverseParams]:
-    """读取 strategy.yaml，返回 (StrategyParams, UniverseParams)。
+def _timing_section(cfg: Dict[str, Any]) -> TimingParams:
+    """timing 段解析。**段可缺省**（策略库旧快照/老 yaml 无此段 → 生产默认值）；
+    段存在时 5 键必须齐全且过范围校验。"""
+    t = cfg.get("timing")
+    if t is None:
+        return TimingParams()
+    if not isinstance(t, dict):
+        raise ConfigError("strategy.yaml timing 段必须是映射(mapping)")
+    for key in ("price_window_years", "price_pctile_max", "yield_min_pct",
+                "below_ma250", "ma_period"):
+        if key not in t:
+            raise ConfigError(f"timing.{key} 缺失")
+    years = _int(t["price_window_years"], "timing.price_window_years", 1, 30)
+    pct = _num(t["price_pctile_max"], "timing.price_pctile_max", 1, 100)
+    yld = _num(t["yield_min_pct"], "timing.yield_min_pct", 0, 30)
+    below = t["below_ma250"]
+    if not isinstance(below, bool):
+        raise ConfigError(f"timing.below_ma250 必须是布尔（当前 {below!r}）")
+    ma = _int(t["ma_period"], "timing.ma_period", 20, 1200)
+    return TimingParams(price_window_years=years, price_pctile_max=pct,
+                        yield_min_pct=yld, below_ma250=below, ma_period=ma)
 
-    缺段/缺键/越界 → ConfigError（避免运行到一半才发现）。
+
+def load_config(path: str) -> Tuple[StrategyParams, UniverseParams, TimingParams]:
+    """读取 strategy.yaml，返回 (StrategyParams, UniverseParams, TimingParams)。
+
+    缺段/缺键/越界 → ConfigError（避免运行到一半才发现）；timing 段例外可缺省。
     ``lake:`` / ``datasource:`` 段不属于本包（lake 与 lake-sync 专用），存在与否
     均不影响本函数（screener.config.load_config 与 lake.config.lake_cfg 各自读取）。
     """
@@ -216,4 +258,4 @@ def load_config(path: str) -> Tuple[StrategyParams, UniverseParams]:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ConfigError("strategy.yaml 顶层必须是映射(mapping)")
-    return _strategy_section(cfg), _universe_section(cfg)
+    return _strategy_section(cfg), _universe_section(cfg), _timing_section(cfg)

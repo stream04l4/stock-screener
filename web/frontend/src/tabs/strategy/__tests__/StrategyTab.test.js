@@ -1,4 +1,4 @@
-// StrategyTab 组件回归（v7.0）：策略库（另存为/加载/删除）+ 18 字段页渲染 + 本地保存校验。
+// StrategyTab 组件回归（v7.0）：策略库（另存为/加载/删除）+ 23 字段页渲染 + 本地保存校验。
 //
 // mock 点：api client（零网络）+ queryRegistry.invalidate（隔离计数）。
 // useLiveQuery 走真实实现（happy-dom），"strategy"/"strategies" key 由 apiMock 按 path 分发。
@@ -50,6 +50,13 @@ const STRATEGY_JSON = {
     price_min_yuan: 3,
     price_max_yuan: 100,
   },
+  timing: {
+    price_window_years: 5,
+    price_pctile_max: 40,
+    yield_min_pct: 4.5,
+    below_ma250: false,
+    ma_period: 250,
+  },
   lake: { baostock_daily_budget: 5000 },
   datasource: { baostock: { daily_quota: 49900 } },
 };
@@ -67,6 +74,28 @@ function mockApi() {
     }
     if (path === "/api/pool/manual" && (!opts.method || opts.method === "GET")) {
       return { n_manual: 0, stocks: {} };
+    }
+    if (path === "/api/my_positions" && opts.method === "PUT") {
+      return { ok: true, ts_code: JSON.parse(opts.body).ts_code, n: 1 };
+    }
+    if (path === "/api/timing" && (!opts.method || opts.method === "GET")) {
+      return {
+        as_of: "2026-10-23", n_pool: 2, n_watchlist: 2, n_push: 1,
+        params: { price_window_years: 5, price_pctile_max: 40, yield_min_pct: 4.5,
+                  below_ma250: false, ma_period: 250 },
+        rows: [
+          { ts_code: "sh.601006", name: "大秦铁路", as_of_date: "2026-10-23", close: 4.52,
+            pctile_window: 21.9, dd_window: 27.5, ttm_yield_pct: 4.59,
+            ma_value: null, below_ma: null, cond_price_low: true, cond_yield: true,
+            cond_below_ma: null, in_watchlist: true, push_eligible: true,
+            reasons: "5年价格分位 21.9%（≤40%）；股息率 4.59%（≥4.5%）" },
+          { ts_code: "sh.601088", name: "中国神华", as_of_date: "2026-10-23", close: 50.2,
+            pctile_window: 88.0, dd_window: 5.0, ttm_yield_pct: 4.8,
+            ma_value: null, below_ma: null, cond_price_low: false, cond_yield: true,
+            cond_below_ma: null, in_watchlist: true, push_eligible: false,
+            reasons: "股息率 4.8%（≥4.5%）" },
+        ],
+      };
     }
     if (path === "/api/pool" && (!opts.method || opts.method === "GET")) {
       return {
@@ -137,16 +166,17 @@ beforeEach(() => {
   mockApi();
 });
 
-describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；lake/datasource 不渲染）", () => {
-  it("渲染 2 组（策略参数/股票池）；字段行 = 18；name 不出现为字段行", async () => {
+describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 隐藏；lake/datasource 不渲染）", () => {
+  it("渲染 3 组（持仓策略/股票池/选股策略）；字段行 = 23；name 不出现为字段行", async () => {
     const w = mk();
     await flushPromises();
     const groups = w.findAll(".s-group");
-    expect(groups.length).toBe(2);
-    expect(groups[0].text()).toContain("策略参数");
+    expect(groups.length).toBe(3);
+    expect(groups[0].text()).toContain("持仓策略");
     expect(groups[1].text()).toContain("股票池");
+    expect(groups[2].text()).toContain("选股策略");
     const fields = w.findAll(".s-field");
-    expect(fields.length).toBe(18);
+    expect(fields.length).toBe(23);
     // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
@@ -156,6 +186,8 @@ describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；la
       "连续分红年数下限", "最少上市交易日",
       // v7.0.12 候选池选股门槛
       "十年回测必须为正", "回测窗口（年）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
+      // v7.0.13 选股时机
+      "价格分位窗口（年）", "价格低位分位上限（%）", "股息率下限 TTM（%）", "叠加「年线之下」条件", "年线周期（交易日）",
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
@@ -165,6 +197,8 @@ describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；la
       "min_consecutive_div_years", "listing_min_trading_days",
       "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
       "price_min_yuan", "price_max_yuan",
+      "price_window_years", "price_pctile_max", "yield_min_pct",
+      "below_ma250", "ma_period",
     ]);
     // name（策略标识）不作为字段行
     expect(keys).not.toContain("策略标识");
@@ -183,10 +217,35 @@ describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；la
     expect(groups[1].text()).toContain("长江电力");   // 手动成员
     expect(groups[1].text()).toContain("手动添加");
     expect(groups[1].text()).toContain("（暂无手动添加）");
+    // v7.0.13：选股策略卡片 = 今日选股表（GET /api/timing）
+    expect(groups[2].text()).toContain("今日选股");
+    expect(groups[2].text()).toContain("大秦铁路");
+    expect(groups[2].text()).toContain("买入区");     // push_eligible 徽标
+    expect(groups[2].text()).toContain("加持仓");
+    expect(groups[2].text()).toContain("2026-10-23");
     w.unmount();
   });
 
-  it("只读态：accounting 显示 cash；编辑态：13 个 number input（strategy 6 + universe 7），accounting 仍只读", async () => {
+  it("今日选股行：加持仓 → 填股数/成本 → PUT /api/my_positions → 成功反馈 + invalidate", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find(".ts-btn").trigger("click");      // 展开行内录入
+    await nextTick();
+    const addInps = w.findAll(".ts-add-row input");
+    expect(addInps.length).toBe(2);
+    expect(addInps[1].element.value).toBe("4.52"); // 成本价默认当前价
+    await addInps[0].setValue("1000");
+    await w.findAll(".ts-add-row .ts-btn")[0].trigger("click"); // 行内保存按钮
+    await flushPromises();
+    const putCall = apiMock.mock.calls.find(([pth, o]) => pth === "/api/my_positions" && (o || {}).method === "PUT");
+    expect(putCall).toBeTruthy();
+    expect(JSON.parse(putCall[1].body)).toEqual({ ts_code: "sh.601006", shares: 1000, cost_price: 4.52 });
+    expect(invalidateMock).toHaveBeenCalledWith("my_positions");
+    expect(w.text()).toContain("已加入「我的持仓」");
+    w.unmount();
+  });
+
+  it("只读态：accounting 显示 cash；编辑态：17 个 number input（strategy 6 + universe 7 + timing 4），accounting 仍只读", async () => {
     const w = mk();
     await flushPromises();
     // 只读态 accounting 值（按 title=原始字段名定位）
@@ -195,10 +254,11 @@ describe("v7 · 18 字段页渲染（strategy 8 + universe 10；name 隐藏；la
     // 进入编辑态
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    // strategy 6（int×2 + float×4）+ universe 7（v7.0.12：mv float + 3×int + 3×float）= 13
-    expect(w.findAll('input[type="number"]').length).toBe(13);
-    // backtest_positive 是 bool select（不是 number input）
-    expect(w.findAll(".s-field select").length).toBeGreaterThanOrEqual(1);
+    // strategy 6（int×2 + float×4）+ universe 7（v7.0.12：mv float + 3×int + 3×float）
+    // + timing 4（v7.0.13：int×2 + float×2）= 17
+    expect(w.findAll('input[type="number"]').length).toBe(17);
+    // backtest_positive / below_ma250 是 bool select（不是 number input）
+    expect(w.findAll(".s-field select").length).toBeGreaterThanOrEqual(2);
     // accounting 编辑态仍是只读展示（无 input，有 .s-readonly）
     const acctRowEdit = w.findAll(".s-field").find((f) => f.find(".s-key").attributes("title") === "accounting");
     expect(acctRowEdit.find("input").exists()).toBe(false);
@@ -255,10 +315,12 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     await flushPromises();
     expect(captured).toBeTruthy();
     expect(captured.strategy.initial_amount).toBe(200000);
-    // PUT full：lake/datasource/universe 段完整带回
+    // PUT full：lake/datasource/universe/timing 段完整带回
     expect(captured.lake).toEqual({ baostock_daily_budget: 5000 });
     expect(captured.datasource).toEqual({ baostock: { daily_quota: 49900 } });
     expect(Object.keys(captured.universe)).toHaveLength(10); // v7.0.12：基础 5 + 门槛 5
+    expect(captured.timing).toEqual({ price_window_years: 5, price_pctile_max: 40,
+      yield_min_pct: 4.5, below_ma250: false, ma_period: 250 }); // v7.0.13：时机段不丢
     expect(toastMsg()).toContain("策略已更新");
     expect(invalidateMock).toHaveBeenCalledWith("strategy");
     expect(w.find("#btn-strategy-save").classes()).toContain("hidden"); // 退出编辑态

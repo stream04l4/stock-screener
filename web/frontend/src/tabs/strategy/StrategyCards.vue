@@ -18,6 +18,7 @@ import { SECTION_GROUPS, SECTION_META, SECTION_DESC, FIELD_DESC, FIELD_LABELS, E
 import FieldEditor from "./FieldEditor.vue";
 import ManualPoolBar from "./ManualPoolBar.vue";
 import PoolMembers from "./PoolMembers.vue";
+import TimingStocks from "./TimingStocks.vue";
 
 const props = defineProps({
   json: Object, // GET /api/strategy 返回的 d.json（只读态数据源）
@@ -104,6 +105,8 @@ const ungrouped = computed(() => {
             <!-- v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条） -->
             <PoolMembers v-if="section === 'universe'" />
             <ManualPoolBar v-if="section === 'universe'" />
+            <!-- v7.0.13：选股策略卡片 = 时机条件 + 今日选股表（含一键加持仓） -->
+            <TimingStocks v-if="section === 'timing'" />
           </div>
         </template>
       </div>

@@ -134,6 +134,10 @@ def test_strategy_yaml_v7_schema_shape():
         # v7.0.12 候选池选股门槛
         "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
         "price_min_yuan", "price_max_yuan"}
+    # v7.0.13 选股时机
+    assert set(cfg["timing"].keys()) == {
+        "price_window_years", "price_pctile_max", "yield_min_pct",
+        "below_ma250", "ma_period"}
     assert "lake" in cfg and "datasource" in cfg
     assert {"sina", "rf", "baostock"} <= set(cfg["datasource"].keys())
     # 旧 12 段不得回潮

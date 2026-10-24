@@ -27,7 +27,7 @@ REAL_YAML = PROJECT_ROOT / "config" / "strategy.yaml"
 # ---------------------------------------------------------------------------
 
 def test_load_real_config():
-    p, u = load_config(str(REAL_YAML))
+    p, u, t = load_config(str(REAL_YAML))
     assert p.name == "drawdown_martingale"
     assert p.accounting == ACCOUNTING_CASH
     assert p.rearm_mode in ("bounce", "newhigh")
@@ -47,6 +47,9 @@ def test_load_real_config():
     assert u.min_total_mv_yi >= 1
     assert u.min_consecutive_div_years >= 1
     assert 20 <= u.listing_min_trading_days <= 1200
+    # v7.0.13 timing：生产 yaml 段 = 拍板默认（5 年 / 40% / 4.5% / 年线关 / 250）
+    assert (t.price_window_years, t.price_pctile_max, t.yield_min_pct,
+            t.below_ma250, t.ma_period) == (5, 40.0, 4.5, False, 250)
 
 
 # ---------------------------------------------------------------------------

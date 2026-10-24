@@ -8,22 +8,25 @@
 // - FIELD_DESC 一律一行口语说明，删掉公式堆砌/内部附注（k=0 占档等**行为差异**保留，
 //   因为直接影响首仓后第一个加仓的金额）。
 //
-// 页面渲染 18 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
-// + universe 10（v7.0.12：基础 5 条件 + 候选池选股门槛 5 键）。
+// 页面渲染 23 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
+// + universe 10（v7.0.12：基础 5 条件 + 候选池选股门槛 5 键）
+// + timing 5（v7.0.13：选股时机 3 条件开关/参数）。
 // accounting 固定 cash（只读，FIELD_TYPE="readonly"）。
 //
 // FIELD_TYPE 约定（沿用旧版）：**按裸字段名**索引（非 section.field）；
 // FieldEditor 用 FIELD_TYPE[field] 取类型，未注册 → 回退 "str"。
 
 export const SECTION_META = {
-  strategy: { title: "策略参数（深回撤金字塔加仓）", icon: "📉" },
+  strategy: { title: "持仓策略（深回撤金字塔加仓）", icon: "📉" },
   universe: { title: "股票池（候选池：基础 5 条件 + 选股 3 门槛）", icon: "🗂️" },
+  timing: { title: "选股策略（买入时机筛选）", icon: "🎯" },
 };
 
 // 分组（有序）。group.id 用于 localStorage 折叠记忆键。
 export const SECTION_GROUPS = [
-  { id: "strategy", title: "策略参数", icon: "📉", defaultOpen: true, sections: ["strategy"] },
+  { id: "strategy", title: "持仓策略", icon: "📉", defaultOpen: true, sections: ["strategy"] },
   { id: "universe", title: "股票池", icon: "🗂️", defaultOpen: true, sections: ["universe"] },
+  { id: "timing", title: "选股策略", icon: "🎯", defaultOpen: true, sections: ["timing"] },
 ];
 
 // 不渲染的段（lake/datasource = yaml-only，lake-sync 专用，Web 只读不改）。
@@ -39,6 +42,10 @@ export const SECTION_DESC = {
     "候选池门槛 = 基础 5 条件（行业白名单、央国企、总市值下限、上市天数、连续分红）" +
     "叠加 3 道选股门槛（十年回测为正、股息率下限、股价区间）；入选 ≠ 买入信号，" +
     "买不买看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。",
+  timing:
+    "在候选池之上筛「何时买」：价格低位（近 N 年分位）+ 高股息率（+ 可选年线之下）三条件。" +
+    "下方「今日选股」= 命中任意已启用条件（OR，观察名单）；" +
+    "微信提醒 = 价格低位**且**高股息率同时命中且是新触发（每日湖更新后自动检查，只推新进入买区的）。",
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +71,12 @@ export const FIELD_LABELS = {
   "universe.min_ttm_yield_pct": "股息率下限 TTM（%）",
   "universe.price_min_yuan": "股价下限（元）",
   "universe.price_max_yuan": "股价上限（元）",
+  // v7.0.13 timing（选股时机）
+  "timing.price_window_years": "价格分位窗口（年）",
+  "timing.price_pctile_max": "价格低位分位上限（%）",
+  "timing.yield_min_pct": "股息率下限 TTM（%）",
+  "timing.below_ma250": "叠加「年线之下」条件",
+  "timing.ma_period": "年线周期（交易日）",
 };
 
 // ---------------------------------------------------------------------------
@@ -104,6 +117,15 @@ export const FIELD_DESC = {
   "universe.min_ttm_yield_pct": "最新估值日 TTM 股息率低于这个数 → 剔除",
   "universe.price_min_yuan": "最新收盘价低于这个价 → 剔除（远离退市风险区）",
   "universe.price_max_yuan": "最新收盘价高于这个价 → 剔除（保证加仓档位整手可行）",
+  // v7.0.13 timing（选股时机）
+  "timing.price_window_years":
+    "条件①的「近年」= 从最新 K线日往回数 N 年的前复权收盘价；当前价在其中的分位决定「是否低位」",
+  "timing.price_pctile_max":
+    "条件①：当前价处于近 N 年价格分位 ≤ 这个值 → 算「价格低位」（如 40 = 比近 5 年 6 成以上交易日都便宜）",
+  "timing.yield_min_pct": "条件②：最新 TTM 股息率 ≥ 这个值 → 算「高股息」（分红兜底）",
+  "timing.below_ma250":
+    "条件③（可选，默认关）：当前价低于年线才算低位；开启后微信提醒需三条件同时满足",
+  "timing.ma_period": "年线 = 最近 N 个交易日收盘价均值（默认 250 = 一年线）",
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +154,12 @@ export const FIELD_TYPE = {
   min_ttm_yield_pct: "float",
   price_min_yuan: "float",
   price_max_yuan: "float",
+  // v7.0.13 timing（选股时机）
+  price_window_years: "int",
+  price_pctile_max: "float",
+  yield_min_pct: "float",
+  below_ma250: "bool",
+  ma_period: "int",
 };
 
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。

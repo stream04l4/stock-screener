@@ -40,7 +40,7 @@ def test_health_contract():
 # strategy 读
 # ---------------------------------------------------------------------------
 
-def test_get_strategy_four_sections():
+def test_get_strategy_five_sections():
     out = wapp.get_strategy()
     assert set(out.keys()) == {"json", "raw"}
     keys = set(out["json"].keys())
@@ -48,6 +48,10 @@ def test_get_strategy_four_sections():
     assert {"strategy", "universe", "lake", "datasource"} <= keys
     assert len(out["json"]["strategy"]) == 9
     assert len(out["json"]["universe"]) == 10  # v7.0.12：5 基础条件 + 5 候选池门槛
+    # v7.0.13：timing 段 5 键（生产 yaml 已有；缺省时 GET 用默认值补齐）
+    assert set(out["json"]["timing"].keys()) == {
+        "price_window_years", "price_pctile_max", "yield_min_pct",
+        "below_ma250", "ma_period"}
     assert {"sina", "rf", "baostock"} <= set(out["json"]["datasource"].keys())
 
 
@@ -145,6 +149,24 @@ def test_validate_strategy_v7012_universe_gates():
     p["universe"]["price_max_yuan"] = 3         # 下限 > 上限
     errs = wapp._validate_strategy(p)
     assert any("price_min_yuan" in e for e in errs)
+
+
+def test_validate_strategy_v7013_timing():
+    # v7.0.13：timing 字段进 PUT 校验（段可选，段存在时 5 键齐全 + 类型/范围）
+    p = _valid_payload()
+    p["timing"]["below_ma250"] = "yes"          # 非布尔
+    errs = wapp._validate_strategy(p)
+    assert any("below_ma250" in e for e in errs)
+    p = _valid_payload()
+    p["timing"]["price_pctile_max"] = 150       # 超范围
+    assert any("price_pctile_max" in e for e in wapp._validate_strategy(p))
+    p = _valid_payload()
+    p["timing"].pop("ma_period")                # 段存在但缺键
+    assert any("timing.ma_period" in e for e in wapp._validate_strategy(p))
+    # 段整体缺省 → 合法（策略库旧快照兼容）
+    p = _valid_payload()
+    p.pop("timing")
+    assert wapp._validate_strategy(p) == []
 
 
 # ---------------------------------------------------------------------------

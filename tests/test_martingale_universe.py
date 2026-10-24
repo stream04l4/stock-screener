@@ -195,7 +195,7 @@ def test_synthetic_run_year_shift(tmp_path):
 def test_production_pool_scale_and_f6_members():
     con = connect_readonly()
     try:
-        p, u = __import__("martingale.config", fromlist=["load_config"]).load_config(
+        _sp, u, _tp = __import__("martingale.config", fromlist=["load_config"]).load_config(
             str(PROJECT_ROOT / "config" / "strategy.yaml"))
         res = build_pool(con, u)
     finally:

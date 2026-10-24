@@ -149,19 +149,10 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
 
 
 def push_pushplus(token: str, title: str, content: str) -> bool:
-    """推推送加（微信）。返回 {"code": 200} → True；失败抛错由调用方记痕。"""
-    import requests
+    """推推送加（微信）。委托 martingale.pushplus.send（v7.0.13 单一实现点）。"""
+    from martingale.pushplus import send as _send
 
-    resp = requests.post(
-        PUSHPLUS_SEND_URL,
-        json={"token": token, "title": title, "content": content,
-              "template": "html"},
-        timeout=15)
-    resp.raise_for_status()
-    body = resp.json()
-    if body.get("code") != 200:
-        # 常见：token 无效/过期、账号被封、额度用尽——msg 里带原因，明确报错
-        raise RuntimeError(f"pushplus 推送失败: {body.get('msg')} (code={body.get('code')})")
+    _send(token, title, content)  # 失败抛 RuntimeError，由调用方记痕
     return True
 
 

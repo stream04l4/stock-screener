@@ -35,4 +35,13 @@ SRC=$?
 if [ "$SRC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] 候选池选股失败 rc=$SRC（Web 回退旧快照，日志见 $LOG 尾部）"
 fi
+
+# v7.0.13：选股时机预计算 + 新触发微信提醒（候选池 ①价格分位 ②股息率 ③年线）。
+# 纯湖内计算零行情零配额；唯一外部调用 = PushPlus 推送（新触发才推）。
+# 失败不阻断：Web「今日选股」读旧快照（fail-closed），次日自动重算重推。
+timeout -k 30 300 .venv/bin/python -m martingale timing >> "$LOG" 2>&1
+TRC=$?
+if [ "$TRC" -ne 0 ]; then
+  echo "[$(date -u +%FT%TZ)] 选股时机失败 rc=$TRC（Web 回退旧快照，日志见 $LOG 尾部）"
+fi
 exit "$RC"

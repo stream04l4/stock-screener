@@ -2,8 +2,9 @@
 # stock-screener v7.0 策略配置（slim schema，2026-10-22；v7.0.12 扩展 universe 选股门槛）
 #
 # 结构：
-#   strategy:   深回撤金字塔加仓参数（9 键，含固定 name）
+#   strategy:   持仓策略参数（深回撤金字塔加仓，9 键，含固定 name）
 #   universe:   股票池 5 条件 + 候选池选股门槛 5 键（v7.0.12；SOE 恒强制，不设开关）
+#   timing:     选股时机 5 键（v7.0.13；候选池内筛买入时机；段可缺省=默认值）
 #   lake:       数据湖配置（lake.config.lake_cfg() 读取；lake-sync 依赖，勿删）
 #   datasource: lake-sync 数据源子段（sina/rf/baostock 必留；lake_backfill 唯一消费点）
 #
@@ -65,6 +66,19 @@ universe:                           # 股票池（全链 5 条件；漏斗 5556�
   min_ttm_yield_pct: 3              # ⑧ TTM 股息率下限（%，最新估值日 valuation_daily）
   price_min_yuan: 3                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
   price_max_yuan: 100               # ⑨ 股价区间上限（元；保证 1 万加仓档 ≥1 手粒度）
+
+timing:                             # 选股时机（v7.0.13，Joel 2026-10-25 拍板）
+  # 作用域 = 候选池成员（基础 5 条件 ∩ 选股 3 门槛 ∪ 手动），筛"何时买"；
+  # 入选 ≠ 买入——买后录入「我的持仓」由持仓策略（strategy 段）接管档位。
+  # 观察口径（页面"今日选股"）= 已启用条件的 OR；提醒口径（PushPlus）= ①且②
+  # （③启用时叠加），仅**新触发**推送（持续在买区不重推；状态 data/alerts/
+  # timing_push_state.json）。PE 估值分位经实测无区分度（池内 0 只 ≤5y 20% 分位）
+  # → 明确不加（2026-10-25）。
+  price_window_years: 5             # ① 价格低位窗口（年，滚动至最新 K线日）
+  price_pctile_max: 40              # ① 当前价处于近 N 年收盘分位 ≤ 此值（%）
+  yield_min_pct: 4.5                # ② TTM 股息率 ≥ 此值（%）
+  below_ma250: false                # ③ 年线条件开关（当前价 < 均线；默认关）
+  ma_period: 250                    # ③ 均线窗口（交易日）
 
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
   baostock_daily_budget: 5000       # Q2：BaoStock 日预算上限（次/日，config 可调；到顶当日停、次日续）

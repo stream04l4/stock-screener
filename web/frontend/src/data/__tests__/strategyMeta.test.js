@@ -34,19 +34,19 @@ function loadStrategyFields() {
 }
 
 describe("strategyMeta · v7 结构", () => {
-  it("SECTION_META = 2 段（strategy/universe），title/icon 齐全", () => {
-    expect(Object.keys(SECTION_META).sort()).toEqual(["strategy", "universe"]);
+  it("SECTION_META = 3 段（strategy/universe/timing），title/icon 齐全", () => {
+    expect(Object.keys(SECTION_META).sort()).toEqual(["strategy", "timing", "universe"]);
     for (const k of Object.keys(SECTION_META)) {
       expect(typeof SECTION_META[k].title).toBe("string");
       expect(typeof SECTION_META[k].icon).toBe("string");
     }
   });
 
-  it("SECTION_GROUPS = 2 组（策略参数/股票池），无重叠，均默认展开", () => {
-    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["strategy", "universe"]);
+  it("SECTION_GROUPS = 3 组（持仓策略/股票池/选股策略），无重叠，均默认展开", () => {
+    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["strategy", "universe", "timing"]);
     const all = SECTION_GROUPS.flatMap((g) => g.sections);
     expect(new Set(all).size).toBe(all.length);
-    expect(all).toEqual(["strategy", "universe"]);
+    expect(all).toEqual(["strategy", "universe", "timing"]);
     for (const g of SECTION_GROUPS) expect(g.defaultOpen).toBe(true);
   });
 
@@ -56,7 +56,7 @@ describe("strategyMeta · v7 结构", () => {
     for (const s of EXCLUDED_SECTIONS) expect(all).not.toContain(s);
   });
 
-  it("SECTION_DESC 覆盖渲染的 2 段；strategy 段含 k=0 占档必附注", () => {
+  it("SECTION_DESC 覆盖渲染的 3 段；strategy 段含 k=0 占档必附注", () => {
     for (const k of Object.keys(SECTION_META)) {
       expect(typeof SECTION_DESC[k]).toBe("string");
       expect(SECTION_DESC[k].length).toBeGreaterThan(10);
@@ -72,7 +72,7 @@ describe("strategyMeta · v7 结构", () => {
 });
 
 describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
-  it("FIELD_TYPE = 19 键（strategy 9 + universe 10），类型逐一断言", () => {
+  it("FIELD_TYPE = 24 键（strategy 9 + universe 10 + timing 5），类型逐一断言", () => {
     const expected = {
       name: "str",
       initial_amount: "int",
@@ -93,6 +93,12 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
       min_ttm_yield_pct: "float",
       price_min_yuan: "float",
       price_max_yuan: "float",
+      // v7.0.13 timing
+      price_window_years: "int",
+      price_pctile_max: "float",
+      yield_min_pct: "float",
+      below_ma250: "bool",
+      ma_period: "int",
     };
     expect(FIELD_TYPE).toEqual(expected);
   });
@@ -133,6 +139,9 @@ describe("strategyMeta · FIELD_DESC/FIELD_TYPE 全字段守卫（防未来加�
     expect(FIELD_DESC["strategy.initial_amount"]).toContain("k=0");
     expect(FIELD_DESC["strategy.accounting"]).toContain("只读");
     expect(FIELD_DESC["universe.min_total_mv_yi"]).toContain("总市值");
+    // v7.0.13 timing desc 关键点
+    expect(FIELD_DESC["timing.price_pctile_max"]).toContain("分位");
+    expect(FIELD_DESC["timing.yield_min_pct"]).toContain("股息率");
   });
 
   it("FIELD_LABELS 覆盖渲染段 yaml 全部字段（通俗名非空；条数=FIELD_TYPE；防未来加字段漏改名）", () => {
