@@ -1,4 +1,4 @@
-# stock-screener · v7.0.0（drawdown_martingale 单策略版）
+# stock-screener · v7.0.13（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -51,11 +51,36 @@ fail-closed：缺行不入选）→ ⑧ **TTM 股息率≥3%** → ⑨ **价格 
 SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
 或名称含 soe_keywords 任一（国务院/国资委/汇金/财政部/国资）。
 
+## 2.5 选股时机（v7.0.13，候选池之上筛「何时买」）
+
+候选池解决「买什么」，时机条件解决「何时买」（Joel 2026-10-24 拍板，5 点全按推荐口径）：
+
+- **① 价格低位**：当前价处近 N 年（默认 5）qfq 收盘**分位 ≤ price_pctile_max**（默认 40%）；
+- **② 高股息**：TTM 股息率 ≥ yield_min_pct（默认 4.5%）；
+- **③ 年线之下**（可选，默认关）：当前价 < MA(ma_period)（默认 250）。
+
+**双口径**（`martingale/timing.py` 单一定义点）：
+- **观察口径**（页面「今日选股」表）= 已启用条件 **OR**（`in_watchlist`）；
+- **提醒口径**（微信 PushPlus）= **①且②**（③启用时叠加，`push_eligible`），
+  且**仅新触发**：边沿状态 `data/alerts/timing_push_state.json`（上轮 eligible 集合；
+  掉出买区清除 → 再进入才重推；持续在买区不重推；**推送失败不落状态 → 下轮重试**）。
+- PE 估值分位经实测不加（池内 0 只低于自身 5y 20% 分位，无区分度）。
+
+**流程**：每日 lake-sync 后 `python -m martingale timing`（~1s 纯湖内计算，
+零网络零配额）→ 整表刷新湖表 `selection_timing`（PK ts_code）→ Web O(1) 读；
+失败不阻断（页面 fail-closed 空表 / 读旧快照，次日重算重推）。
+生产首跑（as_of 10-23）：59 候选 → 观察 18 → 提醒 1（大秦铁路：
+5 年分位 21.9% / 回撤 27.5% / 股息 4.59%）。
+
+**闭环**：今日选股表「加持仓」→ 行内填股数/成本（PUT /api/my_positions）→
+「我的持仓」账本 → 持仓策略接管档位（现有信号/提醒逻辑零改动）。
+
 ## 3. CLI
 
 ```bash
 .venv/bin/python -m martingale pool                       # 打印候选池 + 全漏斗
 .venv/bin/python -m martingale selection                  # 候选池选股预计算（湖表刷新）
+.venv/bin/python -m martingale timing [--no-push] [--dry-run]  # 选股时机预计算 + 新触发微信提醒
 .venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21 \
     --out /tmp/bt_out                                     # 全池回测
 .venv/bin/python -m martingale backtest --codes sh.601088,sz.000651 --out /tmp/bt2
@@ -66,6 +91,9 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 - `selection` = 基础池逐股十年滚动回测 → 整表刷新湖表 `selection_backtest_10y`
   （98 只 ~2s，纯湖内计算零网络零配额）；每日作业在湖增量后自动追加执行，
   失败不阻断（Web 候选池 ⑦ 读旧快照 fail-closed，次日重算）。
+- `timing` = 候选池逐股 ①分位 ②股息率 ③年线 → 整表刷新湖表 `selection_timing`
+  + 提醒口径新触发微信推送（边沿状态防重推）；`--no-push` 只算不推，
+  `--dry-run` 打印不落状态不推送。
 - 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
 - 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
 
@@ -91,6 +119,11 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | backtest_window_years | ⑦ 回测窗口年数（滚动） |
 | | min_ttm_yield_pct | ⑧ TTM 股息率下限（%） |
 | | price_min_yuan / price_max_yuan | ⑨ 最新价区间（元） |
+| timing（**段可缺省**，缺省=默认值） | price_window_years | ① 价格分位窗口（年，默认 5） |
+| | price_pctile_max | ① 分位上限（%，默认 40） |
+| | yield_min_pct | ② TTM 股息率下限（%，默认 4.5） |
+| | below_ma250 | ③ 年线之下开关（默认 false） |
+| | ma_period | ③ 年线周期（交易日，默认 250） |
 | lake / datasource.* | — | lake-sync / 补数专用，Web 只读不渲染 |
 
 **首轮 k=0 占档说明（必附注）**：首仓占用 k=0 档（金额 initial_amount），
@@ -105,15 +138,20 @@ systemctl --user status stock-screener-web     # uvicorn web.app:app
 systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改动后
 ```
 
-四页签：**我的持仓**（录入/信号/提醒状态）·
-**策略**（参数编辑/校验/策略库快照；**股票池卡片** = 候选池：基础 5 条件 +
-选股门槛字段 + **候选股全列表**（59 只，10年回测%/股息率/最新价/来源，可搜索排序）
-+ 手动添加录入条）· **回测**（参数表单 + SSE 进度 + 结果区）·
+四页签：**我的持仓**（录入/信号/提醒状态；一键加持仓也写这里）·
+**策略**（三组卡片：**持仓策略**（原「策略参数」，v7.0.13 改名）/ **股票池**（候选池：
+基础 5 条件 + 选股门槛字段 + 候选股全列表（59 只，10年回测%/股息率/最新价/来源，
+可搜索排序）+ 手动添加录入条）/ **选股策略**（v7.0.13：时机 3 条件开关/参数 +
+**今日选股表**（观察口径 OR 命中，「买入区」徽标 = 提醒口径，每行一键加持仓））；
+参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
 **数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
 
 主要 API：`/api/health` · `/api/pool`（候选池：漏斗 + 成员，读预计算表 O(1)）·
 `/api/pool/manual`（GET 读手动池 / POST 加入 / DELETE 移除，写 `data/manual_pool.json`）·
-`/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份）·
+`/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份；timing 段可选）·
+`/api/timing`（v7.0.13 今日选股：读 `selection_timing` O(1)，as_of/rows/params；
+表缺失 → 空列表 fail-closed，湖持锁 → 503）·
+`/api/my_positions`（GET 账本+信号 / PUT upsert 单只，shares=0 删除）·
 `/api/positions`（同步全池）· `/api/bt/runs`（POST 触发 / GET 列表 / `{id}` status /
 `{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*` · 策略库 CRUD。
 回测 = 异步子进程（单任务 409 + pidfile 锁），进度 SSE（15s 心跳，断线 3 次降级 3s 轮询）。
@@ -124,8 +162,18 @@ crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_
 数据湖每日同步，martingale 的一切查询都依赖它）。v6 的 `35 9 * * 1-5 run_cron.sh`
 （多因子日跑）已删除。
 
-**v7.0.12**：lake-sync 脚本在湖增量结束后自动追加 `python -m martingale selection`
-（候选池选股预计算，~2s，纯湖内计算；失败不阻断，exit 仍取湖增量 RC）。
+**v7.0.12/7.0.13**：lake-sync 脚本在湖增量结束后自动追加
+`python -m martingale selection`（候选池选股预计算，~2s）→
+`python -m martingale timing`（选股时机预计算 + 新触发微信提醒，~1s；
+均纯湖内计算零配额；失败不阻断，exit 仍取湖增量 RC）。
+
+**v7.0.11 持仓点位提醒**：`scripts/position_alert.py` + systemd user timer
+（`stock-screener-alerts.timer`，工作日每 10 分钟 + 时段门 09:15-11:35 /
+12:55-15:05 北京时间；实时价 TencentClient 失败回退湖价，只漏报不误报）。
+「我的持仓」中持仓股到策略点位（首仓线/加仓线）→ PushPlus 微信推送，
+去重键 `code|action|k|触发价`，状态 `data/alerts/pushplus_alert_state.json`。
+PushPlus 客户端单一定义点 `martingale/pushplus.py`（token 在 `.env` PUSHPLUS_TOKEN，
+gitignore，禁入 git/日志）。
 
 **v7.0.8 增量提速**：T2 K线/T3 估值快照改 tushare 全市场单日批量
 （`pro.daily`/`pro.adj_factor`/`pro.daily_basic` 各 1 次/分钟限频，~2.5min），
@@ -138,8 +186,8 @@ crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_
 ## 7. 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 后端：纯 lake 套件 + martingale 套件 + web + 边界守卫
-cd web/frontend && npm test                   # 前端 vitest（208 用例）
+.venv/bin/python -m pytest tests/ -q          # 后端（582 用例，含 test_timing 边沿语义）
+cd web/frontend && npm test                   # 前端 vitest（229 用例）
 cd web/frontend && npm run build               # dist/ 供 StaticFiles 挂载
 ```
 
@@ -159,7 +207,7 @@ martingale/        # v7 策略包：config/data/universe/engine/report/__main__(
 lake/              # 数据湖（v6 保留，零改动红线）
 screener/          # 退化为数据客户端库：config + data/{baostock_client,tencent,sina,rf}
 web/               # FastAPI app.py + frontend/（Vue3 + vitest；dist/ 构建产物）
-config/strategy.yaml   # strategy(9键)/universe(5键)/lake/datasource
+config/strategy.yaml   # strategy(9键)/universe(10键)/timing(5键,可缺省)/lake/datasource
 scripts/           # lake 运维：lake_backfill / run_lake_sync_daily.sh / lake_smoke / …
 data/lake/         # lake.duckdb（gitignore）
 tests/             # pytest（含 fixtures/f6_baseline/）
@@ -174,3 +222,13 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
   逐位对齐后删参考脚本）、`/api/bt/runs` 族（SSE）、前端回测/查询页签。
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
+
+## 10. 近期版本（v7.0.11 → v7.0.13）
+
+- **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
+  去重 + 实时价回退湖价）。
+- **v7.0.12**：候选池（5 条件 ∩ 回测为正 ∩ 股息≥3% ∩ 价 3~100 元 ∪ 手动）
+  收敛进策略页签「股票池」卡片 + 59 只全列表 + 手动添加；移动端视口修正。
+- **v7.0.13**：选股时机（§2.5）——「策略参数」卡改名**持仓策略**，新增
+  **选股策略**卡（3 条件 + 今日选股表 + 一键加持仓）；`timing` 子命令 /
+  `selection_timing` 湖表 / `GET /api/timing` / 边沿状态微信新触发推送。
