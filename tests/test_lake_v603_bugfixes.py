@@ -136,6 +136,7 @@ def test_b1_http_contract_body_over_real_http(tmp_path):
         "from lake import conn as _lc\n"
         "_lc.default_db_path = lambda: {db!r}\n"  # 指向不存在的库 → B-1 未就绪
         "import uvicorn\n"
+        "import os; os.environ['WEB_TEST_NO_AUTH'] = '1'\n"  # v7.0.14 测试钩子：跳过登录门禁
         "from web.app import app\n"
         "uvicorn.run(app, host='127.0.0.1', port={port}, log_level='error')\n"
     ).format(repo=REPO_ROOT, db=missing, port=port)

@@ -12,6 +12,12 @@ export async function api(path, opts = {}) {
   let body = null;
   try { body = await res.json(); } catch { /* 非 JSON */ }
   if (!res.ok) {
+    // v7.0.14：受保护 API 401（会话过期）→ 通知 App.vue 回登录页
+    // （/api/login 自身失败与 /api/auth/me 启动探活的 401 是正常路径，不触发）
+    if (res.status === 401 && !path.startsWith("/api/login")
+        && !path.startsWith("/api/auth/me")) {
+      window.dispatchEvent(new CustomEvent("auth:401"));
+    }
     const detail = body && body.detail ? body.detail : res.statusText;
     const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
     err.status = res.status;

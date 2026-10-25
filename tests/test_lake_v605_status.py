@@ -478,6 +478,7 @@ def test_http_status_ready_new_fields_end_to_end(tmp_path):
         f"_lc.default_db_path = lambda: {p!r}",
         f"_lc.progress_path = lambda: {prog!r}",
         "import uvicorn",
+        "import os; os.environ['WEB_TEST_NO_AUTH'] = '1'",  # v7.0.14 测试钩子：跳过登录门禁
         "from web.app import app",
         f"uvicorn.run(app, host='127.0.0.1', port={port}, log_level='error')",
     ]

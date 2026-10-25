@@ -464,6 +464,7 @@ def _start_lake_server(port: int, db_path: str, progress_path: Optional[str],
             f"_lc.LakeLocked({db_path!r}, {fake_lock_pid!r}))")
     code_lines += [
         "import uvicorn",
+        "import os; os.environ['WEB_TEST_NO_AUTH'] = '1'",  # v7.0.14 测试钩子：跳过登录门禁
         "from web.app import app",
         f"uvicorn.run(app, host='127.0.0.1', port={port}, log_level='error')",
     ]

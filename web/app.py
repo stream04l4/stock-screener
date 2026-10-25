@@ -66,6 +66,78 @@ app = FastAPI(title="stock-screener web", version="7.0.0")
 
 
 # ---------------------------------------------------------------------------
+# 登录门禁（v7.0.14）：/api/* 全部要登录，白名单 = login/logout/health。
+# 会话 = web/auth.py 无状态签名 cookie；页面壳（/）公开，前端未登录时渲染登录页。
+# ---------------------------------------------------------------------------
+from web.auth import (COOKIE_NAME, TOKEN_TTL_S, check_credentials,  # noqa: E402
+                      load_auth_config, lock_status, make_token,
+                      parse_token, record_fail, record_ok)
+
+_AUTH_PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
+
+# 测试钩子：lake HTTP 契约测试以子进程起**真实** web.app（uvicorn），子进程内置
+# WEB_TEST_NO_AUTH=1 跳过登录门禁（那些用例测的是 lake 同步语义，不是登录；
+# 登录门禁本身由 tests/test_web_auth.py 用 TestClient 全量覆盖）。
+# 生产 systemd 环境不设该变量，钩子恒关。
+_AUTH_DISABLED = os.environ.get("WEB_TEST_NO_AUTH") == "1"
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not _AUTH_DISABLED and path not in _AUTH_PUBLIC_PATHS:
+        _u, _p, secret = load_auth_config()
+        if parse_token(request.cookies.get(COOKIE_NAME), secret) is None:
+            return JSONResponse({"detail": "未登录或会话已过期，请先登录"}, status_code=401)
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# 登录/登出/当前用户
+# ---------------------------------------------------------------------------
+class _LoginBody(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+@app.post("/api/login")
+def login(body: _LoginBody, request: Request, response: Response) -> Dict[str, Any]:
+    """登录成功则写签名 cookie（HttpOnly / SameSite=Lax / 7 天）。
+
+    失败 401；连续 5 次失败锁 120s 返回 429；凭据未配置 500 显式失败（不静默放行）。
+    """
+    admin_user, admin_pass, secret = load_auth_config()
+    if not admin_user or not admin_pass:
+        raise HTTPException(status_code=500,
+                            detail="登录凭据未配置（.env WEB_ADMIN_USER/WEB_ADMIN_PASS）")
+    ip = request.client.host if request.client else "unknown"
+    if lock_status(ip):
+        raise HTTPException(status_code=429, detail="失败次数过多，请 2 分钟后再试")
+    if not check_credentials(body.username, body.password, admin_user, admin_pass):
+        record_fail(ip)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    record_ok(ip)
+    response.set_cookie(COOKIE_NAME, make_token(admin_user, secret), max_age=TOKEN_TTL_S,
+                        httponly=True, samesite="lax", path="/")
+    return {"ok": True, "user": admin_user}
+
+
+@app.post("/api/logout")
+def logout(response: Response) -> Dict[str, Any]:
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> Dict[str, Any]:
+    _u, _p, secret = load_auth_config()
+    user = parse_token(request.cookies.get(COOKIE_NAME), secret)
+    if user is None:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+    return {"user": user}
+
+
+# ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
 def _read_csv_rows(path: Path) -> List[Dict[str, str]]:

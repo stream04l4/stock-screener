@@ -177,6 +177,8 @@ from lake import conn as _lc
 # connect_existing() 每次调用现取该值，故无需预开单例）
 _lc.default_db_path = lambda: {db!r}
 import uvicorn
+import os
+os.environ['WEB_TEST_NO_AUTH'] = '1'  # v7.0.14 测试钩子：跳过登录门禁
 from web.app import app
 uvicorn.run(app, host="127.0.0.1", port={port}, log_level="error")
 """

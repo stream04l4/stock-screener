@@ -11,6 +11,7 @@ import BacktestTab from "../tabs/BacktestTab.vue";
 import MyPositionsTab from "../tabs/MyPositionsTab.vue";
 import StrategyTab from "../tabs/StrategyTab.vue";
 import LakeTab from "../tabs/LakeTab.vue";
+import { useAuthStore } from "../stores/authStore.js";
 
 const TABS = [
   ["my_positions", "我的持仓"],
@@ -21,6 +22,12 @@ const TABS = [
 
 // 默认激活第一个页签（v7.0.2：我的持仓 = 日常主入口）
 const active = ref("my_positions");
+
+// v7.0.14：顶栏显示当前用户 + 退出（回登录页，cookie 清除）
+const auth = useAuthStore();
+async function doLogout() {
+  await auth.logout();
+}
 </script>
 
 <template>
@@ -30,6 +37,10 @@ const active = ref("my_positions");
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
     <ToastBar />
+    <div class="topbar-auth">
+      <span class="topbar-user">👤 {{ auth.user }}</span>
+      <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
+    </div>
   </header>
 
   <main>
@@ -47,3 +58,13 @@ const active = ref("my_positions");
     信号用后复权收盘、成交按原始收盘、现金分红单列（cash 口径）。湖内无退市股（幸存者偏差），回测产物已带声明。
   </footer>
 </template>
+
+<style scoped>
+.topbar-auth { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.topbar-user { font-size: 12px; color: #666; }
+.topbar-logout {
+  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line, #d8d8e0);
+  border-radius: 6px; background: #fff; color: #555; cursor: pointer;
+}
+.topbar-logout:hover { border-color: #b42318; color: #b42318; }
+</style>

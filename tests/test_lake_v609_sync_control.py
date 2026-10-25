@@ -90,24 +90,50 @@ def _free_port() -> int:
     return port
 
 
-def _http(port: int, method: str, path: str):
+def _http(port: int, method: str, path: str, cookie: str | None = None):
     import http.client
 
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
     try:
-        c.request(method, path, body="{}")
+        headers = {"Cookie": cookie} if cookie else {}
+        c.request(method, path, body="{}", headers=headers)
         r = c.getresponse()
         return r.status, r.read().decode()
     finally:
         c.close()
 
 
+def _login_cookie(port: int) -> str:
+    """v7.0.14 登录门禁后：real-server 测试先 POST /api/login 取会话 cookie。
+
+    凭据读项目 .env（web.auth.load_auth_config，与生产同源）。"""
+    import http.client
+    import json as _json
+
+    from web.auth import load_auth_config
+    u, pw, _secret = load_auth_config()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        c.request("POST", "/api/login", body=_json.dumps({"username": u, "password": pw}),
+                  headers={"Content-Type": "application/json"})
+        r = c.getresponse()
+        body = r.read().decode()
+        if r.status != 200:
+            raise AssertionError(f"测试登录失败 {r.status}: {body}")
+        sc = r.getheader("Set-Cookie", "")
+        tok = next((x.split(";", 1)[0] for x in sc.split(",") if "ssc_session=" in x), "")
+        assert tok, f"无 ssc_session cookie: {sc}"
+        return tok
+    finally:
+        c.close()
+
+
 def _wait_ready(port: int, tries: int = 60) -> bool:
+    # v7.0.14 后任何 HTTP 响应（含 401 未登录）都说明 uvicorn 已就绪
     for _ in range(tries):
         try:
-            s, _ = _http(port, "GET", "/api/lake/status")
-            if s in (200, 409):
-                return True
+            _http(port, "GET", "/api/lake/status")
+            return True
         except Exception:  # noqa: BLE001
             pass
         time.sleep(0.5)
@@ -787,11 +813,12 @@ def test_http_sync_full_cycle_real_server(tmp_path):
     srv = _start_lake_server(port, p)
     try:
         assert _wait_ready(port), "uvicorn 未在超时内就绪"
+        ck = _login_cookie(port)  # v7.0.14 登录门禁
 
         # 等 holder 持锁生效 → /status backfill_in_progress=true（v6.0.4 三态不变）
         d = None
         for _ in range(40):
-            s, b = _http(port, "GET", "/api/lake/status")
+            s, b = _http(port, "GET", "/api/lake/status", cookie=ck)
             assert s == 200
             d = json.loads(b)
             if d.get("backfill_in_progress"):
@@ -801,7 +828,7 @@ def test_http_sync_full_cycle_real_server(tmp_path):
         assert d["lock_holder_pid"] == holder.pid
 
         # ② POST start → 409 sync_already_running（防双开，顶层契约体）
-        s, b = _http(port, "POST", "/api/lake/sync/start")
+        s, b = _http(port, "POST", "/api/lake/sync/start", cookie=ck)
         assert s == 409, f"已 running 时 start 必须 409，实际 {s}: {b}"
         bd = json.loads(b)
         assert bd.get("error") == "sync_already_running", f"{bd}"
@@ -810,7 +837,7 @@ def test_http_sync_full_cycle_real_server(tmp_path):
         # ③ POST stop → **200 + waiting_task=true**（v6.0.10 异步：发信号即返回，
         #    SIGTERM；holder 无 setsid → 降级 kill）→ 轮询 /status 到锁释放
         t0 = time.monotonic()
-        s, b = _http(port, "POST", "/api/lake/sync/stop")
+        s, b = _http(port, "POST", "/api/lake/sync/stop", cookie=ck)
         assert s == 200, f"stop 应 200，实际 {s}: {b}"
         bd = json.loads(b)
         assert time.monotonic() - t0 < 5.0, f"stop 必须异步立即返回: {bd}"
@@ -823,7 +850,7 @@ def test_http_sync_full_cycle_real_server(tmp_path):
         #    handler → progress 无标记 → stopping=false）
         d = None
         for _ in range(60):
-            s, b = _http(port, "GET", "/api/lake/status")
+            s, b = _http(port, "GET", "/api/lake/status", cookie=ck)
             d = json.loads(b)
             if d.get("backfill_in_progress"):
                 assert d.get("stopping") is False, f"无 runner 标记时 stopping=false: {d}"
@@ -832,7 +859,7 @@ def test_http_sync_full_cycle_real_server(tmp_path):
             time.sleep(0.25)
         assert "backfill_in_progress" not in d, f"停止后不得残留 backfill 键: {d}"
 
-        s, b = _http(port, "POST", "/api/lake/sync/stop")
+        s, b = _http(port, "POST", "/api/lake/sync/stop", cookie=ck)
         assert s == 409, f"未 running 时 stop 必须 409，实际 {s}: {b}"
         bd = json.loads(b)
         assert bd.get("error") == "sync_not_running"
@@ -854,7 +881,8 @@ def test_http_status_three_state_contract_unchanged_v604(tmp_path):
     srv = _start_lake_server(port, missing)
     try:
         assert _wait_ready(port), "uvicorn 未在超时内就绪"
-        s, b = _http(port, "GET", "/api/lake/status")
+        ck = _login_cookie(port)  # v7.0.14 登录门禁
+        s, b = _http(port, "GET", "/api/lake/status", cookie=ck)
         assert s == 200
         d = json.loads(b)
         expect = {

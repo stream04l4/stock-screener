@@ -1,4 +1,4 @@
-# stock-screener · v7.0.13（drawdown_martingale 单策略版）
+# stock-screener · v7.0.14（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -146,7 +146,10 @@ systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改
 参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
 **数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
 
-主要 API：`/api/health` · `/api/pool`（候选池：漏斗 + 成员，读预计算表 O(1)）·
+主要 API：`/api/health` · **登录门禁（v7.0.14）**：`/api/login`（POST，写会话
+cookie）· `/api/logout`（POST）· `/api/auth/me`（GET 当前用户，未登录 401）——
+除这三者外全部 `/api/*` 需有效会话 cookie ·
+`/api/pool`（候选池：漏斗 + 成员，读预计算表 O(1)）·
 `/api/pool/manual`（GET 读手动池 / POST 加入 / DELETE 移除，写 `data/manual_pool.json`）·
 `/api/strategy`（GET/PUT，PUT 语义校验 + .bak 备份；timing 段可选）·
 `/api/timing`（v7.0.13 今日选股：读 `selection_timing` O(1)，as_of/rows/params；
@@ -186,8 +189,8 @@ gitignore，禁入 git/日志）。
 ## 7. 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 后端（582 用例，含 test_timing 边沿语义）
-cd web/frontend && npm test                   # 前端 vitest（229 用例）
+.venv/bin/python -m pytest tests/ -q          # 后端（591 用例，含 test_timing 边沿语义 + test_web_auth 登录门禁）
+cd web/frontend && npm test                   # 前端 vitest（235 用例，含登录页/门禁）
 cd web/frontend && npm run build               # dist/ 供 StaticFiles 挂载
 ```
 
@@ -232,3 +235,8 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - **v7.0.13**：选股时机（§2.5）——「策略参数」卡改名**持仓策略**，新增
   **选股策略**卡（3 条件 + 今日选股表 + 一键加持仓）；`timing` 子命令 /
   `selection_timing` 湖表 / `GET /api/timing` / 边沿状态微信新触发推送。
+- **v7.0.14**：登录门禁——全部 `/api/*`（除 login/logout/health）需登录；
+  无状态签名 cookie（`web/auth.py`，HttpOnly/SameSite=Lax/7 天），凭据在
+  `.env`（`WEB_ADMIN_USER`/`WEB_ADMIN_PASS`/`WEB_SESSION_SECRET`，禁入 git/日志）；
+  前端登录页（未登录不渲染页签）+ 顶栏「退出」；连续 5 次失败锁 120s（429）；
+  运行中 API 401（会话过期）自动回登录页。
