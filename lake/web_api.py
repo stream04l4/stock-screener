@@ -577,20 +577,22 @@ def stock_kline(ts_code: str, days: Optional[str] = Query(default=None),
 # ---------------------------------------------------------------------------
 @router.get("/industries")
 def industries() -> Dict[str, Any]:
-    """stock_master distinct industry_csric2 + 名称映射（code→name，取众数）。
+    """stock_master distinct industry_name（v7.0.18 粗分类口径）。
 
-    供前端"全市场浏览"行业下拉动态填充；库为空 → ``{"industries": []}``
+    v7.0.18（Joel 2026-10-26 拍板）：BaoStock 移除后行业 = tushare **粗分类**
+    （如"电气设备""化学制药"，无 CSRC 代码前缀），``industry_csric2`` 不再维护。
+    下拉改按 ``industry_name`` 去重：code=name=粗分类名（前端 MarketTable 以
+    code 为筛选值，零前端改动）。库为空 → ``{"industries": []}``
     （前端保持"全部行业"占位 + 空态文案）。排序按 code 升序（稳定、可断言）。
     """
     # D-4：每请求短连接，with 保证异常路径也 close（查询语义不变）
     with _con() as con:
         rows = _rows_dicts(
             con,
-            "SELECT industry_csric2 AS code, "
-            "ANY_VALUE(industry_name) FILTER (industry_name IS NOT NULL) AS name "
-            "FROM stock_master WHERE industry_csric2 IS NOT NULL AND industry_csric2 <> '' "
-            "GROUP BY industry_csric2 ORDER BY code")
-        return {"industries": [{"code": r["code"], "name": r["name"] or ""} for r in rows]}
+            "SELECT industry_name AS code "
+            "FROM stock_master WHERE industry_name IS NOT NULL AND industry_name <> '' "
+            "GROUP BY industry_name ORDER BY code")
+        return {"industries": [{"code": r["code"], "name": r["code"]} for r in rows]}
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +675,8 @@ def market(industry: Optional[str] = Query(default=None),
            page_size: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     """T1⋈T3(⋈T2最新行) 全市场浏览（v6.0.6 分页 + **v6.1.4 O1 排序**）。
 
-    :param industry: industry_csric2 精确过滤（如 J66）。
+    :param industry: industry_name 精确过滤（v7.0.18 粗分类名，如"电气设备"；
+        原 industry_csric2 口径随 BaoStock 移除）。
     :param soe: all | soe | other（soe_flag='央国企' / 其余）。
     :param sort: 列名白名单（v6.1.4 O1，brief 逐字）：code/name/industry_name/
         close/volume/amount/pe_ttm/pb/date。**非法 → 400**（与 page_size 的"回退 20"
@@ -715,7 +718,7 @@ def market(industry: Optional[str] = Query(default=None),
         where: List[str] = []
         params: List[Any] = []
         if industry:
-            where.append("m.industry_csric2 = ?")
+            where.append("m.industry_name = ?")
             params.append(industry)
         if soe == "soe":
             where.append("m.soe_flag = '央国企'")
@@ -805,8 +808,8 @@ _VIEW_META = [
 #   total = 七表之和。
 # - ``adapters``：读 ``data/lake/source_health.json``（灌数 driver 启动时
 #   ``_probe_all_adapters()`` 写入；Web 只读）。文件缺失/损坏 → 全 null + stale=true。
-# - ``baostock_probe``：直接透出 progress 顶层既有键（零新增写入代码）；无此键 → null。
 # - ``stale``：source_health.json 缺失或 max(probed_at) 距今 >7 天 → true。
+# - v7.0.18：原 ``baostock_probe`` 透出键随 BaoStock 渠道移除（progress 不再写）。
 #
 # **兼容红线**：locked/uninitialized 态响应键集一个字节不动（test_lake_v605_status
 # 精确断言 set(d.keys())）——本段只在 ready 态经 ``resp.update()`` 追加。
@@ -816,7 +819,7 @@ _CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 confli
 # v6.3.5：conflict 股票数口径的 code 列（index_daily=index_code，其余=ts_code）——
 # 与 _TABLE_META code_col 同口径，防 COUNT(DISTINCT ts_code) 在 index_daily 报列不存在。
 _CONFLICT_CODE_COL = {t[0]: t[5] for t in _TABLE_META}
-_ADAPTER_NAMES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
+_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10"]   # v7.0.18：baostock 随渠道移除
 _STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
 
 
@@ -870,26 +873,13 @@ def _read_source_health():
     return adapters, stale
 
 
-def _quota_from_progress(prog: Dict[str, Any]) -> Optional[int]:
-    """BaoStock 日配额派生 used_today（progress tasks quota_used_today max）。
-
-    现有算法原样复用——多 task 视图可能滞后，取 max 防低估；无 tasks/非 int → None。
-    budget 由调用方从 config ``baostock_daily_budget`` 取（本函数只算 used，单一职责）。
-    """
-    used = None
-    for t in prog.get("tasks", []):
-        if not isinstance(t, dict):
-            continue
-        u = t.get("quota_used_today")
-        if isinstance(u, int):
-            used = max(used or 0, u)
-    return used
+# v7.0.18：原 _quota_from_progress（BaoStock 日配额 used_today 派生）随渠道移除。
 
 
 def _rate_limit_text(name: str, cfg: Dict[str, Any]) -> Optional[str]:
     """限速纪律文案（config ``{name}_min_interval_s`` 派生；未配置 → None）。
 
-    1.0 → "≥1s/股"（整数去小数点）；0.5 → "≥0.5s/股"。tencent/baostock 无
+    1.0 → "≥1s/股"（整数去小数点）；0.5 → "≥0.5s/股"。tencent 无
     min_interval 配置 → None（前端显示"无官方配额"）。
     """
     v = cfg.get(f"{name}_min_interval_s")
@@ -903,19 +893,18 @@ def _build_sources(prog: Dict[str, Any], adapters: Dict[str, Any]) -> List[Dict[
     """v6.1.3：``source_pool.sources`` 数组（**仅 ready 态**，随 source_pool 同规）。
 
     每源一项，固定顺序 = :data:`_ADAPTER_NAMES`（与前端 SOURCE_COLORS 对齐）：
-    - ``enabled``：config 开关（``{name}_enabled``；未配置开关的源=tencent/baostock
-      → True——它们没有独立开关，由探测/配额纪律约束）；
+    - ``enabled``：config 开关（``{name}_enabled``；未配置开关的源=tencent
+      → True——它没有独立开关，由探测纪律约束）；
     - ``available/probed_at/latency_ms``：**复用现有 adapters[name]**（None=未探测，
       语义与 v6.1 adapters 字段一致，零新增探测）；
     - ``authority``：Q1 权威性数值（source_pool.AUTHORITY 静态常量——不 import
       adapter 实例，避免 web 进程触发重依赖懒加载/网络自检）；
     - ``provides``：静态能力表 SOURCE_CAPABILITIES（该源可提供的数据类型+role；
       T4=本地静态缓存不属在线源，不列）；
-    - ``quota``：**仅 baostock 非 null**（有硬配额的唯一源）——used_today 取
-      progress tasks max（现有算法），budget 取 config ``baostock_daily_budget``；
-      其余源 null；
+    - ``quota``：恒 null（v7.0.18：唯一有硬配额的 baostock 已移除；字段保留
+      前端形状稳定）；
     - ``rate_limit``：min_interval_s 派生文案（sina/tdx/adata_f10 有；
-      tencent/baostock → None）。
+      tencent → None）。
 
     全部只读（config 文件 + progress dict + 静态常量），零网络、零库查询。
     """
@@ -923,11 +912,10 @@ def _build_sources(prog: Dict[str, Any], adapters: Dict[str, Any]) -> List[Dict[
     from .ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES
 
     cfg = lake_cfg()
-    used_today = _quota_from_progress(prog)
     out: List[Dict[str, Any]] = []
     for name in _ADAPTER_NAMES:
         a = adapters.get(name) or {}
-        entry: Dict[str, Any] = {
+        out.append({
             "name": name,
             "enabled": bool(cfg.get(f"{name}_enabled", True)),
             "available": a.get("available"),
@@ -937,15 +925,7 @@ def _build_sources(prog: Dict[str, Any], adapters: Dict[str, Any]) -> List[Dict[
             "provides": [dict(p) for p in SOURCE_CAPABILITIES.get(name, [])],
             "quota": None,
             "rate_limit": _rate_limit_text(name, cfg),
-        }
-        if name == "baostock":
-            # 唯一有硬配额的源：budget=config（默认 5000，Q2）；used_today 可能
-            # 为 None（从未灌数/无 tasks）→ 前端按"今日 —/budget"渲染。
-            entry["quota"] = {
-                "used_today": used_today,
-                "budget": int(cfg.get("baostock_daily_budget", 5000)),
-            }
-        out.append(entry)
+        })
     return out
 
 
@@ -963,14 +943,13 @@ def _build_source_pool(con, prog: Dict[str, Any]) -> Dict[str, Any]:
     by_source, conflict_rows, conflict_codes = _source_pool_cache(con, db_path)
 
     adapters, stale = _read_source_health()
-    bs_probe = prog.get("baostock_probe")   # 直接透出 progress 既有键；无 → None
     return {
         "by_source": by_source,
         "conflict_rows": conflict_rows,
         # v6.3.5：conflict 股票数口径（行级计数被 adj 摘要复制放大，误导）
         "conflict_codes": conflict_codes,
         "adapters": adapters,
-        "baostock_probe": bs_probe if isinstance(bs_probe, dict) else None,
+        # v7.0.18：原 baostock_probe 键随渠道移除（progress 不再写该键）。
         "stale": stale,
         # v6.1.3：sources（静态能力表 + 既有探测结果，零网络；仅 ready 态）
         "sources": _build_sources(prog, adapters),
@@ -1364,8 +1343,9 @@ def status() -> Dict[str, Any]:
     =true 时有意义；三态互不串味纪律延续 v6.0.4/v6.0.5）。
 
     v6.1：**仅 ready 态**追加 ``source_pool``（by_source 9表恒定 / conflict_rows
-    T1-T7+total / adapters / baostock_probe / stale，见 :func:`_build_source_pool`）
+    T1-T7+total / adapters / stale，见 :func:`_build_source_pool`）
     ——locked/uninitialized 键集一个字节不动（三态契约红线）。
+    （v7.0.18：原 baostock_probe 键随渠道移除。）
 
     v6.1.3：``source_pool`` 内追加 ``sources`` 数组（各源连通性+数据类型 provides
     +配额 quota+限速 rate_limit，见 :func:`_build_sources`）——随 source_pool 同规
@@ -1460,26 +1440,22 @@ def status() -> Dict[str, Any]:
 # （ruamel roundtrip 保注释 + 写前 .bak 备份 + tmp/rename 原子写）。立即生效=下次
 # resolve_source/灌数启动读到新值（lake_cfg() 每次现读文件、无进程级缓存）；**运行中
 # 灌数不受影响**（adapter 池在启动时构建——文档注明"下次启动生效"）。
-# **probe**：POST /sources/probe {names:[...]} → 逐源清懒缓存 + available()（baostock
-# 走 Q6 probe_baostock_alive 真探测），每源 ≤15s 线程隔离超时（hang 场景不拖死请求，
+# **probe**：POST /sources/probe {names:[...]} → 逐源清懒缓存 + available()，
+# 每源 ≤15s 线程隔离超时（hang 场景不拖死请求，
 # 超时记 available=false detail="probe timeout"）→ 合并写 source_health.json（复用
 # _read_source_health 的落盘格式）+ 返回各源结果。灌数运行中允许探测（只读网络自检、
 # 不碰库——health 是 JSON 文件，与 DuckDB 锁无关）。
+# v7.0.18：原 baostock Q6 真探测特例随渠道移除（4 源统一走 adapter.available()）。
 # ---------------------------------------------------------------------------
-_SOURCE_SWITCH_NAMES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
-_PROBE_TIMEOUT_S = 15.0   # O4 超时纪律：每源最多 15s（baostock hang 不能拖死请求）
+_SOURCE_SWITCH_NAMES = ["sina", "tencent", "tdx", "adata_f10"]
+_PROBE_TIMEOUT_S = 15.0   # O4 超时纪律：每源最多 15s（hang 不能拖死请求）
 
 
 def _probe_one_source(name: str) -> Dict[str, Any]:
     """单源探测（**调用方须在独立线程跑**——本函数内部可能阻塞至网络层超时）。
 
-    - sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
-      （首次触发 EU 自检；失败→False，不抛）。
-    - baostock：available() 只读 Q6 进程内结果（未探测恒 False）——手动探测须**真探**：
-      probe_baostock_alive(10s socket 超时) + set_baostock_alive 回写（与灌数启动
-      _run_bs_probe 同语义；Web 进程内的 Q6 结果只影响本进程后续 resolve_source，
-      灌数子进程有自己的探测——不串味）。**F3/v6.1.5**：显式 wall_budget_s=15（<20s
-      红线；screener/ 零改动——内层预算在本调用点收紧）+ 外层 _with_timeout(15s) 双保险。
+    sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
+    （首次触发 EU 自检；失败→False，不抛）。
     """
     from .ingest import source_pool as sp
 
@@ -1487,22 +1463,14 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
     t0 = time.monotonic()
     detail = ""
     try:
-        if name == "baostock":
-            from screener.data.baostock_client import probe_baostock_alive
-
-            res = probe_baostock_alive(timeout_s=10.0, wall_budget_s=15.0)
-            sp.set_baostock_alive(bool(res.get("alive", False)), res.get("detail", ""))
-            ok = bool(res.get("alive", False))
-            detail = res.get("detail") or ""
-        else:
-            ad = sp.get_adapter(name)
-            if ad is None:
-                return {"available": False, "probed_at": now_s, "latency_ms": None,
-                        "detail": "adapter 未注册（依赖库未装）"}
-            reset = getattr(ad, "reset_available_for_test", None)   # 懒缓存先清（brief 逐字）
-            if callable(reset):
-                reset()
-            ok = bool(ad.available())
+        ad = sp.get_adapter(name)
+        if ad is None:
+            return {"available": False, "probed_at": now_s, "latency_ms": None,
+                    "detail": "adapter 未注册（依赖库未装）"}
+        reset = getattr(ad, "reset_available_for_test", None)   # 懒缓存先清（brief 逐字）
+        if callable(reset):
+            reset()
+        ok = bool(ad.available())
     except Exception as exc:  # noqa: BLE001 - 单源异常→false（不 crash、不拖死请求）
         ok, detail = False, f"probe error: {exc}"
     return {"available": ok, "probed_at": now_s,
@@ -1538,10 +1506,10 @@ def _write_source_health(merged: Dict[str, Any]) -> Optional[str]:
 def sources_toggle(payload: Dict[str, Any]) -> Dict[str, Any]:
     """O4：数据源开关 → 写 config/strategy.yaml lake 段（立即生效于下次灌数启动）。
 
-    :param payload: ``{"name": "sina"|"tencent"|"baostock"|"tdx"|"adata_f10",
-        "enabled": true|false}``。
+    :param payload: ``{"name": "sina"|"tencent"|"tdx"|"adata_f10",
+        "enabled": true|false}``（v7.0.18：baostock 随渠道移除，4 源白名单）。
     - 200 ``{name, key, enabled, path, backup, note}``：写入成功（.bak=写前备份）。
-    - **400**：name 不在 5 源白名单 / enabled 非 bool（不猜键名——写错键=配置静默失效）。
+    - **400**：name 不在 4 源白名单 / enabled 非 bool（不猜键名——写错键=配置静默失效）。
     - **500**：yaml 顶层结构异常（拒绝写入，原文件不动）。
 
     **生效语义**（brief 逐字）：lake_cfg() 每次读文件现读现用（无进程级缓存）→
@@ -1571,11 +1539,11 @@ def sources_toggle(payload: Dict[str, Any]) -> Dict[str, Any]:
 def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
     """O4：手动探测各源连通性（每源 ≤15s 超时隔离；写 source_health.json）。
 
-    :param payload: ``{"names": ["sina", ...]}``（缺省/空 = 全部 5 源）。
+    :param payload: ``{"names": ["sina", ...]}``（缺省/空 = 全部 4 源）。
     - 200 ``{results: {name: {available, probed_at, latency_ms, detail?}}, path}``。
     - **400**：names 含非白名单源名。
 
-    **超时纪律**（brief 逐字）：每源最多 15s——baostock hang 场景不能拖死请求。
+    **超时纪律**（brief 逐字）：每源最多 15s——hang 场景不能拖死请求。
     实现=每源一个 daemon 线程 + join(15)；超时 → available=false detail="probe timeout"
     （线程无法强杀，hang 的后台线程泄漏但请求已返回；socket 层 10s 超时是主防线）。
     **灌数运行中允许探测**：只读网络自检、不碰库（health 是 JSON 文件）。
@@ -1593,8 +1561,8 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     results: Dict[str, Any] = {}
     for name in dict.fromkeys(names):   # 去重保序（重复探测无意义）
-        # F3/v6.1.5：O4 手动探测复用 source_pool._with_timeout（与 baostock available()/
-        # Q6 同一超时工具，不各写一套）。每源 ≤_PROBE_TIMEOUT_S(15s) 墙钟隔离——hang 场景
+        # F3/v6.1.5：O4 手动探测复用 source_pool._with_timeout（通用墙钟超时工具，
+        # 不各写一套）。每源 ≤_PROBE_TIMEOUT_S(15s) 墙钟隔离——hang 场景
         # 请求不拖死；超时 → available=false detail="probe timeout"（brief 逐字语义）。
         try:
             from .ingest.source_pool import _with_timeout

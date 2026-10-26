@@ -6,7 +6,8 @@
 // 若再复制一份就漂移。抽到本模块：SourcePoolPanel（卡片/图例/tooltip）+
 // 任何新组件（如 O4 探测按钮着色）都从这里 import，单一事实来源。
 //
-// 色板与 brief 逐字一致（sina蓝/tencent橙/baostock紫/tdx青/adata_f10粉/local灰）；
+// 色板（v7.0.18：baostock 随渠道移除，历史行走 legacy 灰显）：
+// sina蓝/tencent橙/tdx青/adata_f10粉/local灰；
 // 后端 by_source 的 source 值域 = adapter 名 + "local"（本地缓存 legacy 行）。
 //
 // v6.1.5 F2：local 色 #94a3b8(slate-400) → #64748b(slate-500)。为什么改：白底上
@@ -15,17 +16,18 @@
 // 三处同源自动跟随（防漂移）。
 
 // 固定色板（brief 逐字）；未知源（legacy 't'/'em_local_static' 等）→ UNKNOWN_COLOR。
+// v7.0.18：baostock 随渠道移除（历史库行 source='baostock' 走 LEGACY_SOURCE_ALIASES 灰显）。
 export const SOURCE_COLORS = {
-  sina: "#2563eb", tencent: "#f97316", baostock: "#8b5cf6",
+  sina: "#2563eb", tencent: "#f97316",
   tdx: "#06b6d4", adata_f10: "#ec4899", local: "#64748b",   // v6.1.5 F2：slate-500（白底可读）
 };
 export const UNKNOWN_COLOR = "#cbd5e1";
 
 // 中文源名（O5：图例 + 悬停提示用；brief 逐字 "● sina 新浪 / …"）。
-// 仅列**当前活跃**的 6 个 source 值（与 LEGEND_ORDER 对齐）——legacy 别名走下方
-// LEGACY_SOURCE_ALIASES，不混进图例固定顺序。
+// 仅列**当前活跃**的 source 值（与 LEGEND_ORDER 对齐）——legacy 别名走下方
+// LEGACY_SOURCE_ALIASES，不混进图例固定顺序。v7.0.18：baostock 随渠道移除。
 export const SOURCE_LABELS = {
-  sina: "新浪", tencent: "腾讯", baostock: "BaoStock",
+  sina: "新浪", tencent: "腾讯",
   tdx: "通达信", adata_f10: "adata", local: "本地缓存",
 };
 
@@ -55,21 +57,23 @@ export const SOURCE_VARIANTS = {
 //
 // 核对来源（F1 brief：grep 生产库 SELECT DISTINCT source，read_only 连接）：
 //   kline_daily      → sina / tencent          （当前活跃，已在 SOURCE_LABELS）
-//   stock_master     → baostock                （当前活跃）
+//   stock_master     → tushare                 （v7.0.18 主源；历史行 baostock 走 legacy）
 //   valuation_daily  → tencent                 （当前活跃）
 //   index_daily      → tencent                 （当前活跃）
 //   dividend_events  → em_local_static         （legacy：东财本地静态缓存，分红 T4）
 //   factor_snapshot  → lake_factors            （legacy：本地因子派生 T8）
 //   brief 点名       → t                       （legacy：早期腾讯源标记）
-// 全量实际出现值 = {baostock, em_local_static, lake_factors, sina, tencent} ∪ {t(local)}。
+// 全量实际出现值 = {baostock, em_local_static, lake_factors, sina, tencent} ∪ {t(local)}
+// ∪ {tushare}（v7.0.18 起 T1 新写入）。
 export const LEGACY_SOURCE_ALIASES = {
   t: "腾讯(legacy)",            // brief 点名：早期腾讯源标记（生产库当前无此值，保留可追溯）
+  baostock: "BaoStock(legacy)", // v7.0.18：渠道移除，历史库行灰显可追溯
   em_local_static: "本地缓存",   // 东财本地静态缓存（dividend_events T4 分红历史行）
   lake_factors: "本地因子",      // 本地因子派生（factor_snapshot T8）
 };
 
-// 图例行固定顺序（brief 逐字：sina/tencent/baostock/tdx/adata_f10/local）。
-export const LEGEND_ORDER = ["sina", "tencent", "baostock", "tdx", "adata_f10", "local"];
+// 图例行固定顺序（v7.0.18：baostock 随渠道移除，5 源 + local）。
+export const LEGEND_ORDER = ["sina", "tencent", "tdx", "adata_f10", "local"];
 
 // source → {color, label}（v6.1.5 F1 三级 + v6.3.3 变体级，不再裸显英文）
 //   1) 当前活跃源 SOURCE_COLORS/SOURCE_LABELS → 固定色 + 中文名；

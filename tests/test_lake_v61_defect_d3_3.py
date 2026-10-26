@@ -181,9 +181,9 @@ def test_d33_p0_multisource_no_production_pollution(tmp_path, monkeypatch):
     hp = tmp_path / "source_health.json"
     assert hp.exists(), f"tmp 目录应出现 source_health.json: {sorted(os.listdir(tmp_path))}"
     data = json.loads(hp.read_text(encoding="utf-8"))
-    assert set(data.keys()) == {"sina", "tencent", "baostock", "tdx", "adata_f10"}
+    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10"}  # v7.0.18：4 源（baostock 移除）
     assert data["sina"]["available"] is True      # mock 注册表：sina 存活
-    assert data["baostock"]["available"] is False  # 未注册 → false（不猜 null）
+    assert data["adata_f10"]["available"] is False  # 未注册 → false（不猜 null）
     # progress 同目录（patch 生效，两者一致落 tmp）
     assert os.path.exists(prog)
 

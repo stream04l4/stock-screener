@@ -12,8 +12,9 @@
 - **/sync/start 缺省=full、409 互斥不变**（mock start_sync，零 spawn）。
 
 纪律：全离线——沿用 v614 隔离契约（conftest autouse LAKE_MULTISOURCE=0 → legacy
-单源路径），fake 打在模块级取数函数上（tencent_ingest/baostock_ingest +
-BaoStockClient/TencentClient 构造替身）；T5 的 adata F10 主源经 mock adapter
+单源路径），fake 打在模块级取数函数上（tencent_ingest +
+TencentClient 构造替身；v7.0.18 原 baostock_ingest/BaoStockClient fake 随渠道移除）；
+T5 的 adata F10 主源经 mock adapter
 注入注册表（run_t5 直接 get_adapter("adata_f10")，不走 resolve_source）。
 库一律 tmp_path，不碰 data/lake/、不碰生产灌数进程。
 """
@@ -86,7 +87,6 @@ def _v616_isolate(tmp_path, monkeypatch):
         f.write("lake:\n"
                 "  sina_enabled: true\n"
                 "  tencent_enabled: true\n"
-                "  baostock_probe_enabled: false\n"   # Q6 探测关（离线契约，零网络）
                 "  tdx_enabled: true\n"
                 "  adata_f10_enabled: true\n")
     monkeypatch.setattr(lconfig, "strategy_yaml_path", lambda: yaml_path)
@@ -152,8 +152,8 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
     """离线 fake（v614/v607 同模式）：legacy 路径模块级取数函数 + T5 mock adapter
     + v6.1.7 T6 SinaClient 构造替身。
 
-    - history legacy：ti.fetch_kline_full_history（全史）+ bsi.fetch_adjust_factor
-      （adj，空行=无除权，合法）；BaoStockClient/TencentClient 构造替身（零网络）。
+    - history legacy：ti.fetch_kline_full_history（全史，adj_map=None——
+      v7.0.18 原 BaoStock adj 兜底移除）；TencentClient 构造替身（零网络）。
     - P3 legacy：ti.fetch_kline_ohlcv（T2 窗口/T7 指数共用）+ ti.fetch_snapshot（T3）。
     - T5：mock adata_f10 adapter 注入注册表（run_t5 直接 get_adapter）。
     - T6（v6.1.7）：drv._t6_client_factory → fake SinaClient（fetch_holders 返回
@@ -163,8 +163,6 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
     :return: counter dict（full_history/kline/snapshot/f10/holders 调用计数，可清零重跑）。
     """
     import lake.ingest.tencent_ingest as ti
-    import lake.ingest.baostock_ingest as bsi
-    import screener.data.baostock_client as bsc
     import screener.data.tencent as tmod
 
     counter = {"full_history": 0, "kline": 0, "snapshot": 0, "holders": {}}
@@ -189,13 +187,6 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
         counter["snapshot"] += 1
         return {c: dict(snaps[c]) for c in ts_codes if c in snaps}
 
-    class _FakeBS:   # v6.0.10：driver 构造传 stop_checker=（依赖注入）→ fake 接受 kwargs
-        def __init__(self, *a, **k):
-            pass
-
-        def close(self):
-            pass
-
     class _FakeTClient:
         pass
 
@@ -212,9 +203,6 @@ def _wire_fakes(monkeypatch, codes, hist_kline_fail=False, t5_fail=False,
     monkeypatch.setattr(ti, "fetch_kline_full_history", fake_full_history)
     monkeypatch.setattr(ti, "fetch_kline_ohlcv", fake_kline)
     monkeypatch.setattr(ti, "fetch_snapshot", fake_snapshot)
-    monkeypatch.setattr(bsi, "fetch_adjust_factor",
-                        lambda bs, code, s, e: (["code", "adjustFactor"], []))
-    monkeypatch.setattr(bsc, "BaoStockClient", _FakeBS)
     monkeypatch.setattr(tmod, "TencentClient", _FakeTClient)
     monkeypatch.setattr(drv, "_t6_client_factory", lambda: _FakeSina())
     # v6.1.8 F1：t8/t9 离线替身（零网络、不碰真实 factor/rf 取数）。run_full 经 drv.run_t8/
@@ -693,8 +681,6 @@ def test_d1_cmd_full_rc1_on_real_watchdog(tmp_path):
         f"import sys; sys.path[:0]={[REPO_ROOT, SCRIPTS_DIR]!r}\n"
         "import lake_backfill as drv\n"
         "import lake.ingest.tencent_ingest as ti\n"
-        "import lake.ingest.baostock_ingest as bsi\n"
-        "import screener.data.baostock_client as bsc\n"
         "import screener.data.tencent as tmod\n"
         "from lake.ingest import source_pool as sp\n"
         f"drv._today_beijing=lambda:'{FIXED_TODAY}'\n"
@@ -706,10 +692,8 @@ def test_d1_cmd_full_rc1_on_real_watchdog(tmp_path):
         "ti.fetch_kline_ohlcv=lambda c,t,n:[dict(r) for r in _kl()]\n"
         "ti.fetch_snapshot=lambda c,ts:{x:{'total_mv_yi':1.0,'float_mv_yi':1.0,'pe_ttm':5.0,"
         "'pb':0.8,'turnover':1.0} for x in ts}\n"
-        "bsi.fetch_adjust_factor=lambda bs,code,s,e:(['code','adjustFactor'],[])\n"
-        "class _BS:\n    def __init__(s,*a,**k):pass\n    def close(s):pass\n"
         "class _TC:pass\n"
-        "bsc.BaoStockClient=_BS; tmod.TencentClient=_TC\n"
+        "tmod.TencentClient=_TC\n"
         "class _AD:\n    def available(s):return True\n"
         "    def fetch_f10(s,c):return [{'period':'2026Q1','pub_date':'2026-04-30',"
         "'roe_weighted':5.0,'gross_margin':30.0,'liability_pct':40.0,'yoy_pni':8.0,"

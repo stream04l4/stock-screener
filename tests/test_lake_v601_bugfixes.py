@@ -108,18 +108,20 @@ def _make_industries_con(rows):
 
 
 def test_d3_industries_endpoint_populated(monkeypatch):
-    """有数据：distinct code + 名称映射，按 code 升序；空 code/NULL 被排除。"""
+    """v7.0.18 口径：code=name=industry_name 粗分类，按 code 升序；NULL 被排除。"""
     import lake.web_api as wapi
 
     con = _make_industries_con([("J66", "货币金融服务"), ("C39", "计算机、通信和其他电子设备制造业")])
     monkeypatch.setattr(wapi, "_con", lambda: con)
     try:
         d = wapi.industries()
-        assert [i["code"] for i in d["industries"]] == ["C39", "J66"], \
-            f"应按 code 升序: {d['industries']}"
+        # 粗分类口径：code=name=industry_name（_make_industries_con 的 name 列入库）
+        assert [i["code"] for i in d["industries"]] == [
+            "计算机、通信和其他电子设备制造业", "货币金融服务"], \
+            f"应按 code(=industry_name) 升序: {d['industries']}"
         by_code = {i["code"]: i["name"] for i in d["industries"]}
-        assert by_code["J66"] == "货币金融服务"
-        assert by_code["C39"] == "计算机、通信和其他电子设备制造业"
+        assert by_code["货币金融服务"] == "货币金融服务"
+        assert by_code["计算机、通信和其他电子设备制造业"] == "计算机、通信和其他电子设备制造业"
     finally:
         con.close()
 

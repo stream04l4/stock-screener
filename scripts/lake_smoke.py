@@ -3,13 +3,12 @@
 
 纪律（最高优先级）：
 - 只允许最小冒烟：**20 只 × 1 天**证明链路通；
-- BaoStock 一律走 BaoStockClient（自带 QuotaGuard），**≤5 次**（本脚本只用 1 次：
-  sh.601398 adj_factor 验前向填充）；
 - 腾讯批量接口为主源（免费）；新浪本期冒烟不碰（T6 留全量 backfill）；
-- Tushare 本期冒烟不碰（P2，装包后单独验）。
+- v7.0.18：BaoStock 渠道移除——T1 冒烟走本地缓存（生产 T1=tushare stock_basic，
+  冒烟不碰）；T2 adj_factor 走 tdx hfq÷raw 推导（sh.601398 锚点验证）。
 
 链路：建库 → T4(分红,零网络) → T1(本地缓存,零网络) → T3(腾讯快照) →
-      T2(腾讯K线 + BaoStock adj_factor 前向填充) → T7(四指数末行) →
+      T2(腾讯K线 + tdx adj_factor 推导) → T7(四指数末行) →
       hfq 连续性验证 → Web /api/lake/* 4 端点（由外部 curl 验）。
 """
 from __future__ import annotations
@@ -32,13 +31,13 @@ def hr(title):
 
 
 def main():
-    # ---- 0. 记录 BaoStock 配额前值（验收：≤10 次）----
-    from screener.data.baostock_client import QuotaGuard, default_quota_path
+    # ---- 0. 记录 QuotaGuard 状态前值（v7.0.18 起无计数方，恒 0——机制保留观察用）----
+    from lake.ingest.common import QuotaGuard, default_quota_path
 
     guard = QuotaGuard(path=default_quota_path())
     q_date, q_before = guard.get_state()
-    hr("STEP 0 · BaoStock 配额前值")
-    print(f"date={q_date} used={q_before} quota=49900 path={default_quota_path()}")
+    hr("STEP 0 · QuotaGuard 状态前值（v7.0.18 无计数方，预期恒 0）")
+    print(f"date={q_date} used={q_before} path={default_quota_path()}")
 
     # ---- 1. 建库（fresh：先删旧库证明从零建）----
     from lake import conn as lconn
@@ -167,26 +166,24 @@ def main():
             t2_n += 1
     print(f"T2(腾讯K线) 灌入 {t2_n}/20 只 × 1 天")
 
-    # ---- 6. BaoStock adj_factor（≤5 次，本脚本 1 次）+ 本地全历史 → T2 前向填充 ----
-    hr("STEP 6 · BaoStock adj_factor（sh.601398，1 次调用）+ 本地 kline_af3 全历史 → T2")
-    from screener.data.baostock_client import BaoStockClient
-    from lake.ingest.baostock_ingest import fetch_adjust_factor, load_t2_adj_factor
+    # ---- 6. tdx adj_factor（hfq÷raw 推导，v7.0.18：原 BaoStock 锚点随渠道移除）
+    #      + 本地全历史 → T2 前向填充 ----
+    hr("STEP 6 · tdx adj_factor（sh.601398，hfq÷raw 推导）+ 本地 kline_af3 全历史 → T2")
+    from lake.ingest.easy_tdx_adapter import EasyTdxAdapter
     from lake.ingest.common import forward_fill_af, clean_date, to_float
     from lake.ingest.local_cache_ingest import _read_cache_csv
 
-    bs = BaoStockClient()   # 构造即挂 QuotaGuard（默认路径）
+    tdx_ad = EasyTdxAdapter()
     try:
-        fields, adj_rows = fetch_adjust_factor(bs, "sh.601398", "2016-09-01", "2026-09-14")
-        print(f"query_adjust_factor 返回 {len(adj_rows)} 行（仅除权日）fields={fields}:")
-        adj_map = load_t2_adj_factor(con, "sh.601398", adj_rows)
+        adj_map = tdx_ad.fetch_adj_factor("sh.601398", "2016-09-01", "2026-09-14")
+        assert adj_map, "tdx adj_factor 取空（冒烟失败）"
+        print(f"tdx 推导 adj_factor 返回 {len(adj_map)} 个事件日（仅除权日）:")
         for d in sorted(adj_map):
             print(f"   {d}  af={adj_map[d]}")
-        # 已知锚点：2026-05-13 af=2.5545（brief Q4）
+        # 除权日锚点=事件日期（跨源事实，不依赖归一化基准）：2026-05-13 必有事件
         assert "2026-05-13" in adj_map, "缺 2026-05-13 除权事件"
         af_anchor = adj_map["2026-05-13"]
-        ok = abs(af_anchor - 2.5545) < 0.001
-        print(f"锚点 2026-05-13 af={af_anchor} → {'OK(≈2.5545)' if ok else 'FAIL'}")
-        assert ok, "af 锚点不符（应≈2.5545）"
+        print(f"锚点 2026-05-13 af={af_anchor}（tdx 推导基准，值随基准、日期为事实）")
 
         # 本地 raw close 全历史（kline_af3，零网络；close=不复权价，见 reconstruct.py）
         kl = _read_cache_csv(os.path.join(CACHE_DIR, "kline_af3_sh.601398.csv"))
@@ -223,7 +220,7 @@ def main():
         n6 = load_t2(con, "sh.601398", local_kl, adj_map=adj_map)
         print(f"sh.601398 T2 已灌 {n6} 天历史（含 af 前向填充）")
     finally:
-        bs.close()
+        pass   # v7.0.18：原 bs.close() 随 BaoStock 移除（tdx adapter 无需显式关闭）
 
     # ---- 7. hfq view 数值验证（Q4：hfq close = raw × af，跨除权日连续）----
     hr("STEP 7 · hfq view 数值验证（kline_daily_hfq）")
@@ -274,12 +271,10 @@ def main():
         print(f"   {r[0]}  last_date={r[1]}  close={r[2]}")
     assert len(idx_last) == 4, "四指数未全部灌入"
 
-    # ---- 9. 配额后值 + coverage 汇总 ----
-    hr("STEP 9 · BaoStock 配额后值 + 数据湖 coverage")
+    # ---- 9. QuotaGuard 状态后值 + coverage 汇总 ----
+    hr("STEP 9 · QuotaGuard 状态后值 + 数据湖 coverage")
     q_date2, q_after = guard.get_state()
-    consumed = q_after - q_before
-    print(f"date={q_date2} used={q_after} (前 {q_before}) → 本次冒烟消耗 {consumed} 次")
-    assert consumed <= 10, f"BaoStock 消耗 {consumed} 次 > 10（超限！）"
+    print(f"date={q_date2} used={q_after} (前 {q_before})——v7.0.18 无计数方，应恒相等")
     print(f"\n各表 coverage:")
     for t in TABLES:
         cnt = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
@@ -301,7 +296,6 @@ def main():
 
     con.close()
     hr("SMOKE OK · 全链路通（建库→T4→T1→T3→T2+af→T7→hfq→T8）")
-    print(f"BaoStock 消耗 {consumed} 次 (≤10) ✓")
 
 
 if __name__ == "__main__":

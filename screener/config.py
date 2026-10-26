@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """screener.config —— v7 数据客户端库的最小配置入口。
 
-v7.0 定位：screener 已退化为**数据客户端库**（screener/data/{baostock_client,
-tencent,sina,rf}.py，供 lake/ingest 与 scripts/lake_backfill 只读复用）。策略参数
+v7.0 定位：screener 已退化为**数据客户端库**（screener/data/{tencent,sina,rf}.py
+（+errors.py 中性异常），供 lake/ingest 与 scripts/lake_backfill 只读复用）。策略参数
 的权威校验在 ``martingale.config``（新 schema）；Web 的 strategy 读写亦用
 ``martingale.config.load_config`` 做严格校验。
 

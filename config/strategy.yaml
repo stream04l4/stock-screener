@@ -6,7 +6,7 @@
 #   universe:   股票池 5 条件 + 候选池选股门槛 5 键（v7.0.12；SOE 恒强制，不设开关）
 #   timing:     选股时机 5 键（v7.0.13；候选池内筛买入时机；段可缺省=默认值）
 #   lake:       数据湖配置（lake.config.lake_cfg() 读取；lake-sync 依赖，勿删）
-#   datasource: lake-sync 数据源子段（sina/rf/baostock 必留；lake_backfill 唯一消费点）
+#   datasource: lake-sync 数据源子段（sina/rf 必留；lake_backfill 唯一消费点）
 #
 # 纪律：所有策略阈值必须来自本文件（代码零硬编码策略阈值；佣金/印花税为引擎
 # 常量，TL 拍板不暴露——martingale/config.py 头部注释）。
@@ -81,11 +81,13 @@ timing:                             # 选股时机（v7.0.13，Joel 2026-10-25 �
   ma_period: 250                    # ③ 均线窗口（交易日）
 
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
-  baostock_daily_budget: 5000       # Q2：BaoStock 日预算上限（次/日，config 可调；到顶当日停、次日续）
+  # v7.0.18：baostock_daily_budget 随 BaoStock 移除，键名泛化为 quota_budget_per_day
+  # （QuotaGuard 机制保留、当前无计数方恒不触发；5000=原值）。段须保持 dict 非空
+  # （load_config 校验 lake 段必须存在且为 mapping）。
+  quota_budget_per_day: 5000
 
 datasource:                         # lake-sync 数据源（lake_backfill 经 sina_cfg/rf_cfg 消费；勿删）
-  baostock:                         # BaoStock 每日配额守卫（防打穿配额被封禁）
-    daily_quota: 49900              # 官网限 50000/日/IP，超限封禁 6h×次数；留 100 余量
+  # v7.0.18：baostock 配额段随渠道完全移除（Joel 2026-10-26 拍板）。
   sina:                             # 新浪非官方接口客户端（F10 股东页 + 财务 JSON）
     interval_s: 1.0                 # 请求间隔秒（限速纪律：串行、>=1s）
     timeout_s: 15                   # 单请求超时秒

@@ -499,8 +499,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-spp-stale { font-size: 11px; padding: 1px 8px; }
 /* 区块3：conflict_rows */
 .lake-spp-conflict { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-/* 区块4：baostock_probe */
-.lake-spp-bs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* v7.0.18：原区块4 baostock_probe 样式（.lake-spp-bs）随渠道移除 */
 /* 市场表工具栏 count（与 .tbl-toolbar .count 同视觉） */
 .lake-toolbar .count { font-size: 12px; color: var(--muted); margin-left: auto; }
 

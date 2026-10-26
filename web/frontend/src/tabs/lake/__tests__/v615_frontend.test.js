@@ -33,20 +33,21 @@ import { useLakeStore } from "../../../stores/lakeStore.js";
 // F1：legacy source 别名映射（sourceMeta 三级解析，不再裸显英文）
 // ===========================================================================
 describe("F1：sourceMeta legacy 源名中文映射", () => {
-  it("当前活跃 6 源 → 固定色板 + 中文名（不回归 O5）", () => {
+  it("当前活跃 5 源 → 固定色板 + 中文名（不回归 O5；v7.0.18 baostock 随渠道移除）", () => {
     expect(sourceMeta("sina")).toEqual({ color: "#2563eb", label: "新浪" });
     expect(sourceMeta("tencent").label).toBe("腾讯");
-    expect(sourceMeta("baostock").label).toBe("BaoStock");
     expect(sourceMeta("tdx").label).toBe("通达信");
     expect(sourceMeta("adata_f10").label).toBe("adata");
     expect(sourceMeta("local")).toEqual({ color: "#64748b", label: "本地缓存" });
   });
 
-  it("已知 legacy 别名 → 灰(UNKNOWN_COLOR) + 中文名（brief 点名 t/em_local_static/lake_factors）", () => {
+  it("已知 legacy 别名 → 灰(UNKNOWN_COLOR) + 中文名（brief 点名 t/em_local_static/lake_factors；v7.0.18 +baostock）", () => {
     // brief 逐字：t→"腾讯(legacy)"、em_local_static→"本地缓存"；lake_factors=生产库实际值
     expect(sourceMeta("t")).toEqual({ color: UNKNOWN_COLOR, label: "腾讯(legacy)" });
     expect(sourceMeta("em_local_static")).toEqual({ color: UNKNOWN_COLOR, label: "本地缓存" });
     expect(sourceMeta("lake_factors")).toEqual({ color: UNKNOWN_COLOR, label: "本地因子" });
+    // v7.0.18：渠道移除后历史库行 source='baostock' → legacy 灰显（可追溯）
+    expect(sourceMeta("baostock")).toEqual({ color: UNKNOWN_COLOR, label: "BaoStock(legacy)" });
   });
 
   it("v6.3.3 已知变体：sina_f10→新浪蓝'新浪 F10'（T6 在线源，不再误显灰）；te_local→灰'TE 本地缓存'", () => {
@@ -63,11 +64,11 @@ describe("F1：sourceMeta legacy 源名中文映射", () => {
     expect(m.label).toBe("其他·mystery_src");   // 原值保留在标签里
   });
 
-  it("SOURCE_VARIANTS/LEGACY_SOURCE_ALIASES 覆盖生产库 DISTINCT source 全部实际值（F1 核对清单 + v6.3.3）", () => {
+  it("SOURCE_VARIANTS/LEGACY_SOURCE_ALIASES 覆盖生产库 DISTINCT source 全部实际值（F1 核对清单 + v6.3.3 + v7.0.18）", () => {
     // 生产库 read_only 查询实际出现值 = {baostock,em_local_static,lake_factors,sina,tencent,
-    // sina_f10,te_local}；当前活跃(sina/tencent/baostock)在 SOURCE_LABELS，
-    // 变体(sina_f10/te_local)在 SOURCE_VARIANTS，legacy(em_local_static/lake_factors)在此表。
-    for (const s of ["em_local_static", "lake_factors"]) {
+    // sina_f10,te_local}；当前活跃(sina/tencent)在 SOURCE_LABELS，
+    // 变体(sina_f10/te_local)在 SOURCE_VARIANTS，legacy(em_local_static/lake_factors/baostock)在此表。
+    for (const s of ["em_local_static", "lake_factors", "baostock"]) {
       expect(LEGACY_SOURCE_ALIASES[s]).toBeTruthy();
     }
     for (const s of ["sina_f10", "te_local", "bd_static"]) {
@@ -100,17 +101,16 @@ function makePool() {
     by_source: {
       kline_daily: { sina: 100, tencent: 50 },          // 当前活跃源
       dividend_events: { em_local_static: 30 },          // legacy → title "本地缓存:30"
-      stock_master: { baostock: 20, t: 5 },              // t(legacy) → "腾讯(legacy):5"
+      stock_master: { baostock: 20, t: 5 },              // v7.0.18：baostock=历史行 legacy → "BaoStock(legacy):20"
       factor_snapshot: { lake_factors: 8, mystery: 2 },  // lake_factors + 真正未知
     },
     conflict_rows: { total: 0 },
     adapters: {},
-    baostock_probe: null,
+    // v7.0.18：baostock_probe 键随渠道退役（后端不再产出）
     stale: false,
     sources: [
       { name: "sina", enabled: true, available: true, probed_at: null, latency_ms: null },
       { name: "tencent", enabled: true, available: true, probed_at: null, latency_ms: null },
-      { name: "baostock", enabled: true, available: null, probed_at: null, latency_ms: null },
       { name: "tdx", enabled: true, available: true, probed_at: null, latency_ms: null },
       { name: "adata_f10", enabled: true, available: true, probed_at: null, latency_ms: null },
     ],
@@ -132,10 +132,10 @@ describe("F1：SourcePoolPanel 堆叠条 title 走 sourceMeta（legacy 中文 + 
     w.unmount();
   });
 
-  it("stock_master(baostock+t) → title 'BaoStock:20 腾讯(legacy):5'（t legacy 中文）", () => {
+  it("stock_master(baostock历史行+t) → title 'BaoStock(legacy):20 腾讯(legacy):5'（legacy 中文；v7.0.18）", () => {
     const w = mountSPP();
     const row = w.findAll(".lake-spp-row").find((r) => r.text().includes("T1 股票主档"));
-    expect(row.find(".lake-spp-bar").attributes("title")).toBe("BaoStock:20 腾讯(legacy):5");
+    expect(row.find(".lake-spp-bar").attributes("title")).toBe("BaoStock(legacy):20 腾讯(legacy):5");
     w.unmount();
   });
 
@@ -158,7 +158,7 @@ describe("F2：SourcePoolPanel 图例 local 色点 = #64748b", () => {
   it("#lake-spp-legend local 项色点背景 #64748b（非旧值）", () => {
     const w = mountSPP();
     const items = w.findAll("#lake-spp-legend .lake-spp-legend-item");
-    expect(items.length).toBe(6);
+    expect(items.length).toBe(5);  // v7.0.18：4 活跃源 + local（baostock 随渠道移除）
     // LEGEND_ORDER 末位 = local
     const localItem = items[items.length - 1];
     expect(localItem.text()).toBe("本地缓存");

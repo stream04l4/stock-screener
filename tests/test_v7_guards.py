@@ -141,7 +141,7 @@ def test_strategy_yaml_v7_schema_shape():
         "price_window_years", "price_pctile_max", "yield_min_pct",
         "below_ma250", "ma_period"}
     assert "lake" in cfg and "datasource" in cfg
-    assert {"sina", "rf", "baostock"} <= set(cfg["datasource"].keys())
+    assert {"sina", "rf"} <= set(cfg["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
     # 旧 12 段不得回潮
     gone = {"technical", "dividend", "industry", "fundamental", "scoring", "badges",
             "hard_filter", "data", "crosscheck", "reinvest", "canonical", "health",

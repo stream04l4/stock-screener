@@ -5,17 +5,18 @@
 （避免反向耦合主路径；screener/config.py 不得为 lake 加 accessor——那是主路径改动）。
 
 配置项（缺省值在此，可被 strategy.yaml ``lake:`` 段覆盖）：
-- ``baostock_daily_budget``: BaoStock 日预算上限（默认 5000，Q2；到顶当日停、次日续）。
+- ``quota_budget_per_day``: 日预算上限（默认 5000，Q2 遗留机制；v7.0.18 起
+  无生产路径增量计数，机制保留）。
 
 v6.1（多源资源池，Joel Q1-Q6 拍板）新增：
 - ``source_priority``: 每表字段组的"主源→fallback"序。**权威性排序（Q1）**：
-  新浪(0) > 腾讯(1) > BaoStock(2) > tdx/adata(3) > 本地推导(4)。数值越小越权威，
-  冲突裁决取 authority 更小者——**不用时间戳新者优先**（历史回灌场景低权威源
-  重跑覆盖高权威源方向反了，见 research_report_multisource §4.1）。
+  新浪(0) > 腾讯(1) > tdx/adata(3) > 本地推导(4)（v7.0.18 移除 BaoStock(2)）。
+  数值越小越权威，冲突裁决取 authority 更小者——**不用时间戳新者优先**（历史
+  回灌场景低权威源重跑覆盖高权威源方向反了，见 research_report_multisource §4.1）。
 - ``crosscheck_thresholds``: 跨源交叉校验阈值（报告 §4.3）——相对差超阈 → 写
   conflict_src + log warning，**不阻断**（取主源值）。
-- ``sina.enabled / tdx.enabled / adata_f10.enabled / baostock_probe.enabled``:
-  各新源开关（默认全开；关=该源不进池，worker 直接跳过——零回归兜底）。
+- ``sina.enabled / tdx.enabled / adata_f10.enabled``:
+  各源开关（默认全开；关=该源不进池，worker 直接跳过——零回归兜底）。
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from typing import Any, Dict
 # 缺省值（strategy.yaml 未配 lake 段时用）
 # ---------------------------------------------------------------------------
 _DEFAULTS: Dict[str, Any] = {
-    "baostock_daily_budget": 5000,   # Q2：BaoStock 日预算默认 5,000 次/日
+    "quota_budget_per_day": 5000,   # Q2 遗留：日预算默认 5,000 次/日（v7.0.18 起无计数方）
 
     # v7.0.8：每日增量 tushare 批量判据——gap_start 众数 ≥ 此值才走批量（防
     # 长假后多日缺口误触发）；测试可注入小值。默认 3000（全市场单日缺口 ~5200）。
@@ -36,21 +37,10 @@ _DEFAULTS: Dict[str, Any] = {
     # 测试可注入小值。默认 3000（全市场 ~5500 行）。
     "batch_min_rows": 3000,
 
-    # v6.1.8 F3：T5 交叉校验抽样比例（%）。run_t5 按此比例随机抽样做 BaoStock
-    # 交叉校验（种子=日期+code 可复现；pct=0 全跳、pct=100 全量）。
-    # **成本账（为什么默认 5 而非 100）**：BaoStock 判活后每轮 full，T5 交叉校验 =
-    # 抽样股数 × _F10_CROSSCHECK_QUARTERS(4) 季 × 3 API(query_profit/growth/balance)
-    # = 抽样股数 × 12 次。全量 100% → 5219×12 ≈ 6.3万 次/轮，远超 baostock_daily_budget
-    # (5000)，且交叉校验是**辅助**链路却抢走主链路（adata F10）预算——v6.1.7 实锤今日
-    # T5 只灌 500/5219 就被配额拦。默认 5% → ≈261 股×12 ≈ 3100 次 < 5000 日预算，
-    # 主链路（adata F10 全量 5219 只）不受交叉校验挤占；需全量核对时设 100。
-    "t5_crosscheck_sample_pct": 5,
-
     # v6.1 源开关（默认全开；False=该源不进池，worker 跳过）
     "sina_enabled": True,            # 新浪 akshare stock_zh_a_daily（T2 OHLCV/amount 主源）
     "tdx_enabled": True,             # easy-tdx（T2/T7 fallback + T7 amount）
     "adata_f10_enabled": True,       # adata get_core_index（T5 主源，仅 F10）
-    "baostock_probe_enabled": True,  # Q6：灌数启动探一次 BaoStock 判活
     # v6.1.4 O4：tencent 原无开关键（腾讯是 legacy 直连兜底+T3/T7 主源）——补齐开关
     # （默认 True=现状不变；False=T2/T7 池跳过 tencent、T3 快照仍走腾讯直连——
     # T3 是"当前时点"数据唯一源，不受本开关门控，见 web_api /sources/toggle 文档）。
@@ -61,14 +51,14 @@ _DEFAULTS: Dict[str, Any] = {
     "source_priority": {
         # T2 kline_daily：OHLCV/amount 主源=新浪（全史一次拉全、含 amount、volume=股），
         # fallback=腾讯(分页 n≤2000)→tdx；adj_factor 主源=新浪 hfq÷raw 推导，
-        # fallback=tdx hfq÷raw → BaoStock(探测存活时)。
+        # fallback=tdx hfq÷raw（v7.0.18：原尾部 BaoStock 兜底随渠道移除）。
         "kline_daily": {
             "ohlcv_amount": ["sina", "tencent", "tdx"],
-            "adj_factor": ["sina", "tdx", "baostock"],
+            "adj_factor": ["sina", "tdx"],
         },
-        # T5 fundamentals_quarterly：adata F10 主源；BaoStock 探测存活时交叉校验。
+        # T5 fundamentals_quarterly：adata F10 单源（v7.0.18：原 BaoStock 交叉校验移除）。
         "fundamentals_quarterly": {
-            "f10": ["adata_f10", "baostock"],
+            "f10": ["adata_f10"],
         },
         # T7 index_daily：OHLCV 腾讯主源（现状稳定）+ tdx fallback；amount 补 tdx。
         "index_daily": {
@@ -83,7 +73,7 @@ _DEFAULTS: Dict[str, Any] = {
         "t2_amount_pct": 2.0,         # T2 amount：tdx vs 新浪 >2%（金额单位/浮点容忍略宽）
         "t2_adj_factor_pct": 0.5,     # T2 adj_factor：末因子 hfq/raw 推导对比 >0.5%（从严，af 误差累积进 view）
         "t7_close_pct": 0.3,          # T7 close：腾讯 vs tdx >0.3%（指数点位精度要求高，更严）
-        "t5_pp": 1.0,                 # T5 roe/gross_margin/liability_pct：adata vs BaoStock >1pp（绝对百分点）
+        # v7.0.18：t5_pp 随 BaoStock 交叉校验移除（T5=adata 单源，无跨源可校）。
     },
 
     # v6.1 限速纪律（秒/股；worker 内 sleep，brief 红线）
@@ -115,8 +105,8 @@ def strategy_yaml_path() -> str:
 def set_lake_source_switch(name: str, enabled: bool) -> Dict[str, Any]:
     """v6.1.4 O4：写 strategy.yaml ``lake`` 段源开关（ruamel roundtrip 保注释/格式）。
 
-    :param name: 源名（sina/tencent/baostock/tdx/adata_f10）→ 开关键
-        ``{name}_enabled``（baostock → ``baostock_probe_enabled``，与 _DEFAULTS 对齐）。
+    :param name: 源名（sina/tencent/tdx/adata_f10）→ 开关键 ``{name}_enabled``。
+        （v7.0.18：baostock 随渠道移除，白名单 5 源→4 源。）
     :param enabled: True/False。
 
     **写盘纪律**（brief 红线）：
@@ -132,10 +122,9 @@ def set_lake_source_switch(name: str, enabled: bool) -> Dict[str, Any]:
     :raises ValueError: name 不在 5 源白名单（不猜键名——写错键=配置静默失效）。
     """
     key = {"sina": "sina_enabled", "tencent": "tencent_enabled",
-           "baostock": "baostock_probe_enabled", "tdx": "tdx_enabled",
-           "adata_f10": "adata_f10_enabled"}.get(name)
+           "tdx": "tdx_enabled", "adata_f10": "adata_f10_enabled"}.get(name)
     if key is None:
-        raise ValueError(f"未知源名: {name!r}（白名单 sina/tencent/baostock/tdx/adata_f10）")
+        raise ValueError(f"未知源名: {name!r}（白名单 sina/tencent/tdx/adata_f10）")
 
     from ruamel.yaml import YAML   # 项目依赖（screener 配置工具链已用；roundtrip 保注释）
 
@@ -227,16 +216,4 @@ def crosscheck_threshold(name: str, default: float) -> float:
         return default
 
 
-def t5_crosscheck_sample_pct() -> int:
-    """取 T5 交叉校验抽样比例（%）；夹到 [0,100]。
-
-    v6.1.8 F3：run_t5 按此比例随机抽样做 BaoStock 交叉校验（种子=日期+code 可复现）。
-    非法值（非数值/越界）→ 夹到边界而非抛错——配置项失效不应阻断 T5 主链路灌数
-    （fail-open 到安全侧：>100 按 100 全量、<0 按 0 全跳，与"抽样比例"语义一致）。
-    """
-    v = lake_cfg().get("t5_crosscheck_sample_pct", 5)
-    try:
-        p = int(float(v))
-    except (TypeError, ValueError):
-        p = 5
-    return max(0, min(100, p))
+# v7.0.18：t5_crosscheck_sample_pct() 随 BaoStock 交叉校验移除（T5=adata 单源）。

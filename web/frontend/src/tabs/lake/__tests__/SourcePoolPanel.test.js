@@ -1,7 +1,8 @@
 // SourcePoolPanel 单测（brief D3：v6.1 多源资源池面板渲染）。
 // 覆盖：by_source 堆叠条（9表/固定色板/百分比宽度）、adapters 三态（✓/✗/未知—）、
-//       stale "探测数据过期"角标、conflict_rows total+非零逐行、baostock_probe alive badge、
+//       stale "探测数据过期"角标、conflict_rows total+非零逐行、
 //       backfill_in_progress / pool=null → 整块"灌数中暂不可用"降级。
+// v7.0.18：baostock 渠道移除——adapters/sources 4 源、原区块4（baostock_probe）用例删除。
 import { describe, it, expect } from "vitest";
 import { mount } from "@vue/test-utils";
 import SourcePoolPanel from "../SourcePoolPanel.vue";
@@ -18,8 +19,7 @@ function makePool(over = {}) {
   const adapters = {
     sina: { available: true, probed_at: "2026-09-17T08:00:00", latency_ms: 120 },
     tencent: { available: false, probed_at: "2026-09-17T08:00:01", latency_ms: null },
-    baostock: { available: null, probed_at: null, latency_ms: null },   // 未知—
-    tdx: { available: true, probed_at: "2026-09-17T08:00:02", latency_ms: 3400 },
+    tdx: { available: null, probed_at: null, latency_ms: 3400 },   // 未知—（v7.0.18 原 baostock 位）
     adata_f10: { available: true, probed_at: "2026-09-17T08:00:03", latency_ms: 88 },
   };
   return {
@@ -30,7 +30,7 @@ function makePool(over = {}) {
     conflict_codes: { stock_master: 0, kline_daily: 3, valuation_daily: 1, dividend_events: 0,
       fundamentals_quarterly: 0, holders_snapshot: 0, index_daily: 0, total: 4 },
     adapters,
-    baostock_probe: { alive: false, at: "2026-09-17T08:01:00", elapsed_s: 3.2, detail: "黑名单用户" },
+    // v7.0.18：baostock_probe 键随渠道退役（后端不再产出）
     stale: false,
     ...over,
   };
@@ -71,14 +71,14 @@ describe("SourcePoolPanel：adapters 三态", () => {
   it("available=true → ✓（绿）/ false → ✗（红）/ null → —（未知）", () => {
     const w = mountPanel({ pool: makePool() });
     const cards = w.findAll(".lake-spp-adapter");
-    expect(cards.length).toBe(5);
+    expect(cards.length).toBe(4);
     const byName = {};
     for (const c of cards) byName[c.find("b").text()] = c;
     expect(byName.sina.find(".lake-spp-avail").classes()).toContain("ok");
     expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
     expect(byName.tencent.find(".lake-spp-avail").classes()).toContain("bad");
     expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
-    expect(byName.baostock.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
+    expect(byName.tdx.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
   });
 
   it("probed_at + latency_ms 展示（≥1000ms → s 单位）", () => {
@@ -89,7 +89,7 @@ describe("SourcePoolPanel：adapters 三态", () => {
     expect(byName.sina.text()).toContain("2026-09-17T08:00:00");
     expect(byName.sina.text()).toContain("latency 120ms");
     expect(byName.tdx.text()).toContain("latency 3.4s");
-    expect(byName.baostock.text()).toContain("未探测");
+    expect(byName.tdx.text()).toContain("未探测");
   });
 });
 
@@ -107,7 +107,7 @@ describe("SourcePoolPanel：stale 角标", () => {
   });
 });
 
-describe("SourcePoolPanel：conflict_rows + baostock_probe", () => {
+describe("SourcePoolPanel：conflict_rows", () => {
   it("股票数口径（v6.3.5：'涉及 N 只'徽章 + 非零表逐行 'X 只 · N 行'；零值表不列出）", () => {
     const w = mountPanel({ pool: makePool() });
     const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("跨源分歧"));
@@ -128,24 +128,11 @@ describe("SourcePoolPanel：conflict_rows + baostock_probe", () => {
     expect(block.find(".badge").classes()).toContain("lake-st-fresh");
   });
 
-  it("baostock_probe dead → ✗ dead badge + at/elapsed/detail", () => {
-    const w = mountPanel({ pool: makePool() });
-    const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("BaoStock 恢复探测"));
-    expect(block.find(".badge").text()).toBe("✗ dead");
-    expect(block.text()).toContain("2026-09-17T08:01:00");
-    expect(block.text()).toContain("3.2s");
-    expect(block.text()).toContain("黑名单用户");
-  });
-
-  it("baostock_probe=null → '未探测'占位", () => {
-    const w = mountPanel({ pool: makePool({ baostock_probe: null }) });
-    const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("BaoStock 恢复探测"));
-    expect(block.text()).toContain("未探测");
-  });
+  // v7.0.18：原 baostock_probe 两用例（dead badge / null 占位）随渠道移除。
 });
 
 describe("SourcePoolPanel：backfill 降级", () => {
-  it("backfill_in_progress=true → 整块'灌数中暂不可用'（四区块不渲染）", () => {
+  it("backfill_in_progress=true → 整块'灌数中暂不可用'（三区块不渲染）", () => {
     const w = mountPanel({ pool: makePool(), backfill: true });
     expect(w.find(".lake-spp-off").text()).toContain("灌数中暂不可用");
     expect(w.findAll(".lake-spp-row").length).toBe(0);
@@ -171,9 +158,9 @@ function vueSrc(rel) {
   return readFileSync(resolve(__dirname, rel), "utf-8");
 }
 
-// v6.1.3 形态：pool.sources（后端数组，固定 5 源 + provides/quota/rate_limit/enabled）
+// v6.1.3 形态：pool.sources（后端数组，v7.0.18 起固定 4 源 + provides/quota/rate_limit/enabled）
 function makeSourcesPool(over = {}) {
-  const base = makePool();   // 保留 by_source/conflict/baostock_probe/stale（区块1/3/4 不变）
+  const base = makePool();   // 保留 by_source/conflict/stale（区块1/3 不变；原区块4 已移除）
   return {
     ...base,
     sources: [
@@ -189,17 +176,12 @@ function makeSourcesPool(over = {}) {
           { table: "stock_master", table_cn: "T1 股票主档", field_group: "master", role: "主源" },
           { table: "valuation_daily", table_cn: "T3 估值日线", field_group: "valuation", role: "主源" },
         ], quota: null, rate_limit: null },
-      { name: "baostock", enabled: true, available: null, probed_at: null,
-        latency_ms: null, authority: 2,
-        provides: [
-          { table: "kline_daily", table_cn: "T2 日K线", field_group: "adj_factor", role: "fallback(探测存活时)" },
-        ], quota: { used_today: 1234, budget: 5000 }, rate_limit: null },
       { name: "tdx", enabled: false, available: true, probed_at: "2026-09-17T08:00:02",
         latency_ms: 210, authority: 3,
         provides: [
           { table: "index_daily", table_cn: "T7 指数日线", field_group: "amount", role: "主源" },
         ], quota: null, rate_limit: "≥0.5s/股" },
-      { name: "adata_f10", enabled: true, available: true, probed_at: "2026-09-17T08:00:03",
+      { name: "adata_f10", enabled: true, available: null, probed_at: null,
         latency_ms: 88, authority: 3,
         provides: [
           { table: "fundamentals_quarterly", table_cn: "T5 季度基本面", field_group: "f10", role: "主源" },
@@ -216,12 +198,12 @@ function cardsBy(w) {
 }
 
 describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => {
-  it("区块标题='数据源状态（连通性·数据类型·配额 · 灌数启动时探测）'，5 源各一张卡", () => {
+  it("区块标题='数据源状态（连通性·数据类型·配额 · 灌数启动时探测）'，4 源各一张卡", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const block = w.findAll(".lake-spp-block").find((b) => b.text().includes("数据源状态"));
     expect(block.exists()).toBe(true);
     expect(block.find(".lake-spp-title").text()).toContain("连通性·数据类型·配额");
-    expect(w.findAll(".lake-spp-adapter").length).toBe(5);
+    expect(w.findAll(".lake-spp-adapter").length).toBe(4);
   });
 
   it("卡内四行：连通性（✓可达/✗不可达/—未探测 + latency）+ 探测时间", () => {
@@ -230,10 +212,10 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
     expect(byName.sina.text()).toContain("latency 320ms");
     expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
-    expect(byName.baostock.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
+    expect(byName.adata_f10.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
     // 行4 探测时间（probed_at / 未探测）
     expect(byName.sina.text()).toContain("探测：2026-09-17T08:00:00");
-    expect(byName.baostock.text()).toContain("探测：未探测");
+    expect(byName.adata_f10.text()).toContain("探测：未探测");
   });
 
   it("数据类型 chips（table_cn·字段组 + role 后缀小字 muted）", () => {
@@ -256,12 +238,14 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(roleSpan.text().trim()).toBe("主源");
   });
 
-  it("配额行：baostock='今日 1234/5000'；sina='≥1s/股'；tencent（无 quota 无 rate_limit）='无官方配额'", () => {
+  it("配额行（v7.0.18 起 quota 恒 null）：sina='≥1s/股'；tencent（无 rate_limit）='无官方配额'；adata='≥1s/股'", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const byName = cardsBy(w);
-    expect(byName.baostock.text()).toContain("配额：今日 1234/5000");
     expect(byName.sina.text()).toContain("配额：≥1s/股");
     expect(byName.tencent.text()).toContain("配额：无官方配额");
+    expect(byName.adata_f10.text()).toContain("配额：≥1s/股");
+    // 不再有任何"今日 x/budget"硬配额文案（唯一硬配额源 baostock 已移除）
+    expect(w.text()).not.toContain("今日 ");
   });
 
   it("enabled=false → '已禁用'灰 badge 替代 ✓/✗（连通性行不渲染）", () => {
@@ -274,18 +258,14 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(byName.sina.find(".lake-spp-disabled").exists()).toBe(false);
   });
 
-  it("baostock quota.used_today=null → '今日 —/5000'（从未灌数）", () => {
-    const pool = makeSourcesPool();
-    pool.sources[2].quota = { used_today: null, budget: 5000 };
-    const w = mountPanel({ pool });
-    expect(cardsBy(w).baostock.text()).toContain("配额：今日 —/5000");
-  });
+  // v7.0.18：原 "baostock quota.used_today=null → 配额：今日 —/5000" 用例随渠道移除。
+  // quotaText 的 quota 对象分支仅保留作旧响应兼容（后端恒 null）。
 
-  it("SOURCE_COLORS 左边框着色（sina 蓝 #2563eb / tdx 青 #06b6d4）", () => {
+  it("SOURCE_COLORS 左边框着色（sina 蓝 #2563eb / adata 粉 #ec4899）", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const byName = cardsBy(w);
     expect(byName.sina.attributes("style")).toContain("#2563eb");
-    expect(byName.tdx.attributes("style")).toContain("#06b6d4");
+    expect(byName.adata_f10.attributes("style")).toContain("#ec4899");
   });
 
   it("stale=true → 数据源状态区块出现'探测数据过期'角标（与 by_source 区共 2 处）", () => {
@@ -293,9 +273,9 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(w.findAll(".lake-spp-stale").length).toBe(2);
   });
 
-  it("旧形态（无 sources 键，仅 adapters）→ 回退渲染 5 卡 + '无官方配额'占位", () => {
+  it("旧形态（无 sources 键，仅 adapters）→ 回退渲染 4 卡 + '无官方配额'占位", () => {
     const w = mountPanel({ pool: makePool() });   // makePool 只有 adapters，无 sources
-    expect(w.findAll(".lake-spp-adapter").length).toBe(5);
+    expect(w.findAll(".lake-spp-adapter").length).toBe(4);
     const byName = cardsBy(w);
     expect(byName.sina.text()).toContain("✓ 可达");
     expect(byName.sina.text()).toContain("配额：无官方配额");   // rate_limit=null → 占位

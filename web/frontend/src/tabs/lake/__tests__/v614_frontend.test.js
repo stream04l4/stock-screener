@@ -111,12 +111,11 @@ function makePool() {
     by_source,
     conflict_rows: { total: 0 },
     adapters: {},
-    baostock_probe: null,
+    // v7.0.18：baostock_probe 键随渠道退役（后端不再产出）
     stale: false,
     sources: [
       { name: "sina", enabled: true, available: true, probed_at: "2026-09-17T08:00:00", latency_ms: 320 },
       { name: "tencent", enabled: true, available: false, probed_at: null, latency_ms: null },
-      { name: "baostock", enabled: true, available: null, probed_at: null, latency_ms: null },
       { name: "tdx", enabled: false, available: true, probed_at: null, latency_ms: null },
       { name: "adata_f10", enabled: true, available: true, probed_at: null, latency_ms: null },
     ],
@@ -130,15 +129,15 @@ function mountSPP() {
 }
 
 describe("O5：SourcePoolPanel 固定色板图例行 + 中文悬停提示", () => {
-  it("#lake-spp-legend 6 项（sina 新浪 / tencent 腾讯 / baostock BaoStock / tdx 通达信 / adata_f10 adata / local 本地缓存）+ 色点同源 SOURCE_COLORS", () => {
+  it("#lake-spp-legend 5 项（sina 新浪 / tencent 腾讯 / tdx 通达信 / adata_f10 adata / local 本地缓存）+ 色点同源 SOURCE_COLORS", () => {
     const w = mountSPP();
     const items = w.findAll("#lake-spp-legend .lake-spp-legend-item");
-    expect(items.length).toBe(6);
+    expect(items.length).toBe(5);
     const texts = items.map((i) => i.text());
-    expect(texts).toEqual(["新浪", "腾讯", "BaoStock", "通达信", "adata", "本地缓存"]);
+    expect(texts).toEqual(["新浪", "腾讯", "通达信", "adata", "本地缓存"]);
     // 色点颜色与 sourceMeta 同源（sina 蓝 #2563eb / tdx 青 #06b6d4）
     expect(items[0].find(".lake-spp-dot").attributes("style")).toContain("#2563eb");
-    expect(items[3].find(".lake-spp-dot").attributes("style")).toContain("#06b6d4");
+    expect(items[2].find(".lake-spp-dot").attributes("style")).toContain("#06b6d4");
     w.unmount();
   });
 
@@ -162,10 +161,10 @@ describe("O5：SourcePoolPanel 固定色板图例行 + 中文悬停提示", () =
 describe("O4：SourcePoolPanel 源勾选 + 手动探测按钮", () => {
   it("每源卡有 enabled checkbox（:id=src-enable-<name>）+【探测】按钮；区块标题有【全部探测】", () => {
     const w = mountSPP();
-    for (const n of ["sina", "tencent", "baostock", "tdx", "adata_f10"]) {
+    for (const n of ["sina", "tencent", "tdx", "adata_f10"]) {
       expect(w.find(`#src-enable-${n}`).exists()).toBe(true);
     }
-    expect(w.findAll(".lake-spp-probe").length).toBe(5);
+    expect(w.findAll(".lake-spp-probe").length).toBe(4);
     const allBtn = w.find("#btn-lake-probe-all");
     expect(allBtn.exists()).toBe(true);
     expect(allBtn.text()).toBe("全部探测");
@@ -209,12 +208,12 @@ describe("O4：SourcePoolPanel 源勾选 + 手动探测按钮", () => {
     w.unmount();
   });
 
-  it("点【全部探测】→ POST /sources/probe {names:[5 源全列]}", async () => {
+  it("点【全部探测】→ POST /sources/probe {names:[4 源全列]}", async () => {
     const w = mountSPP();
     await w.find("#btn-lake-probe-all").trigger("click");
     await flushPromises();
     expect(postCalls.length).toBe(1);
-    expect(postCalls[0].body.names).toEqual(["sina", "tencent", "baostock", "tdx", "adata_f10"]);
+    expect(postCalls[0].body.names).toEqual(["sina", "tencent", "tdx", "adata_f10"]);
     w.unmount();
   });
 });

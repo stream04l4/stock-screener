@@ -12,8 +12,9 @@
 3. **done 键毒化**：worker 取空/失败 → 不 mark_done（下轮重试）；
    done 键 period_or_date 固定 "full_history"（不含日期）→ 断点续传跨天有效。
 
-纪律：全部离线——腾讯 session.get / BaoStockClient / fetch_adjust_factor 均
-monkeypatch fake（计数断言零真实网络），库一律 tmp_path，不碰 data/lake/。
+纪律：全部离线——腾讯 fetch_kline_* / TencentClient 构造均 monkeypatch fake
+（计数断言零真实网络；v7.0.18 原 BaoStockClient/fetch_adjust_factor fake 随渠道
+移除，legacy 路径 adj_map=None），库一律 tmp_path，不碰 data/lake/。
 """
 from __future__ import annotations
 
@@ -257,42 +258,25 @@ def _seed_db(db_path: str):
     con.close()
 
 
-def _fake_bs_fields():
-    return (["code", "dividOperateDate", "foreAdjustFactor",
-             "backAdjustFactor", "adjustFactor"], [])
-
-
 def _run_history_offline(monkeypatch, tmp_path, db, codes, start, end,
                          full_history_fake, adj_fake=None):
-    """离线跑 run_history：fake 腾讯全史/BaoStock/快照 + progress 重定向 tmp。"""
+    """离线跑 run_history：fake 腾讯全史/快照 + progress 重定向 tmp。
+
+    v7.0.18：``adj_fake`` 参数保留签名兼容（原 BaoStock adj 兜底随渠道移除，
+    legacy 路径恒 adj_map=None）——传入值不再使用。
+    """
     import lake_backfill as drv
     from lake import backfill as lb
-    from lake.ingest import baostock_ingest as bsi
     import lake.ingest.tencent_ingest as ti
-    import screener.data.baostock_client as bsc
     import screener.data.tencent as tmod
-
-    class _FakeBS:
-        # v6.0.10：driver 构造传 stop_checker=（依赖注入）→ fake 需接受 kwargs
-        def __init__(self, *a, **k):
-            pass
-
-        def close(self):
-            pass
 
     class _FakeTClient:
         pass
 
     monkeypatch.setattr(lb, "_progress_path", lambda: str(tmp_path / "progress.json"))
     monkeypatch.setattr(lb.BackfillRunner, "_quota_state", lambda self: (False, 0))
-    monkeypatch.setattr(bsc, "BaoStockClient", _FakeBS)
     monkeypatch.setattr(tmod, "TencentClient", _FakeTClient)
     monkeypatch.setattr(ti, "fetch_kline_full_history", full_history_fake)
-    if adj_fake is not None:
-        monkeypatch.setattr(bsi, "fetch_adjust_factor", adj_fake)
-    else:
-        monkeypatch.setattr(bsi, "fetch_adjust_factor",
-                            lambda bs, code, s, e: _fake_bs_fields())
 
     from lake import conn as lconn
 
@@ -331,8 +315,12 @@ def test_run_history_worker_failure_not_marked_done(tmp_path, monkeypatch):
 
 
 def test_run_history_success_marks_done_with_stable_key(tmp_path, monkeypatch):
-    """成功路径：全史 K线落库 + adj_factor 前向填充 + done 键 = ("kline_history",
-    code, "full_history")（固定字符串，不含日期）。"""
+    """成功路径：全史 K线落库 + done 键 = ("kline_history",
+    code, "full_history")（固定字符串，不含日期）。
+
+    v7.0.18：legacy 路径 adj_map=None → af 列全 NULL（原 BaoStock 除权日
+    前向填充断言随渠道移除；多源池恢复后由 sina/tdx 推导值补齐）。
+    """
     db = str(tmp_path / "h_ok.duckdb")
     _seed_db(db)
 
@@ -343,15 +331,9 @@ def test_run_history_success_marks_done_with_stable_key(tmp_path, monkeypatch):
     def fake_full(client, ts_code, page_size=2000):
         return [dict(r) for r in rows]
 
-    # BaoStock adj_factor：仅除权日有行（2026-09-14 除权 af=2.5）→ load_t2 前向填充
-    def fake_adj(bs, code, s, e):
-        return (["code", "dividOperateDate", "foreAdjustFactor",
-                 "backAdjustFactor", "adjustFactor"],
-                [[code, "2026-09-14", "1.2", "1.3", "2.5"]])
-
     stats, prog_path = _run_history_offline(
         monkeypatch, tmp_path, db, ["sh.601398"], "1990-01-01", "2026-09-15",
-        fake_full, adj_fake=fake_adj)
+        fake_full)
 
     assert stats["processed"] == 1 and not stats["errors"], f"{stats}"
     prog = json.load(open(prog_path, encoding="utf-8"))
@@ -366,9 +348,8 @@ def test_run_history_success_marks_done_with_stable_key(tmp_path, monkeypatch):
         "ORDER BY date").fetchall()
     con.close()
     assert [str(g[0]) for g in got] == days   # duckdb DATE 列 → datetime.date，转 str 比
-    # 前向填充：除权日之前的行 NULL、除权日起全部 =2.5
-    assert got[0][1] is None and got[1][1] is None
-    assert all(g[1] == 2.5 for g in got[2:])
+    # v7.0.18：legacy adj_map=None → af 全 NULL
+    assert all(g[1] is None for g in got), f"legacy 路径 af 应全 NULL: {got}"
 
 
 def test_run_history_done_key_stable_across_days(tmp_path, monkeypatch):

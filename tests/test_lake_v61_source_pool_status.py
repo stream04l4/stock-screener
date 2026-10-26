@@ -4,9 +4,9 @@
 规格（research_report_frontend §4 + brief D3-A）：
 - **ready 态**追加顶层 ``source_pool``：by_source（9表键恒定，无数据={}）/
   conflict_rows（T1-T7 + total=七表之和）/ adapters（读 source_health.json）/
-  baostock_probe（progress 既有键透出，无→null）/ stale（文件缺失或 max(probed_at)
-  距今>7天 → true）。v6.1.3：ready 态再追加 sources（各源连通性+数据类型+配额；
-  test_lake_v613_source_pool 专测，本文件 A 段键集断言同步含 sources）。
+  stale（文件缺失或 max(probed_at) 距今>7天 → true）。v6.1.3：ready 态再追加
+  sources（各源连通性+数据类型+配额；test_lake_v613_source_pool 专测，本文件
+  A 段键集断言同步含 sources）。（v7.0.18：baostock_probe 键随渠道退役。）
 - **兼容红线**：locked/uninitialized 态响应键集一个字节不动（本文件含显式回归断言；
   test_lake_v605_status C 段同纪律保留必过）。
 - source_health.json 写入方 = 灌数 driver ``_probe_all_adapters()``（LAKE_MULTISOURCE=0
@@ -114,7 +114,7 @@ def test_ready_source_pool_shape_by_source_nine_fixed(tmp_path, monkeypatch):
     # v6.1.3：ready 态 source_pool 追加 sources（各源连通性+数据类型+配额；
     # 仅 ready 态——locked/uninitialized 无 source_pool 键，见 C 段）。
     assert set(sp.keys()) == {"by_source", "conflict_rows", "conflict_codes",
-                              "adapters", "baostock_probe", "stale", "sources"}, \
+                              "adapters", "stale", "sources"}, \
         f"source_pool 键集: {sorted(sp)}"
     # by_source：9 表键恒定（无数据={}，形状稳定）
     assert list(sp["by_source"].keys()) == NINE_TABLES, \
@@ -138,24 +138,18 @@ def test_ready_source_pool_conflict_rows_total_sum(tmp_path, monkeypatch):
     assert cr["total"] == sum(cr[t] for t in SEVEN_CONFLICT) == 1
 
 
-def test_ready_source_pool_baostock_probe_passthrough(tmp_path, monkeypatch):
-    """baostock_probe = progress 顶层既有键直接透出；无此键 → null。"""
-    probe = {"at": "2026-09-15 13:00:00", "alive": False, "elapsed_s": 10.0,
-             "detail": "login timeout"}
-    d = _ready_status(tmp_path, monkeypatch, db_name="sp_bs.duckdb", baostock_probe=probe)
-    assert d["source_pool"]["baostock_probe"] == probe
-    d2 = _ready_status(tmp_path, monkeypatch, db_name="sp_nobs.duckdb")
-    assert d2["source_pool"]["baostock_probe"] is None
+# v7.0.18：原 test_ready_source_pool_baostock_probe_passthrough 随 baostock_probe
+# 键退役删除（progress 不再有该键，/status.source_pool 不再透出）。
 
 
 # ===========================================================================
 # B. adapters / stale（source_health.json 缺失 / 新鲜 / 过期 三分支）
 # ===========================================================================
 def test_ready_adapters_missing_file_all_null_stale(tmp_path, monkeypatch):
-    """文件缺失 → adapters 5 键全 null + stale=true（'从未探测'语义）。"""
+    """文件缺失 → adapters 4 键全 null + stale=true（'从未探测'语义）。"""
     d = _ready_status(tmp_path, monkeypatch)   # 未写 source_health.json
     sp = d["source_pool"]
-    assert set(sp["adapters"].keys()) == {"sina", "tencent", "baostock", "tdx", "adata_f10"}
+    assert set(sp["adapters"].keys()) == {"sina", "tencent", "tdx", "adata_f10"}
     for name, a in sp["adapters"].items():
         assert a == {"available": None, "probed_at": None, "latency_ms": None}, \
             f"{name} 缺失文件应全 null: {a}"
@@ -167,14 +161,13 @@ def test_ready_adapters_fresh_file_stale_false(tmp_path, monkeypatch):
     _write_source_health(tmp_path, {
         "sina": {"available": True, "probed_at": _now_ts(), "latency_ms": 320},
         "tencent": {"available": True, "probed_at": _now_ts(), "latency_ms": 95},
-        "baostock": {"available": False, "probed_at": _now_ts(), "latency_ms": 10000},
-        "tdx": {"available": True, "probed_at": _now_ts(), "latency_ms": 210},
+        "tdx": {"available": False, "probed_at": _now_ts(), "latency_ms": 10000},
         "adata_f10": {"available": None, "probed_at": None, "latency_ms": None},
     })
     d = _ready_status(tmp_path, monkeypatch)
     sp = d["source_pool"]
     assert sp["adapters"]["sina"] == {"available": True, "probed_at": sp["adapters"]["sina"]["probed_at"], "latency_ms": 320}
-    assert sp["adapters"]["baostock"]["available"] is False
+    assert sp["adapters"]["tdx"]["available"] is False
     assert sp["adapters"]["adata_f10"] == {"available": None, "probed_at": None, "latency_ms": None}
     assert sp["stale"] is False
 
@@ -193,7 +186,7 @@ def test_ready_adapters_stale_when_probed_older_than_7d(tmp_path, monkeypatch):
     assert sp["stale"] is True                    # max=8d 前 >7d
     assert sp["adapters"]["sina"]["available"] is True   # 值仍透出（过期≠丢失）
     # 未探测的源补 null（文件缺键 → 全 null 占位，形状恒定）
-    assert sp["adapters"]["baostock"] == {"available": None, "probed_at": None, "latency_ms": None}
+    assert sp["adapters"]["tdx"] == {"available": None, "probed_at": None, "latency_ms": None}
 
 
 def test_ready_adapters_max_probed_at_semantics(tmp_path, monkeypatch):
@@ -309,16 +302,16 @@ def test_probe_all_adapters_multisource_off_skips(tmp_path, monkeypatch):
 
 def test_probe_all_adapters_writes_health_file(tmp_path, monkeypatch):
     """多源开启 + mock adapter → 落 progress 同目录 source_health.json（B-2 派生：
-    自定义 --db → tmp 目录，不碰生产）；5 键齐全、latency_ms=int、未注册源=false。"""
+    自定义 --db → tmp 目录，不碰生产）；4 键齐全、latency_ms=int、未注册源=false。"""
     import lake.ingest.source_pool as sp
     import lake_backfill as drv
 
     monkeypatch.delenv("LAKE_MULTISOURCE", raising=False)   # 多源开启
-    fakes = {n: _FakeAdapter(n, ok=(n != "baostock")) for n in
-             ("sina", "tencent", "tdx", "adata_f10")}
+    fakes = {n: _FakeAdapter(n, ok=True) for n in
+             ("sina", "tencent", "adata_f10")}
 
     def fake_get_adapter(name):
-        return fakes.get(name)   # baostock 未注册 → None → false
+        return fakes.get(name)   # tdx 未注册 → None → false
 
     monkeypatch.setattr(sp, "get_adapter", fake_get_adapter)
     db = str(tmp_path / "custom.duckdb")
@@ -327,9 +320,9 @@ def test_probe_all_adapters_writes_health_file(tmp_path, monkeypatch):
     hp = tmp_path / "source_health.json"     # B-2：自定义 --db → 库目录
     assert res["path"] == str(hp) and hp.exists(), f"应落 {hp}: {res}"
     data = json.loads(hp.read_text(encoding="utf-8"))
-    assert set(data.keys()) == {"sina", "tencent", "baostock", "tdx", "adata_f10"}
+    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10"}
     assert data["sina"]["available"] is True and isinstance(data["sina"]["latency_ms"], int)
-    assert data["baostock"]["available"] is False   # 未注册 → false（不猜 null）
+    assert data["tdx"]["available"] is False   # 未注册 → false（不猜 null）
     for a in data.values():
         assert a["probed_at"], "每个探测源必须有 probed_at"
 

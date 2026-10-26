@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
 import secrets
 import threading
 import time
@@ -208,7 +209,7 @@ class HangWatchdogError(BaseException):
 
     **为什么是 BaseException 而非 Exception**：SIGINT handler 在主线程下一个字节码
     边界抛本异常，而此刻主线程往往正阻塞在某次取数的 ``fut.result()`` 内、且调用栈上
-    有多层 adapter/worker 的 ``except Exception``（sina hfq / tdx hfq / baostock 回退等）。
+    有多层 adapter/worker 的 ``except Exception``（sina hfq / tdx hfq 等）。
     若本异常 ⊂ Exception，会被这些分支**吞掉**（记单任务失败、继续下一任务）——看门狗
     abort 语义彻底失效。BaseException 不被任何 ``except Exception`` 捕获 → 穿透整条
     worker 调用栈直达 driver run_history 的 ``except HangWatchdogError`` 收尾（干净退出）。
@@ -573,3 +574,157 @@ def forward_fill_af(dates: Sequence[str], adj_map: Dict[str, float]) -> Dict[str
             ei += 1
         out[d] = cur
     return out
+
+
+# ---------------------------------------------------------------------------
+# v7.0.18：QuotaGuard —— 通用每日调用配额守卫（原 screener.data.baostock_client）
+# ---------------------------------------------------------------------------
+# BaoStock 渠道完全移除（Joel 2026-10-26 拍板）后，QuotaGuard 从
+# ``screener/data/baostock_client.py``（文件已删除）迁到本模块并泛化：
+# - 类名/行为不变（跨进程 flock + tmp+rename 原子落盘 + 北京时间日期翻转重置）；
+# - 超限异常 ``BaoStockError`` → :class:`QuotaExhaustedError`（中性命名）；
+# - 默认状态文件路径沿用 ``~/.stock_screener/bs_quota.json``（历史命名，保留
+#   现有状态文件连续性，勿改名——运维脚本/旧状态仍指向它）。
+# 目前无生产路径再增量计数（原唯一计数方=BaoStock 调用）；BackfillRunner 的
+# 日预算到顶停机制保留（读 get_state，恒 0 → 永不触发），行为零变化。
+import fcntl
+import json
+import tempfile
+from datetime import datetime
+from typing import Tuple
+from zoneinfo import ZoneInfo
+
+_TZ_BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+class QuotaExhaustedError(RuntimeError):
+    """当日配额耗尽（显式失败：不重试、不等待次日——项目纪律）。"""
+
+
+def default_quota_path() -> str:
+    """配额状态文件默认路径：仓库外、CWD 无关（跨进程共享同一份计数）。"""
+    return os.path.join(os.path.expanduser("~"), ".stock_screener", "bs_quota.json")
+
+
+class QuotaGuard:
+    """每日调用配额守卫（v5.2-p2，TL D1-D4；v7.0.18 自 baostock_client 迁出泛化）。
+
+    - 状态文件：JSON ``{"date": "YYYY-MM-DD", "count": N}``，日期口径=北京时间
+      自然日；读到的 date ≠ 今日 → count 从 0 重置（次日自动恢复）。
+    - **跨进程原子**：fcntl.flock 锁文件 read-modify-write + tmp+rename 原子落盘；
+      同进程多线程并发同理安全。
+    - 超限行为（D4）：立即 raise QuotaExhaustedError——显式失败，不静默降级、
+      不 sleep 等到午夜（项目纪律）。
+    - count 达到 90% 时 log.warning 一次（每进程一次，防刷屏）。
+    """
+
+    def __init__(self, daily_quota: int = 49900, path: Optional[str] = None) -> None:
+        if not isinstance(daily_quota, int) or isinstance(daily_quota, bool) or daily_quota < 1:
+            raise ValueError(f"daily_quota 必须是正整数（当前 {daily_quota!r}）")
+        if path is not None and not isinstance(path, str):
+            raise TypeError(f"quota_path 必须是字符串路径或 None（当前 {path!r}）")
+        self.daily_quota = daily_quota
+        self.path = path or default_quota_path()
+        self._lock = threading.Lock()  # 同进程多线程串行化（flock 只管跨进程）
+        self._warned_90 = False  # D4：90% 告警每进程一次（防刷屏）
+
+    # ---------- 内部 ----------
+    @staticmethod
+    def _today_beijing() -> str:
+        return datetime.now(_TZ_BEIJING).strftime("%Y-%m-%d")
+
+    def _lock_path(self) -> str:
+        return self.path + ".lock"
+
+    def _load(self) -> int:
+        """读状态文件；缺失/损坏 → 0（fail-open：宁可从 0 重计也不阻断运行）。"""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if str(data.get("date")) == self._today_beijing():
+                return max(0, int(data.get("count", 0)))
+            return 0  # 日期翻转（或文件 date 非法）→ 重置
+        except (OSError, ValueError, TypeError):
+            return 0
+
+    def _atomic_write(self, date_s: str, count: int) -> None:
+        """tmp+rename 原子落盘（同目录 tmp 保证 rename 是原子操作）。"""
+        d = os.path.dirname(self.path) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".quota_", suffix=".tmp", dir=d)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"date": date_s, "count": count}, f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _with_lock(self, fn):
+        """跨进程 flock（LOCK_EX）+ 同进程 threading.Lock 双重串行化。"""
+        d = os.path.dirname(self.path) or "."
+        os.makedirs(d, exist_ok=True)
+        with self._lock:
+            with open(self._lock_path(), "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    return fn()
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    # ---------- 对外 ----------
+    def acquire(self) -> int:
+        """放行一次真实 API 调用并计数，返回计后 count。
+
+        已达硬上限 → raise QuotaExhaustedError（D4：显式失败，不重试、不等待）。
+        """
+        def _step() -> int:
+            date_s = self._today_beijing()
+            count = self._load() + 1
+            if count > self.daily_quota:
+                # 注意：超限的那次**不计数、不落盘**——直接拒绝，保持文件停在
+                # daily_quota（运维显示"恰好用满"而非越界值）。
+                raise QuotaExhaustedError(
+                    f"当日配额耗尽 ({self.daily_quota}/{self.daily_quota})，"
+                    "北京时间次日 0 点自动恢复；禁止继续调用"
+                )
+            self._atomic_write(date_s, count)
+            if not self._warned_90 and count >= int(self.daily_quota * 0.9):
+                self._warned_90 = True  # 每进程（每实例）只告警一次，防刷屏
+                log.warning(
+                    "当日配额已达 %.0f%% (%d/%d)——接近硬上限，"
+                    "继续调用将触发 QuotaExhaustedError（北京时间次日 0 点重置）",
+                    count / self.daily_quota * 100, count, self.daily_quota,
+                )
+            return count
+
+        return self._with_lock(_step)
+
+    def get_state(self) -> Tuple[str, int]:
+        """当前 (北京时间日期, 已用次数)；文件缺失/损坏 → (今日, 0)。"""
+        date_s = self._today_beijing()
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if str(data.get("date")) == date_s:
+                return date_s, max(0, int(data.get("count", 0)))
+        except (OSError, ValueError, TypeError):
+            pass
+        return date_s, 0
+
+    def set_count(self, count: int, date_s: Optional[str] = None) -> None:
+        """手动播种/重置计数（运维重置用；date 缺省=今日北京时间）。"""
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"count 必须是非负整数（当前 {count!r}）")
+        date_s = date_s or self._today_beijing()
+
+        def _step() -> None:
+            self._atomic_write(date_s, count)
+
+        self._with_lock(_step)

@@ -16,7 +16,8 @@ duckdb.connect（**不执行 init_schema**），端点统一 ``with _con() as co
    /industries codes 集合精确相等、无 500；/market 行结构正确（ts_code 列必须
    是 ts_code 值而非别的查询的列——WRONG-CODES 交错的直接判据）。
 
-fixture：6 股 × C39/J66 两行业 + valuation_daily（与 tester diag / TL 核验同构）。
+fixture：6 股 × C39/J66 两行业（industry_name="行业C39/行业J66" 粗分类，v7.0.18 口径）
++ valuation_daily（与 tester diag / TL 核验同构）。
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ duckdb = pytest.importorskip("duckdb")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable or os.path.join(REPO_ROOT, ".venv", "bin", "python")
 
-EXPECTED_INDUSTRIES = {"C39", "J66"}
+EXPECTED_INDUSTRIES = {"行业C39", "行业J66"}   # v7.0.18：/industries 口径=industry_name 粗分类（code=name）
 
 
 # ---------------------------------------------------------------------------

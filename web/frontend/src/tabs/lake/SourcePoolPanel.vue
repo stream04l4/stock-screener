@@ -1,16 +1,15 @@
 <script setup>
 // SourcePoolPanel —— v6.1 多源资源池面板（brief D3-B；数据 = /status.source_pool）。
 //
-// 四区块（报告 §3 T-数据湖）：
-//   1) 采用源分布：每表 by_source **横向堆叠条**（固定色板 sina蓝/tencent橙/baostock紫/
+// 三区块（报告 §3 T-数据湖；v7.0.18：原区块4 BaoStock 恢复探测随渠道移除）：
+//   1) 采用源分布：每表 by_source **横向堆叠条**（固定色板 sina蓝/tencent橙/
 //      tdx青/adata_f10粉/local灰；legacy 未知 source → 灰）+ 数字；
-//   2) 数据源状态（v6.1.3，原"资源池健康度"升级）：每源一张卡（5 色 SOURCE_COLORS
+//   2) 数据源状态（v6.1.3，原"资源池健康度"升级）：每源一张卡（SOURCE_COLORS
 //      左边框/标题着色），卡内四行——连通性（✓可达/✗不可达/—未探测 + latency；
 //      enabled=false → "已禁用"灰 badge 替代 ✓/✗）/ 数据类型（provides chips，role
-//      后缀小字 muted）/ 配额（baostock 今日 used/budget；其余 rate_limit 文案或
-//      "无官方配额"）/ 探测时间（stale=true → "探测数据过期"角标）。
+//      后缀小字 muted）/ 配额（rate_limit 文案或"无官方配额"——v7.0.18 起无硬配额源）/
+//      探测时间（stale=true → "探测数据过期"角标）。
 //   3) conflict_src：total + 非零表逐行（T8/T9 无该列，后端不出现在对象里）；
-//   4) BaoStock 恢复探测：alive badge + at/elapsed/detail。
 // **backfill_in_progress 时整块"灌数中暂不可用"**（库被独占写锁持有期间 source_pool
 // 只在 ready 态出现——locked 态响应无此键，本组件按 props.pool==null 降级）。
 import { computed, reactive, ref } from "vue";
@@ -163,7 +162,8 @@ const FIELD_GROUP_CN = {
   valuation: "估值", f10: "F10基本面", ohlcv: "OHLCV", amount: "amount",
   holders: "前十大股东",
 };
-// 配额行：quota 非 null → 今日 used/budget；否则 rate_limit 文案或"无官方配额"
+// 配额行：v7.0.18 起后端 quota 恒 null（唯一硬配额源 baostock 已移除）→ 恒走
+// rate_limit 文案或"无官方配额"。函数保留（quota 对象分支防旧响应兼容）。
 function quotaText(s) {
   if (s.quota && typeof s.quota === "object") {
     const u = s.quota.used_today == null ? "—" : s.quota.used_today;
@@ -186,8 +186,7 @@ const conflicts = computed(() => {
   return { total, codesTotal, nonzero, codesByTable };
 });
 
-// 区块4：baostock_probe（progress 既有键透出；null → 未探测占位）
-const bsProbe = computed(() => (props.pool && props.pool.baostock_probe) || null);
+// v7.0.18：原区块4 bsProbe computed（pool.baostock_probe 透出）随渠道移除。
 
 const stale = computed(() => !!(props.pool && props.pool.stale));
 
@@ -274,7 +273,7 @@ function fmtLatency(ms) {
               </template>
               <span v-else class="muted small">—</span>
             </div>
-            <!-- 行3 配额（baostock 今日 used/budget；其余 rate_limit 或"无官方配额"） -->
+            <!-- 行3 配额（v7.0.18 起无硬配额源：rate_limit 文案或"无官方配额"） -->
             <div class="muted small mono">配额：{{ quotaText(s) }}</div>
             <!-- 行4 探测时间 -->
             <div class="muted small mono">探测：{{ s.probed_at || "未探测" }}</div>
@@ -297,20 +296,7 @@ function fmtLatency(ms) {
           <span v-else class="muted small">无分歧（全部单源一致）</span>
         </div>
       </div>
-
-      <!-- 区块4：BaoStock 恢复探测（Q6） -->
-      <div class="lake-spp-block">
-        <div class="lake-spp-title">BaoStock 恢复探测（Q6 · 灌数启动探一次）</div>
-        <div v-if="bsProbe" class="lake-spp-bs">
-          <span class="badge" :class="bsProbe.alive ? 'lake-st-fresh' : 'lake-st-empty'">
-            {{ bsProbe.alive ? "✓ alive" : "✗ dead" }}
-          </span>
-          <span class="muted small mono">{{ bsProbe.at || "—" }}</span>
-          <span v-if="bsProbe.elapsed_s != null" class="muted small mono">{{ Number(bsProbe.elapsed_s).toFixed(1) }}s</span>
-          <span v-if="bsProbe.detail" class="muted small">{{ bsProbe.detail }}</span>
-        </div>
-        <span v-else class="muted small">未探测（最近一次灌数未记录 Q6 结果）</span>
-      </div>
+      <!-- v7.0.18：原区块4（BaoStock 恢复探测 Q6）随渠道移除。 -->
     </template>
   </div>
 </template>

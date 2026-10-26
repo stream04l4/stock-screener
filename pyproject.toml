@@ -4,15 +4,22 @@ version = "7.0.0"
 description = "A股深回撤金字塔加仓策略（drawdown_martingale）：5 条件股票池 + 逐股状态机回测 + Web 查询/按需回测（数据源 = DuckDB 数据湖）"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "baostock>=0.8.9",
+    # v7.0.18：baostock 随渠道完全移除（Joel 2026-10-26 拍板）；tushare 升为 T1 主源
+    # （T2/T3 日增主源自 v7.0.8 起已在用，此处首次显式入依赖）
+    "tushare>=1.4",
     "pandas>=2.0",
     "PyYAML>=6.0",
     "ruamel.yaml>=0.17",
     "requests>=2.31",
+    # v7.0.18：以下此前 ad-hoc `uv pip install`、未入 lock——2026-10-26 `uv sync`
+    # 对齐 lock 时被误清（web 服务/ T5 取数当场缺包）→ 全部显式化：
+    "adata>=0.1",           # T5 季度基本面 F10（lake/ingest/adata_f10_adapter.py）
+    "pypinyin>=0.51",        # Web 股票名拼音模糊搜索（web/app.py）
+    "python-dotenv>=1.0",    # .env 读 TUSHARE_TOKEN / PUSHPLUS_TOKEN
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "httpx>=0.27"]   # httpx：starlette TestClient（lake web 单测）
 # v5.2 Phase 1：akshare 校验源（**pin 死版本**——非官方接口、迭代快，漂移风险高；
 # 仅交叉校验用途，不进主计算路径。装法：uv pip install 'akshare==1.18.88'）
 validate = ["akshare==1.18.88"]
@@ -20,6 +27,8 @@ validate = ["akshare==1.18.88"]
 # （martingale/data.py read_only 连接 lake.duckdb）；本部署 venv 已装，未装时
 # `python -m martingale` 报 LakeMissing/LakeInvalidFile 类错误。
 lake = ["duckdb>=1.5,<2"]
+# Web 控制台（FastAPI 后端 + 静态 SPA；stock-screener-web.service 消费）
+web = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [build-system]
 requires = ["hatchling"]

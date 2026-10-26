@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """test_lake_v613_source_pool —— v6.1.3 数据源池状态面板：/status.source_pool.sources。
 
-规格（v6.1.3 brief A/C）：
-- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 sina/tencent/baostock/
+规格（v6.1.3 brief A/C；v7.0.18 更新）：
+- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 sina/tencent/
   tdx/adata_f10，与前端 SOURCE_COLORS 对齐），每源一项：
   ``{name, enabled, available, probed_at, latency_ms, authority, provides, quota,
   rate_limit}``。
 - ``available/probed_at/latency_ms`` **复用现有 adapters[name]**（null=未探测）；
 - ``authority`` = Q1 权威性数值（source_pool.AUTHORITY，越小越权威）；
 - ``provides`` = 静态能力表 SOURCE_CAPABILITIES（该源可提供的数据类型+role；T4 不列）；
-- ``quota`` **仅 baostock 非 null**：used_today=progress tasks quota_used_today max、
-  budget=config ``baostock_daily_budget``；其余源 null；
-- ``rate_limit`` = min_interval_s 派生文案（sina/tdx/adata_f10 有，tencent/baostock→null）；
+- ``quota`` **恒 null**（v7.0.18：baostock 日配额随渠道移除，无计数方）；
+- ``rate_limit`` = min_interval_s 派生文案（sina/tdx/adata_f10 有，tencent→null）；
 - **三态契约红线**：sources 仅 ready 态出现——locked/uninitialized 响应体逐字节不动
   （无 source_pool 键 → 无 sources）；ready 态 ``sync.quota_used_today/quota_budget``
   **保留不删**（v605 断言依赖 + API 契约，本次只是前端不再展示）。
@@ -36,8 +35,8 @@ import lake.web_api as wapi  # noqa: E402
 from lake import conn as lconn  # noqa: E402
 from lake.ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES  # noqa: E402
 
-# 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐）
-FIVE_SOURCES = ["sina", "tencent", "baostock", "tdx", "adata_f10"]
+# 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐；v7.0.18 baostock 移除）
+FOUR_SOURCES = ["sina", "tencent", "tdx", "adata_f10"]
 # 每源条目键集恒定（形状稳定，前端按此渲染四行卡）
 ENTRY_KEYS = {"name", "enabled", "available", "probed_at", "latency_ms",
               "authority", "provides", "quota", "rate_limit"}
@@ -104,7 +103,7 @@ def _uninitialized_status(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# A. ready 态 sources 数组结构（5 源齐全 + 固定顺序 + 每源键集恒定）
+# A. ready 态 sources 数组结构（4 源齐全 + 固定顺序 + 每源键集恒定）
 # ===========================================================================
 def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
@@ -112,15 +111,15 @@ def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     # v6.1.3：sources 键随 source_pool 追加（旧 5 键仍在）；
     # v6.3.5：追加 conflict_codes（股票数口径——行级被 adj 摘要复制放大误导）
     assert set(sp.keys()) == {"by_source", "conflict_rows", "conflict_codes",
-                              "adapters", "baostock_probe", "stale", "sources"}, \
+                              "adapters", "stale", "sources"}, \
         f"source_pool 键集: {sorted(sp)}"
     # conflict_codes 形状 = conflict_rows 同键集（T1-T7 + total）
     assert set(sp["conflict_codes"].keys()) == set(sp["conflict_rows"].keys())
     srcs = sp["sources"]
-    assert isinstance(srcs, list) and len(srcs) == 5, f"sources 应 5 源: {len(srcs)}"
+    assert isinstance(srcs, list) and len(srcs) == 4, f"sources 应 4 源: {len(srcs)}"
     # 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐）
-    assert [s["name"] for s in srcs] == FIVE_SOURCES, \
-        f"sources 顺序必须 sina/tencent/baostock/tdx/adata_f10: {[s['name'] for s in srcs]}"
+    assert [s["name"] for s in srcs] == FOUR_SOURCES, \
+        f"sources 顺序必须 sina/tencent/tdx/adata_f10: {[s['name'] for s in srcs]}"
     # 每源条目键集恒定（形状稳定）
     for s in srcs:
         assert set(s.keys()) == ENTRY_KEYS, f"{s['name']} 键集: {sorted(s)}"
@@ -153,7 +152,7 @@ def test_ready_sources_available_passthrough_when_probed(tmp_path, monkeypatch):
     assert by_name["sina"]["latency_ms"] == 320
     assert by_name["tencent"]["available"] is False
     # 未探测源仍 null（文件缺键 → adapters 补 null 占位，sources 同）
-    assert by_name["baostock"]["available"] is None
+    assert by_name["tdx"]["available"] is None
 
 
 def _write_source_health(tmp_path, adapters: dict):
@@ -169,12 +168,12 @@ def _write_source_health(tmp_path, adapters: dict):
 def test_ready_sources_authority_from_constant(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    for name in FIVE_SOURCES:
+    for name in FOUR_SOURCES:
         assert by_name[name]["authority"] == AUTHORITY[name], \
             f"{name} authority 应={AUTHORITY[name]}: {by_name[name]['authority']}"
-    # Q1 序：sina(0) < tencent(1) < baostock(2) < tdx(3) == adata_f10(3)
+    # Q1 序：sina(0) < tencent(1) < tdx(3) == adata_f10(3)（baostock:2 空位随渠道移除）
     assert by_name["sina"]["authority"] < by_name["tencent"]["authority"] \
-        < by_name["baostock"]["authority"] < by_name["tdx"]["authority"]
+        < by_name["tdx"]["authority"]
     assert by_name["tdx"]["authority"] == by_name["adata_f10"]["authority"] == 3
 
 
@@ -184,7 +183,7 @@ def test_ready_sources_authority_from_constant(tmp_path, monkeypatch):
 def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    for name in FIVE_SOURCES:
+    for name in FOUR_SOURCES:
         # 原样透出（deep copy，值相等）
         assert by_name[name]["provides"] == SOURCE_CAPABILITIES.get(name, []), \
             f"{name} provides 应=SOURCE_CAPABILITIES: {by_name[name]['provides']}"
@@ -209,49 +208,30 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "主源"}]
     # T4 分红=本地静态缓存，不属任何在线源 → 任一 provides 不得含 dividend_events
-    for name in FIVE_SOURCES:
+    for name in FOUR_SOURCES:
         assert all(p["table"] != "dividend_events" for p in by_name[name]["provides"]), \
             f"{name} provides 不应含 T4（本地静态缓存）"
 
 
 # ===========================================================================
-# D. quota（仅 baostock 非 null；used=tasks max，budget=config）
+# D. quota（v7.0.18：baostock 日配额随渠道移除 → 全源恒 null）
 # ===========================================================================
-def test_ready_sources_quota_baostock_only(tmp_path, monkeypatch):
+def test_ready_sources_quota_all_null(tmp_path, monkeypatch):
+    """v7.0.18：sources[].quota 恒 null（无计数方；progress tasks 配额键不影响）。"""
     tasks = [
         {"table": "kline_daily", "quota_used_today": 300, "quota_budget": 5000},
         {"table": "stock_master", "quota_used_today": 900, "quota_budget": 5000},
     ]
     d = _ready_status(tmp_path, monkeypatch, tasks=tasks)
-    by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    # baostock：used_today=max(300,900)=900，budget=config 默认 5000
-    assert by_name["baostock"]["quota"] == {"used_today": 900, "budget": 5000}, \
-        f"baostock quota 应 used=900/budget=5000: {by_name['baostock']['quota']}"
-    # 其余源 quota=null（无硬配额）
-    for name in ("sina", "tencent", "tdx", "adata_f10"):
-        assert by_name[name]["quota"] is None, f"{name} quota 应 null: {by_name[name]['quota']}"
+    for s in d["source_pool"]["sources"]:
+        assert s["quota"] is None, f"{s['name']} quota 应恒 null: {s['quota']}"
 
 
-def test_ready_sources_quota_baostock_no_tasks_used_none(tmp_path, monkeypatch):
-    """无 tasks（从未灌数）→ baostock used_today=None，budget 仍=config。"""
+def test_ready_sources_quota_none_without_tasks(tmp_path, monkeypatch):
+    """无 tasks（从未灌数）→ 仍全源 quota=null（形状稳定）。"""
     d = _ready_status(tmp_path, monkeypatch, tasks=[])
-    bs = {s["name"]: s for s in d["source_pool"]["sources"]}["baostock"]
-    assert bs["quota"] == {"used_today": None, "budget": 5000}, \
-        f"无 tasks baostock quota: {bs['quota']}"
-
-
-def test_ready_sources_quota_budget_from_config(tmp_path, monkeypatch):
-    """budget 取 config ``baostock_daily_budget``（monkeypatch lake_cfg 验证派生）。"""
-    import lake.config as lcfg
-
-    real = lcfg.lake_cfg()
-    fake = dict(real)
-    fake["baostock_daily_budget"] = 7777
-    monkeypatch.setattr(lcfg, "lake_cfg", lambda: fake)
-    d = _ready_status(tmp_path, monkeypatch, tasks=[{"quota_used_today": 5}])
-    bs = {s["name"]: s for s in d["source_pool"]["sources"]}["baostock"]
-    assert bs["quota"] == {"used_today": 5, "budget": 7777}, \
-        f"budget 应取 config=7777: {bs['quota']}"
+    for s in d["source_pool"]["sources"]:
+        assert s["quota"] is None
 
 
 # ===========================================================================
@@ -264,9 +244,8 @@ def test_ready_sources_rate_limit_text(tmp_path, monkeypatch):
     assert by_name["sina"]["rate_limit"] == "≥1s/股", by_name["sina"]["rate_limit"]
     assert by_name["tdx"]["rate_limit"] == "≥0.5s/股", by_name["tdx"]["rate_limit"]
     assert by_name["adata_f10"]["rate_limit"] == "≥1s/股", by_name["adata_f10"]["rate_limit"]
-    # tencent/baostock 无 min_interval 配置 → null（前端显示"无官方配额"）
+    # tencent 无 min_interval 配置 → null（前端显示"无官方配额"）
     assert by_name["tencent"]["rate_limit"] is None
-    assert by_name["baostock"]["rate_limit"] is None
 
 
 def test_ready_sources_rate_limit_from_config_override(tmp_path, monkeypatch):
@@ -288,8 +267,8 @@ def test_ready_sources_rate_limit_from_config_override(tmp_path, monkeypatch):
 def test_ready_sources_enabled_default_true(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    # 默认全开（config 缺省 *_enabled=True；tencent/baostock 无独立开关 → True）
-    for name in FIVE_SOURCES:
+    # 默认全开（config 缺省 *_enabled=True；tencent 无独立开关 → True）
+    for name in FOUR_SOURCES:
         assert by_name[name]["enabled"] is True, f"{name} enabled 默认应 True"
 
 
@@ -358,10 +337,10 @@ def test_build_sources_no_db_no_adapter_import(tmp_path, monkeypatch):
     monkeypatch.setattr(sp, "_REGISTRY", {"sina": object()})
     prog = {"tasks": [{"quota_used_today": 42}]}
     adapters = {n: {"available": None, "probed_at": None, "latency_ms": None}
-                for n in FIVE_SOURCES}
+                for n in FOUR_SOURCES}
     out = wapi._build_sources(prog, adapters)
-    assert [s["name"] for s in out] == FIVE_SOURCES
-    bs = {s["name"]: s for s in out}["baostock"]
-    assert bs["quota"]["used_today"] == 42
+    assert [s["name"] for s in out] == FOUR_SOURCES
+    # v7.0.18：quota 恒 null（progress 配额键不影响——无计数方）
+    assert all(s["quota"] is None for s in out)
     # provides 来自常量（不依赖 adapter 实例）
     assert out[0]["provides"] == SOURCE_CAPABILITIES["sina"]

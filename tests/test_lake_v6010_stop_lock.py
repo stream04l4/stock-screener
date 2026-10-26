@@ -510,72 +510,8 @@ def test_new_run_clears_residual_persisted_in_first_task_window(tmp_path, monkey
 
 # ===========================================================================
 # 4. 重试循环提前中断（收尾加速）——BaoStock / 腾讯
-# ===========================================================================
-def test_baostock_retry_interrupted_by_stop_flag(monkeypatch):
-    """BaoStockClient._query 停止中断双路径：
-    ① 标志**调用前**已置位 → 第 1 轮 attempt 前检查即抛（0 次 API 调用，最快收尾）；
-    ② 标志在**退避期间**到达（第 1 次失败后 query_fn 置位）→ 退避 sleep 拆块逐查、
-       ~0.5s 内立即中断（不等满 base_delay=5s × 抖动的完整退避）。"""
-    from screener.data.baostock_client import BaoStockClient, BaoStockError
-
-    monkeypatch.setenv("HOME", "/tmp/v6010_fake_home")   # 隔离配额文件（不碰生产）
-    from lake import backfill as lb
-    client = BaoStockClient(max_attempts=3, base_delay=5.0, max_delay=30.0,
-                            quota_path=False, stop_checker=lb.stop_requested)
-
-    calls = {"n": 0}
-
-    def _boom(**kw):
-        calls["n"] += 1
-        raise ConnectionError("simulated network failure")
-
-    # ① 标志调用前已置位 → 立即抛（0 次 API 调用）
-    lb.set_stop_requested()
-    try:
-        t0 = time.monotonic()
-        with pytest.raises(BaoStockError) as ei1:
-            client.call(_boom, label="q")
-        elapsed = time.monotonic() - t0
-        assert calls["n"] == 0, f"标志已置位时不得再发 API 调用: {calls}"
-        assert elapsed < 1.0, f"必须立即中断，实际 {elapsed:.2f}s"
-        assert "停止信号" in str(ei1.value)
-    finally:
-        lb.clear_stop_requested()
-
-    # ② 标志在退避期间到达：query_fn 第 1 次调用后置位 → attempt 1 执行（n=1）→
-    #    失败进退避 → sleep 拆块逐查命中 → ~0.5-1s 内中断（完整退避 ≥2.5s）
-    calls["n"] = 0
-
-    def _boom_then_stop(**kw):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            lb.set_stop_requested()   # 模拟 SIGTERM 在任务执行中到达
-        raise ConnectionError("simulated network failure")
-
-    try:
-        t0 = time.monotonic()
-        with pytest.raises(BaoStockError) as ei2:
-            client.call(_boom_then_stop, label="q")
-        elapsed = time.monotonic() - t0
-        assert calls["n"] == 1, f"退避期间中断后不得继续重试: {calls}"
-        # 完整退避下界 = base_delay×0.5（抖动最小值）= 2.5s + 拆块粒度；上限 ≈7.5s。
-        # 断言 < 完整退避+下一轮 attempt 的时间窗（~11s），证明"提前中断、不等满"。
-        assert elapsed < 11.0, \
-            f"必须提前中断（不等满退避 base=5s×抖动[0.5,1.5]），实际 {elapsed:.2f}s"
-        assert "停止信号" in str(ei2.value), f"错误文案应指停止信号: {ei2.value}"
-    finally:
-        lb.clear_stop_requested()
-
-    # ③ 无标志：完整重试走完（原行为零变化回归）
-    calls["n"] = 0
-    t0 = time.monotonic()
-    with pytest.raises(BaoStockError):
-        client.call(_boom, label="q")
-    elapsed_no_flag = time.monotonic() - t0
-    assert calls["n"] == 3 and elapsed_no_flag >= 4.0, \
-        f"无标志时应走完重试: n={calls['n']} t={elapsed_no_flag:.2f}"
-
-
+# v7.0.18：原 BaoStockClient._query 停止中断用例随 baostock 渠道整体移除
+#（腾讯侧停止感知用例保留——重试提前中断语义同口径适用）。
 def test_tencent_fetch_kline_interrupted_by_stop_flag(monkeypatch):
     """腾讯 fetch_kline_ohlcv：请求失败重试中收到停止标志 → 抛 StopRequestedError
     （不静默返回 []——p0 worker 对空结果仍 mark_done，会把未取数误标完成）。"""

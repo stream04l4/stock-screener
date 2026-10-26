@@ -76,11 +76,11 @@ def main():
         shutil.rmtree(WORK)
     os.makedirs(WORK, exist_ok=True)
 
-    from screener.data.baostock_client import QuotaGuard, default_quota_path
+    from lake.ingest.common import QuotaGuard, default_quota_path
 
     guard = QuotaGuard(path=default_quota_path())
     q_date, q_before = guard.get_state()
-    hr("STEP 0 · BaoStock 配额前值（生产灌数并发运行中，本冒烟 ≤2 次调用）")
+    hr("STEP 0 · 日配额前值（v7.0.18 起无计数方，恒 0——机制保留观察用）")
     print(f"date={q_date} used={q_before} path={default_quota_path()}")
 
     # ---- 1. tmp 库 init（driver CLI，幂等建 schema）----

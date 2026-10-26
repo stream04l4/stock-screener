@@ -84,9 +84,9 @@ def test_strategy_yaml_is_single_source_of_truth():
     # lake: 段必须保留（lake/config.py 读取；lake-sync 依赖）
     assert isinstance(cfg.get("lake"), dict) and cfg["lake"], "缺 lake: 段（lake-sync 依赖）"
 
-    # datasource.{sina,rf,baostock} 子段必须保留（lake_backfill 唯一消费）
+    # datasource.{sina,rf} 子段必须保留（lake_backfill 唯一消费；v7.0.18 baostock 段移除）
     ds = cfg.get("datasource", {})
-    for sub in ("sina", "rf", "baostock"):
+    for sub in ("sina", "rf"):
         assert isinstance(ds.get(sub), dict), f"datasource.{sub} 子段缺失（lake-sync 依赖）"
 
     # pct 字段必须为整数百分数（config.py 负责 /100 转小数）

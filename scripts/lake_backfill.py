@@ -5,18 +5,19 @@
 P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary 打印，
 **全部抓取/限速/幂等逻辑复用现有 ingest + BackfillRunner**（不重写）：
 
-- T1 stock_master     ← baostock_ingest.fetch_stock_basic/fetch_industry/load_t1
-                        （BaoStockClient 构造即挂 QuotaGuard，~2 次调用；
-                        name/is_st 由腾讯快照补——load_t1 只落 BaoStock 侧列）
+- T1 stock_master     ← tushare stock_basic（v7.0.18：BaoStock 移除后改 tushare
+                        主源，L+D 状态 ~2 次调用、65s 间隔限频；行业=粗分类，
+                        industry_csric2 不再维护；name/is_st 由腾讯快照补）
 - T4 dividend_events  ← em_dividend_ingest.load_dividends（cache/em_dividend_all.csv
                         静态导入全史，**零网络**）
 - T7 index_daily      ← tencent_ingest.fetch_kline_ohlcv + load_t7（4 指数 × N 天）
 - T2 kline_daily      ← v6.1 DEF-1 多源（source_pool：sina→tencent→tdx，窗口化近 N 天；
-                        adj sina/tdx 推导 + cross_check tdx；池空回退腾讯单源逐字节不变）
+                        adj sina/tdx 推导 + cross_check tdx；池空回退腾讯单源 K线
+                        （adj_map=None，v7.0.18 原尾部 BaoStock adj 兜底移除））
 - T3 valuation_daily  ← tencent_ingest.fetch_snapshot + load_t3（批量快照 50/批，
                         批间小睡；done 键同样幂等）
-- history             ← P2 全史后台补（v6.0.7：腾讯 K线分页翻到 IPO + BaoStock
-                        adj_factor；done 键固定 "full_history" 跨天续传；取空/失败
+- history             ← P2 全史后台补（腾讯 K线分页翻到 IPO + 多源池 adj_factor
+                        推导；done 键固定 "full_history" 跨天续传；取空/失败
                         抛错不 mark_done），走 BackfillRunner（budget_per_day 门）。
                         **本批次只构建不跑**——TL 验收后由 TL 实际执行。
 - full                ← v6.1.6 单按钮全量补齐（Joel 拍板：一个按钮负责启动停止，
@@ -28,7 +29,7 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                           phase2 P3 增量（kline_daily→valuation_daily→index_daily，
                                   run_incremental 原样复用）
                           phase3 T5 fundamentals_quarterly（run_t5 原样复用：
-                                  adata F10 主源 + BaoStock 探测存活时交叉校验，
+                                  adata F10 单源；v7.0.18 原 BaoStock 交叉校验移除，
                                   限速 adata_f10_min_interval_s）
                           phase4 T6 holders_snapshot（v6.1.7：SinaClient.fetch_holders
                                   全史前十大股东 → sina_ingest.load_t6；限速/WAF退避/
@@ -38,9 +39,12 @@ P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary �
                         任一阶段异常 → last_error + 该任务 state=error，**继续下一
                         阶段**（单表故障不拖死全量；hang1 R3 停滞看门狗照旧兜底）。
 
-纪律（v6.0.2）：
-- BaoStock 一律走 QuotaGuard（baostock_ingest 现有路径），不得裸调；日预算到顶
-  当日停、次日续（BackfillRunner._quota_state + QuotaGuard 日期翻转）。
+纪律（v6.0.2；v7.0.18 修订）：
+- v7.0.18（Joel 2026-10-26 拍板）：**BaoStock 渠道完全移除**（每日配额过紧 +
+  经常故障）——T1 改 tushare stock_basic、T5 交叉校验去除、T2 adj 兜底链
+  sina→tdx、Q6 存活探测退役、QuotaGuard 迁 lake/ingest/common.py（机制保留、
+  无计数方、恒不触发）。日预算到顶停机制保留（BackfillRunner._quota_state +
+  QuotaGuard 日期翻转）。
 - 零回归红线：本脚本只 import lake/* + screener.data.*，**不改动 screener/**。
 - duckdb 未装 → LakeUnavailable 友好报错退出（exit 3），不崩 traceback。
 - **D-1（v6.0.3 rework）**：--db 指向 0 字节/无效库文件（duckdb 打不开）→
@@ -128,9 +132,12 @@ def _print_summary(title: str, summary: Dict[str, Any]) -> None:
 
 
 def _quota_state() -> Dict[str, Any]:
-    """QuotaGuard 当前状态（本地文件读，零网络）。失败 → {}（不阻断）。"""
+    """QuotaGuard 当前状态（本地文件读，零网络）。失败 → {}（不阻断）。
+
+    v7.0.18：QuotaGuard 迁至 lake/ingest/common.py（baostock_client 删除）。
+    """
     try:
-        from screener.data.baostock_client import QuotaGuard, default_quota_path
+        from lake.ingest.common import QuotaGuard, default_quota_path
 
         guard = QuotaGuard(path=default_quota_path())
         date_s, used = guard.get_state()
@@ -141,86 +148,11 @@ def _quota_state() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# v6.1（Q6）：BaoStock 恢复探测——灌数启动时探一次，结果写日志+progress
+# v7.0.18：原 Q6 BaoStock 恢复探测段（_q6_probe_timeout_s + _run_bs_probe）
+# 已整体删除——BaoStock 渠道移除后无探测对象；progress 顶层 baostock_probe 键
+# 随 summary 返回字段一并退役（Web 源页区块 4 同步移除）。
 # ---------------------------------------------------------------------------
-def _q6_probe_timeout_s() -> float:
-    """Q6 启动探测墙钟硬上限（秒）。缺省 **20.0**（brief F3 红线"不得超过 20s"逐字值）。
 
-    env ``BS_Q6_PROBE_TIMEOUT_S`` 可覆盖——**仅供离线测试提速**（生产不设=20s）。
-    与 baostock_adapter._available_timeout_s 同模式：每次现读 env。非法值回退 20.0。
-    """
-    try:
-        return max(1.0, float(os.environ.get("BS_Q6_PROBE_TIMEOUT_S", "20")))
-    except ValueError:
-        return 20.0
-
-
-def _run_bs_probe(db_path: Optional[str] = None) -> Dict[str, Any]:
-    """灌数启动的 Q6 BaoStock 存活探测（p0/history/reconcile 各调一次）。
-
-    - config ``baostock_probe_enabled=False`` → 跳过（按"死"处理，零网络——离线单测契约）。
-    - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 同样跳过（与 resolve_source 一致）。
-    - 探测本身 fail-fast：socket 10s 超时 + **F3/v6.1.5 墙钟硬上限 20s**（绝不阻塞灌数启动；
-      红线"任何代码路径在 baostock 上阻塞不得超过 20s"）。实现=``_with_timeout``（与
-      O4/adapter.available() 同一超时工具，不各写一套）：内层 probe 显式 wall_budget_s=15
-      （<20，正常 hang 由内层先判死并给出干净 detail），外层 20s 硬兜底——任一层先到即
-      alive=false（detail="probe timeout >20s"）。**红线：screener/ 零改动**——超时全部在
-      lake/scripts 层施加，probe_baostock_alive 本身未动。
-    - 结果写日志 + progress 顶层 ``baostock_probe``（Web /status 可观测）。
-
-    **progress 路径按 db_path 派生**（v6.1 隔离修复）：自定义 --db（E2E/tmp 库）→
-    写到该库目录的 progress，**绝不污染生产 data/lake/backfill_progress.json**；
-    缺省库 → None → load/save_progress 走生产默认路径（原行为不变）。
-    """
-    from lake.config import lake_cfg
-
-    if os.environ.get("LAKE_MULTISOURCE") == "0":
-        return {"enabled": False, "alive": False, "detail": "multisource off (test isolation)"}
-    # DEFECT-HANG-1（repro 纪律）：env LAKE_DISABLE_BAOSTOCK=1 → 跳过 BaoStock 探测
-    # （baostock_alive 恒 False → adapter available()=False → 各池排除 baostock，零连接）。
-    # 用途：生产 backfill 正在跑（BaoStock 串行占用）时，repro/并行作业必须避免**第二个**
-    # BaoStock 连接源（>~4 并发连接触发服务端黑名单，见团队纪律）。sina/tencent/tdx 不受
-    # 影响——HANG-1 卡死点恰在这三源网络路径（ESTAB→Tencent:443 + CLOSE-WAIT），R1 证据完整。
-    if os.environ.get("LAKE_DISABLE_BAOSTOCK") == "1":
-        return {"enabled": False, "alive": False,
-                "detail": "baostock disabled (LAKE_DISABLE_BAOSTOCK=1)"}
-    if not lake_cfg().get("baostock_probe_enabled", True):
-        return {"enabled": False, "alive": False, "detail": "probe disabled by config"}
-    from lake.ingest.source_pool import _with_timeout, set_baostock_alive
-
-    # F3/v6.1.5：Q6 启动探测 ≤20s 硬上限（brief 逐字"同样 ≤20s 硬超时，超时记
-    # alive=false detail='probe timeout >20s'"）。内层 wall_budget_s=15 <20（正常 hang
-    # 由 probe 自身先判死、detail 干净）；外层 _with_timeout(缺省 20s) 兜底——协议层若
-    # 吞掉 socket.timeout 进内部循环，必在预算内返回。screener/ 零改动：超时全在本调用点施加。
-    tmo = _q6_probe_timeout_s()   # 缺省 20.0（brief 红线值）；env BS_Q6_PROBE_TIMEOUT_S 仅测试提速
-    t0 = time.monotonic()
-    try:
-        from screener.data.baostock_client import probe_baostock_alive
-
-        res = _with_timeout(
-            lambda: probe_baostock_alive(timeout_s=10.0, wall_budget_s=15.0),
-            secs=tmo, name="bs-q6-probe")
-    except TimeoutError:
-        log.warning("Q6 BaoStock 探测超时 >%.0fs（按死处理，不阻塞灌数启动）", tmo)
-        res = {"alive": False, "elapsed_s": round(time.monotonic() - t0, 2),
-               "detail": f"probe timeout >{tmo:.0f}s"}
-
-    set_baostock_alive(res.get("alive", False), res.get("detail", ""))
-    log.info("Q6 BaoStock 恢复探测: alive=%s elapsed=%ss %s",
-             res.get("alive"), res.get("elapsed_s"), res.get("detail"))
-    # progress 落盘（Web /status 可观测）——失败不阻断灌数；路径按 db_path 派生（隔离）
-    try:
-        from lake.backfill import load_progress, save_progress
-
-        prog_path = _progress_for_db(db_path)  # None=缺省库→生产默认路径；自定义→库目录
-        prog = load_progress(prog_path)
-        prog["baostock_probe"] = {"at": _dt.datetime.now(_dt.timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"), "alive": bool(res.get("alive")),
-            "elapsed_s": res.get("elapsed_s"), "detail": res.get("detail", "")}
-        save_progress(prog, prog_path)
-    except Exception as exc:  # noqa: BLE001 - progress 写失败不影响灌数
-        log.warning("Q6 探测结果写 progress 失败（不阻断）: %s", exc)
-    return {"enabled": True, **res}
 
 
 # ---------------------------------------------------------------------------
@@ -232,17 +164,15 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
 
     - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 跳过，零网络（与 _run_bs_probe /
       resolve_source 同口径；conftest autouse 默认置位 → 离线单测不触网）。
-    - 探测对象 = AUTHORITY 的 5 个外部源（sina/tencent/baostock/tdx/adata_f10）；
+    - 探测对象 = AUTHORITY 的外部源（v7.0.18 后=sina/tencent/tdx/adata_f10）；
       ``local`` 是本地推导（静态 csv/factors 派生），无网络可达性概念，不进健康度。
     - 各 adapter ``available()`` 记 latency_ms：首次调用触发 EU 自检（网络探测），
       失败→False 自动跳过该源（不 crash、不阻塞灌数启动——单源异常只记 false）。
-      baostock adapter 的 available() = Q6 探测结果（零网络）——**history/reconcile
-      路径须先跑 _run_bs_probe 再调本函数**，否则按"未探测=死"保守记录。
     - adapter 未注册（依赖库未装/import 失败）→ 记 available=false（该源在本环境
       恒不可用——resolve_source 同样跳过它；不猜 null）。
     - 落点 = progress 同目录的 ``source_health.json``（B-2 纪律：自定义 --db → 库
       目录，绝不污染生产 data/lake/；缺省库 → 生产默认路径）。原子写（tmp+rename）；
-      写失败不阻断灌数（与 _run_bs_probe 的 progress 写纪律一致）。
+      写失败不阻断灌数。
 
     :return: ``{"enabled": bool, "path": str|None, "adapters": {...}}``（summary 用）。
     """
@@ -251,7 +181,7 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
     if os.environ.get("LAKE_MULTISOURCE") == "0":
         return {"enabled": False, "path": None,
                 "detail": "multisource off (test isolation)"}
-    names = [n for n in ("sina", "tencent", "baostock", "tdx", "adata_f10")
+    names = [n for n in ("sina", "tencent", "tdx", "adata_f10")
              if n in AUTHORITY]
     now_s = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     adapters: Dict[str, Any] = {}
@@ -269,8 +199,7 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
             # 时都会被调一次——同进程 adapter 单例的 available() 懒缓存已被早期阶段
             # 预热，后探测命中缓存记 0ms，把首探的真网络延迟覆盖成假值（实测
             # 10-02 sina/tencent/tdx/adata 4 源二次探测全 0ms，页面误显"可达·0ms"）。
-            # 方法名虽为 *_for_test，语义=清懒缓存，生产探测恰需此行为。baostock 经
-            # 其三级短路（reset 后仍复用 Q6 已探结果、零网络），无副作用。
+            # 方法名虽为 *_for_test，语义=清懒缓存，生产探测恰需此行为。
             if hasattr(ad, "reset_available_for_test"):
                 ad.reset_available_for_test()  # type: ignore[attr-defined]
             ok = bool(ad.available())
@@ -311,33 +240,64 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# T1 stock_master（BaoStock ~2 次 + 腾讯快照补 name/is_st）
+# T1 stock_master（v7.0.18：tushare stock_basic ~2 次 + 腾讯快照补 name/is_st）
 # ---------------------------------------------------------------------------
-def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
-    """T1：BaoStock all_stock + 行业分类（QuotaGuard 内，~2 次调用）。
+def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
+    """T1：tushare stock_basic 全市场主档 + 行业粗分类（~2 次 API 调用）。
 
-    load_t1 只落 BaoStock 侧列（name/is_st/soe_* 留 NULL）；随后用**一次**腾讯
-    批量快照补 name/is_st（v5 口径：名称含 ST → is_st=1），不额外耗 BaoStock。
+    **v7.0.18（Joel 2026-10-26 拍板）**：BaoStock 渠道完全移除（每日配额过紧 +
+    经常故障）。股票全集/上市退市日/板块/行业改 tushare ``stock_basic``：
+    - **1 次调用**（免费档实测限频 1 次/**小时**——2026-10-26 实测 65s 间隔的
+      第 2 次调用即被限流拒绝）：``list_status='L'``（在市：ts_code/name/
+      industry/market/list_date）。退市档（D）低频独立刷新：``t1-delist``
+      子命令（单 D 调用，建议每周；delist_date 其余时间沿用 stock_master 旧值）。
+    - **universe = sh/sz 沪深两市**（market ∈ 主板/创业板/科创板）——与既有
+      5556 行口径一致；北交所（tushare L 状态含 ~353 只）排除。
+    - 行业 = **粗分类**（如"电气设备""化学制药"，tushare industry 字段）；
+      ``industry_csric2`` 置 NULL（证监会细分类不再维护，页面行业下拉/筛选
+      改走 industry_name，见 web_api /industries 与 /market 过滤）。
+    - board 由代码前缀推导（与旧 _board 口径一致：68→科创、30→创业、其余→主板）。
+    - name 先落 tushare 值，随后腾讯快照批量覆盖补 name/is_st（tushare 无 ST
+      标记，is_st 判定仍按 v5 口径：名称含 ST）。失败不阻断 T1 主体。
     """
-    from lake.backfill import stop_requested as _bk_stop
-    from lake.ingest import baostock_ingest as bsi
-    from screener.data.baostock_client import BaoStockClient
+    from lake.ingest import tushare_ingest as ti
+    from lake.ingest.common import DATA_VERSION, clean_date, now_ts, upsert
 
-    # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
-    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）
-    # v6.1.8 F4：daily_quota=lake 日预算（与 BackfillRunner.budget_per_day 同口径）——
-    # 硬上限==预算，严格 ≤budget（acquire 在 count>budget 时拒），防单任务内多次调用越界。
-    from lake.config import lake_cfg as _lcfg_t1
-    bs = BaoStockClient(stop_checker=_bk_stop,
-                        daily_quota=int(_lcfg_t1().get("baostock_daily_budget", 5000)))
-    try:
-        basic_fields, basic_rows = bsi.fetch_stock_basic(bs)      # 1 次配额
-        ind_fields, ind_rows = bsi.fetch_industry(bs)             # 1 次配额
-    finally:
-        bs.close()
-    industry_map: Dict[str, Tuple[Optional[str], Optional[str]]] = \
-        bsi.build_industry_map(ind_fields, ind_rows)
-    n = bsi.load_t1(con, basic_rows, industry_map)
+    if not ti.tushare_available():
+        raise RuntimeError("tushare 不可用（T1 主源）：uv pip install tushare + .env TUSHARE_TOKEN")
+    pro = ti._pro()
+
+    # v7.0.18.1 限频实测修正：stock_basic 免费档 = 1 次/小时（非 1 次/分钟）→
+    # T1 主档只发 1 次 L 调用；退市档 D 拆独立低频子命令 t1-delist（见下方
+    # run_t1_delist），delist_date 沿用 stock_master 现存值（下方读回后原样
+    # 写回——新上市股无旧行 → NULL，正确）。
+    df_l = pro.stock_basic(exchange="", list_status="L",
+                           fields="ts_code,name,industry,market,list_date")
+    delist_map = {r[0]: r[1] for r in con.execute(
+        "SELECT ts_code, delist_date FROM stock_master").fetchall()}
+    _MARKET_BOARD = {"主板": "主板", "创业板": "创业", "科创板": "科创"}
+    rows = []
+    for r in df_l.itertuples(index=False):
+        if r.market not in _MARKET_BOARD:   # 排除北交所（universe=沪深，口径不变）
+            continue
+        ts = r.ts_code
+        ind = (str(r.industry).strip() or None) if getattr(r, "industry", None) else None
+        rows.append([
+            ts,
+            str(r.name),            # name：腾讯快照随后覆盖（v5 口径）
+            None,                   # industry_csric2：粗分类口径下不再维护（NULL）
+            ind,                    # industry_name：tushare 粗分类（如"电气设备"）
+            clean_date(getattr(r, "list_date")),
+            delist_map.get(ts),
+            _MARKET_BOARD[r.market],
+            None,                   # is_st：腾讯快照补（名称含 ST → 1）
+            None, None, None,       # st_since / soe_flag / soe_basis
+            "tushare", now_ts(), DATA_VERSION,
+        ])
+    n = upsert(con, "stock_master", [
+        "ts_code", "name", "industry_csric2", "industry_name", "list_date",
+        "delist_date", "board", "is_st", "st_since", "soe_flag", "soe_basis",
+        "source", "fetched_at", "data_version"], rows)
 
     # 腾讯快照补 name/is_st（批量 50/批，免费；失败不阻断——name 可后补）
     ts_codes = [r[0] for r in con.execute("SELECT ts_code FROM stock_master").fetchall()]
@@ -363,25 +323,48 @@ def run_t1(con, db_path: str, quota_before: int) -> Dict[str, Any]:
                 enriched += 1
             time.sleep(0.3)  # 批间小睡（限速纪律）
     except Exception as exc:  # noqa: BLE001 - name/is_st 补齐失败不阻断 T1 主体
-        log.warning("T1 腾讯快照补 name/is_st 失败（不影响 BaoStock 侧列）: %s", exc)
-
-    # v6.1.1 FIX-2：industry_csric2 自愈回填（BaoStock 挂时 csric2 全空 → 从
-    # industry_name 提取 [A-Z]\d{1,3} 前缀；幂等、零网络；失败不阻断 T1 主体）
-    try:
-        industry_backfilled = backfill_industry_csric2(con)
-    except Exception as exc:  # noqa: BLE001 - 回填失败不阻断（下轮 T1/手动 UPDATE 再补）
-        log.warning("T1 industry_csric2 自愈回填失败（不影响 T1 主体）: %s", exc)
-        industry_backfilled = 0
+        log.warning("T1 腾讯快照补 name/is_st 失败（不影响主档列）: %s", exc)
 
     return {
         "table": "stock_master",
         "rows_written": n,
         "name_isst_enriched": enriched,
-        "industry_csric2_backfilled": industry_backfilled,
-        "baostock_calls_this_step": 2,
-        "note": "BaoStock 侧列=list_date/delist_date/board/industry；"
-                "name/is_st 由腾讯快照补；soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
+        "tushare_calls_this_step": 1,
+        "note": "tushare stock_basic：list_date/board/industry(粗分类)；delist_date "
+                "沿用旧值（D 档由 t1-delist 低频刷新，免费档 1 次/小时）；"
+                "name/is_st 由腾讯快照补；industry_csric2 不再维护（粗分类口径，"
+                "v7.0.18 BaoStock 移除）；soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
     }
+
+
+def run_t1_delist(con) -> Dict[str, Any]:
+    """T1 退市档刷新（CLI 子命令 ``t1-delist``）：单次 tushare ``stock_basic D``。
+
+    **为什么独立低频**：免费档 stock_basic 实测 1 次/小时（2026-10-26），
+    T1 主档（L）与退市档（D）同跑必限流 → 拆开。退市事件低频（日均 <1 只）→
+    建议每周跑一次；只 UPDATE 命中行的 delist_date + fetched_at，不碰其他
+    主档列（name/industry 等由 run_t1 的 L 全量 upsert 负责）。
+    """
+    from lake.ingest import tushare_ingest as ti
+    from lake.ingest.common import clean_date, now_ts
+
+    if not ti.tushare_available():
+        raise RuntimeError("tushare 不可用（T1 主源）：uv pip install tushare + .env TUSHARE_TOKEN")
+    pro = ti._pro()
+    df_d = pro.stock_basic(exchange="", list_status="D",
+                           fields="ts_code,delist_date")
+    n = 0
+    for r in df_d.itertuples(index=False):
+        cur = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code=?",
+                          [r.ts_code]).fetchone()[0]
+        if not cur:
+            continue   # 库里没有（北交所等 universe 外）→ 不插入
+        con.execute("UPDATE stock_master SET delist_date=?, fetched_at=? WHERE ts_code=?",
+                    [clean_date(getattr(r, "delist_date")), now_ts(), r.ts_code])
+        n += 1
+    return {"table": "stock_master", "delist_updated": n,
+            "tushare_calls_this_step": 1,
+            "note": "退市档 D 低频刷新（每周）；只更新命中行的 delist_date"}
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +549,7 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
     （tencent=1 覆盖 sina=0）。现改为与 run_history 相同的多源逻辑（**窗口化**）：
 
     - ``ohlcv_srcs = resolve_source("kline_daily","ohlcv_amount")``（config 序
-      sina→tencent→tdx）、``adj_srcs = resolve_source(...,"adj_factor")``（sina→tdx→baostock）；
+      sina→tencent→tdx）、``adj_srcs = resolve_source(...,"adj_factor")``（sina→tdx）；
       按 Q1 优先级取第一个 available() 且成功的源（break）。
     - **窗口化**：p0 是"近 N 天增量"，非全史重写——``window_start = (今日北京时间 -
       (days+30) 自然日)``；对每个源 ``fetch_kline(code, start=window_start)``，取数后
@@ -867,7 +850,7 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     """p0 编排：T1 → T4 → T7 → T2 → T3（当前数据优先，Joel"先灌当前"）。
 
     :param codes: 冒烟股票子集（None=stock_master 全集）。
-    :param skip_t1: 跳过 BaoStock T1（重跑/冒烟用；T2/T3 universe 依赖已有 stock_master）。
+    :param skip_t1: 跳过 T1（重跑/冒烟用；T2/T3 universe 依赖已有 stock_master）。
     :param t4_scope: T4 过滤（None=全史全表）。
     :param force: **B-3** 强制重取 T7 指数（清空 index_daily done 键）。
     """
@@ -883,13 +866,11 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     steps: Dict[str, Any] = {}
 
     # v6.1 D3：p0 启动也探资源池健康（Web /status.source_pool.adapters 数据源；
-    # LAKE_MULTISOURCE=0 → 跳过零网络）。baostock adapter available() 读 Q6 进程内
-    # 状态——p0 本身不跑 _run_bs_probe，未探测时按"死"保守记录（与 baostock_alive
-    # 的保守语义一致；history/reconcile 路径先探 Q6 再探健康度）。
+    # LAKE_MULTISOURCE=0 → 跳过零网络）。
     health_res = _probe_all_adapters(db_path)
 
     if not skip_t1:
-        print("[p0] T1 stock_master（BaoStock ~2 次，QuotaGuard 内）...")
+        print("[p0] T1 stock_master（tushare stock_basic 单次 L 调用；退市档 D 走 t1-delist 低频）...")
         steps["t1"] = run_t1(con, db_path, quota_before)
     else:
         steps["t1"] = {"skipped": True}
@@ -915,7 +896,8 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
         "days": days,
         "codes_scope": ",".join(codes) if codes else "stock_master_full_universe",
         "steps": steps,
-        "baostock_quota": {
+        # v7.0.18：原 baostock_quota 键更名 quota（机制保留、无计数方，恒 0）
+        "quota": {
             "before": quota_before,
             "after": quota_after,
             "consumed": max(0, quota_after - quota_before),
@@ -947,32 +929,28 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     - OHLCV/amount 主源=**新浪** akshare stock_zh_a_daily（全史一次拉全、含 amount、
       volume=股），fallback=腾讯(分页 n≤2000)→tdx；
     - adj_factor 主源=**新浪 hfq÷raw 推导**（raw+hfq 两次调用一次拿齐），
-      fallback=tdx hfq÷raw → BaoStock(Q6 探测存活时)；
+      fallback=tdx hfq÷raw（v7.0.18：原尾部 BaoStock 兜底随渠道移除）；
     - cross_check：采用新浪主源时，用 tdx 最近窗口（raw+hfq）做轻量验证
       （close/amount/末因子，阈值 config 集中）→ 分歧写 conflict_src（不阻断）。
       单源成功 → conflict_src=NULL。
-    - **池全不可用（离线单测/新源全降级）→ 回退既有路径**（腾讯全史 + BaoStock adj，
-      v6.0.7 行为逐字节不变——零回归兜底）。
+    - **池全不可用（离线单测/新源全降级）→ 回退腾讯单源全史 K线**
+      （adj_map=None——v7.0.18 原 BaoStock adj 兜底移除，af 下次多源路径补齐）。
 
     v6.0.7 修复保留：done 键 ``period_or_date="full_history"``（固定字符串，跨天续传）；
     取空/失败 → worker 抛错**不 mark_done**（杜绝 done 键毒化）。
 
-    **Q6**：启动时探一次 BaoStock（10s socket 超时判活；结果写日志+progress）——
-    存活则参与 adj fallback/交叉校验，死亡则自动跳过（不 crash、不阻塞）。
+    **v7.0.18**：原 Q6 BaoStock 启动探测随渠道移除（T2 adj 兜底链=sina→tdx）。
     """
     from lake.backfill import BackfillRunner, Task, save_progress, stop_requested as _bk_stop
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
     from lake.ingest.common import HangWatchdogError, ProgressWatchdog
     from lake.ingest.tencent_ingest import load_t2
-    from screener.data.baostock_client import BaoStockClient
     from screener.data.tencent import TencentClient
 
-    # v6.1 Q6：灌数启动探一次 BaoStock（config 关/单测门控 → 跳过，零网络）；
-    # progress 落盘按 db_path 派生（自定义 --db → 库目录，不污染生产 progress）
-    probe_res = _run_bs_probe(db_path)
-    # v6.1 D3：资源池健康探测（Q6 之后——baostock adapter available() 读 Q6 结果；
-    # LAKE_MULTISOURCE=0 → 跳过零网络）。落 source_health.json，Web /status 消费。
+    # v7.0.18：Q6 BaoStock 探测随渠道移除（原 probe_res = _run_bs_probe(db_path)）。
+    # v6.1 D3：资源池健康探测（LAKE_MULTISOURCE=0 → 跳过零网络）。
+    # 落 source_health.json，Web /status 消费。
     health_res = _probe_all_adapters(db_path)
 
     codes = codes or _universe_codes(con)
@@ -992,13 +970,8 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
         runner.progress["done"] = [list(k) for k in sorted(runner._done)]
         log.info("history --force: 已清空 %d 只的 kline_history done 键（强制重取）", len(force_set))
 
-    # v6.0.10：注入停止检查钩子——SIGTERM 后 BaoStock 重试退避提前中断（收尾加速；
-    # 依赖注入保持 screener 层零 import lake，见 baostock_client._query 注释）。
-    # v6.1.8 F4：daily_quota=lake 日预算（硬上限==预算，严格 ≤budget——防单任务内多次
-    # 调用越界；同 run_t1/run_t5 口径）。多源模式下本源仅 legacy 回退路径使用。
-    from lake.config import lake_cfg as _lcfg_hist
-    bs = BaoStockClient(stop_checker=_bk_stop,
-                        daily_quota=int(_lcfg_hist().get("baostock_daily_budget", 5000)))
+    # v6.1.8 F4 遗留注释：daily_quota 日预算机制保留（v7.0.18 起无计数方，恒不触发）。
+    # 原 bs = BaoStockClient(...) 构造随渠道移除（legacy 路径不再取 BaoStock adj）。
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes),
                              "start_date": start_date, "end_date": end_date}
@@ -1015,8 +988,11 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     def worker(task: Task) -> None:
         code = task.ts_code
         if not ohlcv_srcs and not adj_srcs:
-            # ---- legacy 路径（池全不可用：离线单测/新源全降级）——v6.0.7 行为逐字节不变 ----
-            from lake.ingest import baostock_ingest as bsi
+            # ---- legacy 路径（池全不可用：离线单测/新源全降级）----
+            # v7.0.18：原尾部 BaoStock adj_factor 兜底随渠道移除——legacy 路径
+            # 仅腾讯全史 K线，adj_map=None（af 列留 NULL，多源池恢复后由
+            # sina/tdx 推导值在下次增量/全史重取时补齐；af_rebase 钩子兜底对齐）。
+            # 取空/失败 → 抛错不标 done（旧 done 键毒化根因，v6.0.7 修复保留）。
             from lake.ingest.tencent_ingest import fetch_kline_full_history
 
             kl = fetch_kline_full_history(tclient, code)
@@ -1024,9 +1000,7 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                 # 防御：fetch_kline_full_history 契约上取空即抛错，这里双保险——
                 # 绝不在无数据时 mark_done（旧 done 键毒化根因）
                 raise RuntimeError(f"腾讯K线全史为空 {code}（不标 done，下轮重试）")
-            fields, adj_rows = bsi.fetch_adjust_factor(bs, code, start_date, end_date)
-            adj_map = bsi.load_t2_adj_factor(con, code, adj_rows)
-            load_t2(con, code, kl, adj_map=adj_map)
+            load_t2(con, code, kl, adj_map=None)
             time.sleep(0.3)
             return
 
@@ -1111,14 +1085,12 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                 _entry["last_error"] = f"progress 停滞 >{_stall_min:.0f}min → 看门狗 abort"
         runner.progress["stopping_at"] = None
         save_progress(runner.progress, runner.progress_path)
-        bs.close()   # R4：baostock send_msg 紧循环守卫已装（CLOSE-WAIT 立即返回，不 spin）
         return _stats_hang
     finally:
         if _wd is not None:
             _wd.stop()   # 恢复原 SIGINT handler + 停看门狗线程（正常收尾/异常都执行）
 
-    bs.close()
-    return {"sub": "history", **stats, "baostock_probe": probe_res,
+    return {"sub": "history", **stats,
             "source_health": health_res,
             "multisource": bool(ohlcv_srcs or adj_srcs),
             "ohlcv_sources": [a.name for a in ohlcv_srcs],
@@ -1138,41 +1110,20 @@ def _merge_conflict(a: Optional[str], b: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # T5 fundamentals_quarterly（v6.1：adata F10 主源 + BaoStock 交叉校验）
 # ---------------------------------------------------------------------------
-def _t5_crosscheck_sampled(code: str, pct: int) -> bool:
-    """F3 抽样判定：该 code 今日是否做 BaoStock 交叉校验（种子=日期+code，可复现）。
-
-    - pct<=0 → 恒 False（全跳）；pct>=100 → 恒 True（全量）——边界短路，零哈希开销。
-    - 中间值：``md5(f"{today_beijing()}|{code}")`` 前 8 hex → [0,1) 均匀伪随机数 < pct/100
-      则选中。为什么用 md5 而非内置 hash()：hash() 受 PYTHONHASHSEED 影响（跨进程/重启
-      不可复现）；md5 稳定——**同一天同一 code 判定恒一致**（断点续传重跑不漂移），
-      **不同天自然轮换**（交叉校验覆盖随日期滚动，长期看全市场都被抽样到）。
-    - 纯函数、零网络、确定性——离线单测可 monkeypatch 本函数验证 pct=0/100/种子可复现。
-    """
-    if pct <= 0:
-        return False
-    if pct >= 100:
-        return True
-    import hashlib
-
-    seed = f"{_today_beijing()}|{code}"
-    h = int(hashlib.md5(seed.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-    return h < (pct / 100.0)
-
+# v7.0.18：原 _t5_crosscheck_sampled（T5 BaoStock 交叉校验抽样）随渠道移除。
 
 def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, Any]:
-    """T5 基本面（v6.1 多源，brief §D；v6.1.8 F3 交叉校验抽样）。
+    """T5 基本面（adata F10 单源；v7.0.18：BaoStock 交叉校验随渠道移除）。
 
     - **adata F10 主源**（Q4：仅 fetch_f10；全报告期 PIT）→ load_t5 upsert。
-    - **BaoStock 探测存活时交叉校验**（最近 4 季；>1pp 记 conflict_src，不阻断）。
-      BaoStock 死（Q6 探测 False）→ 零调用、conflict_src=NULL（单源）。
-    - **v6.1.8 F3 抽样**：交叉校验按 config ``t5_crosscheck_sample_pct``（默认 5%）随机
-      抽样做（种子=日期+code，可复现；pct=0 全跳/100 全量）——成本账见 lake.config。
-      主源 adata F10 **不受抽样影响**（全量灌），抽样只省 BaoStock 交叉校验配额。
+    - v7.0.18（Joel 2026-10-26 拍板）：原 BaoStock 探测存活时交叉校验（最近 4 季、
+      >1pp 记 conflict_src、F3 抽样 5%）随渠道移除——T5=adata 单源，conflict_src
+      恒 NULL（跨源对账能力放弃，属拍板接受的损失）。
     - done 键 (fundamentals_quarterly, ts_code, "f10_full")——固定字符串跨天续传。
     - adata 不可用/取空 → worker 抛错**不 mark_done**（下轮重试，防 done 键毒化）。
     """
     from lake.backfill import Task
-    from lake.config import crosscheck_threshold, lake_cfg, t5_crosscheck_sample_pct
+    from lake.config import lake_cfg
     from lake.ingest import source_pool as sp
     from lake.ingest.adata_f10_adapter import load_t5
 
@@ -1180,37 +1131,22 @@ def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
     tasks = [Task(priority=2, table="fundamentals_quarterly", ts_code=c,
                   period_or_date="f10_full", tier="P2") for c in codes]
     stats: Dict[str, Any] = {"codes_requested": len(codes)}
-    t5_pp = crosscheck_threshold("t5_pp", 1.0)
-    cc_pct = t5_crosscheck_sample_pct()   # F3：交叉校验抽样比例（%）
 
     def worker(task: Task) -> None:
         code = task.ts_code
-        # adata F10 主源（Q4 硬编码边界：仅 fetch_f10；**全量**，不受交叉校验抽样影响）
+        # adata F10 主源（Q4 硬编码边界：仅 fetch_f10；全量灌）
         ad = sp.get_adapter("adata_f10")
         if ad is None or not lake_cfg().get("adata_f10_enabled", True) or not ad.available():
             raise RuntimeError(f"T5 adata F10 不可用 {code}（不标 done，下轮重试）")
         recs = ad.fetch_f10(code)
         if not recs:
             raise RuntimeError(f"T5 adata F10 取空 {code}（不标 done，下轮重试）")
-        # BaoStock 交叉校验（F3：仅抽样命中的 code；Q6 探测存活时；>1pp 记 conflict_src）
-        conflict_src: Optional[str] = None
-        bs_ad = sp.get_adapter("baostock")
-        if bs_ad is not None and bs_ad.available() and _t5_crosscheck_sampled(code, cc_pct):
-            try:
-                bs_recs = bs_ad.fetch_f10(code)  # 最近 4 季（配额内）
-                if bs_recs:
-                    conflict_src = sp.cross_check_f10(recs, "adata_f10",
-                                                      bs_recs, "baostock", pp=t5_pp)
-            except Exception as exc:  # noqa: BLE001 - 校验失败不阻断（取主源值）
-                log.warning("T5 %s BaoStock 交叉校验失败（不阻断）: %s", code, exc)
-        load_t5(con, code, recs, source="adata_f10", conflict_src=conflict_src)
+        load_t5(con, code, recs, source="adata_f10", conflict_src=None)
         time.sleep(0.3)
 
     stats.update(runner.run(tasks, worker))
-    sampled_n = sum(1 for c in codes if _t5_crosscheck_sampled(c, cc_pct))
-    log.info("T5 交叉校验抽样：pct=%d%% → %d/%d 股（种子=日期+code，可复现）",
-             cc_pct, sampled_n, len(codes))
     return {"table": "fundamentals_quarterly", **stats}
+
 
 
 # ---------------------------------------------------------------------------
@@ -1462,7 +1398,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
 
     - **kline_daily**：对全市场取**最近缺口**（每股 date_max+1→今日；无行→近 250 日），
       走 source_pool ``resolve_source("kline_daily","ohlcv_amount")`` + adj_factor 组
-      （Q1 优先级 sina→tencent→tdx / sina→tdx→baostock，与 history/p0 同一 worker 语义）；
+      （Q1 优先级 sina→tencent→tdx / sina→tdx，与 history/p0 同一 worker 语义）；
       upsert 复用 load_t2（内部 common.upsert）。限速：sina/tdx adapter 内置
       RateLimiter（config sina_min_interval_s 等）+ worker 尾 0.3s。
     - **valuation_daily**：Tencent load_t3 逐只取最新快照（date=今日；腾讯快照是
@@ -1494,9 +1430,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     today_s = _today_beijing()
     inc_period = f"inc:{today_s}"   # T2/T7 幂等键的周期段（per-table+code+运行日）
 
-    # Q6/健康探测（与 p0/history 一致：baostock adapter available() 读 Q6 结果；
-    # 落 source_health.json 按 db_path 派生——自定义 --db 不污染生产目录）
-    probe_res = _run_bs_probe(db_path)
+    # v7.0.18：Q6 BaoStock 探测随渠道移除（原 probe_res = _run_bs_probe(db_path)）。
+    # 资源池健康探测（落 source_health.json 按 db_path 派生——自定义 --db 不污染生产目录）
     health_res = _probe_all_adapters(db_path)
 
     codes = codes or _universe_codes(con)
@@ -1672,7 +1607,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         log.info("incremental 预检: 全部表 %s 已齐 → 无需灌数（提前返回）", data_date)
         _mark_precheck_done_views(db_path, precheck, len(codes))
         return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
-                "baostock_probe": probe_res, "source_health": health_res,
+                "source_health": health_res,
                 "multisource": bool(ohlcv_srcs or adj_srcs),
                 "ohlcv_sources": [a.name for a in ohlcv_srcs],
                 "adj_sources": [a.name for a in adj_srcs]}
@@ -1941,7 +1876,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     #（entry 由 precheck 标记直接落盘），无需覆盖。
     _mark_precheck_done_views(db_path, precheck, len(codes))
     return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
-            "baostock_probe": probe_res, "source_health": health_res,
+            "source_health": health_res,
             "multisource": bool(ohlcv_srcs or adj_srcs),
             "ohlcv_sources": [a.name for a in ohlcv_srcs],
             "adj_sources": [a.name for a in adj_srcs]}
@@ -2926,7 +2861,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--codes", default=None,
                     help="逗号分隔股票子集（缺省=stock_master 全集；冒烟用，如 sh.601398,sz.000001）")
     sp.add_argument("--skip-t1", action="store_true",
-                    help="跳过 BaoStock T1（重跑/冒烟用）")
+                    help="跳过 T1（重跑/冒烟用）")
     sp.add_argument("--t4-codes", default=None,
                     help="T4 分红过滤（逗号分隔；缺省=全史全表）")
     sp.add_argument("--force", action="store_true",
@@ -2938,12 +2873,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--start-date", default="1990-01-01", help="全史起点（默认 1990-01-01）")
     sp.add_argument("--end-date", default=None, help="全史终点（缺省=今日北京时间）")
     sp.add_argument("--t5", action="store_true",
-                    help="v6.1：同时灌 T5 基本面（adata F10 主源 + BaoStock 探测存活时交叉校验）")
+                    help="v6.1：同时灌 T5 基本面（adata F10 单源）")
     sp.add_argument("--force", action="store_true",
                     help="02_code 修正轮：重灌指定 --codes 的 T2（含 adj_factor）——清空这些 code "
                          "的 kline_history done 键强制重取（t2_repair.md 损坏股重灌用；"
                          "缺省幂等跳过已完成股票，不重取）")
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser(
+        "t1-delist",
+        help="v7.0.18：T1 退市档低频刷新（单次 tushare stock_basic D 调用，免费档 1 次/小时，"
+             "建议每周；只更新 stock_master 命中行的 delist_date）")
+    sp.set_defaults(func=cmd_t1_delist)
 
     sp = sub.add_parser(
         "incremental",
@@ -3039,6 +2980,12 @@ def cmd_status(args, con, db_path: str) -> int:
     return EXIT_OK
 
 
+def cmd_t1_delist(args, con, db_path: str) -> int:
+    summary = run_t1_delist(con)
+    _print_summary("t1-delist", summary)
+    return EXIT_OK
+
+
 def cmd_p0(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     t4_scope = _parse_codes(args.t4_codes)
@@ -3071,8 +3018,7 @@ def cmd_history(args, con, db_path: str) -> int:
 def cmd_reconcile(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     end_date = args.end_date or _today_beijing()
-    # v6.1 Q6：reconcile 也探一次 BaoStock（一致性；结果写日志+progress，按 db_path 派生）
-    _run_bs_probe(db_path)
+    # v7.0.18：原 Q6 BaoStock 探测随渠道移除。
     summary = run_reconcile(con, db_path, codes, args.start_date, end_date)
     _print_summary("reconcile", summary)
     return EXIT_OK
@@ -3112,7 +3058,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # full（v6.1.6）：同一把锁贯穿三阶段全程（brief §A"天然无竞争"）。
     # t6（v6.3.4）：独立子命令同样持写锁（run_t6 写 holders_snapshot + progress）。
     # t9（v6.3.5）：历史回填持写锁（写 macro_rf）。
-    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile", "t6", "t9", "t3-history")
+    write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile",
+                             "t6", "t9", "t3-history", "t1-delist")
 
     if not write_cmd:
         return _run_unlocked(args)

@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
-from .baostock_client import DataSourceError
+from .errors import DataSourceError
 
 log = logging.getLogger("screener.data.sina")
 

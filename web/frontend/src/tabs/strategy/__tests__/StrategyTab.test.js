@@ -57,8 +57,8 @@ const STRATEGY_JSON = {
     below_ma250: false,
     ma_period: 250,
   },
-  lake: { baostock_daily_budget: 5000 },
-  datasource: { baostock: { daily_quota: 49900 } },
+  lake: null,   // v7.0.18：lake 段空（baostock_daily_budget 随渠道移除；yaml 无键 → None）
+  datasource: { sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } },  // v7.0.18：baostock 段移除
 };
 
 const LIB = [
@@ -316,9 +316,9 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     await flushPromises();
     expect(captured).toBeTruthy();
     expect(captured.strategy.initial_amount).toBe(200000);
-    // PUT full：lake/datasource/universe/timing 段完整带回
-    expect(captured.lake).toEqual({ baostock_daily_budget: 5000 });
-    expect(captured.datasource).toEqual({ baostock: { daily_quota: 49900 } });
+    // PUT full：lake/datasource/universe/timing 段完整带回（v7.0.18：lake 空段 null 原样回）
+    expect(captured.lake).toBeNull();
+    expect(captured.datasource).toEqual({ sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } });
     expect(Object.keys(captured.universe)).toHaveLength(10); // v7.0.12：基础 5 + 门槛 5
     expect(captured.timing).toEqual({ price_window_years: 5, price_pctile_max: 40,
       yield_min_pct: 4.5, below_ma250: false, ma_period: 250 }); // v7.0.13：时机段不丢

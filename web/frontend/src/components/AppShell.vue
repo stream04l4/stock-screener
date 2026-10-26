@@ -53,7 +53,7 @@ async function doLogout() {
   </main>
 
   <footer class="footnote">
-    数据源：本机 DuckDB 数据湖（data/lake/，lake-sync 定时灌数，BaoStock T+1）；页面数据读自湖 + output/backtest_martingale/ 回测产物 + config/strategy.yaml。
+    数据源：本机 DuckDB 数据湖（data/lake/，lake-sync 定时灌数，T+1）；页面数据读自湖 + output/backtest_martingale/ 回测产物 + config/strategy.yaml。
     v7.0：单一策略（深回撤金字塔加仓）——逐股独立状态机，高点回撤首仓、每再跌一档加仓一档（金额×growth 递增，上不封顶）、不卖出、无熔断；
     信号用后复权收盘、成交按原始收盘、现金分红单列（cash 口径）。湖内无退市股（幸存者偏差），回测产物已带声明。
   </footer>

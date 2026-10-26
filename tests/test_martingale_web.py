@@ -52,7 +52,7 @@ def test_get_strategy_five_sections():
     assert set(out["json"]["timing"].keys()) == {
         "price_window_years", "price_pctile_max", "yield_min_pct",
         "below_ma250", "ma_period"}
-    assert {"sina", "rf", "baostock"} <= set(out["json"]["datasource"].keys())
+    assert {"sina", "rf"} <= set(out["json"]["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
 
 
 # ---------------------------------------------------------------------------

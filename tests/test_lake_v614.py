@@ -95,12 +95,12 @@ def _v614_isolate(tmp_path, monkeypatch):
 # helpers
 # ===========================================================================
 def _seed_master(db_path: str, codes) -> None:
-    """T1 stock_master 播种（delist_date=NULL → universe 全集）。"""
+    """T1 stock_master 播种（delist_date=NULL → universe 全集；v7.0.18 补 industry_name 粗分类）。"""
     con = lconn.open(db_path)
     con.executemany(
-        "INSERT INTO stock_master (ts_code,name,industry_csric2,board,is_st,"
-        "source,fetched_at,data_version) VALUES (?,?,?,?,0,'t','2026-09-15 09:00:00','v6.1')",
-        [(c, f"股{c}", "J66", "主板") for c in codes])
+        "INSERT INTO stock_master (ts_code,name,industry_csric2,industry_name,board,is_st,"
+        "source,fetched_at,data_version) VALUES (?,?,?,?,?,0,'t','2026-09-15 09:00:00','v6.1')",
+        [(c, f"股{c}", "J66", "金融", "主板") for c in codes])
     con.close()
 
 
@@ -177,11 +177,11 @@ def _seed_market_sort_db(db_path: str) -> None:
     """
     con = lconn.open(db_path)
     con.executemany(
-        "INSERT INTO stock_master (ts_code,name,industry_csric2,board,is_st,"
-        "source,fetched_at,data_version) VALUES (?,?,?,?,0,'t','2026-09-15 09:00:00','v6.1')",
-        [("sh.600001", "甲银行", "J66", "主板"),
-         ("sh.600002", "乙地产", "J70", "主板"),
-         ("sz.000003", "丙科技", "I65", "主板")])
+        "INSERT INTO stock_master (ts_code,name,industry_csric2,industry_name,board,is_st,"
+        "source,fetched_at,data_version) VALUES (?,?,?,?,?,0,'t','2026-09-15 09:00:00','v6.1')",
+        [("sh.600001", "甲银行", "J66", "金融", "主板"),
+         ("sh.600002", "乙地产", "J70", "房地产", "主板"),
+         ("sz.000003", "丙科技", "I65", "科技", "主板")])
     con.executemany(
         "INSERT INTO kline_daily (ts_code,date,open,high,low,\"close\",volume,"
         "amount,source,fetched_at,data_version) VALUES (?,?,?,?,?,?,?,?,'t','2026-09-15 09:00:00','v6.1')",
@@ -249,8 +249,8 @@ def test_o1_market_bad_order_400(tmp_path, monkeypatch, bad_order):
 
 
 def test_o1_market_sort_with_industry_filter(tmp_path, monkeypatch):
-    """排序与既有 industry 过滤正交（WHERE + ORDER BY 同查询）。"""
-    d = _market(tmp_path, monkeypatch, industry="J66", sort="close", order="desc")
+    """排序与既有 industry 过滤正交（WHERE + ORDER BY 同查询；v7.0.18 过滤=industry_name 粗分类）。"""
+    d = _market(tmp_path, monkeypatch, industry="金融", sort="close", order="desc")
     assert [r["ts_code"] for r in d["rows"]] == ["sh.600001"]
     assert d["total"] == 1
 
@@ -595,14 +595,14 @@ def test_o4_toggle_immediate_effect_via_lake_cfg(tmp_path, monkeypatch):
         "lake_cfg 现读现用——toggle 后必须立即读到新值"
 
 
-def test_o4_toggle_baostock_key_name(tmp_path, monkeypatch):
-    """baostock → baostock_probe_enabled（与 _DEFAULTS 对齐，非 baostock_enabled）。"""
+def test_o4_toggle_key_name(tmp_path, monkeypatch):
+    """v7.0.18：4 源开关键 = {name}_enabled（原 baostock_probe_enabled 特例随渠道移除）。"""
     import lake.config as lconfig
 
-    d = wapi.sources_toggle({"name": "baostock", "enabled": False})
-    assert d["key"] == "baostock_probe_enabled"
+    d = wapi.sources_toggle({"name": "tdx", "enabled": False})
+    assert d["key"] == "tdx_enabled"
     with open(lconfig.strategy_yaml_path(), encoding="utf-8") as f:
-        assert "baostock_probe_enabled: false" in f.read()
+        assert "tdx_enabled: false" in f.read()
 
 
 @pytest.mark.parametrize("payload", [
@@ -654,8 +654,8 @@ def test_o4_probe_default_all_and_bad_name_400(tmp_path, monkeypatch):
         wapi, "_probe_one_source",
         lambda name: (calls.append(name), {"available": False, "probed_at": None,
                                            "latency_ms": None, "detail": ""})[1])
-    d = wapi.sources_probe({})   # 缺省 = 全部 5 源
-    assert calls == ["sina", "tencent", "baostock", "tdx", "adata_f10"]
+    d = wapi.sources_probe({})   # 缺省 = 全部 4 源（v7.0.18：baostock 随渠道移除）
+    assert calls == ["sina", "tencent", "tdx", "adata_f10"]
     with pytest.raises(wapi.HTTPException) as ei:
         wapi.sources_probe({"names": ["sina", "nope"]})
     assert ei.value.status_code == 400
@@ -682,8 +682,8 @@ def test_o4_probe_timeout_15s_isolation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(wapi, "_probe_one_source", hang)
     t0 = _time.monotonic()
-    d = wapi.sources_probe({"names": ["baostock"]})
+    d = wapi.sources_probe({"names": ["tdx"]})   # v7.0.18：原 baostock 位改 tdx
     elapsed = _time.monotonic() - t0
     assert elapsed < 2.0, f"hang 源不得拖死请求（{elapsed:.1f}s）"
-    r = d["results"]["baostock"]
+    r = d["results"]["tdx"]
     assert r["available"] is False and r["detail"] == "probe timeout"

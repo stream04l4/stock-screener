@@ -5,9 +5,10 @@
 ``resolve_source(table, field_group)`` 返回的优先级序取**第一个 available() 且成功**
 的源；跨源数值分歧由 :func:`cross_check` 判阈 → 写 ``conflict_src`` 审计列（不阻断）。
 
-**权威性排序（Q1，Joel 拍板）**：新浪(0) > 腾讯(1) > BaoStock(2) > tdx/adata(3)
-> 本地推导(4)。数值越小越权威——冲突裁决取 authority 更小者，**不用时间戳新者优先**
-（历史回灌场景用 fetched_at 新者覆盖会让重跑时低权威源覆盖高权威源，方向反了）。
+**权威性排序（Q1，Joel 拍板；v7.0.18 移除 BaoStock 后）**：
+新浪(0) > 腾讯(1) > tdx/adata(3) > 本地推导(4)。数值越小越权威——冲突裁决取
+authority 更小者，**不用时间戳新者优先**（历史回灌场景用 fetched_at 新者覆盖
+会让重跑时低权威源覆盖高权威源，方向反了）。
 
 **零回归红线**：adapter ``available()`` 懒缓存 + EU 自检——首次调用探测，失败→False
 自动跳过该源（不 crash、不阻塞）；新源未装/不可达 → worker 回退既有主源路径，
@@ -100,7 +101,7 @@ def _with_timeout(fn: Callable[[], Any], secs: float,
 AUTHORITY: Dict[str, int] = {
     "sina": 0,        # 新浪 akshare stock_zh_a_daily（T2 OHLCV/amount 主源）
     "tencent": 1,     # 腾讯（fallback；T7 主源/T3 单源）
-    "baostock": 2,    # BaoStock（探测存活时参与 fallback/交叉校验）
+    # v7.0.18：BaoStock(2) 已完全移除（渠道每日配额过紧且经常故障，Joel 拍板）。
     "tdx": 3,         # easy-tdx（协议直连非官方）
     "adata_f10": 3,   # adata F10（社区聚合）
     "local": 4,       # 本地推导（静态 csv / factors 派生）
@@ -142,12 +143,6 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
          "field_group": "valuation", "role": "主源"},
         {"table": "index_daily", "table_cn": "T7 指数日线",
          "field_group": "ohlcv", "role": "主源"},
-    ],
-    "baostock": [
-        {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "fallback(探测存活时)"},
-        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
-         "field_group": "f10", "role": "交叉校验"},
     ],
     "tdx": [
         {"table": "kline_daily", "table_cn": "T2 日K线",
@@ -220,12 +215,6 @@ def _adapter_registry() -> Dict[str, SourceAdapter]:
             reg["tencent"] = TencentKlineAdapter()
         except Exception as exc:  # noqa: BLE001
             log.warning("tencent adapter 不可用（不进池）: %s", exc)
-        try:
-            from .baostock_adapter import BaoStockAdapter
-
-            reg["baostock"] = BaoStockAdapter()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("baostock adapter 不可用（不进池）: %s", exc)
         try:
             from .easy_tdx_adapter import EasyTdxAdapter
 
@@ -402,7 +391,7 @@ def cross_check_adj_factor(adj_a: Dict[str, float], src_a: str,
 def cross_check_f10(recs_a: Sequence[Dict[str, Any]], src_a: str,
                     recs_b: Sequence[Dict[str, Any]], src_b: str,
                     pp: float = 1.0) -> Optional[str]:
-    """T5 基本面跨源校验（adata vs BaoStock）：roe_weighted/gross_margin/liability_pct。
+    """T5 基本面跨源校验（原 adata vs BaoStock；v7.0.18 后仅保留函数供测试/未来多源复用）。
 
     :param recs_a/recs_b: [{period, roe_weighted, gross_margin, liability_pct,...}]。
     :param pp: 绝对百分点阈值（财报四舍五入口径差容忍宽，报告 §4.3 =1pp）。
@@ -481,40 +470,7 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# BaoStock 存活状态（Q6：灌数启动探一次，进程内共享）
+# v7.0.18：原 BaoStock 存活状态段（_BS_ALIVE / set_baostock_alive /
+# baostock_alive / baostock_probed / reset_baostock_state_for_test）已整体删除——
+# BaoStock 渠道移除后无存活探测对象（Q6 机制随渠道退役）。
 # ---------------------------------------------------------------------------
-_BS_ALIVE: Optional[bool] = None
-_BS_ALIVE_LOCK = threading.Lock()
-
-
-def set_baostock_alive(alive: bool, detail: str = "") -> None:
-    """记录 Q6 探测结果（灌数启动时由 driver 调用；写日志+progress）。"""
-    global _BS_ALIVE
-    with _BS_ALIVE_LOCK:
-        _BS_ALIVE = bool(alive)
-    log.info("BaoStock 恢复探测(Q6): alive=%s %s", alive, detail or "")
-
-
-def baostock_alive() -> bool:
-    """当前进程内 BaoStock 是否存活（未探测 → False，按"死"处理——保守）。"""
-    with _BS_ALIVE_LOCK:
-        return bool(_BS_ALIVE)
-
-
-def baostock_probed() -> bool:
-    """本进程是否**已做过一次真实探测**（Q6 启动探测 / adapter.available() 真探）。
-
-    F3（v6.1.5）：区分"未探测（None，保守按死）"与"已探测得 False（真死）"。
-    adapter.available() 用它判断能否直接复用共享结果——**已探过就不再重复探网**
-    （避免 Q6 启动探测 + available() 各探一次 = 双连接，团队纪律：BaoStock >~4 并发
-    连接触发服务端黑名单）。未探 → False（调用方应做自己的硬超时真探）。
-    """
-    with _BS_ALIVE_LOCK:
-        return _BS_ALIVE is not None
-
-
-def reset_baostock_state_for_test() -> None:
-    """测试隔离。"""
-    global _BS_ALIVE
-    with _BS_ALIVE_LOCK:
-        _BS_ALIVE = None

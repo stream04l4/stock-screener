@@ -4,8 +4,10 @@
 设计（调研报告 §4）：
 - **优先级队列**：P1 候选池 > P2 白名单行业全量 > P3 其余市场。队列元素
   ``(priority, table, ts_code, period_or_date)``，按 priority 升序消费；每表独立游标。
-- **限速/守卫集成**：BaoStock→BaoStockClient（QuotaGuard）+ lake 侧**日预算上限**
-  （默认 5,000 次/日，config 可调），到顶当日停、次日续；新浪/腾讯走各自客户端限速。
+- **限速/守卫集成**：日预算上限（默认 5,000 次/日，config 可调）+ QuotaGuard
+  跨进程配额文件（lake/ingest/common.py），到顶当日停、次日续；
+  v7.0.18 起无生产路径增量计数（原唯一计数方=BaoStock，已移除），机制保留行为零变化；
+  新浪/腾讯/tdx 走各自客户端限速。
 - **幂等断点续传**：进度文件 ``data/lake/backfill_progress.json``，键
   ``(table, ts_code, period_or_date)``→done；落盘即标记；中断重跑先读 progress
   跳过 done 键 → **不重复耗配额**。写入 INSERT OR REPLACE（PK 表）幂等。
@@ -195,8 +197,9 @@ def _check_stop() -> None:
 class BackfillRunner:
     """优先级队列消费 + 幂等断点续传 + 日预算守卫。
 
-    :param budget_per_day: BaoStock 日预算上限（默认 5000，config 可调；Q2）。
+    :param budget_per_day: 日预算上限（默认 5000，config 可调；Q2 遗留机制）。
         到顶当日停（state=blocked_quota），次日自动续（QuotaGuard 日期翻转重置）。
+        v7.0.18 起配额文件不再有增量计数（BaoStock 移除），实际永不触发。
     :param progress_path: 进度文件路径（测试可注入 tmp）。
     :param db_path: **B-2（v6.0.3）** runner 自身库路径。缺省 None = coverage 沿用进程级
         单例 get_conn()（默认库，行为不变）；传自定义 --db 时 _refresh_coverage 改读该库
@@ -209,11 +212,12 @@ class BackfillRunner:
     def __init__(self, budget_per_day: Optional[int] = None,
                  progress_path: Optional[str] = None,
                  db_path: Optional[str] = None) -> None:
-        # Q2：日预算默认 5000（config 可调）——缺省从 strategy.yaml lake 段读
+        # Q2 遗留：日预算默认 5000（config 可调）——缺省从 strategy.yaml lake 段读
+        # （v7.0.18：键名 baostock_daily_budget → quota_budget_per_day 泛化）
         if budget_per_day is None:
             from .config import lake_cfg
 
-            budget_per_day = int(lake_cfg().get("baostock_daily_budget", 5000))
+            budget_per_day = int(lake_cfg().get("quota_budget_per_day", 5000))
         self.budget_per_day = int(budget_per_day)
         # B-2：runner 自身库路径（None=缺省库，coverage 走 get_conn 单例；自定义 --db 时
         # _refresh_coverage 改读该库）。progress 路径逻辑保持不变（见 docstring 说明）。
@@ -296,18 +300,18 @@ class BackfillRunner:
     def _quota_state(self) -> Tuple[bool, int]:
         """返回 (是否到顶, 今日已用)。读 QuotaGuard 状态文件（跨进程共享计数）。"""
         try:
-            from screener.data.baostock_client import QuotaGuard
+            from .ingest.common import QuotaGuard
 
             guard = QuotaGuard(path=self._quota_path())
             date_s, used = guard.get_state()
             return (used >= self.budget_per_day, used)
-        except Exception:  # noqa: BLE001 - 守卫不可用时不阻断（fail-open，靠 QuotaGuard 硬上限兜底）
+        except Exception:  # noqa: BLE001 - 守卫不可用时不阻断（fail-open）
             return (False, 0)
 
     def _quota_path(self) -> Optional[str]:
-        """复用默认配额文件路径（~/.stock_screener/bs_quota.json）。"""
+        """复用默认配额文件路径（~/.stock_screener/bs_quota.json，历史命名沿用）。"""
         try:
-            from screener.data.baostock_client import default_quota_path
+            from .ingest.common import default_quota_path
 
             return default_quota_path()
         except Exception:  # noqa: BLE001
