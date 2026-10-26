@@ -411,6 +411,28 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     expect(w.text()).toContain("尚无回测结果");
     w.unmount();
   });
+
+  it("关闭：右上角 ✕ 与 Esc 都能关（存量 bug 回归：曾漏绑 @close）", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.find(".modal").exists()).toBe(true);
+    // ✕ 按钮
+    await w.find(".modal-head button").trigger("click");
+    await flushPromises();
+    expect(w.find(".modal").exists()).toBe(false);
+    // 重开 → Esc
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.find(".modal").exists()).toBe(true);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    expect(w.find(".modal").exists()).toBe(false);
+    w.unmount();
+  });
 });
 
 describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {

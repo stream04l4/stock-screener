@@ -411,8 +411,9 @@ function pnlColor(v) {
       </template>
     </div>
 
-    <!-- 行点击弹层：策略参考 + 编辑 + 买入历史 -->
-    <Modal :open="!!modalRow" :title="(modalRow && modalRow.name) || '持仓详情'">
+    <!-- 行点击弹层：策略参考 + 编辑 + 买入登记 + 买入历史 -->
+    <Modal :open="!!modalRow" :title="(modalRow && modalRow.name) || '持仓详情'"
+           @close="modalRow = null">
       <div v-if="modalRow">
         <div class="detail-grid">
           <div v-for="[k, label] in [
