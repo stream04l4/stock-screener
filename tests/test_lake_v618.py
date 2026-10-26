@@ -298,19 +298,24 @@ class _FakeDF:
 
 
 class _FakePro:
-    """v7.0.18：T1 主源=tushare stock_basic——fake 零网络（L 状态含 1 只北交所验证排除）。"""
+    """v7.0.18：T1 主源=tushare stock_basic——fake 零网络（L 状态含 1 只北交所验证排除）。
+
+    **ts_code 必须用 tushare 原生格式（600001.SH）**：真实 API 就是原生格式，
+    湖格式（sh.600001）由 run_t1 内 _to_lake_code 转换——fake 若直接给湖格式，
+    转换纪律就永远测不到（2026-10-26 生产 5224 行重复行事故的直接教训）。
+    """
 
     def stock_basic(self, exchange="", list_status="L", fields=""):
         if list_status == "L":
             return _FakeDF([
-                {"ts_code": "sh.600001", "name": "股600001", "industry": "金融",
+                {"ts_code": "600001.SH", "name": "股600001", "industry": "金融",
                  "market": "主板", "list_date": "1999-01-01"},
-                {"ts_code": "sz.000002", "name": "股000002", "industry": "农林牧渔",
+                {"ts_code": "000002.SZ", "name": "股000002", "industry": "农林牧渔",
                  "market": "主板", "list_date": "1999-01-01"},
-                {"ts_code": "bj.920001", "name": "北交所股", "industry": "其他",
+                {"ts_code": "920001.BJ", "name": "北交所股", "industry": "其他",
                  "market": "北交所", "list_date": "2021-01-01"},
             ])
-        return _FakeDF([{"ts_code": "sh.600001", "delist_date": None}])
+        return _FakeDF([{"ts_code": "600001.SH", "delist_date": None}])
 
 
 def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
@@ -425,11 +430,11 @@ def test_t1_single_l_call_preserves_delist_and_coarse_industry(tmp_path, monkeyp
             calls.append(list_status)
             if list_status == "L":
                 return _FakeDF([
-                    {"ts_code": "sh.600001", "name": "股600001", "industry": "金融",
+                    {"ts_code": "600001.SH", "name": "股600001", "industry": "金融",
                      "market": "主板", "list_date": "1999-01-01"},
-                    {"ts_code": "sz.000002", "name": "股000002", "industry": "农林牧渔",
+                    {"ts_code": "000002.SZ", "name": "股000002", "industry": "农林牧渔",
                      "market": "主板", "list_date": "1999-01-01"},
-                    {"ts_code": "bj.920001", "name": "北交所股", "industry": "其他",
+                    {"ts_code": "920001.BJ", "name": "北交所股", "industry": "其他",
                      "market": "北交所", "list_date": "2021-01-01"},
                 ])
             return _FakeDF([])
@@ -470,8 +475,8 @@ def test_t1_delist_updates_only_existing_rows(tmp_path, monkeypatch):
         def stock_basic(self, exchange="", list_status="D", fields=""):
             assert list_status == "D"
             return _FakeDF([
-                {"ts_code": "sz.000002", "delist_date": "2026-10-09"},
-                {"ts_code": "bj.920999", "delist_date": "2026-10-09"},   # 不在库 → 跳过
+                {"ts_code": "000002.SZ", "delist_date": "2026-10-09"},
+                {"ts_code": "920999.BJ", "delist_date": "2026-10-09"},   # 不在库 → 跳过
             ])
 
     monkeypatch.setattr(tsi, "tushare_available", lambda: True)

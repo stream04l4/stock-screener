@@ -280,7 +280,12 @@ def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
     for r in df_l.itertuples(index=False):
         if r.market not in _MARKET_BOARD:   # 排除北交所（universe=沪深，口径不变）
             continue
-        ts = r.ts_code
+        # **必须转湖格式**（tushare 原生 601398.SH → 湖 sh.601398）：stock_master PK 与
+        # kline/market 各表 JOIN 键全部是湖格式；漏转会插入同股异码的重复行
+        # （2026-10-26 生产实锤：5224 行 tushare 格式未命中 PK，5556+5224 双轨并存）。
+        ts = ti._to_lake_code(r.ts_code)
+        if ts is None:
+            continue  # 双保险（market 过滤已排除北交所；BJ 等湖不覆盖）
         ind = (str(r.industry).strip() or None) if getattr(r, "industry", None) else None
         rows.append([
             ts,
@@ -355,12 +360,17 @@ def run_t1_delist(con) -> Dict[str, Any]:
                            fields="ts_code,delist_date")
     n = 0
     for r in df_d.itertuples(index=False):
+        # 必须转湖格式（tushare 601398.SH → 湖 sh.601398），否则 WHERE ts_code=?
+        # 用原生格式永不命中湖内行（delist_updated 恒 0）——与 run_t1 同一纪律。
+        ts = ti._to_lake_code(r.ts_code)
+        if not ts:
+            continue  # 北交所等 universe 外 → 不插入
         cur = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code=?",
-                          [r.ts_code]).fetchone()[0]
+                          [ts]).fetchone()[0]
         if not cur:
-            continue   # 库里没有（北交所等 universe 外）→ 不插入
+            continue   # 库里没有 → 不插入
         con.execute("UPDATE stock_master SET delist_date=?, fetched_at=? WHERE ts_code=?",
-                    [clean_date(getattr(r, "delist_date")), now_ts(), r.ts_code])
+                    [clean_date(getattr(r, "delist_date")), now_ts(), ts])
         n += 1
     return {"table": "stock_master", "delist_updated": n,
             "tushare_calls_this_step": 1,
