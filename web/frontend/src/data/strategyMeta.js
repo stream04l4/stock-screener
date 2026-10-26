@@ -25,8 +25,8 @@ export const SECTION_META = {
 // 分组（有序）。group.id 用于 localStorage 折叠记忆键。
 export const SECTION_GROUPS = [
   { id: "strategy", title: "持仓策略", icon: "📉", defaultOpen: true, sections: ["strategy"] },
-  { id: "universe", title: "股票池", icon: "🗂️", defaultOpen: true, sections: ["universe"] },
   { id: "timing", title: "选股策略", icon: "🎯", defaultOpen: true, sections: ["timing"] },
+  { id: "universe", title: "股票池", icon: "🗂️", defaultOpen: true, sections: ["universe"] },
 ];
 
 // 不渲染的段（lake/datasource = yaml-only，lake-sync 专用，Web 只读不改）。

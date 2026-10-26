@@ -42,11 +42,11 @@ describe("strategyMeta · v7 结构", () => {
     }
   });
 
-  it("SECTION_GROUPS = 3 组（持仓策略/股票池/选股策略），无重叠，均默认展开", () => {
-    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["strategy", "universe", "timing"]);
+  it("SECTION_GROUPS = 3 组（持仓策略/选股策略/股票池），无重叠，均默认展开", () => {
+    expect(SECTION_GROUPS.map((g) => g.id)).toEqual(["strategy", "timing", "universe"]);
     const all = SECTION_GROUPS.flatMap((g) => g.sections);
     expect(new Set(all).size).toBe(all.length);
-    expect(all).toEqual(["strategy", "universe", "timing"]);
+    expect(all).toEqual(["strategy", "timing", "universe"]);
     for (const g of SECTION_GROUPS) expect(g.defaultOpen).toBe(true);
   });
 

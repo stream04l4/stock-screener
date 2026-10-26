@@ -167,38 +167,39 @@ beforeEach(() => {
 });
 
 describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 隐藏；lake/datasource 不渲染）", () => {
-  it("渲染 3 组（持仓策略/股票池/选股策略）；字段行 = 23；name 不出现为字段行", async () => {
+  it("渲染 3 组（持仓策略/选股策略/股票池）；字段行 = 23；name 不出现为字段行", async () => {
     const w = mk();
     await flushPromises();
     const groups = w.findAll(".s-group");
     expect(groups.length).toBe(3);
     expect(groups[0].text()).toContain("持仓策略");
-    expect(groups[1].text()).toContain("股票池");
-    expect(groups[2].text()).toContain("选股策略");
+    expect(groups[1].text()).toContain("选股策略");
+    expect(groups[2].text()).toContain("股票池");
     const fields = w.findAll(".s-field");
     expect(fields.length).toBe(23);
     // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
+    // 2026-10-26：选股策略（timing）调到股票池之前 → 字段序 = strategy 8 + timing 5 + universe 10
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
       "首仓金额（元）", "加仓基准金额（元）", "首次建仓回撤（%）", "加仓步长（%）",
       "加仓递增比率", "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
-      "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
-      "连续分红年数下限", "最少上市交易日",
-      // v7.0.12 候选池选股门槛
-      "十年回测必须为正", "回测窗口（年）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
       // v7.0.13 选股时机
       "价格分位窗口（年）", "价格低位分位上限（%）", "股息率下限 TTM（%）", "叠加「年线之下」条件", "年线周期（交易日）",
+      // v7.0.12 股票池 + 候选池选股门槛
+      "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
+      "连续分红年数下限", "最少上市交易日",
+      "十年回测必须为正", "回测窗口（年）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
       "initial_amount", "base_add_amount", "first_drawdown_pct", "add_step_pct",
       "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
+      "price_window_years", "price_pctile_max", "yield_min_pct",
+      "below_ma250", "ma_period",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
       "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
       "price_min_yuan", "price_max_yuan",
-      "price_window_years", "price_pctile_max", "yield_min_pct",
-      "below_ma250", "ma_period",
     ]);
     // name（策略标识）不作为字段行
     expect(keys).not.toContain("策略标识");
@@ -211,18 +212,18 @@ describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 
     // enum 值只读态显示通俗短名（bounce → 反弹重置），不是裸值
     const rearmRow = fields.find((f) => f.find(".s-key").attributes("title") === "rearm_mode");
     expect(rearmRow.find(".s-val").text()).toBe("反弹重置");
+    // v7.0.13：选股策略卡片 = 今日选股表（GET /api/timing）——2026-10-26 调到股票池之前
+    expect(groups[1].text()).toContain("今日选股");
+    expect(groups[1].text()).toContain("大秦铁路");
+    expect(groups[1].text()).toContain("买入区");     // push_eligible 徽标
+    expect(groups[1].text()).toContain("加持仓");
+    expect(groups[1].text()).toContain("2026-10-23");
     // v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条）
-    expect(groups[1].text()).toContain("候选股票");
-    expect(groups[1].text()).toContain("中国神华");   // 自动成员
-    expect(groups[1].text()).toContain("长江电力");   // 手动成员
-    expect(groups[1].text()).toContain("手动添加");
-    expect(groups[1].text()).toContain("（暂无手动添加）");
-    // v7.0.13：选股策略卡片 = 今日选股表（GET /api/timing）
-    expect(groups[2].text()).toContain("今日选股");
-    expect(groups[2].text()).toContain("大秦铁路");
-    expect(groups[2].text()).toContain("买入区");     // push_eligible 徽标
-    expect(groups[2].text()).toContain("加持仓");
-    expect(groups[2].text()).toContain("2026-10-23");
+    expect(groups[2].text()).toContain("候选股票");
+    expect(groups[2].text()).toContain("中国神华");   // 自动成员
+    expect(groups[2].text()).toContain("长江电力");   // 手动成员
+    expect(groups[2].text()).toContain("手动添加");
+    expect(groups[2].text()).toContain("（暂无手动添加）");
     w.unmount();
   });
 
