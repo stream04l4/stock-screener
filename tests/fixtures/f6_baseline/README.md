@@ -11,7 +11,7 @@
 - 参数 f6: initial=10000, first_amount=100000, drawdown=0.15, step=0.05, growth=1.1,
   ladder=high, rearm=bounce, rearm_pct=0.15, accounting=cash, comm=3bps, stamp=5bps
 - 窗口: 2016-01-04 → 2026-10-21
-- 当前基线数字 (2026-10-26 af 对齐后, 待 Joel 复核确认):
+- 当前基线数字 (2026-10-26 af 对齐后, Joel 2026-10-26 已确认):
   逐位对齐 = per_stock.csv 数值字段 + summary.md 买入时间表 日期/价格/金额 完全一致
   - sh.601088 中国神华: 9 买, 188,410 → 590,243.24 (+213.3%)
   - sh.600036 招商银行: 22 买, 326,610 → 748,168.72 (+129.1%)
