@@ -1,6 +1,6 @@
 # 马丁格尔深回撤加仓回测 summary
 
-- 参数: initial=10000, growth=1.1, drawdown=0.15, step=0.05, exit=none, accounting=cash, comm=3bps, stamp=5bps
+- 参数: initial_amount=100000, base_add_amount=10000, growth_ratio=1.1, first_drawdown_pct=15%, add_step_pct=5%, rearm_mode=bounce, rearm_pct=15%, accounting=cash, comm=3bps, stamp=5bps
 - 数据: /home/ubuntu/stock-screener/data/lake/lake.duckdb
 - 窗口: 2022-04-21T00:00:00.000000000 ~ 2026-10-21T00:00:00.000000000 (1090 交易日), 股票数: 1
 - 口径: 信号=后复权; cash：原始价成交(人民币)+现金分红单列, 股价增长=总盈亏-分红
@@ -9,7 +9,7 @@
 ## 触发
 - 触发过建仓的股票: 1/1 (100.0%)
 - 加仓次数分布: mean=10.0, median=10, max=10
-- 轮次(建仓→全清): mean=1.00, max=1
+- 轮次: mean=1.00, max=1
 
 ## 收益（触发过的股票，pnl_pct = 总盈亏/总投入）
 - 股票数: 1
@@ -51,4 +51,4 @@
   - 2026-06-16T00:00:00.000000000 @ 31.27 买 11,000
   - 2026-06-23T00:00:00.000000000 @ 29.34 买 12,100
   - 2026-06-26T00:00:00.000000000 @ 27.37 买 13,310
-耗时 0.1s
+耗时 0.4s

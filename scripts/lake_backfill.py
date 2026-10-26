@@ -1504,6 +1504,21 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes), "as_of": today_s}
 
+    # ---- v7.0.16 T2 af 基准对齐（前置，2026-10-26 sh.600018 假 0.5% 分位实锤）----
+    # 多源池逐日换源 → 各适配器 adj_factor 源私有基准 → 换源日假断崖（hfq/qfq
+    # 断步 → 5 年分位/MA250/马丁阶梯/十年回测失真）。检测最近 10 天假跳变 →
+    # 自动对齐（新段基准换算，幂等）+ warning 记痕。
+    # 位置纪律：必须在本轮**任何写库之前**——本轮新写入行可能含当日换源新基准，
+    # 由下一轮前置对齐统一收口（10 天窗口覆盖）；若放本轮尾部会反过来把刚写入的
+    # 原值行（tushare 批量/t2 落库 af 原样语义）再归一化，破坏"原值落库"契约
+    # （test_lake_v708_batch 2026-10-26 实锤）。失败不阻断增量（记痕，不静默）。
+    try:
+        from lake.af_rebase import rebase_recent
+        stats["af_rebase"] = rebase_recent(con, days=10)
+    except Exception as exc:  # noqa: BLE001 - 对齐失败不阻断增量（记痕，不静默）
+        log.error("incremental af 基准对齐失败（不阻断）: %s", exc)
+        stats["af_rebase_error"] = str(exc)
+
     # 多源池（门控同 run_t2/run_history：LAKE_MULTISOURCE=0 / 源开关全关 → [] → legacy）
     ohlcv_srcs = sp.resolve_source("kline_daily", "ohlcv_amount")
     adj_srcs = sp.resolve_source("kline_daily", "adj_factor")
