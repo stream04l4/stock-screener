@@ -16,7 +16,9 @@
   → bbc55f5（v7.0.8：每日增量提速 tushare 全市场批量 T2/T3 + None 重试
   加固 + 配额惩罚 fast-fail，lake/ 有意变更，基线前移）
   → 4c8e0a9（v7.0.9：表级完整性预检 + 退出 CHECKPOINT + 进度簿记批量化，
-  lake/ 有意变更，基线前移）。
+  lake/ 有意变更，基线前移）
+  → 9b2e026（v7.0.16：lake.af_rebase 多源 adj_factor 基准对齐新增模块，
+  lake/ 有意变更，基线前移；Joel 2026-10-26 确认）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -35,7 +37,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # v7.0.9 增量检测机制（4c8e0a9）：表级完整性预检 + 退出 CHECKPOINT + 进度簿记
 # 批量化，lake/ 有意变更，基线前移。
-BASELINE = "4c8e0a9"
+BASELINE = "9b2e026"
 
 
 def _git(*args) -> str:

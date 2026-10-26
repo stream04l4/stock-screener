@@ -65,7 +65,8 @@ const MY_BUY = {
 const MY_EMPTY = { as_of: null, n: 0, positions: [],
   totals: { market_value: 0, cost: 0, pnl: 0, pnl_pct: null } };
 
-function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }]) {
+function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }],
+                trades = []) {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path.startsWith("/api/my_positions") && (!opts || !opts.method || opts.method === "GET")) {
       return JSON.parse(JSON.stringify(my));
@@ -73,6 +74,46 @@ function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-2
     if (path.startsWith("/api/my_positions") && opts && opts.method === "PUT") {
       const body = JSON.parse(opts.body);
       return { ok: true, ts_code: body.ts_code, n: 1 };
+    }
+    // v7.0.17 交易登记：按传入账本 my 模拟服务端记账（买加权 / 卖减股 / 清仓移除）
+    if (path === "/api/my_trades" && opts && opts.method === "POST") {
+      const body = JSON.parse(opts.body);
+      const pos0 = (my.positions || []).find((p) => p.ts_code === body.ts_code) || {};
+      const oldShares = pos0.shares || 0;
+      const oldCost = pos0.cost_price || 0;
+      const ns = body.shares;
+      let newShares, newCost, removed = false;
+      if (ns > 0) {
+        newShares = oldShares + ns;
+        newCost = Math.round(((oldShares * oldCost + ns * body.price) / newShares) * 1000) / 1000;
+      } else {
+        newShares = Math.max(oldShares + ns, 0);
+        newCost = oldCost;
+        removed = oldShares + ns <= 0;
+      }
+      const trade = {
+        id: "t" + (trades.length + 1) + "00",
+        ts_code: body.ts_code, name: body.name || "",
+        direction: ns > 0 ? "buy" : "sell", shares: Math.abs(ns), price: body.price,
+        amount: Math.abs(ns) * body.price, date: "2026-10-26",
+        realized_pnl: ns < 0 ? Math.round((body.price - oldCost) * Math.abs(ns) * 100) / 100 : null,
+        created_at: "2026-10-26T01:00:00Z",
+      };
+      trades.unshift(trade);
+      return { ok: true, trade, position: { ts_code: body.ts_code, shares: newShares,
+        cost_price: removed ? null : newCost, removed } };
+    }
+    if (path.startsWith("/api/my_trades?") ) {
+      const code = decodeURIComponent((path.split("ts_code=")[1] || "").trim());
+      const rows = trades.filter((t) => t.ts_code === code);
+      return { n: rows.length, trades: JSON.parse(JSON.stringify(rows)) };
+    }
+    if (path.startsWith("/api/my_trades/") && opts && opts.method === "DELETE") {
+      const id = decodeURIComponent(path.split("/").pop());
+      const i = trades.findIndex((t) => t.id === id);
+      if (i < 0) { const e = new Error("record not found"); e.status = 404; throw e; }
+      trades.splice(i, 1);
+      return { ok: true, n: trades.length };
     }
     if (path === "/api/strategies") {
       return JSON.parse(JSON.stringify(strategies));
@@ -435,7 +476,7 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
   });
 });
 
-describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
+describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => {
   async function openRow(w, code = "sh.601088") {
     const row = w.findAll("tbody tr").find((r) => r.text().includes(code));
     await row.trigger("click");
@@ -444,6 +485,7 @@ describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
   }
   const buyInputs = (w) => w.findAll(".buy-inputs input");
   const buyBtn = (w) => w.findAll(".buy-bar button").find((b) => b.text() === "登记");
+  const posts = () => apiMock.mock.calls.filter((c) => c[1] && c[1].method === "POST");
 
   it("有信号 → 股数预填建议值（建议金额÷信号价取整手）+ 价格预填最新价", async () => {
     mockApi(MY_SIGNAL); // sh.601088：suggested 100000 @ 现价 40.0 → 2500 股；last_price 33.9
@@ -469,7 +511,7 @@ describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
     w.unmount();
   });
 
-  it("登记成功 → PUT 加权更新（新总股数/3 位加权成本）+ 成功文案 + 编辑框同步", async () => {
+  it("正数登记（买入）→ POST /api/my_trades 加权更新 + 成功文案 + 编辑框同步", async () => {
     mockApi(MY); // 1200 股 @ 25
     const w = mk();
     await flushPromises();
@@ -481,17 +523,57 @@ describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
     expect(w.find(".buy-preview").text()).toContain("1400 股 @ 25.714");
     await buyBtn(w).trigger("click");
     await flushPromises();
-    expect(puts()).toHaveLength(1);
-    expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 1400, cost_price: 25.714 });
-    expect(w.text()).toContain("已登记 200 股 @ 30 → 1400 股 @ 25.714");
+    expect(posts()).toHaveLength(1);
+    expect(JSON.parse(posts()[0][1].body)).toEqual(
+      { ts_code: "sh.601088", shares: 200, price: 30, name: "中国神华" });
+    expect(w.text()).toContain("已登记买入 200 股 @ 30 → 1400 股 @ 25.714");
     const editInputs = w.findAll(".edit-bar input");
     expect(editInputs[0].element.value).toBe("1400"); // 编辑框同步新值
     expect(editInputs[1].element.value).toBe("25.714");
+    // 交易历史即时出现新记录（登记后 loadTrades 刷新）
+    expect(w.find(".trade-hist").exists()).toBe(true);
+    expect(w.text()).toContain("已登记买入");
     w.unmount();
   });
 
-  it("校验：非整手 / 非正整数 / 价格非正 → 报错不发 PUT", async () => {
+  it("负数登记（卖出）→ POST 负股数 + 预览含已实现盈亏 + 成功文案", async () => {
+    mockApi(MY); // 1200 股 @ 25
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    await ins[0].setValue("-200");
+    await ins[1].setValue("30");
+    // 卖出预览：减股数 + 均价不变 + 已实现盈亏 (30−25)×200 = +1000
+    expect(w.find(".buy-preview").text()).toContain("→ 1000 股 @ 25");
+    expect(w.find(".buy-preview").text()).toContain("已实现盈亏 +1000.00");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(posts()).toHaveLength(1);
+    expect(JSON.parse(posts()[0][1].body).shares).toBe(-200);
+    expect(w.text()).toContain("已登记卖出 200 股 @ 30 → 1000 股 @ 25.000");
+    const editInputs = w.findAll(".edit-bar input");
+    expect(editInputs[0].element.value).toBe("1000");
+    expect(editInputs[1].element.value).toBe("25"); // 卖出后剩余均价不变
+    w.unmount();
+  });
+
+  it("卖光（负数 = −当前持仓）→ 清仓移除提示", async () => {
+    mockApi(MY); // 1200 股
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    await ins[0].setValue("-1200");
+    await ins[1].setValue("30");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(posts()).toHaveLength(1);
+    expect(w.text()).toContain("清仓移除");
+    w.unmount();
+  });
+
+  it("校验：非整手 / 非整数 / 价格非正 / 卖出超持仓 → 报错不发 POST", async () => {
     mockApi(MY);
     const w = mk();
     await flushPromises();
@@ -502,20 +584,95 @@ describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
     await buyBtn(w).trigger("click");
     await flushPromises();
     expect(w.text()).toContain("整手");
-    expect(puts()).toHaveLength(0);
+    expect(posts()).toHaveLength(0);
 
     await ins[0].setValue("abc");
     await buyBtn(w).trigger("click");
     await flushPromises();
-    expect(w.text()).toContain("正整数");
-    expect(puts()).toHaveLength(0);
+    expect(w.text()).toContain("非零整数");
+    expect(posts()).toHaveLength(0);
+
+    await ins[0].setValue("0");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("非零整数");
+    expect(posts()).toHaveLength(0);
+
+    await ins[0].setValue("-2000"); // 超持仓 1200
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("卖出不能超过持仓");
+    expect(posts()).toHaveLength(0);
 
     await ins[0].setValue("200");
     await ins[1].setValue("0");
     await buyBtn(w).trigger("click");
     await flushPromises();
     expect(w.text()).toContain("本次价格应为正数");
-    expect(puts()).toHaveLength(0);
+    expect(posts()).toHaveLength(0);
+    w.unmount();
+  });
+});
+
+describe("MyPositionsTab · 弹层交易历史（v7.0.17）", () => {
+  const HISTORY = [
+    { id: "t200", ts_code: "sh.601088", name: "中国神华", direction: "buy", shares: 200,
+      price: 30, amount: 6000, date: "2026-09-10", realized_pnl: null,
+      created_at: "2026-09-10T01:00:00Z" },
+    { id: "t100", ts_code: "sh.601088", name: "中国神华", direction: "sell", shares: 100,
+      price: 20, amount: 2000, date: "2026-08-01", realized_pnl: -500,
+      created_at: "2026-08-01T01:00:00Z" },
+    { id: "t300", ts_code: "sz.000651", name: "格力电器", direction: "buy", shares: 100,
+      price: 40, amount: 4000, date: "2026-09-01", realized_pnl: null,
+      created_at: "2026-09-01T01:00:00Z" },
+  ];
+
+  it("弹层打开 → 按当前股加载交易历史（买/卖标签 + 已实现盈亏 + 仅本股条目）", async () => {
+    mockApi(MY, undefined, JSON.parse(JSON.stringify(HISTORY)));
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.find(".trade-hist").exists()).toBe(true);
+    const rows = w.findAll(".trade-hist tbody tr");
+    expect(rows).toHaveLength(2); // sz.000651 的条目不显示
+    expect(rows[0].text()).toContain("2026-09-10");
+    expect(rows[0].text()).toContain("买");
+    expect(rows[1].text()).toContain("2026-08-01");
+    expect(rows[1].text()).toContain("卖");
+    expect(rows[1].text()).toContain("-500"); // 已实现盈亏（负）
+    // 删除按钮每行一个
+    expect(w.findAll(".trade-hist tbody button")).toHaveLength(2);
+    w.unmount();
+  });
+
+  it("删除（confirm）→ DELETE /api/my_trades/{id} + 列表刷新", async () => {
+    mockApi(MY, undefined, JSON.parse(JSON.stringify(HISTORY)));
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    const delBtns = w.findAll(".trade-hist tbody button");
+    await delBtns[0].trigger("click"); // 最新一条 t200（confirm stub=true）
+    await flushPromises();
+    const dels = apiMock.mock.calls.filter((c) => c[1] && c[1].method === "DELETE");
+    expect(dels).toHaveLength(1);
+    expect(dels[0][0]).toBe("/api/my_trades/t200");
+    expect(w.findAll(".trade-hist tbody tr")).toHaveLength(1); // 剩 t100
+    w.unmount();
+  });
+
+  it("无交易记录 → 空态提示", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("暂无交易记录");
+    expect(w.find(".trade-hist").exists()).toBe(false);
     w.unmount();
   });
 });

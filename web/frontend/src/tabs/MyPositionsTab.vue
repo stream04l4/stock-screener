@@ -192,6 +192,8 @@ function onRow(r) {
   buy.price = r.last_price != null ? String(r.last_price) : "";
   buyMsg.value = "";
   buyErr.value = "";
+  tradeErr.value = "";
+  loadTrades(); // 实盘交易历史（v7.0.17）
 }
 
 async function saveEdit() {
@@ -227,14 +229,18 @@ async function deleteRow() {
 }
 
 // ---------------------------------------------------------------------------
-// 买入登记（v7.0.15）：加仓/首仓信号触发 → 券商实盘买入 → 在此登记本次股数+价格，
-// 直接更新当前持仓：新总股数 = 旧股数 + 本次；新成本价 = 新旧加权平均（3 位小数，
-// 券商口径，不含手续费）。复用「添加/更新」同一 PUT upsert 端点，刷新后策略档位
-// （状态机按账本重播种）自动按新持仓重算。
+// 交易登记（v7.0.17，原「买入登记」v7.0.15）：实盘买入/卖出后在此登记，
+// 正数 = 买入（整手）、负数 = 卖出。后端单次请求原子完成两件事：
+// ① 更新当前持仓（买：加权成本 3 位小数，券商口径不含手续费；卖：减股数、
+//    剩余均价不变、清仓自动移除）② 追加实盘交易历史（data/my_trades.json）。
+// 刷新后策略档位（状态机按账本重播种）自动按新持仓重算。
 // ---------------------------------------------------------------------------
 const buy = reactive({ shares: "", price: "" });
 const buyMsg = ref("");
 const buyErr = ref("");
+// 实盘交易历史（v7.0.17）：弹层内按当前行股票加载；删除仅移除记录不回改持仓
+const tradeHist = ref([]);
+const tradeErr = ref("");
 
 function activeSignal(code) {
   return (myData.value?.signals || []).find((s) => s.ts_code === code) || null;
@@ -249,48 +255,91 @@ function suggestShares(s) {
   return n >= 100 ? String(n) : "";
 }
 
-// 实时预览：旧持仓 + 本次 → 新总股数/加权成本（基于已保存账本值，非编辑框）
+// 实时预览：买（正数）= 加权成本；卖（负数）= 减股数 + 已实现盈亏
 const buyPreview = computed(() => {
   const r = modalRow.value;
   const ns = Number(buy.shares);
   const np = Number(buy.price);
-  if (!r || !Number.isInteger(ns) || ns <= 0 || !Number.isFinite(np) || np <= 0) return "";
+  if (!r || !Number.isInteger(ns) || ns === 0 || !Number.isFinite(np) || np <= 0) return "";
   const oldShares = r.shares || 0;
   const oldCost = r.cost_price || 0;
-  const newShares = oldShares + ns;
-  const newCost = (oldShares * oldCost + ns * np) / newShares;
-  return `当前 ${oldShares} 股 @ ${oldCost} ＋ 本次 ${ns} 股 @ ${np}` +
-    ` → ${newShares} 股 @ ${newCost.toFixed(3)}（本次金额 ¥${(ns * np).toLocaleString()}）`;
+  if (ns > 0) {
+    const newShares = oldShares + ns;
+    const newCost = (oldShares * oldCost + ns * np) / newShares;
+    return `当前 ${oldShares} 股 @ ${oldCost} ＋ 本次 ${ns} 股 @ ${np}` +
+      ` → ${newShares} 股 @ ${newCost.toFixed(3)}（本次金额 ¥${(ns * np).toLocaleString()}）`;
+  }
+  const nSell = -ns;
+  if (nSell > oldShares) return `⚠ 卖出不能超过持仓：当前 ${oldShares} 股`;
+  const newShares = oldShares - nSell;
+  const pnl = (np - oldCost) * nSell;
+  return `当前 ${oldShares} 股 @ ${oldCost} − 本次 ${nSell} 股 @ ${np}` +
+    ` → ${newShares} 股 @ ${oldCost}（已实现盈亏 ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}）`;
 });
 
-async function recordBuy() {
+async function postTrade(code, shares, price) {
+  return api("/api/my_trades", {
+    method: "POST",
+    body: JSON.stringify({
+      ts_code: code, shares, price: Number(price),
+      name: (modalRow.value && modalRow.value.name) || "",
+    }),
+  });
+}
+
+async function recordTrade() {
   buyErr.value = "";
   buyMsg.value = "";
   const r = modalRow.value;
   if (!r) return;
   const ns = Number(buy.shares);
   const np = Number(buy.price);
-  if (!Number.isInteger(ns) || ns <= 0) { buyErr.value = "本次股数应为正整数"; return; }
-  if (ns % 100 !== 0) { buyErr.value = "A 股买入按整手（100 股倍数）"; return; }
+  if (!Number.isInteger(ns) || ns === 0) { buyErr.value = "本次股数应为非零整数（正=买入，负=卖出）"; return; }
+  if (ns > 0 && ns % 100 !== 0) { buyErr.value = "A 股买入按整手（100 股倍数）"; return; }
+  if (ns < 0 && -ns > (r.shares || 0)) { buyErr.value = `卖出不能超过持仓：当前 ${r.shares || 0} 股`; return; }
   if (!Number.isFinite(np) || np <= 0) { buyErr.value = "本次价格应为正数"; return; }
-  const oldShares = r.shares || 0;
-  const oldCost = r.cost_price || 0;
-  const newShares = oldShares + ns;
-  const newCost = Number(((oldShares * oldCost + ns * np) / newShares).toFixed(3));
   try {
-    await putPos(r.ts_code, newShares, newCost);
-    buyMsg.value = `已登记 ${ns} 股 @ ${np} → ${newShares} 股 @ ${newCost.toFixed(3)}`;
-    // 弹层内同步：编辑框 + 账本快照字段（策略档位列刷新后重开弹层可见新值）
-    edit.shares = String(newShares);
-    edit.cost = String(newCost);
-    Object.assign(r, { shares: newShares, cost_price: newCost });
+    const res = await postTrade(r.ts_code, ns, np);
+    const pos = res.position;
+    if (pos.removed) {
+      buyMsg.value = `已登记卖出 ${-ns} 股 @ ${np}，清仓移除`;
+    } else {
+      buyMsg.value = ns > 0
+        ? `已登记买入 ${ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`
+        : `已登记卖出 ${-ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`;
+      // 弹层内同步：编辑框 + 账本快照字段（策略档位列刷新后重开弹层可见新值）
+      edit.shares = String(pos.shares);
+      edit.cost = String(pos.cost_price);
+      Object.assign(r, { shares: pos.shares, cost_price: pos.cost_price });
+    }
     buy.shares = "";
     buy.price = "";
     saveMsg.value = "";
     refresh();
+    loadTrades(); // 交易历史即时刷新（新记录排最前）
   } catch (e) {
     buyErr.value = e.message;
   }
+}
+
+// 实盘交易历史加载（弹层内，按当前行股票过滤；服务端最新在前）
+async function loadTrades() {
+  const code = modalRow.value?.ts_code;
+  if (!code) { tradeHist.value = []; return; }
+  try {
+    const d = await api("/api/my_trades?ts_code=" + encodeURIComponent(code));
+    tradeHist.value = d.trades || [];
+  } catch { tradeHist.value = []; } // 加载失败不阻塞弹层（历史区显示空）
+}
+
+// 删除一条历史记录：仅移除日志，不回改当前持仓（持仓账本是唯一状态源）
+async function deleteTrade(id) {
+  if (!window.confirm("删除这条交易记录？（仅移除记录，不回改当前持仓）")) return;
+  tradeErr.value = "";
+  try {
+    await api("/api/my_trades/" + encodeURIComponent(id), { method: "DELETE" });
+    await loadTrades();
+  } catch (e) { tradeErr.value = e.message; }
 }
 
 // 该股在最近一次回测中的买入历史（taskStore 缓存；无 → 提示去回测页跑一次）
@@ -411,7 +460,7 @@ function pnlColor(v) {
       </template>
     </div>
 
-    <!-- 行点击弹层：策略参考 + 编辑 + 买入登记 + 买入历史 -->
+    <!-- 行点击弹层：策略参考 + 编辑 + 交易登记 + 交易历史 + 回测逐笔 -->
     <Modal :open="!!modalRow" :title="(modalRow && modalRow.name) || '持仓详情'"
            @close="modalRow = null">
       <div v-if="modalRow">
@@ -441,26 +490,51 @@ function pnlColor(v) {
           <span v-if="saveErr" class="msg-err">{{ saveErr }}</span>
         </div>
 
-        <!-- 买入登记（v7.0.15）：信号触发 → 券商买入 → 登记后当前持仓自动更新（加权成本） -->
+        <!-- 交易登记（v7.0.17）：实盘买入/卖出后登记 → 当前持仓自动更新 + 写入交易历史 -->
         <div class="buy-bar">
-          <h4>📝 买入登记 <span class="muted small">（券商买入后在此登记，当前持仓自动更新）</span></h4>
+          <h4>📝 交易登记 <span class="muted small">（正数=买入 / 负数=卖出；登记后当前持仓自动更新并写入交易历史）</span></h4>
           <div class="buy-inputs">
             <label class="edit-field">
               <span>本次股数</span>
-              <input v-model="buy.shares" class="inp num" placeholder="整手 100 股倍数" />
+              <input v-model="buy.shares" class="inp num" placeholder="正=买（整手），负=卖" />
             </label>
             <label class="edit-field">
               <span>本次价格</span>
               <input v-model="buy.price" class="inp num" placeholder="元" />
             </label>
-            <button class="primary-btn" @click="recordBuy">登记</button>
+            <button class="primary-btn" @click="recordTrade">登记</button>
             <span v-if="buyMsg" class="msg-ok">{{ buyMsg }}</span>
             <span v-if="buyErr" class="msg-err">{{ buyErr }}</span>
           </div>
           <p v-if="buyPreview" class="muted small buy-preview">{{ buyPreview }}</p>
         </div>
+        <!-- 交易历史（v7.0.17）：实盘登记产生的买卖记录，可删除（仅移除记录，不回改持仓） -->
         <div class="detail-buys">
-          <h4>买入历史（最近回测：{{ modalBuys ? modalBuys.taskId : "无" }}）</h4>
+          <h4>📜 交易历史 <span class="muted small">（{{ tradeHist.length }} 条 · 删除仅移除记录，不回改当前持仓）</span></h4>
+          <table v-if="tradeHist.length" class="trade-hist">
+            <thead>
+              <tr><th>日期</th><th>方向</th><th>股数</th><th>价格</th><th>金额</th><th>已实现盈亏</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="t in tradeHist" :key="t.id">
+                <td>{{ t.date }}</td>
+                <td><span :class="t.direction === 'buy' ? 'tag-buy' : 'tag-sell'">{{ t.direction === 'buy' ? '买' : '卖' }}</span></td>
+                <td class="num">{{ t.shares }}</td>
+                <td class="num">{{ t.price }}</td>
+                <td class="num">{{ t.amount }}</td>
+                <td class="num" :style="t.realized_pnl == null ? '' : { color: pnlColor(t.realized_pnl) }">
+                  {{ t.realized_pnl == null ? "—" : (t.realized_pnl >= 0 ? "+" : "") + t.realized_pnl }}
+                </td>
+                <td class="num"><button class="ghost-btn tiny" title="删除这条记录" @click="deleteTrade(t.id)">🗑</button></td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-else class="muted small">暂无交易记录——在上方「交易登记」登记买入/卖出后出现。</p>
+          <span v-if="tradeErr" class="msg-err">{{ tradeErr }}</span>
+        </div>
+        <!-- 回测逐笔（最近一次回测的模拟买入，与实盘交易历史分离） -->
+        <div class="detail-buys">
+          <h4>📊 回测逐笔 <span class="muted small">（最近回测：{{ modalBuys ? modalBuys.taskId : "无" }}）</span></h4>
           <template v-if="modalBuys">
             <SimpleTable v-if="modalBuys.rows.length" :rows="modalBuys.rows" :cols="BUYS_COLS" />
             <p v-else class="muted small">该标的在最近一次回测中无买入。</p>

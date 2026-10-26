@@ -572,6 +572,15 @@ tr.lake-row-muted .badge { opacity: .85; }
 }
 .tag-buy { background: #ffe0b2; color: #e65100; }   /* 买入·首仓：橙 */
 .tag-add { background: #ffcdd2; color: #b71c1c; }   /* 加仓：红 */
+.tag-sell { background: #c8e6c9; color: #1b5e20; }  /* 卖出：绿（与买入对色） */
+
+/* ---------- v7.0.17 实盘交易历史（我的持仓弹层） ---------- */
+.trade-hist { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+.trade-hist th, .trade-hist td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.trade-hist thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.trade-hist td.num, .trade-hist th.num { text-align: right; font-family: var(--mono); }
+.trade-hist tbody tr:hover { background: #f6f9ff; }
+.ghost-btn.tiny { padding: 0 6px; font-size: 12px; line-height: 20px; }
 
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }

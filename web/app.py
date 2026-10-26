@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +49,8 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
 # "我的持仓"用户持仓账本（本机状态，/data/ 已 gitignore；单用户单进程写，tmp+rename 原子落盘）
 USER_POSITIONS_PATH = PROJECT_ROOT / "data" / "user_positions.json"
+# "我的持仓"实盘交易历史（v7.0.17）：追加式买卖登记日志，/data/ 已 gitignore
+USER_TRADES_PATH = PROJECT_ROOT / "data" / "my_trades.json"
 _TS_CODE_RE = re.compile(r"^[a-z]{2}\.\d{6}$")
 # v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
 BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
@@ -1273,6 +1275,137 @@ def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
         positions[code] = {"shares": shares_f, "cost_price": cost_f, "updated_at": now}
     _up_write(positions)
     return {"ok": True, "ts_code": code, "n": len(positions)}
+
+
+# ---------------------------------------------------------------------------
+# 交易历史（v7.0.17）：实盘买卖登记账，与当前持仓账本分离
+# - data/my_trades.json：追加式日志 {"updated_at":..., "trades":[...]}（原子替换落盘）
+# - 登记 = 更新当前持仓（买：加权成本；卖：减股数成本不变，清仓移除）+ 追加历史，
+#   单次请求原子完成；手工 upsert（PUT /api/my_positions）是"修正"语义，不写历史
+# - 删除记录仅移除日志，**不回改当前持仓**（持仓账本是唯一状态源）
+# - 口径同 v7.0.15：成本 3 位小数、不含手续费；买整手 100 股倍数，卖允许零股
+#   （A 股卖出可零股一次了结）
+# ---------------------------------------------------------------------------
+def _trades_read() -> List[Dict[str, Any]]:
+    if not USER_TRADES_PATH.exists():
+        return []
+    try:
+        d = json.loads(USER_TRADES_PATH.read_text(encoding="utf-8"))
+        tr = d.get("trades", [])
+        return tr if isinstance(tr, list) else []
+    except Exception:  # noqa: BLE001 - 账本损坏不 500，按空日志
+        return []
+
+
+def _trades_write(trades: List[Dict[str, Any]]) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    USER_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"updated_at": now, "trades": trades}
+    tmp = USER_TRADES_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, USER_TRADES_PATH)  # 原子替换，防半截账本
+
+
+@app.post("/api/my_trades")
+def record_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """登记一笔实盘交易：shares 正=买入（整手）、负=卖出。
+
+    原子更新当前持仓 + 追加 data/my_trades.json；卖出记录含已实现盈亏
+    （=（卖价−登记时成本）×股数，快照值，供历史回看）。
+    """
+    code = str(payload.get("ts_code", "")).strip()
+    if not _TS_CODE_RE.fullmatch(code):
+        raise HTTPException(status_code=400, detail="ts_code 应为 sh.600000 / sz.000001 形式")
+    shares = payload.get("shares")
+    price = payload.get("price")
+    try:
+        shares_i = int(shares)
+        price_f = float(price)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="shares/price 应为数字")
+    if float(shares_i) != float(shares):  # 拒非整数股数（1.5 手之类）
+        raise HTTPException(status_code=400, detail="shares 必须为整数")
+    if shares_i == 0:
+        raise HTTPException(status_code=400, detail="shares 不能为 0（正=买入，负=卖出）")
+    if not price_f > 0:
+        raise HTTPException(status_code=400, detail="price 必须为正数")
+    date_s = str(payload.get("date") or "").strip()
+    if not date_s:
+        date_s = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_s):
+        raise HTTPException(status_code=400, detail="date 应为 YYYY-MM-DD")
+    name = str(payload.get("name") or "").strip()[:32]
+
+    positions = _up_read()
+    cur = positions.get(code) or {}
+    old_shares = float(cur.get("shares") or 0)
+    old_cost = float(cur.get("cost_price") or 0)
+    realized_pnl: Optional[float] = None
+    if shares_i > 0:
+        if shares_i % 100 != 0:
+            raise HTTPException(status_code=400, detail="A 股买入按整手（100 股倍数）")
+        new_shares = old_shares + shares_i
+        new_cost = round((old_shares * old_cost + shares_i * price_f) / new_shares, 3)
+    else:
+        n_sell = -shares_i
+        if old_shares <= 0:
+            raise HTTPException(status_code=400, detail="未持有该股，不能卖出（先登记持仓）")
+        if n_sell > old_shares:
+            raise HTTPException(
+                status_code=400,
+                detail=f"卖出不能超过持仓：当前 {old_shares:.0f} 股，拟卖 {n_sell} 股")
+        new_shares = old_shares - n_sell
+        new_cost = old_cost  # 卖出后剩余持仓均价不变（券商口径）
+        realized_pnl = round((price_f - old_cost) * n_sell, 2)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if new_shares <= 0:
+        positions.pop(code, None)
+    else:
+        positions[code] = {"shares": new_shares, "cost_price": new_cost, "updated_at": now}
+    _up_write(positions)
+
+    trades = _trades_read()
+    tid = "t" + str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    while any(t.get("id") == tid for t in trades):  # 同毫秒连笔 → 加后缀保唯一
+        tid += "x"
+    trade = {
+        "id": tid, "ts_code": code, "name": name,
+        "direction": "buy" if shares_i > 0 else "sell",
+        "shares": abs(shares_i), "price": price_f,
+        "amount": round(abs(shares_i) * price_f, 2),
+        "date": date_s, "realized_pnl": realized_pnl, "created_at": now,
+    }
+    trades.append(trade)
+    _trades_write(trades)
+    return {"ok": True, "trade": trade,
+            "position": {"ts_code": code, "shares": max(new_shares, 0.0),
+                         "cost_price": new_cost if new_shares > 0 else None,
+                         "removed": new_shares <= 0}}
+
+
+@app.get("/api/my_trades")
+def list_trades(ts_code: Optional[str] = None) -> Dict[str, Any]:
+    """交易历史（最新在前）；ts_code 可选过滤单股。"""
+    trades = _trades_read()
+    if ts_code:
+        code = ts_code.strip().lower()
+        trades = [t for t in trades if t.get("ts_code") == code]
+    trades = sorted(trades, key=lambda t: (t.get("created_at") or "", t.get("id") or ""),
+                    reverse=True)
+    return {"n": len(trades), "trades": trades}
+
+
+@app.delete("/api/my_trades/{trade_id}")
+def delete_trade(trade_id: str) -> Dict[str, Any]:
+    """删除一条历史记录。仅移除日志，**不回改当前持仓**（持仓是唯一状态源）。"""
+    trades = _trades_read()
+    for i, t in enumerate(trades):
+        if t.get("id") == trade_id:
+            removed = trades.pop(i)
+            _trades_write(trades)
+            return {"ok": True, "ts_code": removed.get("ts_code"), "n": len(trades)}
+    raise HTTPException(status_code=404, detail="记录不存在")
 
 
 # ---------------------------------------------------------------------------
