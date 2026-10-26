@@ -1,4 +1,4 @@
-# stock-screener · v7.0.14（drawdown_martingale 单策略版）
+# stock-screener · v7.0.15（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -190,7 +190,7 @@ gitignore，禁入 git/日志）。
 
 ```bash
 .venv/bin/python -m pytest tests/ -q          # 后端（591 用例，含 test_timing 边沿语义 + test_web_auth 登录门禁）
-cd web/frontend && npm test                   # 前端 vitest（235 用例，含登录页/门禁）
+cd web/frontend && npm test                   # 前端 vitest（239 用例，含登录页/门禁/买入登记）
 cd web/frontend && npm run build               # dist/ 供 StaticFiles 挂载
 ```
 
@@ -226,7 +226,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.13）
+## 10. 近期版本（v7.0.11 → v7.0.15）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -240,3 +240,8 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
   `.env`（`WEB_ADMIN_USER`/`WEB_ADMIN_PASS`/`WEB_SESSION_SECRET`，禁入 git/日志）；
   前端登录页（未登录不渲染页签）+ 顶栏「退出」；连续 5 次失败锁 120s（429）；
   运行中 API 401（会话过期）自动回登录页。
+- **v7.0.15**：持仓弹层「📝 买入登记」——加仓/首仓信号触发、券商实盘买入后，
+  点持仓行弹层内登记「本次股数 + 本次价格」即更新当前持仓：新总股数 = 旧 + 本次，
+  新成本价 = 新旧加权平均（3 位小数，券商口径不含手续费）；有活跃信号时股数
+  按建议金额÷现价预填整手、价格预填最新价；登记前实时预览合并结果；
+  复用 `/api/my_positions` PUT upsert（后端零改动），刷新后策略档位自动重算。

@@ -412,3 +412,88 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     w.unmount();
   });
 });
+
+describe("MyPositionsTab · 弹层买入登记（v7.0.15）", () => {
+  async function openRow(w, code = "sh.601088") {
+    const row = w.findAll("tbody tr").find((r) => r.text().includes(code));
+    await row.trigger("click");
+    await flushPromises();
+    return w;
+  }
+  const buyInputs = (w) => w.findAll(".buy-inputs input");
+  const buyBtn = (w) => w.findAll(".buy-bar button").find((b) => b.text() === "登记");
+
+  it("有信号 → 股数预填建议值（建议金额÷信号价取整手）+ 价格预填最新价", async () => {
+    mockApi(MY_SIGNAL); // sh.601088：suggested 100000 @ 现价 40.0 → 2500 股；last_price 33.9
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    expect(ins).toHaveLength(2);
+    expect(ins[0].element.value).toBe("2500"); // floor(100000/100/40)*100
+    expect(ins[1].element.value).toBe("33.9"); // 最新价预填
+    expect(w.find(".buy-preview").exists()).toBe(true);
+    w.unmount();
+  });
+
+  it("无信号 → 股数不预填，价格仍预填最新价", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    expect(ins[0].element.value).toBe("");
+    expect(ins[1].element.value).toBe("33.9");
+    w.unmount();
+  });
+
+  it("登记成功 → PUT 加权更新（新总股数/3 位加权成本）+ 成功文案 + 编辑框同步", async () => {
+    mockApi(MY); // 1200 股 @ 25
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    await ins[0].setValue("200");
+    await ins[1].setValue("30");
+    // 预览：(1200×25 + 200×30) / 1400 = 25.714
+    expect(w.find(".buy-preview").text()).toContain("1400 股 @ 25.714");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(puts()).toHaveLength(1);
+    expect(JSON.parse(puts()[0][1].body)).toEqual(
+      { ts_code: "sh.601088", shares: 1400, cost_price: 25.714 });
+    expect(w.text()).toContain("已登记 200 股 @ 30 → 1400 股 @ 25.714");
+    const editInputs = w.findAll(".edit-bar input");
+    expect(editInputs[0].element.value).toBe("1400"); // 编辑框同步新值
+    expect(editInputs[1].element.value).toBe("25.714");
+    w.unmount();
+  });
+
+  it("校验：非整手 / 非正整数 / 价格非正 → 报错不发 PUT", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+
+    await ins[0].setValue("150");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("整手");
+    expect(puts()).toHaveLength(0);
+
+    await ins[0].setValue("abc");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("正整数");
+    expect(puts()).toHaveLength(0);
+
+    await ins[0].setValue("200");
+    await ins[1].setValue("0");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("本次价格应为正数");
+    expect(puts()).toHaveLength(0);
+    w.unmount();
+  });
+});

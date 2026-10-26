@@ -186,6 +186,12 @@ function onRow(r) {
   edit.cost = String(r.cost_price ?? "");
   saveMsg.value = "";
   saveErr.value = "";
+  // 买入登记预填：该股有活跃信号 → 建议股数（建议金额÷现价取整手）；价格默认最新价
+  const s = activeSignal(r.ts_code);
+  buy.shares = s ? suggestShares(s) : "";
+  buy.price = r.last_price != null ? String(r.last_price) : "";
+  buyMsg.value = "";
+  buyErr.value = "";
 }
 
 async function saveEdit() {
@@ -217,6 +223,73 @@ async function deleteRow() {
     refresh();
   } catch (e) {
     saveErr.value = e.message;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 买入登记（v7.0.15）：加仓/首仓信号触发 → 券商实盘买入 → 在此登记本次股数+价格，
+// 直接更新当前持仓：新总股数 = 旧股数 + 本次；新成本价 = 新旧加权平均（3 位小数，
+// 券商口径，不含手续费）。复用「添加/更新」同一 PUT upsert 端点，刷新后策略档位
+// （状态机按账本重播种）自动按新持仓重算。
+// ---------------------------------------------------------------------------
+const buy = reactive({ shares: "", price: "" });
+const buyMsg = ref("");
+const buyErr = ref("");
+
+function activeSignal(code) {
+  return (myData.value?.signals || []).find((s) => s.ts_code === code) || null;
+}
+
+// 建议股数：信号建议金额 ÷ 现价，向下取整到整手（100 股）
+function suggestShares(s) {
+  if (!s || s.suggested_amount == null) return "";
+  const p = s.price || (modalRow.value && modalRow.value.last_price);
+  if (!p) return "";
+  const n = Math.floor(s.suggested_amount / 100 / p) * 100;
+  return n >= 100 ? String(n) : "";
+}
+
+// 实时预览：旧持仓 + 本次 → 新总股数/加权成本（基于已保存账本值，非编辑框）
+const buyPreview = computed(() => {
+  const r = modalRow.value;
+  const ns = Number(buy.shares);
+  const np = Number(buy.price);
+  if (!r || !Number.isInteger(ns) || ns <= 0 || !Number.isFinite(np) || np <= 0) return "";
+  const oldShares = r.shares || 0;
+  const oldCost = r.cost_price || 0;
+  const newShares = oldShares + ns;
+  const newCost = (oldShares * oldCost + ns * np) / newShares;
+  return `当前 ${oldShares} 股 @ ${oldCost} ＋ 本次 ${ns} 股 @ ${np}` +
+    ` → ${newShares} 股 @ ${newCost.toFixed(3)}（本次金额 ¥${(ns * np).toLocaleString()}）`;
+});
+
+async function recordBuy() {
+  buyErr.value = "";
+  buyMsg.value = "";
+  const r = modalRow.value;
+  if (!r) return;
+  const ns = Number(buy.shares);
+  const np = Number(buy.price);
+  if (!Number.isInteger(ns) || ns <= 0) { buyErr.value = "本次股数应为正整数"; return; }
+  if (ns % 100 !== 0) { buyErr.value = "A 股买入按整手（100 股倍数）"; return; }
+  if (!Number.isFinite(np) || np <= 0) { buyErr.value = "本次价格应为正数"; return; }
+  const oldShares = r.shares || 0;
+  const oldCost = r.cost_price || 0;
+  const newShares = oldShares + ns;
+  const newCost = Number(((oldShares * oldCost + ns * np) / newShares).toFixed(3));
+  try {
+    await putPos(r.ts_code, newShares, newCost);
+    buyMsg.value = `已登记 ${ns} 股 @ ${np} → ${newShares} 股 @ ${newCost.toFixed(3)}`;
+    // 弹层内同步：编辑框 + 账本快照字段（策略档位列刷新后重开弹层可见新值）
+    edit.shares = String(newShares);
+    edit.cost = String(newCost);
+    Object.assign(r, { shares: newShares, cost_price: newCost });
+    buy.shares = "";
+    buy.price = "";
+    saveMsg.value = "";
+    refresh();
+  } catch (e) {
+    buyErr.value = e.message;
   }
 }
 
@@ -365,6 +438,25 @@ function pnlColor(v) {
           <button class="ghost-btn" @click="deleteRow">删除</button>
           <span v-if="saveMsg" class="msg-ok">{{ saveMsg }}</span>
           <span v-if="saveErr" class="msg-err">{{ saveErr }}</span>
+        </div>
+
+        <!-- 买入登记（v7.0.15）：信号触发 → 券商买入 → 登记后当前持仓自动更新（加权成本） -->
+        <div class="buy-bar">
+          <h4>📝 买入登记 <span class="muted small">（券商买入后在此登记，当前持仓自动更新）</span></h4>
+          <div class="buy-inputs">
+            <label class="edit-field">
+              <span>本次股数</span>
+              <input v-model="buy.shares" class="inp num" placeholder="整手 100 股倍数" />
+            </label>
+            <label class="edit-field">
+              <span>本次价格</span>
+              <input v-model="buy.price" class="inp num" placeholder="元" />
+            </label>
+            <button class="primary-btn" @click="recordBuy">登记</button>
+            <span v-if="buyMsg" class="msg-ok">{{ buyMsg }}</span>
+            <span v-if="buyErr" class="msg-err">{{ buyErr }}</span>
+          </div>
+          <p v-if="buyPreview" class="muted small buy-preview">{{ buyPreview }}</p>
         </div>
         <div class="detail-buys">
           <h4>买入历史（最近回测：{{ modalBuys ? modalBuys.taskId : "无" }}）</h4>

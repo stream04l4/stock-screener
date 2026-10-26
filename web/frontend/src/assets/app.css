@@ -518,6 +518,11 @@ tr.lake-row-muted .badge { opacity: .85; }
 .totals-bar { display: flex; gap: 22px; flex-wrap: wrap; margin: 6px 0 12px; font-size: 13.5px; }
 .totals-bar b { font-family: var(--mono); }
 .edit-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0; padding: 12px; background: var(--accent-soft); border-radius: 10px; }
+/* v7.0.15 弹层内「买入登记」：券商买入后登记 → 当前持仓加权更新 */
+.buy-bar { margin: 14px 0; padding: 12px; background: rgba(46, 125, 50, 0.07); border: 1px solid rgba(46, 125, 50, 0.25); border-radius: 10px; }
+.buy-bar h4 { margin: 0 0 8px; font-size: 13.5px; }
+.buy-inputs { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.buy-preview { margin: 8px 0 0; font-family: var(--mono); }
 .edit-field { display: flex; gap: 6px; align-items: center; font-size: 13px; }
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; margin-bottom: 10px; }
 .d-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed var(--line); }
