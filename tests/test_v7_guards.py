@@ -38,8 +38,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# v7.0.18.3 tester 缺陷修复（6d0796f）：lake/ingest 边界函数加固，lake/ 有意变更，基线前移。
-BASELINE = "6d0796f"
+# v7.0.18.4 DEF-4（5606358）：T6 季度新鲜度口径 + 季度重抓 cron，lake/web_api.py
+# 有意变更（_quarter_deadline/_expected_quarter_end + 季度表缺期判 lagging），基线前移。
+BASELINE = "5606358"
 
 
 def _git(*args) -> str:
@@ -164,7 +165,37 @@ def test_deleted_artifacts_gone():
     gone_files = [
         "screener/__main__.py", "run_cron.sh", "backtest/", "scripts/backtest_martingale.py",
         "tests/smoke_cron_guard.py",
+        # v7.0.0 删除（raw 层/canonical 统一 schema 随 v5→v7 架构退役）
+        "screener/data/rawstore.py", "screener/data/canonical.py",
     ]
     for g in gone_files:
         p = PROJECT_ROOT / g
         assert not p.exists(), f"已删文件回潮: {g}"
+
+
+def test_no_imports_of_deleted_modules():
+    """活代码不得再 import 已删模块（v7.0.18.4 事故防回潮）。
+
+    2026-10-27 实锤：v7.0.0 删 rawstore.py 时漏删 sina.py 两处惰性导入，
+    T6 抓取路径整体断裂 5 天（DEF-4 数据冻结真根因），592 项测试无一覆盖
+    fetch_holders 活路径 → 静默。本测试扫活代码树（screener/lake/scripts/
+    web/martingale/config 的 .py）禁止任何形态的已删模块导入——文件级
+    gone 检查抓不到"模块删了、import 还在"的断链。
+    """
+    import re
+    gone_mods = ("rawstore", "canonical")
+    bad = []
+    for d in ("screener", "lake", "scripts", "web", "martingale", "config"):
+        root = PROJECT_ROOT / d
+        if not root.exists():
+            continue
+        for p in root.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(
+                    r"(?:from\s+[\w.]*import\s+[\w., ]*\b(?:%s)\b"
+                    r"|\bimport\s+[\w.]*\b(?:%s)\b)" % (
+                        "|".join(gone_mods), "|".join(gone_mods)), text):
+                bad.append(f"{p.relative_to(PROJECT_ROOT)}: {m.group(0).strip()}")
+    assert not bad, "已删模块 import 回潮（删模块必须连 import 一起清）:\n" + "\n".join(bad)

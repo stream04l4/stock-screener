@@ -401,9 +401,6 @@ class SinaClient:
         except (LookupError, UnicodeError) as exc:  # pragma: no cover - gbk 恒可用
             raise SinaDataError(f"新浪 F10 {code6} GBK 解码失败: {exc}") from exc
         periods = parse_holders_page(html)
-        # v5.2 Phase 1：新浪 F10 股东页原始响应落 raw（零转换；canonical.enabled=false → no-op）
-        from . import rawstore as _raw
-        _raw.record_response("sina", f"f10_holders_{code6}", html, meta={"periods": len(periods)})
         if not periods:
             if _holders_page_empty_shell(html):
                 # 合法空页：HTTP 200 + 表框架完整 + 0 报告期 → 新浪无此股数据。
@@ -445,9 +442,6 @@ class SinaClient:
                 payload = resp.json()
             except ValueError as exc:
                 raise SinaDataError(f"新浪财务JSON {code6} 非 JSON 响应: {exc}") from exc
-            # v5.2 Phase 1：CF JSON 原始响应落 raw（零转换；canonical.enabled=false → no-op）
-            from . import rawstore as _raw
-            _raw.record_response("sina", f"cf_{code6}_p{page}", payload)
             page_reports = parse_cf_report(payload)
             if not page_reports:
                 break
