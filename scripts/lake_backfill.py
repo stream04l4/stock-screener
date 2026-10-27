@@ -2691,6 +2691,24 @@ def cmd_t6(args, con, db_path: str) -> int:
               f"{len(code_set)} 只指定" if code_set else "全市场（慎用）")
 
     stats = run_t6(con, db_path, codes, _make_runner(db_path))
+    # v7.0.18.4：独立子命令收尾——progress 任务视图归位（与 full 收尾同语义）。
+    # 此前缺陷：t6 独立跑成功后视图仍停在 state=running + 上一轮失败残留的
+    # last_error（2026-10-27 实锤：重抓成功 5227 只，视图仍显示 10-02 的
+    # "2913 task(s) failed"）→ 观测误导。
+    try:
+        prog = load_progress(_progress_for_db(db_path))
+        e = next((t for t in prog.get("tasks", []) if t.get("table") == "holders_snapshot"), None)
+        if e is not None:
+            if not stats.get("errors"):
+                e["state"] = "done"
+                e["last_error"] = ""
+                e["eta_min"] = None
+            else:
+                e["state"] = "error"
+                e["last_error"] = f"t6: {len(stats['errors'])} task(s) failed（见日志）"
+            save_progress(prog, _progress_for_db(db_path))
+    except Exception as exc:  # noqa: BLE001 - 视图落盘失败不阻断（数据已入湖）
+        log.warning("t6 收尾：progress 视图写失败（不阻断）: %s", exc)
     print(f"===== t6 =====（holders_snapshot）")
     print(f"  processed={stats.get('processed')}  skipped_done={stats.get('skipped_done')}  "
           f"no_data={stats.get('no_data_count')}  errors={len(stats.get('errors', []))}")
