@@ -1142,6 +1142,35 @@ def _table_stats(con, table: str, code_col: Optional[str],
     return out
 
 
+def _quarter_deadline(period_end: datetime.date) -> datetime.date:
+    """给定报告期（季末日）→ 其法定披露截止日（与 _expected_quarter_end 同源）。"""
+    if period_end.month in (3, 12):
+        # Q1→当年 04-30；年报→次年 04-30
+        y = period_end.year + 1 if period_end.month == 12 else period_end.year
+        return datetime.date(y, 4, 30)
+    if period_end.month == 6:
+        return datetime.date(period_end.year, 8, 31)
+    if period_end.month == 9:
+        return datetime.date(period_end.year, 10, 31)
+    raise ValueError(f"非季末报告期: {period_end}")
+
+
+def _expected_quarter_end(ref: datetime.date) -> datetime.date:
+    """截至 ref 日，法定披露截止日**已过**的最新报告期（A 股披露期限）。
+
+    截止日未过 → 该期不算"应披露"（数据缺它不判滞后）。只回看近两年，
+    足够覆盖任何 ref。
+    """
+    best = None
+    for y in (ref.year - 1, ref.year):
+        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+            end = datetime.date(y, month, day)
+            if _quarter_deadline(end) <= ref and (best is None or end > best):
+                best = end
+    assert best is not None  # 至少前年年报截止日恒已过
+    return best
+
+
 def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
                     ref_date: Optional[str], dividend_as_of: Optional[str],
                     prog: Optional[Dict[str, Any]] = None) -> tuple:
@@ -1180,9 +1209,26 @@ def _classify_state(key: str, kind: str, rows: int, date_max: Optional[str],
         if total_n and done_n is not None:
             if done_n >= total_n:
                 # 已完成：季度表（T5/T6）PIT 披露日天然落后最新交易日（如 Q2 年报
-                # 8 月底披露完），不做日期差——直接"截至"；日频表（T8/T9）跟踪
+                # 8 月底披露完），不做日期差；日频表（T8/T9）跟踪
                 # 最新交易日，按 gap 判 fresh/lagging。
                 if key in ("fundamentals_quarterly", "holders_snapshot"):
+                    # v7.0.18.4（tester DEF-4）：季度表**不再无条件 fresh**——
+                    # 某报告期法定披露截止日已过而表内缺该期 → lagging（前端 🕓
+                    # 徽章），否则"冻结数据恒显示最新"（2026-10-27 实锤：T6 冻结
+                    # 09-28 仍显示"✅ 最新"）。口径：
+                    # - T6 as_of_date=报告期本身：date_max < 应披露最新期 → 缺期；
+                    # - T5 pub_date=披露日：披露日最晚贴近截止日，date_max 落后
+                    #   截止日 >30 天 → 判缺期（30 天容差吸收个别晚披公司）。
+                    if date_max and ref_date:
+                        ref_d = datetime.date.fromisoformat(ref_date)
+                        exp = _expected_quarter_end(ref_d)
+                        if key == "holders_snapshot":
+                            stale = datetime.date.fromisoformat(date_max) < exp
+                        else:
+                            stale = datetime.date.fromisoformat(date_max) < \
+                                _quarter_deadline(exp) - datetime.timedelta(days=30)
+                        if stale:
+                            return "lagging", f"缺{exp}报告期（截至{date_max}）"
                     return "fresh", f"截至{date_max or '—'}"
                 if date_max and ref_date:
                     gap = (datetime.date.fromisoformat(ref_date)

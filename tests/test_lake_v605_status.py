@@ -304,10 +304,12 @@ def test_status_state_p2p3_progress_views(tmp_path, monkeypatch):
                                 ref, None, {"tasks": [
         {"table": "holders_snapshot", "total": 2, "done": 1}]}) == \
         ("lagging", "补齐中 1/2")
+    # v7.0.18.4：季度表新鲜度判定依赖 ref 日（法定披露截止日）→ 用**固定** ref
+    # 保持测试时点无关（ref=2026-10-27：应披露最新期=中报 06-30，Q3 截止 10-31 未过）
     assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 10,
-                                "2026-08-31", ref, None, {"tasks": [
+                                "2026-08-31", "2026-10-27", None, {"tasks": [
         {"table": "fundamentals_quarterly", "total": 1, "done": 1}]}) == \
-        ("fresh", "截至2026-08-31")   # 季度表 PIT 披露落后 → 不做日期差
+        ("fresh", "截至2026-08-31")   # Q2 披露日 08-31 ≥ 08-31-30d 阈值 → fresh
     assert wapi._classify_state("macro_rf", "pending_p3", 3, "2026-09-22", ref, None,
                                 {"tasks": [
         {"table": "macro_rf", "total": 1, "done": 1}]})[0] == "lagging"   # 日频 gap>1
@@ -361,9 +363,10 @@ def test_classify_state_unit_four_branches():
     # 有行但 progress 无完成记录 → lagging"补齐中"（v6.3.2：不再恒 pending）
     assert wapi._classify_state("factor_snapshot", "pending_p2", 99, "2026-01-01",
                                 ref, None)[0] == "lagging"
-    # 有行 + progress done>=total：季度表→fresh"截至"；日频按 gap
+    # 有行 + progress done>=total：季度表按"应披露报告期"判（v7.0.18.4）→
+    # 固定 ref=2026-10-27（应披露最新期=06-30），披露日 08-31 未超 30d 容差 → fresh
     assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 99,
-                                "2026-08-31", ref, None,
+                                "2026-08-31", "2026-10-27", None,
                                 {"tasks": [{"table": "fundamentals_quarterly",
                                             "total": 1, "done": 1}]}) == \
         ("fresh", "截至2026-08-31")
@@ -382,6 +385,74 @@ def test_classify_state_unit_four_branches():
                                 "2026-09-10") == ("fresh", "快照截至2026-09-10")
     assert wapi._classify_state("dividend_events", "snapshot", 5, None, ref,
                                 None) == ("fresh", "全史静态导入")
+
+
+def test_quarter_deadline_and_expected_quarter_end():
+    """v7.0.18.4（tester DEF-4）：_quarter_deadline / _expected_quarter_end——
+    A 股法定披露期限（固定日期，时点无关）。"""
+    from lake import web_api as wapi
+    d = dt.date
+    # _quarter_deadline：各期 → 截止日
+    assert wapi._quarter_deadline(d(2026, 3, 31)) == d(2026, 4, 30)
+    assert wapi._quarter_deadline(d(2026, 6, 30)) == d(2026, 8, 31)
+    assert wapi._quarter_deadline(d(2026, 9, 30)) == d(2026, 10, 31)
+    assert wapi._quarter_deadline(d(2026, 12, 31)) == d(2027, 4, 30)   # 年报→次年
+    with pytest.raises(ValueError):
+        wapi._quarter_deadline(d(2026, 5, 1))   # 非季末
+    # _expected_quarter_end：截止日已过才"应披露"
+    # 10-27：Q3(09-30)截止 10-31 未过 → 应披露最新期=中报 06-30
+    assert wapi._expected_quarter_end(d(2026, 10, 27)) == d(2026, 6, 30)
+    # 10-31：Q3 截止日当天已过 → 09-30
+    assert wapi._expected_quarter_end(d(2026, 10, 31)) == d(2026, 9, 30)
+    # 11-01：同 09-30（年报截止次年 4-30 未到）
+    assert wapi._expected_quarter_end(d(2026, 11, 1)) == d(2026, 9, 30)
+    # 05-10：年报(12-31)次年 4-30 已过 + Q1(03-31) 4-30 已过 → 最新期=03-31
+    assert wapi._expected_quarter_end(d(2027, 5, 10)) == d(2027, 3, 31)
+    # 04-30 当天：Q1(03-31) 与年报(前一年 12-31) 截止日同日已过 → 03-31（更新）
+    assert wapi._expected_quarter_end(d(2027, 4, 30)) == d(2027, 3, 31)
+
+
+def test_classify_state_quarterly_staleness_t6_as_of():
+    """T6（holders_snapshot，date_col=as_of_date=报告期）：缺应披露期→lagging。
+
+    2026-10-27 实锤缺陷：数据冻结 09-28 仍显示"✅ 最新"——修复后应 🕓 滞后。
+    """
+    from lake import web_api as wapi
+    prog = {"tasks": [{"table": "holders_snapshot", "total": 1, "done": 1}]}
+    # ref=10-27 应披露最新期=06-30：数据截至 06-30 → fresh
+    assert wapi._classify_state("holders_snapshot", "pending_p2", 10, "2026-06-30",
+                                "2026-10-27", None, prog) == \
+        ("fresh", "截至2026-06-30")
+    # ref=11-05 应披露最新期=09-30：数据仍停在 06-30（Q3 未进）→ lagging
+    assert wapi._classify_state("holders_snapshot", "pending_p2", 10, "2026-06-30",
+                                "2026-11-05", None, prog) == \
+        ("lagging", "缺2026-09-30报告期（截至2026-06-30）")
+    # 数据已含 09-30 → fresh
+    assert wapi._classify_state("holders_snapshot", "pending_p2", 10, "2026-09-30",
+                                "2026-11-05", None, prog) == \
+        ("fresh", "截至2026-09-30")
+    # date_max 缺失（异常防御）→ 退回原 fresh 口径，不崩
+    assert wapi._classify_state("holders_snapshot", "pending_p2", 10, None,
+                                "2026-11-05", None, prog) == ("fresh", "截至—")
+
+
+def test_classify_state_quarterly_staleness_t5_pub_date():
+    """T5（fundamentals_quarterly，date_col=pub_date=披露日）：披露日落后截止日
+    >30 天 → lagging（30d 容差吸收个别晚披公司）。"""
+    from lake import web_api as wapi
+    prog = {"tasks": [{"table": "fundamentals_quarterly", "total": 1, "done": 1}]}
+    # ref=11-05 应披露最新期=09-30（截止 10-31）：
+    # 最新披露日 10-28（贴近截止日）→ fresh
+    assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 10, "2026-10-28",
+                                "2026-11-05", None, prog) == \
+        ("fresh", "截至2026-10-28")
+    # 最新披露日仍停在 08-31（Q2，距 Q3 截止 10-31 已 31 天+）→ lagging
+    assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 10, "2026-08-31",
+                                "2026-11-05", None, prog) == \
+        ("lagging", "缺2026-09-30报告期（截至2026-08-31）")
+    # 30d 容差边界：10-02 披露（= 截止 10-31 - 29d）→ 未超容差 → fresh
+    assert wapi._classify_state("fundamentals_quarterly", "pending_p2", 10, "2026-10-02",
+                                "2026-11-05", None, prog)[0] == "fresh"
 
 
 # ===========================================================================
