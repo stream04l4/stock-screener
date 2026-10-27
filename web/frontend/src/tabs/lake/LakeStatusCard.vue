@@ -162,7 +162,7 @@ const tables = computed(() => (d.value && d.value.tables) || []);
           </div>
           <div v-if="afPct != null" class="lake-af-line">
             <span class="muted small">复权因子覆盖 {{ afPct.toFixed(1) }}%</span>
-            <span class="progress-track lake-af-track"><span class="progress-bar" :style="{ width: afPct + '%' }"></span></span>
+            <span class="progress-track lake-af-track"><div class="progress-bar" :style="{ width: afPct + '%' }"></div></span>
             <span v-if="afPct < 5" class="lake-af-hint muted small">history 补齐后 hfq/qfq 全量可用</span>
           </div>
         </div>

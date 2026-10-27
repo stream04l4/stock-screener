@@ -99,10 +99,16 @@ def fetch_dividend(ts_code: str) -> List[Dict[str, Any]]:
 # 新浪逐只 ~9-10h 不可受）；逐只多源 fallback 全保留（批量失败→legacy 路径）。
 # ---------------------------------------------------------------------------
 def _to_lake_code(ts_code: str) -> Optional[str]:
-    """tushare 601398.SH → 湖 sh.601398（非 sh/sz 市场 → None，湖不覆盖）。"""
+    """tushare 601398.SH → 湖 sh.601398（非 sh/sz 市场 → None，湖不覆盖）。
+
+    v7.0.18.3 加固（tester DEF-1）：数字段必须为 6 位纯数字，否则 None——
+    湖层无 ts_code 格式校验，边界处放行的脏码（如 '.SH'→'sh.'）会直接入湖。
+    """
     if not ts_code or "." not in ts_code:
         return None
     num, ex = ts_code.split(".", 1)
+    if len(num) != 6 or not num.isdigit():
+        return None
     if ex == "SH":
         return f"sh.{num}"
     if ex == "SZ":
@@ -169,7 +175,9 @@ def _ymd(s: Any) -> str:
     测试 fake 必须用 tushare 真实 wire 格式（'20261023'），防再次漂移。
     """
     if not isinstance(s, str):
-        return str(s)
+        # v7.0.18.3 加固（tester DEF-2）：int 型 wire 日期（pandas int64 列）先转
+        # str 再走 8 位数字判断——此前 int 直通会把 '20261023' 原样写湖。
+        s = str(s)
     s = s.strip()
     if len(s) == 8 and s.isdigit():
         return f"{s[:4]}-{s[4:6]}-{s[6:]}"

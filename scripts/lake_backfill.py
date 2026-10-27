@@ -59,6 +59,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -320,6 +321,11 @@ def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
                 if not snap or not snap.get("name"):
                     continue
                 name = str(snap["name"])
+                # v7.0.18.3（tester DEF-3）：除息日腾讯实时名带 XD/DR/XR 前缀且按
+                # 8 字节 GBK 截断（2026-10-26 实测 sh601088='XD中国神'，4 行被覆盖
+                # 致 Web 按常用名检索失效）→ 此类名跳过覆盖，保留库内稳定原名。
+                if re.match(r"^(XD|DR|XR)", name):
+                    continue
                 is_st = 1 if "ST" in name.upper() else 0
                 con.execute(
                     "UPDATE stock_master SET name=?, is_st=? WHERE ts_code=?",

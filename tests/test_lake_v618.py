@@ -489,3 +489,97 @@ def test_t1_delist_updates_only_existing_rows(tmp_path, monkeypatch):
     n = con.execute("SELECT COUNT(*) FROM stock_master").fetchone()[0]
     assert n == 1, f"universe 外 code 不得插入: {n}"
     con.close()
+
+
+# ===========================================================================
+# v7.0.18.3（tester DEF-1/DEF-2/DEF-3）：边界函数加固 + 除息日 XD 名跳过
+# ===========================================================================
+def test_to_lake_code_rejects_malformed():
+    """DEF-1：数字段空/非 6 位/非数字 → None（脏码不得绕过边界入湖）。"""
+    from lake.ingest.tushare_ingest import _to_lake_code
+    assert _to_lake_code("601398.SH") == "sh.601398"
+    assert _to_lake_code("000002.SZ") == "sz.000002"
+    assert _to_lake_code(".SH") is None          # 数字段为空（tester 复现用例）
+    assert _to_lake_code("60139.SH") is None     # 5 位
+    assert _to_lake_code("6013981.SH") is None   # 7 位
+    assert _to_lake_code("60139a.SH") is None    # 非数字
+    assert _to_lake_code("920001.BJ") is None    # 北交所
+    assert _to_lake_code("601398sh") is None     # 无点分隔
+
+
+def test_ymd_handles_int_wire_date():
+    """DEF-2：int 型 wire 日期（pandas int64 列）须转横线格式。"""
+    from lake.ingest.tushare_ingest import _ymd
+    assert _ymd(20261023) == "2026-10-23"        # int（tester 复现用例）
+    assert _ymd("20261023") == "2026-10-23"      # str wire
+    assert _ymd("2026-10-23") == "2026-10-23"    # 已横线 → 原样
+    assert _ymd(" 20261023 ") == "2026-10-23"    # 带空白
+
+
+def test_t1_skips_exdividend_xd_names(tmp_path, monkeypatch):
+    """DEF-3：除息日腾讯名带 XD/DR/XR 前缀（GBK 截断）→ 跳过覆盖，保留原名。"""
+    import lake.ingest.tushare_ingest as tsi
+    import lake.ingest.tencent_ingest as ti
+    import screener.data.tencent as tmod
+
+    db = str(tmp_path / "t1x.duckdb")
+    con = lconn.open(db)
+    con.execute(
+        "INSERT INTO stock_master (ts_code,name,board,is_st,source,fetched_at,data_version) "
+        "VALUES ('sh.601088','中国神华','主板',0,'t','2026-01-01 09:00:00','v6.1')")
+
+    class _P:
+        def stock_basic(self, exchange="", list_status="L", fields=""):
+            return _FakeDF([
+                {"ts_code": "601088.SH", "name": "中国神华", "industry": "煤炭",
+                 "market": "主板", "list_date": "2007-10-09"},
+            ])
+
+    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
+    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    # 腾讯快照：除息日返回 XD 前缀截断名
+    monkeypatch.setattr(ti, "fetch_snapshot",
+                        lambda c, b: {"sh.601088": {"name": "XD中国神"}})
+
+    class _TC:
+        pass
+
+    monkeypatch.setattr(tmod, "TencentClient", _TC)
+    drv.run_t1(con, db)
+    name = con.execute("SELECT name FROM stock_master WHERE ts_code='sh.601088'").fetchone()[0]
+    assert name == "中国神华", f"XD 前缀名不得覆盖稳定原名: {name}"
+    con.close()
+
+
+def test_t1_applies_clean_tencent_name(tmp_path, monkeypatch):
+    """DEF-3 对照：非除息日（无 XD/DR/XR 前缀）的腾讯名正常覆盖补 ST 标记。"""
+    import lake.ingest.tushare_ingest as tsi
+    import lake.ingest.tencent_ingest as ti
+    import screener.data.tencent as tmod
+
+    db = str(tmp_path / "t1c.duckdb")
+    con = lconn.open(db)
+    con.execute(
+        "INSERT INTO stock_master (ts_code,name,board,is_st,source,fetched_at,data_version) "
+        "VALUES ('sz.000001','平安银行','主板',0,'t','2026-01-01 09:00:00','v6.1')")
+
+    class _P:
+        def stock_basic(self, exchange="", list_status="L", fields=""):
+            return _FakeDF([
+                {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行",
+                 "market": "主板", "list_date": "1991-04-03"},
+            ])
+
+    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
+    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    monkeypatch.setattr(ti, "fetch_snapshot",
+                        lambda c, b: {"sz.000001": {"name": "*ST测试"}})
+
+    class _TC:
+        pass
+
+    monkeypatch.setattr(tmod, "TencentClient", _TC)
+    drv.run_t1(con, db)
+    row = con.execute("SELECT name, is_st FROM stock_master WHERE ts_code='sz.000001'").fetchone()
+    assert row == ("*ST测试", 1), f"干净名应覆盖且 ST 标记生效: {row}"
+    con.close()
