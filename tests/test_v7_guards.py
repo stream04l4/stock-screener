@@ -19,7 +19,9 @@
   lake/ 有意变更，基线前移）
   → 9b2e026（v7.0.16：lake.af_rebase 多源 adj_factor 基准对齐新增模块，
   lake/ 有意变更，基线前移；Joel 2026-10-26 确认）
-  → 88cf6fc（v7.0.18：baostock 渠道完全移除，lake/ 有意变更，基线前移）。
+  → 88cf6fc（v7.0.18：baostock 渠道完全移除，lake/ 有意变更，基线前移）
+  → 6d0796f（v7.0.18.3：tester 缺陷 DEF-1/2 边界函数加固，lake/ingest 有意变更，
+  基线前移）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -36,8 +38,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# v7.0.18 baostock 渠道完全移除（88cf6fc）：lake/ 有意变更，基线前移。
-BASELINE = "88cf6fc"
+# v7.0.18.3 tester 缺陷修复（6d0796f）：lake/ingest 边界函数加固，lake/ 有意变更，基线前移。
+BASELINE = "6d0796f"
 
 
 def _git(*args) -> str:
