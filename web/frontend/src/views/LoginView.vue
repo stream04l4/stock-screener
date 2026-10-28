@@ -1,4 +1,7 @@
-// 登录页（v7.0.14）：用户名 + 密码 → POST /api/login → cookie 会话 → 跳回主页（AppShell）。
+// 登录页（v7.0.18.5）：双系统统一登录入口 —— 同一账号密码，两个按钮分别登录进两个系统。
+// - 📉 登录 A股4维选股：POST /api/login → cookie → 本站 AppShell（表单默认/回车触发）；
+// - ⚡ 登录 Quant iTransformer：同样 POST /api/login（ssc_session cookie 按 host 跨端口共享）
+//   → 成功后整页跳转 :9091，指挥塔凭同一 cookie 免登；
 // - 失败 → 行内错误文案（401 用户名或密码错误 / 429 锁定提示）；
 // - 样式自包含（.login-*），移动端 320px 可用。
 <script setup>
@@ -8,15 +11,21 @@ import { useAuthStore } from "../stores/authStore.js";
 const auth = useAuthStore();
 const form = reactive({ username: "", password: "" });
 const busy = ref(false);
+// 指挥塔端口（同 hostname，cookie 按 host 不按端口 → 跳转后免登）
+const quantUrl = "http://" + window.location.hostname + ":9091/";
 
-async function doLogin() {
+async function doLogin(target) {
   if (!form.username.trim() || !form.password) {
     auth.loginErr = "请输入用户名和密码";
     return;
   }
   busy.value = true;
   try {
-    await auth.login(form.username.trim(), form.password);
+    const ok = await auth.login(form.username.trim(), form.password);
+    if (ok && target === "quant") {
+      // cookie 已由 /api/login 写入浏览器 → 整页跳转，指挥塔免登
+      window.location.href = quantUrl;
+    }
   } finally {
     busy.value = false;
   }
@@ -25,9 +34,9 @@ async function doLogin() {
 
 <template>
   <div class="login-wrap">
-    <form class="login-card" @submit.prevent="doLogin">
-      <h1 class="login-title">📉 深回撤金字塔加仓策略</h1>
-      <p class="login-sub">A股深回撤加仓单策略 · 数据湖驱动 · 登录后查看</p>
+    <form class="login-card" @submit.prevent="doLogin('stock')">
+      <h1 class="login-title">📉⚡ 双系统统一登录</h1>
+      <p class="login-sub">A股4维选股 · Quant iTransformer · 同一账号密码，选择要进入的系统</p>
       <label class="login-field">
         <span>用户名</span>
         <input v-model="form.username" autocomplete="username" placeholder="admin" />
@@ -35,11 +44,14 @@ async function doLogin() {
       <label class="login-field">
         <span>密码</span>
         <input v-model="form.password" type="password" autocomplete="current-password"
-               placeholder="••••••••" @keyup.enter="doLogin" />
+               placeholder="••••••••" @keyup.enter="doLogin('stock')" />
       </label>
       <p v-if="auth.loginErr" class="login-err">{{ auth.loginErr }}</p>
-      <button type="submit" class="login-btn" :disabled="busy">
-        {{ busy ? "登录中…" : "登 录" }}
+      <button type="submit" class="login-btn login-btn-stock" :disabled="busy">
+        📉 {{ busy ? "登录中…" : "登录 A股4维选股" }}
+      </button>
+      <button type="button" class="login-btn login-btn-quant" :disabled="busy" @click="doLogin('quant')">
+        ⚡ {{ busy ? "登录中…" : "登录 Quant iTransformer" }}
       </button>
     </form>
   </div>
@@ -65,9 +77,13 @@ async function doLogin() {
 }
 .login-err { color: #b42318; font-size: 13px; margin: 0 0 10px; }
 .login-btn {
-  width: 100%; padding: 9px 0; font-size: 14px; letter-spacing: 4px;
-  border: none; border-radius: 8px; background: #14783c; color: #fff; cursor: pointer;
+  width: 100%; padding: 9px 0; font-size: 14px; letter-spacing: 2px;
+  border: none; border-radius: 8px; color: #fff; cursor: pointer;
 }
-.login-btn:hover:not(:disabled) { background: #0f5c2e; }
+.login-btn + .login-btn { margin-top: 8px; }
+.login-btn-stock { background: #14783c; }
+.login-btn-stock:hover:not(:disabled) { background: #0f5c2e; }
+.login-btn-quant { background: #1a56db; }
+.login-btn-quant:hover:not(:disabled) { background: #1646b0; }
 .login-btn:disabled { opacity: 0.6; cursor: default; }
 </style>

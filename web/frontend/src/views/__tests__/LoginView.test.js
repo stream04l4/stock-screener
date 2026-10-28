@@ -2,9 +2,9 @@
 //
 // mock 点：api client（零网络）。流程契约：
 // - 启动 → GET /api/auth/me：401 → 渲染登录页；200 → 直进 AppShell；
-// - 登录提交 → POST /api/login：成功 → 系统选择页（共享登录双系统入口）→
-//   选「A股4维选股」→ AppShell 挂载 + taskStore.restore（/api/health）；
-//   失败 → 行内错误文案，停留登录页；
+// - 登录提交（表单默认/回车 = A股按钮）→ POST /api/login：成功 → AppShell 挂载
+//   + taskStore.restore（/api/health）；失败 → 行内错误文案，停留登录页；
+//   （Quant 按钮走同一 POST，成功后整页跳转 :9091，浏览器 E2E 覆盖）
 // - 运行中任意受保护 API 401 → client 发 auth:401 → 回登录页；
 // - 顶栏「退出」→ POST /api/logout → 回登录页。
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -45,7 +45,6 @@ function mockApi({ me = 401 } = {}) {
 
 const mk = () => mount(App, { attachTo: document.body, global: { plugins: [createPinia()] } });
 const isLogin = (w) => !!w.find(".login-card").exists();
-const isChoice = (w) => !!w.find(".choice-wrap").exists();
 const isShell = (w) => w.find(".topbar .brand").exists();
 
 beforeEach(() => {
@@ -54,12 +53,14 @@ beforeEach(() => {
 });
 
 describe("App 登录门禁", () => {
-  it("未登录（me 401）→ 登录页；加载态不渲染页签", async () => {
+  it("未登录（me 401）→ 登录页；双系统登录按钮在位；加载态不渲染页签", async () => {
     const w = mk();
     expect(isLogin(w)).toBe(false); // checked=false 加载中
     await flushPromises();
     expect(isLogin(w)).toBe(true);
-    expect(w.find(".login-card").text()).toContain("深回撤金字塔加仓策略");
+    expect(w.find(".login-title").text()).toContain("双系统统一登录");
+    expect(w.find(".login-btn-stock").exists()).toBe(true);
+    expect(w.find(".login-btn-quant").exists()).toBe(true);
     w.unmount();
   });
 
@@ -82,15 +83,9 @@ describe("App 登录门禁", () => {
     await flushPromises();
     expect(isLogin(w)).toBe(true);
     expect(w.find(".login-err").text()).toContain("用户名或密码错误");
-    // 成功
+    // 成功（A股按钮 = 表单提交）→ 直进主页
     await w.find('input[type="password"]').setValue("unit-test-only-pass");
     await w.find("form.login-card").trigger("submit");
-    await flushPromises();
-    // 登录成功 → 系统选择页（共享登录：A股4维选股 / Quant iTransformer）
-    expect(isChoice(w)).toBe(true);
-    expect(w.find(".choice-quant").text()).toContain("Quant iTransformer");
-    // 选「A股4维选股」→ 进主页
-    await w.find(".choice-stock").trigger("click");
     await flushPromises();
     expect(isShell(w)).toBe(true);
     expect(w.find(".topbar-user").text()).toContain("admin");
