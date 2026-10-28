@@ -2,7 +2,8 @@
 //
 // mock 点：api client（零网络）。流程契约：
 // - 启动 → GET /api/auth/me：401 → 渲染登录页；200 → 直进 AppShell；
-// - 登录提交 → POST /api/login：成功 → AppShell 挂载 + taskStore.restore（/api/health）；
+// - 登录提交 → POST /api/login：成功 → 系统选择页（共享登录双系统入口）→
+//   选「A股4维选股」→ AppShell 挂载 + taskStore.restore（/api/health）；
 //   失败 → 行内错误文案，停留登录页；
 // - 运行中任意受保护 API 401 → client 发 auth:401 → 回登录页；
 // - 顶栏「退出」→ POST /api/logout → 回登录页。
@@ -44,6 +45,7 @@ function mockApi({ me = 401 } = {}) {
 
 const mk = () => mount(App, { attachTo: document.body, global: { plugins: [createPinia()] } });
 const isLogin = (w) => !!w.find(".login-card").exists();
+const isChoice = (w) => !!w.find(".choice-wrap").exists();
 const isShell = (w) => w.find(".topbar .brand").exists();
 
 beforeEach(() => {
@@ -83,6 +85,12 @@ describe("App 登录门禁", () => {
     // 成功
     await w.find('input[type="password"]').setValue("unit-test-only-pass");
     await w.find("form.login-card").trigger("submit");
+    await flushPromises();
+    // 登录成功 → 系统选择页（共享登录：A股4维选股 / Quant iTransformer）
+    expect(isChoice(w)).toBe(true);
+    expect(w.find(".choice-quant").text()).toContain("Quant iTransformer");
+    // 选「A股4维选股」→ 进主页
+    await w.find(".choice-stock").trigger("click");
     await flushPromises();
     expect(isShell(w)).toBe(true);
     expect(w.find(".topbar-user").text()).toContain("admin");

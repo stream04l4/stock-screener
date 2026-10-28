@@ -28,6 +28,9 @@ const auth = useAuthStore();
 async function doLogout() {
   await auth.logout();
 }
+
+// 共享登录跳转：Quant iTransformer 指挥塔（9091，同 hostname，cookie 跨端口生效）
+const quantUrl = "http://" + window.location.hostname + ":9091/";
 </script>
 
 <template>
@@ -38,6 +41,7 @@ async function doLogout() {
     </nav>
     <ToastBar />
     <div class="topbar-auth">
+      <a class="topbar-quant" title="进入 Quant iTransformer 指挥塔（9091，共享登录）" :href="quantUrl">⚡Quant</a>
       <span class="topbar-user">👤 {{ auth.user }}</span>
       <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
     </div>
@@ -61,6 +65,11 @@ async function doLogout() {
 
 <style scoped>
 .topbar-auth { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.topbar-quant {
+  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line, #d8d8e0);
+  border-radius: 6px; background: #fff; color: #1a56db; text-decoration: none;
+}
+.topbar-quant:hover { border-color: #1a56db; background: #f2f6ff; }
 .topbar-user { font-size: 12px; color: #666; }
 .topbar-logout {
   font-size: 12px; padding: 2px 10px; border: 1px solid var(--line, #d8d8e0);

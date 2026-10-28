@@ -11,12 +11,16 @@ export const useAuthStore = defineStore("auth", {
     user: null,   // 登录后的用户名；null = 未登录
     checked: false, // 启动探活完成前 App.vue 显示加载态
     loginErr: "",  // 登录失败文案（登录页显示）
+    // 刚完成登录动作 → 显示系统选择页（A股选股 / Quant iTransformer）；
+    // cookie 恢复（刷新/重进）不弹选择，直达控制台。
+    justLoggedIn: false,
   }),
   actions: {
     async check() {
       try {
         const d = await api("/api/auth/me");
         this.user = d.user;
+        this.justLoggedIn = false; // 会话恢复 ≠ 刚登录，不弹系统选择
       } catch {
         this.user = null;
       } finally {
@@ -31,6 +35,7 @@ export const useAuthStore = defineStore("auth", {
           body: JSON.stringify({ username, password }),
         });
         this.user = d.user;
+        this.justLoggedIn = true; // 登录成功 → App.vue 渲染系统选择页
         return true;
       } catch (e) {
         this.loginErr = String((e && e.message) || e);
@@ -41,7 +46,9 @@ export const useAuthStore = defineStore("auth", {
       try { await api("/api/logout", { method: "POST" }); } catch { /* 兜底：客户端照样退出 */ }
       this.user = null;
     },
+    // 登录成功后的系统选择页：选「A股选股」→ 关闭选择进控制台
+    dismissChoice() { this.justLoggedIn = false; },
     // 任何受保护 API 返回 401（会话过期/被踢）→ 回登录页
-    onUnauthorized() { this.user = null; },
+    onUnauthorized() { this.user = null; this.justLoggedIn = false; },
   },
 });

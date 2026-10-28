@@ -10,6 +10,7 @@
 import { onBeforeUnmount, onMounted, watch } from "vue";
 import AppShell from "./components/AppShell.vue";
 import LoginView from "./views/LoginView.vue";
+import SystemChoiceView from "./views/SystemChoiceView.vue";
 import { useAuthStore } from "./stores/authStore.js";
 import { useTaskStore } from "./stores/taskStore.js";
 
@@ -37,6 +38,7 @@ watch(() => auth.user, (u) => {
 <template>
   <div v-if="!auth.checked" class="auth-loading">加载中…</div>
   <LoginView v-else-if="!auth.user" />
+  <SystemChoiceView v-else-if="auth.justLoggedIn" />
   <AppShell v-else />
 </template>
 
