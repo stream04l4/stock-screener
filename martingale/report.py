@@ -138,7 +138,7 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
             A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {r['last_status']}, "
               f"最差浮亏 {float(r['min_unreal_pct']):.1%}")
             A("- 买入时间表:")
-            for bdate, bprice, bamt in buys_by_code.get(r["ts_code"], []):
+            for bdate, bprice, bamt, _bk, _bor in buys_by_code.get(r["ts_code"], []):
                 A(f"  - {bdate} @ {bprice:g} 买 {bamt:,.0f}")
     else:
         A("## Top / Bottom 10（按 pnl_pct，仅触发过的股票）")
@@ -180,7 +180,7 @@ def write_outputs(out_dir: str, sp, db_path: str, gdates: np.ndarray,
         w = csv.writer(f)
         w.writerow(["ts_code", "seq", "date", "price", "amount"])
         for c in sorted(buys_by_code):
-            for seq, (bdate, bprice, bamt) in enumerate(buys_by_code[c], start=1):
+            for seq, (bdate, bprice, bamt, _bk, _bor) in enumerate(buys_by_code[c], start=1):
                 w.writerow([c, seq, bdate, repr(float(bprice)), repr(float(bamt))])
 
     # equity_curve.csv

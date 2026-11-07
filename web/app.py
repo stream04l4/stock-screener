@@ -1034,10 +1034,12 @@ def get_timing() -> Dict[str, Any]:
     }
 
 
-def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:
+def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False) -> Dict[str, Dict[str, Any]]:
     """对 codes 逐股跑状态机 → {code: 持仓行}（/api/positions 与 /api/my_positions 共用）。
 
     end=YYYY-MM-DD 截窗口（含）；缺省跑到各股最新 bar。湖中无数据的代码不产出行。
+    include_buys=True 时行内附 buys（历史触发逐笔，v7.0.19 策略信号中心用；
+    5 元组 (date,price,amount,k,first_of_round) → 转为 dict 列表）。
     """
     from martingale.engine import load, run_stock
 
@@ -1081,6 +1083,21 @@ def _strategy_state_rows(sp, con, codes, end=None) -> Dict[str, Dict[str, Any]]:
             rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
         else:
             rows[c]["next_rearm_price_raw"] = None
+        if include_buys:
+            # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
+            # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」）
+            rows[c]["buys"] = [
+                {"date": str(b[0])[:10], "price": b[1], "amount": b[2],
+                 "level": b[3], "first_of_round": b[4]} for b in _buys
+            ]
+            # 首仓线（本周期 H×(1−first_drawdown) 的原始口径）：策略信号中心对
+            # **非持仓**股用它作触发价——未持仓用户可执行的信号是首仓，而非
+            # 模拟已买入的 next 档（模拟 in_pos/k 仅作参考展示）
+            if float(state["entry_high"]) > 0:
+                rows[c]["first_level_raw"] = round(
+                    sp.level_price(state["entry_high"], 0) / f, 4)
+            else:
+                rows[c]["first_level_raw"] = None
     return rows
 
 
@@ -1248,6 +1265,161 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
             "cost": round(tot_cost, 2),
             "pnl": round(tot_mv - tot_cost, 2) if has_price else None,
             "pnl_pct": round((tot_mv - tot_cost) / tot_cost * 100.0, 2) if (has_price and tot_cost > 0) else None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 策略信号中心（v7.0.19）：当前信号 / 即将进入信号区 / 历史信号 + 持仓·非持仓
+# ---------------------------------------------------------------------------
+@app.get("/api/strategy_signals")
+def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
+    """策略信号中心（Joel 2026-11-07：我的持仓页新增信号模块）。
+
+    对 **股票池 ∪ 我的持仓** 逐股给「现价 vs 下一档触发价」的完整状态：
+    - status: active（当前信号，现价 ≤ 触发价）/ approaching（即将进入信号区，
+      触发价上方 approach_pct% 带内）/ idle（远离）/ no_data（无价或无触发价）；
+    - held = 在用户账本（持仓），否则非持仓（池内非持仓股同样有策略参考——
+      状态机不挑池）；触发价口径：按 in_pos 分支（与 held 无关）——
+      in_pos（模拟持仓已建立）= 模拟周期 next 档（next_add_price_raw，加仓
+      第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
+      （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
+      动作恒为买入·首仓、金额 initial_amount）。
+    - history = 状态机历史触发逐笔（buys：日期/触发价/档位金额/档下标/是否本轮
+      首笔）全池汇总，日期降序（同日同股按档位先后）；
+    - strategy / 价源 / 湖降级语义与 /api/my_positions 一致；分类走
+      martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
+      同一单一定义点，防口径漂移）。
+    """
+    from martingale.signals import DEFAULT_APPROACH_PCT, classify_signal
+
+    strategy_name = (strategy or "current").strip() or "current"
+    cfg_path: Optional[str] = None
+    if strategy_name != "current":
+        cfg_file = _strategy_path(_sanitize_strategy_name(strategy_name))
+        if not cfg_file.is_file():
+            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy_name})
+        cfg_path = str(cfg_file)
+    user = _up_read()
+
+    from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
+
+    lake_locked = False
+    rows: Dict[str, Dict[str, Any]] = {}
+    sp_obj = None
+    universe: List[str] = []
+    try:
+        _sp, _up, con, pool = _load_pool_ctx(cfg_path)
+        sp_obj = _sp
+        try:
+            universe = sorted(set(pool.codes) | set(user.keys()))
+            rows = _strategy_state_rows(_sp, con, universe, include_buys=True)
+        finally:
+            con.close()
+    except (LakeLocked, LakeMissing, LakeInvalidFile):
+        # 湖锁定/缺失 → 降级：只能列账本代码（无触发价 → 全部 no_data）
+        lake_locked = True
+        rows = {}
+        universe = sorted(user.keys())
+    if not universe:
+        return {"as_of": None, "strategy": strategy_name, "lake_locked": lake_locked,
+                "approach_pct": DEFAULT_APPROACH_PCT, "price_source": "lake",
+                "spot_time": None, "n_stocks": 0, "stocks": [], "history": [],
+                "totals": {"n_stocks": 0, "n_active": 0, "n_approaching": 0,
+                           "n_idle": 0, "n_no_data": 0, "n_active_held": 0,
+                           "n_active_unheld": 0, "n_history": 0}}
+    # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
+    # 只漏报不误报；湖中无数据的代码无触发价，直接 no_data，不必取行情）
+    spot: Dict[str, Dict[str, Any]] = {}
+    try:
+        from screener.data.tencent import TencentClient
+        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(
+            [c for c in universe if c in rows]) or {}
+    except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
+        spot = {}
+    price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
+    spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
+
+    stocks: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
+    n_active = n_appr = n_idle = n_nodata = n_act_held = n_act_unheld = 0
+    for c in universe:
+        held = c in user
+        r = rows.get(c)
+        price = (spot.get(c) or {}).get("price")
+        if price is None and r is not None:
+            price = r.get("last_price")
+        # 触发价口径（v7.0.19 定案）：按 in_pos 分支，与 held 无关——
+        # - in_pos（模拟持仓已建立）：模拟周期 next 档（next_add_price_raw），
+        #   动作 = 加仓第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线；
+        # - 未 in_pos（模拟尚未建仓）：首仓线（first_level_raw = 本周期
+        #   H×(1−first_drawdown)），动作 = 买入·首仓（金额 initial_amount）。
+        # 为什么非持仓股不能恒用首仓线：状态机自数据起点回放，老股的当前周期
+        # entry_high 可能锚在多年前高点（复权口径），周期一旦开始，首仓线即
+        # 远高于市价 → 恒假 active（幽灵信号）；此时可执行的只有 next 档。
+        in_pos = bool((r or {}).get("in_pos"))
+        trigger = ((r or {}).get("next_add_price_raw") if in_pos
+                   else (r or {}).get("first_level_raw"))
+        cls = classify_signal(price, trigger, in_pos,
+                              (r.get("k_level") or 0) if r else 0, sp_obj)
+        stocks.append({
+            "ts_code": c,
+            "name": (r or {}).get("name") or c,
+            "held": held,
+            "in_pos": (r or {}).get("in_pos"),
+            "k_level": (r or {}).get("k_level"),
+            "price": price,
+            "next_add_price_raw": trigger,
+            "status": cls["status"],
+            "distance_pct": cls["distance_pct"],
+            "action": cls["action"],
+            "suggested_amount": cls["suggested_amount"],
+            "n_history": len((r or {}).get("buys", [])),
+            "end_date": (r or {}).get("end_date"),
+        })
+        if cls["status"] == "active":
+            n_active += 1
+            if held:
+                n_act_held += 1
+            else:
+                n_act_unheld += 1
+        elif cls["status"] == "approaching":
+            n_appr += 1
+        elif cls["status"] == "idle":
+            n_idle += 1
+        else:
+            n_nodata += 1
+        for i, b in enumerate((r or {}).get("buys", [])):
+            history.append({
+                "ts_code": c, "name": (r or {}).get("name") or c, "held": held,
+                "date": b["date"], "price": b["price"], "amount": b["amount"],
+                "level": b["level"], "first_of_round": b["first_of_round"],
+                "_seq": i,
+            })
+    # 日期降序；稳定排序保留同日同股「档位先后」（先首仓后加仓）
+    history.sort(key=lambda h: (h["ts_code"], h["_seq"]))
+    history.sort(key=lambda h: h["date"], reverse=True)
+    for h in history:
+        del h["_seq"]
+    return {
+        "as_of": max((r["end_date"] for r in rows.values() if r.get("end_date")), default=None),
+        "strategy": strategy_name,
+        "lake_locked": lake_locked,
+        "approach_pct": DEFAULT_APPROACH_PCT,
+        "price_source": price_source,
+        "spot_time": spot_time,
+        "n_stocks": len(universe),
+        "stocks": stocks,
+        "history": history,
+        "totals": {
+            "n_stocks": len(universe),
+            "n_active": n_active,
+            "n_approaching": n_appr,
+            "n_idle": n_idle,
+            "n_no_data": n_nodata,
+            "n_active_held": n_act_held,
+            "n_active_unheld": n_act_unheld,
+            "n_history": len(history),
         },
     }
 

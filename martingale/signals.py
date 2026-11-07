@@ -17,6 +17,57 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+# 「即将进入信号区」显示阈值（百分数）：现价高于下一档触发价且在
+# trigger×(1+3%) 以内 → approaching。
+# **显示参数，非策略阈值**：不影响状态机任何决策/成交金额（schema 定案勿增删，
+# 不进 config/strategy.yaml、不进 Web 配置）——只决定股票出现在哪个展示分区。
+DEFAULT_APPROACH_PCT = 3.0
+
+
+def classify_signal(price: Optional[float], trigger: Optional[float],
+                    in_pos: Optional[bool], k_level: int, sp: Optional[Any] = None,
+                    approach_pct: float = DEFAULT_APPROACH_PCT) -> Dict[str, Any]:
+    """现价 vs 下一档触发价（原始口径）→ 四态分类（纯函数，零 I/O）。
+
+    状态（v7.0.19 策略信号中心口径，active 与 build_signals 逐字一致）：
+    - active:      price ≤ trigger（当前信号，已触线）
+    - approaching: trigger < price ≤ trigger×(1+approach_pct/100)（即将进入信号区）
+    - idle:        price 高于 approaching 带
+    - no_data:     price 或 trigger 缺失/非正（湖中无数据/价源不可用）
+
+    action/suggested_amount 对 active 与 approaching 均给出（即将触发的动作与
+    建议金额：in_pos→加仓 base×growth^k；未持仓→首仓 initial_amount）；
+    sp=None 时 suggested_amount=None（与 build_signals 缺省语义一致）。
+
+    :return: {status, action, suggested_amount, distance_pct}
+        distance_pct = (price−trigger)/trigger×100（active ≤ 0，
+        approaching ∈ (0, approach_pct]，2 位小数；no_data 为 None）
+    """
+    k = k_level or 0
+    if price is None or trigger is None or trigger <= 0:
+        return {"status": "no_data", "action": None, "suggested_amount": None,
+                "distance_pct": None}
+    if in_pos:
+        action = "add"
+        suggested = (sp.base_add_amount * (sp.growth_ratio ** k)) if sp is not None else None
+    else:
+        action = "buy"
+        suggested = sp.initial_amount if sp is not None else None
+    distance_pct = round((price - trigger) / trigger * 100.0, 2)
+    if price <= trigger:
+        status = "active"
+    elif price <= trigger * (1.0 + approach_pct / 100.0):
+        status = "approaching"
+    else:
+        status = "idle"
+    return {
+        "status": status,
+        "action": action if status in ("active", "approaching") else None,
+        "suggested_amount": round(suggested) if (
+            suggested is not None and status in ("active", "approaching")) else None,
+        "distance_pct": distance_pct,
+    }
+
 
 def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Dict[str, Any]]:
     """对 positions（含 spot_price/next_add_price_raw/in_pos/k_level）产信号列表。
@@ -33,24 +84,22 @@ def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Di
         if price_now is None:
             price_now = pos.get("last_price")
         nap_raw = pos.get("next_add_price_raw")
-        if not (price_now is not None and nap_raw is not None and price_now <= nap_raw):
+        # v7.0.19：判定收敛到 classify_signal（active 语义与旧内联判定逐字一致：
+        # price_now ≤ nap_raw 才触发；无价/无触发价 → no_data → 跳过）
+        c = classify_signal(price_now, nap_raw, pos.get("in_pos"),
+                            pos.get("k_level") or 0, sp)
+        if c["status"] != "active":
             continue
-        k = pos.get("k_level") or 0
-        if pos.get("in_pos"):
-            suggested = (sp.base_add_amount * (sp.growth_ratio ** k)) if sp is not None else None
-            action, next_level = "add", k + 1
-        else:
-            suggested = sp.initial_amount if sp is not None else None
-            action, next_level = "buy", 1
+        next_level = (pos.get("k_level") or 0) + 1
         signals.append({
             "ts_code": pos.get("ts_code"),
             "name": pos.get("name"),
             "price": price_now,
             "next_add_price": nap_raw,
-            "k_level": k,
+            "k_level": pos.get("k_level") or 0,
             "next_level": next_level,
-            "suggested_amount": round(suggested) if suggested is not None else None,
-            "action": action,
+            "suggested_amount": c["suggested_amount"],
+            "action": c["action"],
         })
     signals.sort(key=lambda x: x.get("ts_code") or "")
     return signals

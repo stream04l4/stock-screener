@@ -573,6 +573,15 @@ tr.lake-row-muted .badge { opacity: .85; }
 .tag-add { background: #ffcdd2; color: #b71c1c; }   /* 加仓：红 */
 .tag-sell { background: #c8e6c9; color: #1b5e20; }  /* 卖出：绿（与买入对色） */
 
+/* ---------- v7.0.19 策略信号中心（我的持仓页）：分段切换 ---------- */
+.sig-seg { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.sig-seg button {
+  padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line);
+  background: #fff; color: var(--text); font-size: 13px; cursor: pointer;
+}
+.sig-seg button:hover { border-color: #1565c0; color: #1565c0; }
+.sig-seg button.on { background: #1565c0; border-color: #1565c0; color: #fff; font-weight: 600; }
+
 /* ---------- v7.0.17 实盘交易历史（我的持仓弹层） ---------- */
 .trade-hist { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
 .trade-hist th, .trade-hist td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }

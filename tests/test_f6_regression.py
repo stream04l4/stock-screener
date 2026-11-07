@@ -87,8 +87,9 @@ def test_f6_buy_timeline(code, cfg, loaded):
     stat, buys = _run(cfg, loaded, code)
     fx_buys = _fixture_buys(code)
     assert stat["n_buys"] == len(fx_buys), (code, stat["n_buys"], len(fx_buys))
-    for (dt, price, amt), (f_dt, f_price, f_amt) in zip(buys, fx_buys):
+    for (dt, price, amt, _k, _for), (f_dt, f_price, f_amt) in zip(buys, fx_buys):
         assert dt == f_dt, (code, dt, f_dt)
         assert price == float(f_price), (code, dt, price, f_price)
         # summary 按整数千分位渲染（:,.0f）→ 金额按四舍五入对齐（float 幂次有 ulp 尾差）
+        # _k/_for = v7.0.19 新增档下标/本轮首笔标注，仅 Web 历史信号用，不参与 f6 对齐
         assert round(amt) == int(f_amt.replace(",", "")), (code, dt, amt, f_amt)

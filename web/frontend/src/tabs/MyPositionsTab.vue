@@ -35,6 +35,7 @@ const stratLabel = computed(() => stratSel.value === "current" ? "当前策略" 
 // 切换策略 → 失效缓存重拉（fetcher 闭包读 stratSel，带 ?strategy=）+ 记住选择
 watch(stratSel, (v) => {
   invalidate("my_positions");
+  invalidate("strategy_signals");
   try { localStorage.setItem(STRAT_LS_KEY, v); } catch { /* 隐私模式等：忽略 */ }
 });
 
@@ -48,7 +49,70 @@ const { data: myData, loading: myLoading, error: myError } =
 
 function refresh() {
   invalidate("my_positions");
+  invalidate("strategy_signals");
 }
+
+// ---------------------------------------------------------------------------
+// 策略信号中心（v7.0.19）：当前信号 / 即将进入信号区 / 历史信号 + 持仓·非持仓
+// 数据 = /api/strategy_signals（股票池 ∪ 我的持仓，口径与 /api/my_positions 同一
+// 定义点）；策略选择与顶部 stratSel 联动；分段切换（active/approaching/history）。
+// ---------------------------------------------------------------------------
+const sigSel = ref("active"); // active | approaching | history
+const { data: sigData, loading: sigLoading, error: sigError } =
+  useLiveQuery("strategy_signals",
+    () => api("/api/strategy_signals" + (stratSel.value !== "current"
+      ? "?strategy=" + encodeURIComponent(stratSel.value) : "")), {});
+
+const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
+const sigStocks = computed(() => sigData.value?.stocks || []);
+const sigActive = computed(() => sigStocks.value.filter((s) => s.status === "active"));
+const sigApproach = computed(() => sigStocks.value.filter((s) => s.status === "approaching"));
+const sigHistoryAll = computed(() => sigData.value?.history || []);
+const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
+
+// 档位标签：策略首笔（k=0 且本轮首买）=「首仓」，其余 =「第 N 档」（N=k+1）
+function levelLabel(level, firstOfRound) {
+  if (firstOfRound && level === 0) return "首仓";
+  return "第" + ((level ?? 0) + 1) + "档";
+}
+function fmtWan(v) {
+  if (v === null || v === undefined) return "—";
+  return (v / 10000).toFixed(1);
+}
+// 分段 → 展示行（预渲染标签列；SimpleTable 单元格为纯文本）
+const sigShown = computed(() => {
+  if (sigSel.value === "active") {
+    return sigActive.value.map((s) => ({ ...s,
+      status_tag: s.held ? "● 持仓" : "○ 非持仓",
+      action_label: s.action === "buy" ? "买入·首仓" : "加仓",
+      level_label: s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
+      amount_w: s.suggested_amount == null ? null : fmtWan(s.suggested_amount) }));
+  }
+  if (sigSel.value === "approaching") {
+    return sigApproach.value.map((s) => ({ ...s,
+      status_tag: s.held ? "● 持仓" : "○ 非持仓",
+      distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
+      level_label: s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）" }));
+  }
+  return sigHistory.value.map((h) => ({ ...h,
+    status_tag: h.held ? "● 持仓" : "○ 非持仓",
+    level_label: levelLabel(h.level, h.first_of_round),
+    amount_w: fmtWan(h.amount) }));
+});
+const SIG_ACTIVE_COLS = [
+  ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
+  ["price", "现价", true], ["next_add_price_raw", "触发价", true],
+  ["action_label", "动作"], ["level_label", "档位"], ["amount_w", "建议金额(万)", true],
+];
+const SIG_APPROACH_COLS = [
+  ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
+  ["price", "现价", true], ["next_add_price_raw", "触发价", true],
+  ["distance_s", "距触发", true], ["level_label", "档位"],
+];
+const SIG_HISTORY_COLS = [
+  ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
+  ["level_label", "档位"], ["price", "触发价", true], ["amount_w", "金额(万)", true],
+];
 
 // ---------------------------------------------------------------------------
 // 表格列
@@ -457,6 +521,39 @@ function pnlColor(v) {
         </div>
         <SimpleTable :rows="displayRows" :cols="MY_COLS"
                      empty="（尚未录入持仓——上方输入代码/股数/成本添加）" @row-click="onRow" />
+      </template>
+    </div>
+
+    <!-- 策略信号中心（v7.0.19）：当前信号 / 即将进入 / 历史信号 + 持仓·非持仓 -->
+    <div class="card">
+      <h3>📡 策略信号（{{ stratLabel }}）</h3>
+      <p class="muted small">
+        覆盖股票池 ∪ 我的持仓 · 信号区 = 下一档触发价 ·
+        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 3 }}% 以内
+        <span v-if="sigData?.price_source === 'spot'">
+          · 价源：实时行情{{ sigData.spot_time ? " " + sigData.spot_time : "" }}</span>
+        <span v-else-if="sigData">· 价源：最新收盘（T+1）</span>
+      </p>
+      <div v-if="sigData?.lake_locked" class="lake-backfill">
+        ⏳ 数据湖正被灌数进程占用——策略参考暂不可用（仅列账本代码）；灌数结束后刷新。
+      </div>
+      <div class="sig-seg">
+        <button :class="{ on: sigSel === 'active' }" @click="sigSel = 'active'">当前信号（{{ sigActive.length }}）</button>
+        <button :class="{ on: sigSel === 'approaching' }" @click="sigSel = 'approaching'">即将进入（{{ sigApproach.length }}）</button>
+        <button :class="{ on: sigSel === 'history' }" @click="sigSel = 'history'">历史信号（{{ sigHistoryAll.length }}）</button>
+      </div>
+      <p v-if="sigLoading && !sigData" class="placeholder">加载中…</p>
+      <p v-else-if="sigError && !sigData" class="msg-err">加载失败: {{ sigError.message }}</p>
+      <template v-else-if="sigData">
+        <SimpleTable v-if="sigSel !== 'history'" :rows="sigShown"
+                     :cols="sigSel === 'active' ? SIG_ACTIVE_COLS : SIG_APPROACH_COLS"
+                     empty="（无）" />
+        <template v-else>
+          <SimpleTable :rows="sigShown" :cols="SIG_HISTORY_COLS" empty="（历史无触发）" />
+          <p v-if="sigHistoryAll.length > SIG_HISTORY_CAP" class="muted small">
+            仅显示最近 {{ SIG_HISTORY_CAP }} 条
+          </p>
+        </template>
       </template>
     </div>
 

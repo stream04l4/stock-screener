@@ -65,8 +65,39 @@ const MY_BUY = {
 const MY_EMPTY = { as_of: null, n: 0, positions: [],
   totals: { market_value: 0, cost: 0, pnl: 0, pnl_pct: null } };
 
+// v7.0.19 策略信号中心 fixture：2 当前（持仓加仓 + 非持仓首仓）/ 1 即将进入 / 3 历史
+const SIG = {
+  as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 3,
+  price_source: "spot", spot_time: "20261107093000", n_stocks: 3,
+  stocks: [
+    { ts_code: "sh.601088", name: "中国神华", held: true, in_pos: true, k_level: 1,
+      price: 40.0, next_add_price_raw: 42.07, status: "active", distance_pct: -4.9,
+      action: "add", suggested_amount: 11000, n_history: 2, end_date: "2026-11-06" },
+    { ts_code: "sh.600941", name: "中国移动", held: false, in_pos: false, k_level: 0,
+      price: 70.0, next_add_price_raw: 72.36, status: "active", distance_pct: -3.26,
+      action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06" },
+    { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
+      price: 28.56, next_add_price_raw: 28.0, status: "approaching", distance_pct: 2.0,
+      action: "add", suggested_amount: 10000, n_history: 1, end_date: "2026-11-06" },
+  ],
+  history: [
+    { ts_code: "sh.601088", name: "中国神华", held: true, date: "2026-11-02",
+      price: 43.1, amount: 11000, level: 1, first_of_round: false },
+    { ts_code: "sh.601088", name: "中国神华", held: true, date: "2026-10-20",
+      price: 45.0, amount: 100000, level: 0, first_of_round: true },
+    { ts_code: "sh.600900", name: "长江电力", held: true, date: "2026-10-11",
+      price: 29.0, amount: 100000, level: 0, first_of_round: true },
+  ],
+  totals: { n_stocks: 3, n_active: 2, n_approaching: 1, n_idle: 0, n_no_data: 0,
+            n_active_held: 1, n_active_unheld: 1, n_history: 3 },
+};
+const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approach_pct: 3,
+  price_source: "lake", spot_time: null, n_stocks: 0, stocks: [], history: [],
+  totals: { n_stocks: 0, n_active: 0, n_approaching: 0, n_idle: 0, n_no_data: 0,
+            n_active_held: 0, n_active_unheld: 0, n_history: 0 } };
+
 function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }],
-                trades = []) {
+                trades = [], signals = SIG_EMPTY) {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path.startsWith("/api/my_positions") && (!opts || !opts.method || opts.method === "GET")) {
       return JSON.parse(JSON.stringify(my));
@@ -118,6 +149,9 @@ function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-2
     if (path === "/api/strategies") {
       return JSON.parse(JSON.stringify(strategies));
     }
+    if (path.startsWith("/api/strategy_signals")) {
+      return JSON.parse(JSON.stringify(signals));
+    }
     if (path.startsWith("/api/stocks/search")) {
       const q = decodeURIComponent((path.split("q=")[1] || "").trim());
       const SUG = {
@@ -151,6 +185,7 @@ beforeEach(() => {
   // registry 是模块级单例（会话缓存语义）→ 测试间必须清缓存，否则首个测试的
   // 数据（或空数据）会被后续测试的挂载直接命中。
   invalidate("my_positions");
+  invalidate("strategy_signals");
   localStorage.clear(); // 策略选择持久化 → 测试间隔离
   vi.stubGlobal("confirm", vi.fn(() => true));
 });
@@ -673,6 +708,77 @@ describe("MyPositionsTab · 弹层交易历史（v7.0.17）", () => {
     await flushPromises();
     expect(w.text()).toContain("暂无交易记录");
     expect(w.find(".trade-hist").exists()).toBe(false);
+    w.unmount();
+  });
+});
+
+describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
+  const STRATS = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }];
+
+  it("渲染卡片 + 三档分段计数 + 默认当前信号（持仓加仓/非持仓首仓 + 建议金额 + 价源）", async () => {
+    mockApi(MY, STRATS, [], SIG);
+    const w = mk();
+    await flushPromises();
+    // 卡片标题 + 覆盖说明 + 价源标注
+    expect(w.text()).toContain("📡 策略信号");
+    expect(w.text()).toContain("股票池 ∪ 我的持仓");
+    expect(w.text()).toContain("3% 以内"); // approach_pct
+    expect(w.text()).toContain("实时行情"); // price_source=spot
+    // 分段计数
+    expect(w.text()).toContain("当前信号（2）");
+    expect(w.text()).toContain("即将进入（1）");
+    expect(w.text()).toContain("历史信号（3）");
+    // 默认 active：持仓加仓（11000→1.1万）+ 非持仓首仓（100000→10.0万）
+    expect(w.text()).toContain("● 持仓");
+    expect(w.text()).toContain("○ 非持仓");
+    expect(w.text()).toContain("加仓");
+    expect(w.text()).toContain("买入·首仓");
+    expect(w.text()).toContain("1.1");
+    expect(w.text()).toContain("10.0");
+    w.unmount();
+  });
+
+  it("切「即将进入」显示距触发%；切「历史信号」按日期降序 + 档位标签（首仓/第N档）", async () => {
+    mockApi(MY, STRATS, [], SIG);
+    const w = mk();
+    await flushPromises();
+    const segBtns = () => w.findAll(".sig-seg button");
+    await segBtns()[1].trigger("click"); // 即将进入
+    await flushPromises();
+    expect(w.text()).toContain("2.0%"); // 距触发 distance_pct
+    expect(w.text()).toContain("长江电力"); // approaching 股在表内
+    await segBtns()[2].trigger("click"); // 历史信号
+    await flushPromises();
+    // 历史日期降序：2026-11-02 在前，2026-10-11 在后
+    const idx1102 = w.text().indexOf("2026-11-02");
+    const idx1011 = w.text().indexOf("2026-10-11");
+    expect(idx1102).toBeGreaterThanOrEqual(0);
+    expect(idx1011).toBeGreaterThanOrEqual(idx1102);
+    // 档位标签：首仓（first_of_round && level=0）+ 第2档（level=1）
+    expect(w.text()).toContain("首仓");
+    expect(w.text()).toContain("第2档");
+    w.unmount();
+  });
+
+  it("lake_locked 降级提示条（仅列账本）", async () => {
+    const locked = { ...JSON.parse(JSON.stringify(SIG)), lake_locked: true };
+    mockApi(MY, STRATS, [], locked);
+    const w = mk();
+    await flushPromises();
+    expect(w.text()).toContain("数据湖正被灌数进程占用");
+    w.unmount();
+  });
+
+  it("切换策略应用 → 带 ?strategy= 重拉信号数据", async () => {
+    mockApi(MY, STRATS, [], SIG);
+    const w = mk();
+    await flushPromises();
+    const before = apiMock.mock.calls.filter((c) => c[0].startsWith("/api/strategy_signals")).length;
+    await w.find(".strat-sel select").setValue("保守_低档");
+    await flushPromises();
+    const after = apiMock.mock.calls.filter((c) => c[0].startsWith("/api/strategy_signals"));
+    expect(after.length).toBeGreaterThan(before);
+    expect(after[after.length - 1][0]).toBe("/api/strategy_signals?strategy=" + encodeURIComponent("保守_低档"));
     w.unmount();
   });
 });

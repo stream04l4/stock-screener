@@ -132,8 +132,12 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
       为比率而非百分数；first/last_buy_date 为 datetime64[ns] 的 str，缺买为 ""）；
     - state: 当前持仓状态投影（status 子命令 / /api/positions 用）；
     - v_arr/c_arr/flag: 逐 bar 组合价值/成本/持仓标记；
-    - buys: [(date_str, price, amount), ...]（date_str = datetime64[ns] 的 str，
-      与 summary 买入时间表逐位一致）。
+    - buys: [(date_str, price, amount, k, first_of_round), ...]
+      （date_str = datetime64[ns] 的 str，price = 原始成交价，amount = 档位金额，
+      k = 该笔触发的档下标 0 起（买入前值，未含本笔 +1），first_of_round = 是否
+      本轮首笔（首仓/再武装后重启）。前 3 元与历史 3 元组逐位一致——v7.0.19 为
+      Web 策略信号「历史信号」补 k/first_of_round 标注，状态机计算零改动；
+      消费方 report.py 已同步解包，buys.csv 列不变（f6 基线不受影响）。）
     """
     n = len(sig)
     comm = p.commission  # 3bps 买入佣金（引擎常量）
@@ -153,7 +157,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     first_buy_i = -1
     last_buy_i = -1
     min_unreal_pct = 0.0
-    buys: List[Tuple[str, float, float]] = []
+    buys: List[Tuple[str, float, float, int, bool]] = []
 
     v_arr = np.zeros(n)
     c_arr = np.zeros(n)
@@ -262,7 +266,10 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                 n_rounds += 1
                 if first_buy_i < 0:
                     first_buy_i = i
-            buys.append((str(dates[i]), round(float(price), 3), float(buy_amt)))
+            # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
+            # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）
+            buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
+                         int(k_level), bool(first_of_round)))
             k_level += 1
         val = shares * price + cash_div
         if in_pos and open_cost > 0.0:
