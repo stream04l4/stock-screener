@@ -21,7 +21,9 @@
   lake/ 有意变更，基线前移；Joel 2026-10-26 确认）
   → 88cf6fc（v7.0.18：baostock 渠道完全移除，lake/ 有意变更，基线前移）
   → 6d0796f（v7.0.18.3：tester 缺陷 DEF-1/2 边界函数加固，lake/ingest 有意变更，
-  基线前移）。
+  基线前移）
+  → 7f7b2ba（v7.0.21：af_rebase 由 lake/ 提升至仓库根共享模块（martingale CLI
+  预对齐护栏需跨包调用；两包零 import 耦合不变），lake/ 有意变更，基线前移）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -40,7 +42,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # v7.0.18.4 DEF-4（5606358）：T6 季度新鲜度口径 + 季度重抓 cron，lake/web_api.py
 # 有意变更（_quarter_deadline/_expected_quarter_end + 季度表缺期判 lagging），基线前移。
-BASELINE = "5606358"
+# v7.0.21（7f7b2ba）：af_rebase 提升至仓库根共享模块（跨包护栏调用），基线前移。
+BASELINE = "7f7b2ba"
 
 
 def _git(*args) -> str:
