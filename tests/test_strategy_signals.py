@@ -10,7 +10,12 @@
   （in_pos=模拟 next 档；未 in_pos=首仓线）、**时机门**（非持仓股买入信号须
   timing.push_eligible；持仓股不受限）、**十年回测标注**（bt_pnl_pct/bt_n_buys）、
   history 仅近 90 天 + **微信推送标记**（代码|动作|档 前缀匹配去重态）、
-  湖锁定降级、strategy 库名 400、空 universe。
+  湖锁定降级、strategy 库名 400、空 universe；
+- **v7.0.20 盘中触碰**：最新行情日最低价已触线、现价回出 → status=touched
+  （保留当日，次日行情日滚动后移出）；停牌股（行情日≠全池最新）不算今日触碰；
+  触碰事件并入 history（同 代码|日期|档 去重 buy 优先、90 天窗口、文件缺失
+  fail-safe）；martingale.touches 纯函数（quote_date_of / compute_touches /
+  merge_events / dedupe_buys）。
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ import martingale.selection as sel_mod  # noqa: E402
 import martingale.timing as timing_mod  # noqa: E402
 from martingale.config import StrategyParams  # noqa: E402
 from martingale.engine import run_stock  # noqa: E402
+from martingale import touches as touches_mod  # noqa: E402
 from martingale.signals import (  # noqa: E402
     DEFAULT_APPROACH_PCT, build_signals, classify_signal,
 )
@@ -254,7 +260,7 @@ PUSHED_STATE = {"alerts": {"sh.600001|add|1|10.0":
 
 
 def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
-          tmap=TIMING, bmap=BMAP, pushed=PUSHED_STATE, lake_exc=None):
+          tmap=TIMING, bmap=BMAP, pushed=PUSHED_STATE, touch=None, lake_exc=None):
     monkeypatch.setattr(wapp, "_up_read", lambda: dict(user))
     monkeypatch.setattr(timing_mod, "load_timing_map", lambda con: dict(tmap))
     monkeypatch.setattr(sel_mod, "load_backtest_map", lambda con: dict(bmap))
@@ -263,6 +269,12 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
     p.write_text("{}" if pushed is None else json.dumps(pushed, ensure_ascii=False),
                  encoding="utf-8")
     monkeypatch.setattr(wapp, "PUSH_ALERT_STATE_PATH", p)
+    # 盘中触碰事件态（v7.0.20）→ 临时文件（touch=None 表示无事件，隔离真实
+    # data/alerts/signal_touch_state.json，测试 hermetic）
+    tp = tmp_path / "touch_state.json"
+    tp.write_text("{}" if touch is None else json.dumps(touch, ensure_ascii=False),
+                  encoding="utf-8")
+    monkeypatch.setattr(wapp, "TOUCH_STATE_PATH", tp)
 
     def _pool_ctx(cfg=None):
         return SP, None, SimpleNamespace(close=lambda: None), SimpleNamespace(codes=list(pool))
@@ -331,9 +343,9 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s5["timing_ok"] is False and s5["timing_reasons"] == "无时机数据"
 
     t = out["totals"]
-    assert t == {"n_stocks": 5, "n_active": 3, "n_approaching": 1, "n_idle": 0,
-                 "n_no_data": 1, "n_active_held": 1, "n_active_unheld": 2,
-                 "n_history": 3}
+    assert t == {"n_stocks": 5, "n_active": 3, "n_touched": 0, "n_approaching": 1,
+                 "n_idle": 0, "n_no_data": 1, "n_active_held": 1,
+                 "n_active_unheld": 2, "n_history": 3}
     # history：仅 90 天窗口内；日期降序；微信推送标记（甲股 add 第1档 已推）
     h = out["history"]
     assert [(x["date"], x["ts_code"]) for x in h] == [
@@ -457,3 +469,189 @@ def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):
     # 湖价 10.1 > 触发 10.0 但 +1%（3% 带内）→ approaching（非 active）
     assert by["sh.600001"]["price"] == 10.1
     assert by["sh.600001"]["status"] == "approaching"
+
+
+# ---------------------------------------------------------------------------
+# v7.0.20 盘中触碰（touched）
+# ---------------------------------------------------------------------------
+
+def test_strategy_signals_touch_current_retained(monkeypatch, tmp_path):
+    """盘中触线又反弹：600003 现价 30.6（+2% approaching）但当日最低 29.9 已摸过
+    触发线 30.0（行情日=全池最新）→ status=touched 保留在当前段，动作/金额按
+    active 口径补齐（持仓 in_pos k=0 → 加仓 1 万）。"""
+    spot = {**SPOT, "sh.600003": {"price": 30.6, "low": 29.9,
+                                  "timestamp": "20261107093000"}}
+    _wire(monkeypatch, tmp_path, spot=spot)
+    out = wapp.get_strategy_signals()
+    s3 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600003")
+    assert s3["status"] == "touched" and s3["touched"] is True
+    assert s3["day_low"] == 29.9
+    assert s3["action"] == "add" and s3["suggested_amount"] == 10000
+    assert s3["distance_pct"] == pytest.approx(2.0)  # 价格状态仍如实展示
+    t = out["totals"]
+    assert t["n_touched"] == 1 and t["n_approaching"] == 0 and t["n_active"] == 3
+
+
+def test_strategy_signals_touch_stale_quote_date_ignored(monkeypatch, tmp_path):
+    """停牌股行情停在旧日：day_low 是旧日数据，不得算「今日触碰」。
+    600003 行情日 11-06（全池最新 11-07）+ 旧日低 29.9 触线 → 不标 touched，
+    保持 approaching。"""
+    spot = {**SPOT, "sh.600003": {"price": 30.6, "low": 29.9,
+                                  "timestamp": "20261106150000"}}
+    _wire(monkeypatch, tmp_path, spot=spot)
+    out = wapp.get_strategy_signals()
+    s3 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600003")
+    assert s3["status"] == "approaching" and s3["touched"] is False
+    assert out["totals"]["n_touched"] == 0
+
+
+def test_strategy_signals_touch_unheld_timing_gate(monkeypatch, tmp_path):
+    """非持仓股触碰后仍受时机门约束：600004 未 in_pos，首仓线 40.0，现价 41.0
+    （+2.5% approaching）当日低 39.9 触线 → touched；时机未过 → 无动作；
+    时机过 → 动作补「买入」+ 首仓金额。"""
+    spot = {**SPOT, "sh.600004": {"price": 41.0, "low": 39.9,
+                                  "timestamp": "20261107093000"}}
+    _wire(monkeypatch, tmp_path, spot=spot)
+    out = wapp.get_strategy_signals()
+    s4 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600004")
+    assert s4["status"] == "touched" and s4["touched"] is True
+    assert s4["timing_ok"] is False
+    assert s4["action"] is None and s4["suggested_amount"] is None
+    # 时机过 → 放行（买入 + 首仓 10 万）
+    tmap_ok = dict(TIMING, **{"sh.600004": dict(TIMING["sh.600004"],
+                                                push_eligible=True)})
+    _wire(monkeypatch, tmp_path, spot=spot, tmap=tmap_ok)
+    out = wapp.get_strategy_signals()
+    s4 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600004")
+    assert s4["action"] == "buy" and s4["suggested_amount"] == 100000
+
+
+def test_strategy_signals_touch_history_merge_dedupe_window(monkeypatch, tmp_path):
+    """触碰事件并入历史：窗口内保留（source=touch）；同 (代码,日期,档) 与回放
+    buy 去重（buy 优先——600001 2026-10-20 第1档回放已记）；窗口外清掉。"""
+    touch = {"alerts": {
+        "sh.600002": {"ts_code": "sh.600002", "name": "乙股", "date": "2026-11-04",
+                      "level": 2, "first_of_round": False, "level_price": 19.5,
+                      "amount": 12100.0, "low_price": 19.4, "price": 20.0},
+        "sh.600001": {"ts_code": "sh.600001", "name": "甲股", "date": "2026-10-20",
+                      "level": 1, "first_of_round": False, "level_price": 10.0,
+                      "amount": 11000.0, "low_price": 9.98, "price": 10.1},
+        "sh.600003": {"ts_code": "sh.600003", "name": "丙股", "date": "2026-01-01",
+                      "level": 0, "first_of_round": True, "level_price": 31.0,
+                      "amount": 100000.0, "low_price": 30.9, "price": 31.5},
+    }}
+    _wire(monkeypatch, tmp_path, touch=touch)
+    out = wapp.get_strategy_signals()
+    h = out["history"]
+    assert [(x["ts_code"], x["date"]) for x in h] == [
+        ("sh.600002", "2026-11-04"),   # touch 事件（窗口内）
+        ("sh.600001", "2026-10-20"),   # 回放 buy（touch 同键被去重）
+        ("sh.600001", "2026-10-15"),   # 回放 buy
+        ("sh.600003", "2026-10-01"),   # 回放 buy（1-01 touch 窗口外被滤）
+    ]
+    assert h[0]["source"] == "touch"
+    assert h[0]["price"] == 19.5 and h[0]["level"] == 2 and h[0]["first_of_round"] is False
+    assert "source" not in h[1]  # buy 行无 source 字段
+    assert out["totals"]["n_history"] == 4
+
+
+def test_strategy_signals_touch_corrupt_file_ok(monkeypatch, tmp_path):
+    """触碰事件文件损坏 → 按无事件处理，不 500。"""
+    _wire(monkeypatch, tmp_path)
+    (tmp_path / "touch_state.json").write_text("{bad json", encoding="utf-8")
+    out = wapp.get_strategy_signals()
+    assert [(x["ts_code"], x["date"]) for x in out["history"]] == [
+        ("sh.600001", "2026-10-20"), ("sh.600001", "2026-10-15"),
+        ("sh.600003", "2026-10-01"),
+    ]  # 仅回放 buys，无 touch 行
+    assert out["totals"]["n_history"] == 3
+    assert all(x["touched"] is False for x in out["stocks"])
+
+
+# ---------------------------------------------------------------------------
+# martingale.touches 纯函数
+# ---------------------------------------------------------------------------
+
+def test_touches_quote_date_of():
+    assert touches_mod.quote_date_of("20261107093000") == "2026-11-07"
+    assert touches_mod.quote_date_of("20261107") == "2026-11-07"
+    assert touches_mod.quote_date_of(None) is None
+    assert touches_mod.quote_date_of("bad") is None
+    assert touches_mod.quote_date_of("202611071") is None
+
+
+def test_touches_compute_fail_closed_and_event_shape():
+    """无低/无触发线 → 不产事件（fail-closed）；事件档位/金额/首笔口径与
+    classify_signal 一致（in_pos → 加仓 base×growth^k；未 in_pos → 首仓）。"""
+    rows = {
+        "a": {"name": "A", "in_pos": True, "k_level": 1,
+              "next_add_price_raw": 10.0, "first_level_raw": 12.0},
+        "b": {"name": "B", "in_pos": False, "k_level": 0,
+              "next_add_price_raw": 35.0, "first_level_raw": 40.0},
+        "c": {"name": "C", "in_pos": True, "k_level": 0,
+              "next_add_price_raw": 30.0, "first_level_raw": 30.0},
+        "d": {"name": "D", "in_pos": None, "k_level": None,
+              "next_add_price_raw": None, "first_level_raw": None},
+    }
+    spot = {
+        "a": {"price": 10.5, "low": 9.9, "timestamp": "20261106150000"},
+        "b": {"price": 41.0, "low": 40.0, "timestamp": "20261106150000"},
+        "c": {"price": 31.0, "timestamp": "20261106150000"},  # 无 low
+        "d": {"price": 5.0, "low": 4.9, "timestamp": "20261106150000"},
+    }
+    evs = touches_mod.compute_touches(rows, spot, SP)
+    by = {e["ts_code"]: e for e in evs}
+    assert set(by) == {"a", "b"}
+    assert by["a"]["date"] == "2026-11-06" and by["a"]["level"] == 1
+    assert by["a"]["first_of_round"] is False
+    assert by["a"]["amount"] == round(10000.0 * 1.1)
+    assert by["b"]["level"] == 0 and by["b"]["first_of_round"] is True
+    assert by["b"]["amount"] == 100000 and by["b"]["low_price"] == 40.0
+
+
+def test_touches_merge_idempotent_and_window():
+    """同日重跑覆盖（幂等）；窗口外的老事件按全量最大日期清掉。"""
+    existing = {
+        "a": {"ts_code": "a", "date": "2026-01-01", "level": 0, "name": "A"},
+        "b": {"ts_code": "b", "date": "2026-10-01", "level": 0, "name": "B"},
+    }
+    new = [
+        {"ts_code": "a", "date": "2026-11-06", "level": 1, "name": "A"},
+        {"ts_code": "c", "date": "2026-11-06", "level": 0, "name": "C"},
+    ]
+    merged = touches_mod.merge_events(existing, new)
+    assert set(merged) == {"a", "b", "c"}
+    assert merged["a"]["date"] == "2026-11-06"  # 覆盖旧事件
+    # 最大日期 11-06 − 90 天 = 2026-08-08 → b(10-01) 在窗内保留
+    assert all(e["date"] >= "2026-08-08" for e in merged.values())
+    # 幂等：同一批再合并不变
+    assert touches_mod.merge_events(merged, new) == merged
+
+
+def test_touches_dedupe_buys_buy_wins():
+    h = [
+        {"ts_code": "a", "date": "2026-11-04", "level": 2, "source": "touch"},
+        {"ts_code": "a", "date": "2026-11-04", "level": 2, "source": "buy"},
+        {"ts_code": "a", "date": "2026-11-05", "level": 3, "source": "touch"},
+        {"ts_code": "b", "date": "2026-11-04", "level": 0},  # buy 行无 source
+    ]
+    out = touches_mod.dedupe_buys(h)
+    assert len(out) == 3
+    kept = {(x["ts_code"], x["date"], x["level"]): x.get("source") for x in out}
+    assert kept[("a", "2026-11-04", 2)] == "buy"  # 同键 buy 优先
+    assert kept[("a", "2026-11-05", 3)] == "touch"
+    assert kept[("b", "2026-11-04", 0)] is None
+
+
+def test_touches_load_state_fail_safe(tmp_path):
+    p = tmp_path / "nope.json"
+    assert touches_mod.load_state(str(p)) == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("{bad", encoding="utf-8")
+    assert touches_mod.load_state(str(bad)) == {}
+    ok = tmp_path / "ok.json"
+    ok.write_text(json.dumps({"alerts": {"a": {"date": "2026-11-06"},
+                                         "b": "corrupt-value"}}),
+                  encoding="utf-8")
+    state = touches_mod.load_state(str(ok))
+    assert set(state) == {"a"}  # 非 dict 值被过滤

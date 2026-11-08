@@ -9,7 +9,8 @@ BaoStock 不复权 close af=3）。
 - **响应 GBK 编码，必须 .decode('gbk')**；无需特殊请求头。
 - 每只一行 ``v_sh600519="f0~f1~...";``，字段以 ~ 分隔（共 88 个）。
 - 关键字段下标（0-based）：[1]名称 [2]代码 [3]最新价 [30]时间戳
-  [32]涨跌幅% [38]换手率% [39]PE(TTM) [44]流通市值(亿) [45]总市值(亿) [46]PB。
+  [32]涨跌幅% [33]当日最高 [34]当日最低 [38]换手率% [39]PE(TTM)
+  [44]流通市值(亿) [45]总市值(亿) [46]PB。
 """
 from __future__ import annotations
 
@@ -30,6 +31,8 @@ IDX_CODE = 2
 IDX_PRICE = 3
 IDX_TIMESTAMP = 30
 IDX_PCT_CHG = 32
+IDX_HIGH = 33     # 当日最高（v7.0.20：盘中触碰信号判定源，2026-11-08 实测确认）
+IDX_LOW = 34      # 当日最低
 IDX_TURNOVER = 38
 IDX_PE_TTM = 39
 IDX_FLOAT_MV = 44   # 亿元
@@ -57,8 +60,10 @@ class TencentClient:
         """批量取行情快照。
 
         :param codes: BaoStock 格式代码列表（sh.601398）
-        :return: {bs_code: {name, price, timestamp, pct_chg, turnover, pe_ttm,
-                            float_mv_yi, total_mv_yi, pb}}；未返回的 code 不在结果里。
+        :return: {bs_code: {name, price, high, low, timestamp, pct_chg, turnover,
+                            pe_ttm, float_mv_yi, total_mv_yi, pb, ttm_yield_pct}}；
+                 未返回的 code 不在结果里。high/low = **最新行情日**的当日高/低
+                 （盘后 = 全天；停牌日 = 停牌前最后交易日，由消费方按 timestamp 判断）。
         """
         out: Dict[str, Dict[str, Optional[float]]] = {}
         for i in range(0, len(codes), batch_size):
@@ -109,6 +114,8 @@ class TencentClient:
             out[bs_code] = {
                 "name": f[IDX_NAME],
                 "price": _f(IDX_PRICE),
+                "high": _f(IDX_HIGH),
+                "low": _f(IDX_LOW),
                 "timestamp": f[IDX_TIMESTAMP],
                 "pct_chg": _f(IDX_PCT_CHG),
                 "turnover": _f(IDX_TURNOVER),

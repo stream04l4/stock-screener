@@ -54,6 +54,10 @@ USER_TRADES_PATH = PROJECT_ROOT / "data" / "my_trades.json"
 # 点位提醒微信推送去重状态（scripts/position_alert.py 原子写；信号中心只读，
 # 用于历史信号行标「已推送」）
 PUSH_ALERT_STATE_PATH = PROJECT_ROOT / "data" / "alerts" / "pushplus_alert_state.json"
+# 盘中触碰事件状态（scripts/signal_touch.py 收盘后（12:05 UTC / 北京 20:05，
+# lake-sync 灌完当日 bar 后）原子写；信号中心只读，
+# 历史信号 = 状态机回放 buys ∪ 触碰事件，同 代码|日期|档 去重，buy 优先）
+TOUCH_STATE_PATH = PROJECT_ROOT / "data" / "alerts" / "signal_touch_state.json"
 _TS_CODE_RE = re.compile(r"^[a-z]{2}\.\d{6}$")
 # v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
 BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
@@ -1040,68 +1044,11 @@ def get_timing() -> Dict[str, Any]:
 def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False) -> Dict[str, Dict[str, Any]]:
     """对 codes 逐股跑状态机 → {code: 持仓行}（/api/positions 与 /api/my_positions 共用）。
 
-    end=YYYY-MM-DD 截窗口（含）；缺省跑到各股最新 bar。湖中无数据的代码不产出行。
-    include_buys=True 时行内附 buys（历史触发逐笔，v7.0.19 策略信号中心用；
-    5 元组 (date,price,amount,k,first_of_round) → 转为 dict 列表）。
+    v7.0.20：实现下沉至 martingale.engine.state_rows（scripts/signal_touch.py 共用
+    同一口径）——此处保留别名，调用方/测试 monkeypatch 不变。
     """
-    from martingale.engine import load, run_stock
-
-    names, data, divs = load(con, codes=list(codes), start=None, end=end)
-    rows: Dict[str, Dict[str, Any]] = {}
-    for c in codes:
-        series = data.get(c)
-        if not series or len(series[0]) < 2:
-            continue
-        dates, sig, exec_c = series
-        _stat, state, _v, _c, _f, _buys = run_stock(
-            c, dates, sig, exec_c, divs.get(c), sp, verbose=False)
-        rows[c] = {
-            "ts_code": c,
-            "name": names.get(c, ""),
-            "in_pos": bool(state["in_pos"]),
-            "shares": round(float(state["shares"]), 2),
-            "avg_cost": round(float(state["avg_cost"]), 4),
-            "last_price": float(state["last_price"]),
-            "market_value": round(float(state["market_value"]), 2),
-            "cash_div": round(float(state["cash_div"]), 2),
-            "unreal_pct": round(float(state["unreal_pct"]) * 100.0, 2),
-            "k_level": int(state["k_level"]),
-            "entry_high": float(state["entry_high"]),
-            "low_since_high": float(state["low_since_high"]),
-            # 触发价原始口径（_raw）：引擎的 next_add/next_rearm 基于 hfq 信号价，
-            # 而 last_price 是原始收盘——直接比较会因复权因子（分红股 F 可达数十倍）
-            # 产生假信号。raw = hfq / F，F = sig[-1]/exec_c[-1]（最新 bar 复权因子）。
-            "next_add_price": round(float(state["next_add_price"]), 4)
-                if state["next_add_price"] is not None else None,
-            "next_rearm_price": round(float(state["next_rearm_price"]), 4)
-                if state["next_rearm_price"] is not None else None,
-            "end_date": str(dates[-1])[:10],
-        }
-        f = float(sig[-1]) / float(exec_c[-1]) if float(exec_c[-1]) > 0 else 1.0
-        if rows[c]["next_add_price"] is not None:
-            rows[c]["next_add_price_raw"] = round(rows[c]["next_add_price"] / f, 4)
-        else:
-            rows[c]["next_add_price_raw"] = None
-        if rows[c]["next_rearm_price"] is not None:
-            rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
-        else:
-            rows[c]["next_rearm_price_raw"] = None
-        if include_buys:
-            # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
-            # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」）
-            rows[c]["buys"] = [
-                {"date": str(b[0])[:10], "price": b[1], "amount": b[2],
-                 "level": b[3], "first_of_round": b[4]} for b in _buys
-            ]
-            # 首仓线（本周期 H×(1−first_drawdown) 的原始口径）：策略信号中心对
-            # **非持仓**股用它作触发价——未持仓用户可执行的信号是首仓，而非
-            # 模拟已买入的 next 档（模拟 in_pos/k 仅作参考展示）
-            if float(state["entry_high"]) > 0:
-                rows[c]["first_level_raw"] = round(
-                    sp.level_price(state["entry_high"], 0) / f, 4)
-            else:
-                rows[c]["first_level_raw"] = None
-    return rows
+    from martingale.engine import state_rows
+    return state_rows(sp, con, codes, end=end, include_buys=include_buys)
 
 
 @app.get("/api/positions")
@@ -1313,8 +1260,16 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     """策略信号中心（Joel 2026-11-07：我的持仓页新增信号模块）。
 
     对 **股票池 ∪ 我的持仓** 逐股给「现价 vs 下一档触发价」的完整状态：
-    - status: active（当前信号，现价 ≤ 触发价）/ approaching（即将进入信号区，
-      触发价上方 approach_pct% 带内）/ idle（远离）/ no_data（无价或无触发价）；
+    - status: active（现价 ≤ 触发价）/ **touched（盘中触碰，v7.0.20：
+      最新行情日最低价已触线、现价回出信号区——信号今日已发生，行情日
+      滚动后自动移出，次日在 history 段可见）** / approaching（即将进入
+      信号区，触发价上方 approach_pct% 带内）/ idle（远离）/ no_data（无价或
+      无触发价）；status 是**价格状态事实**；**「当前信号」段的归属另由前端
+      约束（v7.0.20 Joel 2026-11-08 定案）= (active|touched) 且 (持仓 OR
+      in_pos=false)**——非持仓但模拟已建仓（in_pos=true）的股票触发价 = 模拟
+      加仓档（用户连建仓都未建），加仓信号不入当前信号；其盘中触碰事件仍由
+      收盘 job 落盘进 history 段。touched 行的动作/金额按 active 同口径补齐
+      （信号今日已发生）。
     - held = 在用户账本（持仓），否则非持仓（池内非持仓股同样有策略参考——
       状态机不挑池）；触发价口径：按 in_pos 分支（与 held 无关）——
       in_pos（模拟持仓已建立）= 模拟周期 next 档（next_add_price_raw，加仓
@@ -1332,10 +1287,15 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
       （10 年回测收益 %）/ bt_n_buys（回测触发档数），读 selection_backtest_10y；
       池外/无回测 → None。
     - history = 状态机历史触发逐笔（buys：日期/触发价/档位金额/档下标/是否本轮
-      首笔/是否已推送微信），**仅保留近 SIG_HISTORY_WINDOW_DAYS 日**（全量回放
-      历史自 2000 年起动辄数千笔，页面无用），日期降序（同日同股按档位先后）；
-      pushed = 该档「代码|动作|档」前缀命中 scripts/position_alert.py 的推送去重态
-      （data/alerts/pushplus_alert_state.json）→ 已推送过微信点位提醒。
+      首笔/是否已推送微信）∪ **盘中触碰事件（v7.0.20：scripts/signal_touch.py
+      收盘后（12:05 UTC / 北京 20:05，lake-sync 灌完当日 bar 后）判定「最新行情日
+      最低价≤触发线」落盘 data/alerts/
+      signal_touch_state.json，90 天滚动窗口）**，**仅保留近 SIG_HISTORY_WINDOW_DAYS
+      日**（全量回放历史自 2000 年起动辄数千笔，页面无用），日期降序（同日同股
+      按档位先后，buy 行在 touch 行前）；同 (代码,日期,档) 去重 buy 优先（收盘
+      过线那天的触碰回放已记，不重复展示）；pushed = 该档「代码|动作|档」前缀
+      命中 scripts/position_alert.py 的推送去重态（data/alerts/
+      pushplus_alert_state.json）→ 已推送过微信点位提醒。
     - strategy / 价源 / 湖降级语义与 /api/my_positions 一致；分类走
       martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
       同一单一定义点，防口径漂移）。
@@ -1391,7 +1351,8 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         return {"as_of": None, "strategy": strategy_name, "lake_locked": lake_locked,
                 "approach_pct": DEFAULT_APPROACH_PCT, "price_source": "lake",
                 "spot_time": None, "n_stocks": 0, "stocks": [], "history": [],
-                "totals": {"n_stocks": 0, "n_active": 0, "n_approaching": 0,
+                "totals": {"n_stocks": 0, "n_active": 0, "n_touched": 0,
+                           "n_approaching": 0,
                            "n_idle": 0, "n_no_data": 0, "n_active_held": 0,
                            "n_active_unheld": 0, "n_history": 0}}
     # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
@@ -1405,6 +1366,12 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         spot = {}
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
+    # 最新行情日（v7.0.20 盘中触碰判定基准）：全池最大 quote_date——停牌股行情
+    # 停在旧日，day_low 是旧日数据，不得算「今日触碰」；只有行情日=最新日才算
+    from martingale import touches as _touches
+    quote_dates = [_touches.quote_date_of((v or {}).get("timestamp"))
+                   for v in spot.values()]
+    ref_quote_date = max((d for d in quote_dates if d), default=None)
 
     # 微信推送状态（scripts/position_alert.py 点位提醒去重态，原子替换写）→
     # 历史信号按「代码|动作|档下标」前缀匹配标「已推送」。读取失败按未推送
@@ -1416,6 +1383,9 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     except (OSError, ValueError):
         pushed_keys = set()
     pushed_pfx = {k.rsplit("|", 1)[0] + "|" for k in pushed_keys}
+    # 盘中触碰事件（v7.0.20）：收盘 job（12:05 UTC / 北京 20:05）落盘的快照（只读；缺失/损坏 → 无
+    # 事件，不影响主流程）→ 合并进历史信号（同 代码|日期|档 去重，buy 优先）
+    touch_state = _touches.load_state(str(TOUCH_STATE_PATH))
     # 历史信号保留窗口：近 N 日（Joel 2026-11-07 定案——不展示状态机自 2000
     # 年起的全量回放历史，只留近期可核对的触发记录）
     hist_cutoff: Optional[str] = None
@@ -1425,7 +1395,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
 
     stocks: List[Dict[str, Any]] = []
     history: List[Dict[str, Any]] = []
-    n_active = n_appr = n_idle = n_nodata = n_act_held = n_act_unheld = 0
+    n_active = n_appr = n_idle = n_nodata = n_act_held = n_act_unheld = n_touched = 0
     for c in universe:
         held = c in user
         r = rows.get(c)
@@ -1443,8 +1413,17 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         in_pos = bool((r or {}).get("in_pos"))
         trigger = ((r or {}).get("next_add_price_raw") if in_pos
                    else (r or {}).get("first_level_raw"))
-        cls = classify_signal(price, trigger, in_pos,
-                              (r.get("k_level") or 0) if r else 0, sp_obj)
+        k = (r.get("k_level") or 0) if r else 0
+        cls = classify_signal(price, trigger, in_pos, k, sp_obj)
+        # 盘中触碰（v7.0.20，Joel 2026-11-08：「盘中达成信号又涨回出区的，保留
+        # 到当日，第二天移入历史信号」）：最新行情日最低价已触线、现价回出信号区
+        # → 信号今日已发生，保留在当前段（status=touched）；行情日滚动后自动
+        # 移出（收盘 job 已把事件落盘 → 次日在历史段可见）
+        q = spot.get(c) or {}
+        day_low = q.get("low")
+        touched = (trigger is not None and day_low is not None
+                   and _touches.quote_date_of(q.get("timestamp")) == ref_quote_date
+                   and day_low <= trigger and cls["status"] != "active")
         # 时机门（Joel 2026-11-07 定案）：非持仓股的买入信号须先过策略选股
         # 时机提醒口径（①价格分位 且 ②股息率，③启用时叠加；selection_timing
         # 预计算快照，O(1)）——到买入时机才给买入信号；持仓股不受时机限制
@@ -1460,6 +1439,15 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
         suggested = cls["suggested_amount"]
+        if touched and action is None and sp_obj is not None:
+            # 已触回（现价已高于触发线 → cls 无动作）：信号今日已发生，动作/
+            # 金额按 active 同口径补齐（in_pos=加仓 base×growth^k；否则首仓）
+            if in_pos:
+                action = "add"
+                suggested = round(sp_obj.base_add_amount * (sp_obj.growth_ratio ** k))
+            else:
+                action = "buy"
+                suggested = sp_obj.initial_amount
         if not held:
             # 非持仓股的动作统一为「买入」（next 档对非持仓用户是加入策略的
             # 买入位，不是加仓）；时机门未过 → 无动作（价格状态照展示）
@@ -1468,6 +1456,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             if timing_ok is not True:
                 action = None
                 suggested = None
+        status = "touched" if touched else cls["status"]
         bt = bmap.get(c) or {}
         stocks.append({
             "ts_code": c,
@@ -1477,7 +1466,10 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             "k_level": (r or {}).get("k_level"),
             "price": price,
             "next_add_price_raw": trigger,
-            "status": cls["status"],
+            "status": status,
+            "touched": touched,
+            "day_low": (round(float(day_low), 4)
+                        if day_low is not None else None),
             "distance_pct": cls["distance_pct"],
             "action": action,
             "suggested_amount": suggested,
@@ -1496,6 +1488,8 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
                 n_act_held += 1
             else:
                 n_act_unheld += 1
+        elif touched:
+            n_touched += 1
         elif cls["status"] == "approaching":
             n_appr += 1
         elif cls["status"] == "idle":
@@ -1514,6 +1508,25 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
                 "pushed": f"{c}|{baction}|{b['level']}|" in pushed_pfx,
                 "_seq": i,
             })
+    # 盘中触碰事件（v7.0.20）：收盘 job（12:05 UTC）落盘快照 → 并入历史信号
+    # （90 天窗口同口径；同 代码|日期|档 与回放 buys 去重——收盘过线那天的
+    # 触碰回放已记，buy 优先不重复展示；_seq 大值保证同日 buy 行在前）
+    tseq = 0
+    for tc in sorted(touch_state, key=lambda x: str(touch_state[x].get("date") or "")):
+        ev = touch_state[tc]
+        d = ev.get("date")
+        if not d or tc not in universe or (hist_cutoff is not None and d < hist_cutoff):
+            continue
+        ev_action = "buy" if ev.get("first_of_round") else "add"
+        history.append({
+            "ts_code": tc, "name": ev.get("name") or tc, "held": tc in user,
+            "date": d, "price": ev.get("level_price"), "amount": ev.get("amount"),
+            "level": ev.get("level"), "first_of_round": bool(ev.get("first_of_round")),
+            "pushed": f"{tc}|{ev_action}|{ev.get('level')}|" in pushed_pfx,
+            "source": "touch", "_seq": 10 ** 6 + tseq,
+        })
+        tseq += 1
+    history = _touches.dedupe_buys(history)
     # 日期降序；稳定排序保留同日同股「档位先后」（先首仓后加仓）
     history.sort(key=lambda h: (h["ts_code"], h["_seq"]))
     history.sort(key=lambda h: h["date"], reverse=True)
@@ -1533,6 +1546,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         "totals": {
             "n_stocks": len(universe),
             "n_active": n_active,
+            "n_touched": n_touched,
             "n_approaching": n_appr,
             "n_idle": n_idle,
             "n_no_data": n_nodata,

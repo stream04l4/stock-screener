@@ -1,4 +1,4 @@
-# stock-screener · v7.0.19（drawdown_martingale 单策略版）
+# stock-screener · v7.0.20（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -226,7 +226,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.19）
+## 10. 近期版本（v7.0.11 → v7.0.20）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -261,3 +261,26 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
   与微信提醒同口径；触发价按 in_pos 分支：in_pos=模拟 next 档，未 in_pos=
   首仓线——老股 entry_high 锚点会致非持仓误报）；状态机 buys 元组 3→5 元
   （追加 k 档下标 + first_of_round，前 3 元逐位不变，f6 红线守护）。
+- **v7.0.20**：信号中心「盘中触碰保留」（Joel 2026-11-08：盘中达成信号又涨回
+  出区的，保留一段时间、第二天再移入历史信号）——
+  - **判定源**：腾讯行情新增当日最高/最低（`screener/data/tencent.py`
+    IDX_HIGH=33 / IDX_LOW=34，实测确认）；触碰 = **最新行情日最低价 ≤ 触发线**
+    （与 active 判定同向；停牌股行情停在旧日 → 不算「今日触碰」，须行情日=全池
+    最大行情日）。
+  - **当前信号** = 现价在区内 **或** 今日已触碰（`status=touched`「已触回」，
+    动作/金额按 active 同口径补齐；非持仓股仍受时机门约束）；新增「日内低」列；
+    行情日滚动后自动移出当前段。**段归属定案（Joel 2026-11-08 v2）**：当前信号
+    仅含 持仓股（加仓信号）+ 非持仓股的**买入信号**（in_pos=false → 触发线=
+    首仓线）——非持仓但模拟已建仓（in_pos=true）的股票触发线是模拟加仓档，连
+    建仓都未建，不入当前信号（前端过滤；其触碰事件仍落历史信号）。
+  - **历史信号** = 状态机回放 buys ∪ 触碰事件（同 代码|日期|档 去重，**回放
+    buy 优先**——收盘过线那天的触碰不重复记），同 90 天窗口。
+  - **事件落盘**：`scripts/signal_touch.py` 每交易日 12:05 UTC（北京 20:05，
+    lake-sync 灌完当日 bar 后 → job 信号线与页面同口径）写
+    `data/alerts/signal_touch_state.json`（原子替换、90 天滚动、同日重跑幂等；
+    退出码 0=正常/2=配置错/3=湖不可用/4=行情失败，失败下轮重试不清状态）；
+    Web 端点只读，缺失/损坏按无事件（fail-safe）。
+  - 实现下沉：`_strategy_state_rows` → `martingale.engine.state_rows`（job 与
+    Web 共用单一口径防漂移）；`martingale/touches.py` 纯函数模块（compute_touches
+    / merge_events / dedupe_buys / quote_date_of）。状态机数学零改动（f6 红线
+    守护）；approach_pct 仍为纯显示参数。

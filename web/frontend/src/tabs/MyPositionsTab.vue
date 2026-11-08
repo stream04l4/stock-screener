@@ -65,7 +65,15 @@ const { data: sigData, loading: sigLoading, error: sigError } =
 
 const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
 const sigStocks = computed(() => sigData.value?.stocks || []);
-const sigActive = computed(() => sigStocks.value.filter((s) => s.status === "active"));
+// 当前信号 = active（现价在区内）+ touched（v7.0.20：今日已触线、现价回出——
+// 盘中达成过信号就保留到当日，次日行情日滚动后自动移出、移入历史段）
+// 且（v7.0.20 Joel 2026-11-08 定案）：仅含 持仓股（加仓信号）与非持仓股的
+// **买入信号**（in_pos=false → 触发线=首仓线）。非持仓但模拟已建仓（in_pos=true）
+// 的股票触发线是模拟加仓档——连建仓都未建，加仓信号不该出现在当前信号；
+// 其盘中触碰记录仍落「历史信号」（收盘 job 落盘事件）。
+const sigActive = computed(() => sigStocks.value.filter(
+  (s) => (s.status === "active" || s.status === "touched")
+         && (s.held || s.in_pos === false)));
 const sigApproach = computed(() => sigStocks.value.filter((s) => s.status === "approaching"));
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
@@ -100,10 +108,11 @@ function actionText(s) {
 const sigShown = computed(() => {
   if (sigSel.value === "active") {
     return sigActive.value.map((s) => ({ ...s,
-      status_tag: s.held ? "● 持仓" : "○ 非持仓",
+      status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
       level_label: s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
       amount_w: s.suggested_amount == null ? "—" : fmtWan(s.suggested_amount),
+      day_low_s: s.day_low == null ? "—" : String(s.day_low),
       bt_s: btText(s), timing_s: timingText(s) }));
   }
   if (sigSel.value === "approaching") {
@@ -122,6 +131,7 @@ const sigShown = computed(() => {
 const SIG_ACTIVE_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true], ["next_add_price_raw", "触发价", true],
+  ["day_low_s", "日内低", true],
   ["action_label", "动作"], ["level_label", "档位"], ["amount_w", "建议金额(万)", true],
   ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
@@ -553,6 +563,8 @@ function pnlColor(v) {
       <p class="muted small">
         覆盖股票池 ∪ 我的持仓 · 信号区 = 下一档触发价 ·
         「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 3 }}% 以内
+        · 当前 = 现价在区内 或 今日已触线（「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史）；
+        仅持仓加仓信号 + 非持仓买入信号（首仓线），非持仓模拟已建仓的加仓档不入当前信号（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（价格分位 且 股息率，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
         · 10年回测 = 策略十年回放

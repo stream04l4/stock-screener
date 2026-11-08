@@ -91,20 +91,24 @@ def test_no_stale_multifactor_references_in_tracked_files():
 # ---------------------------------------------------------------------------
 
 def test_crontab_only_lake_sync_business_line():
-    """stock-screener 的 crontab 业务行恰为 3 条（v7.0.18.4 起）：
+    """stock-screener 的 crontab 业务行恰为 4 条（v7.0.20 起）：
     lake-sync 每日增量（1-5 11:30 UTC）+ t1-delist 周频退市档（周日 11:30 UTC，
     tushare stock_basic D 单调用）+ t6 季度全市场重抓（9/11/5 月 5 日 11:30 UTC，
-    tester DEF-4：季度报告期披露截止日后补新期）。团队基础设施行——hermes
-    memory-backup/pipeline-watchdog——不属本项目，按路径过滤。"""
+    tester DEF-4：季度报告期披露截止日后补新期）+ signal-touch 盘中触碰落盘
+    （1-5 12:05 UTC 收盘后 = 北京 20:05，lake-sync 灌完当日 bar 后，
+    data/alerts/signal_touch_state.json，v7.0.20
+    Joel 定案「盘中达成信号保留到当日、次日移入历史」）。团队基础设施行——
+    hermes memory-backup/pipeline-watchdog——不属本项目，按路径过滤。"""
     r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("无 crontab 条目（非部署环境）")
     proj = [l for l in r.stdout.splitlines()
             if l.strip() and not l.strip().startswith("#") and "stock-screener" in l]
-    assert len(proj) == 3, f"stock-screener crontab 业务行应恰为 3（lake-sync + t1-delist + t6-quarterly），实际 {len(proj)}: {proj}"
+    assert len(proj) == 4, f"stock-screener crontab 业务行应恰为 4（lake-sync + t1-delist + t6-quarterly + signal-touch），实际 {len(proj)}: {proj}"
     assert any("run_lake_sync_daily.sh" in l for l in proj)
     assert any("run_t1_delist_weekly.sh" in l for l in proj)
     assert any("run_t6_quarterly.sh" in l for l in proj)
+    assert any("run_signal_touch_daily.sh" in l for l in proj)
     assert "run_cron" not in r.stdout, "crontab 不得含 run_cron（含注释外任何形态）"
 
 

@@ -28,7 +28,7 @@ f6 验收配置 = --ladder high --rearm bounce --rearm-pct 0.15 --exit none
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -342,3 +342,71 @@ def aggregate_into(gdates: np.ndarray, g_value: np.ndarray, g_cost: np.ndarray,
         g_value[gi[-1]:] += v_arr[-1]
         g_cost[gi[-1]:] += c_arr[-1]
         g_open[gi[-1]:] += flag[-1]
+
+
+def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
+               include_buys: bool = False) -> Dict[str, Dict[str, Any]]:
+    """对 codes 逐股跑状态机 → {code: 持仓行}（Web /api/positions、
+    /api/my_positions、/api/strategy_signals 与 scripts/signal_touch.py 共用——
+    单一口径，防漂移；v7.0.20 由 web/app.py._strategy_state_rows 下沉至此）。
+
+    end=YYYY-MM-DD 截窗口（含）；缺省跑到各股最新 bar。湖中无数据的代码不产出行。
+    include_buys=True 时行内附 buys（历史触发逐笔；5 元组 (date,price,amount,
+    k,first_of_round) → dict 列表）+ first_level_raw（非持仓股触发价口径）。
+    """
+    names, data, divs = load(con, codes=list(codes), start=None, end=end)
+    rows: Dict[str, Dict[str, Any]] = {}
+    for c in codes:
+        series = data.get(c)
+        if not series or len(series[0]) < 2:
+            continue
+        dates, sig, exec_c = series
+        _stat, state, _v, _c, _f, _buys = run_stock(
+            c, dates, sig, exec_c, divs.get(c), sp, verbose=False)
+        rows[c] = {
+            "ts_code": c,
+            "name": names.get(c, ""),
+            "in_pos": bool(state["in_pos"]),
+            "shares": round(float(state["shares"]), 2),
+            "avg_cost": round(float(state["avg_cost"]), 4),
+            "last_price": float(state["last_price"]),
+            "market_value": round(float(state["market_value"]), 2),
+            "cash_div": round(float(state["cash_div"]), 2),
+            "unreal_pct": round(float(state["unreal_pct"]) * 100.0, 2),
+            "k_level": int(state["k_level"]),
+            "entry_high": float(state["entry_high"]),
+            "low_since_high": float(state["low_since_high"]),
+            # 触发价原始口径（_raw）：引擎的 next_add/next_rearm 基于 hfq 信号价，
+            # 而 last_price 是原始收盘——直接比较会因复权因子（分红股 F 可达数十倍）
+            # 产生假信号。raw = hfq / F，F = sig[-1]/exec_c[-1]（最新 bar 复权因子）。
+            "next_add_price": round(float(state["next_add_price"]), 4)
+                if state["next_add_price"] is not None else None,
+            "next_rearm_price": round(float(state["next_rearm_price"]), 4)
+                if state["next_rearm_price"] is not None else None,
+            "end_date": str(dates[-1])[:10],
+        }
+        f = float(sig[-1]) / float(exec_c[-1]) if float(exec_c[-1]) > 0 else 1.0
+        if rows[c]["next_add_price"] is not None:
+            rows[c]["next_add_price_raw"] = round(rows[c]["next_add_price"] / f, 4)
+        else:
+            rows[c]["next_add_price_raw"] = None
+        if rows[c]["next_rearm_price"] is not None:
+            rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
+        else:
+            rows[c]["next_rearm_price_raw"] = None
+        if include_buys:
+            # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
+            # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」）
+            rows[c]["buys"] = [
+                {"date": str(b[0])[:10], "price": b[1], "amount": b[2],
+                 "level": b[3], "first_of_round": b[4]} for b in _buys
+            ]
+            # 首仓线（本周期 H×(1−first_drawdown) 的原始口径）：策略信号中心对
+            # **非持仓**股用它作触发价——未持仓用户可执行的信号是首仓，而非
+            # 模拟已买入的 next 档（模拟 in_pos/k 仅作参考展示）
+            if float(state["entry_high"]) > 0:
+                rows[c]["first_level_raw"] = round(
+                    sp.level_price(state["entry_high"], 0) / f, 4)
+            else:
+                rows[c]["first_level_raw"] = None
+    return rows
