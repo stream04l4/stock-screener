@@ -30,7 +30,29 @@ echo "[$(date -u +%FT%TZ)] 湖增量退出 rc=$RC（0=完成；非0=部分失败
 # v7.0.12：候选池选股预计算（基础池十年滚动回测 → selection_backtest_10y）。
 # 纯湖内计算零网络；增量持锁已结束，此处独占写连接安全。
 # 失败不阻断：Web 候选池 G7 读旧快照（fail-closed：缺行不入选），次日自动重算。
-timeout -k 30 600 .venv/bin/python -m martingale selection >> "$LOG" 2>&1
+# v7.0.21（2026-11-08）：湖进程退出瞬间锁可能未释放（今日实锤 selection/timing
+# 双双 Conflicting lock rc=1）→ 锁竞争时等待 5s 重试一次。
+run_step() {  # run_step <label> <timeout-s> <cmd...>
+  local label="$1" tmo="$2"; shift 2
+  local out rc i
+  for i in 1 2; do
+    out=$( { timeout -k 30 "$tmo" "$@"; } 2>&1 )
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '%s\n' "$out" >> "$LOG"; return 0
+    fi
+    if printf '%s' "$out" | grep -q "Conflicting lock"; then
+      echo "[$(date -u +%FT%TZ)] $label: DuckDB 锁竞争（湖进程未完全退出）→ 5s 后重试 ($i/1)"
+      sleep 5
+      continue
+    fi
+    printf '%s\n' "$out" >> "$LOG"
+    return "$rc"
+  done
+  return "$rc"
+}
+
+run_step "候选池选股" 600 .venv/bin/python -m martingale selection
 SRC=$?
 if [ "$SRC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] 候选池选股失败 rc=$SRC（Web 回退旧快照，日志见 $LOG 尾部）"
@@ -39,7 +61,7 @@ fi
 # v7.0.13：选股时机预计算 + 新触发微信提醒（候选池 ①价格分位 ②股息率 ③年线）。
 # 纯湖内计算零行情零配额；唯一外部调用 = PushPlus 推送（新触发才推）。
 # 失败不阻断：Web「今日选股」读旧快照（fail-closed），次日自动重算重推。
-timeout -k 30 300 .venv/bin/python -m martingale timing >> "$LOG" 2>&1
+run_step "选股时机" 300 .venv/bin/python -m martingale timing
 TRC=$?
 if [ "$TRC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] 选股时机失败 rc=$TRC（Web 回退旧快照，日志见 $LOG 尾部）"

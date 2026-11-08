@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""test_af_rebase —— v7.0.16 adj_factor 基准对齐（lake.af_rebase）单元测试。
+"""test_af_rebase —— v7.0.16 adj_factor 基准对齐（af_rebase，v7.0.21 提升至根模块）单元测试。
 
 背景：sh.600018 上港集团 5 年分位=0.5% 假信号（2026-10-26）。多源池逐日换源，
 各适配器 af 是源私有归一化 → 换源日假断崖 → hfq/qfq view 断步。af_rebase 把
@@ -54,7 +54,7 @@ def hfq_series(con, ts_code):
 
 def assert_hfq_continuous(con, ts_code, max_step=0.02):
     """断步消除后：非事件日 hfq 跳变 ≈ raw 跳变；事件日（已知或大缺口）hfq 连续。"""
-    from lake.af_rebase import LARGE_DROP_RATIO
+    from af_rebase import LARGE_DROP_RATIO
     events = {str(d)[:10] for (d,) in con.execute(
         "SELECT DISTINCT ex_date FROM dividend_events WHERE ts_code=?",
         [ts_code]).fetchall()}
@@ -81,7 +81,7 @@ def assert_hfq_continuous(con, ts_code, max_step=0.02):
 # 1. 基准切换（无事件）：sh.600018 同构
 # ---------------------------------------------------------------------------
 def test_base_switch_no_event_rebased_and_idempotent(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     rows = [("2026-09-10", 5.50, 16.987), ("2026-09-14", 5.48, 16.987),
             ("2026-09-15", 5.47, 16.987),           # tencent 段末
             ("2026-09-16", 5.46, 1.747253),        # sina 段首（基准 ÷9.72）
@@ -104,7 +104,7 @@ def test_base_switch_no_event_rebased_and_idempotent(con):
 # 2. 已知除权日同源自洽（不触发——除权日 af_move=price_ratio 精确成立）
 # ---------------------------------------------------------------------------
 def test_known_dividend_same_source_unchanged(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     # 除息日 D=0.5：close 10.0→9.5；源 hfq 连续 ⇒ af 跳 10/9.5
     rows = [("2026-07-21", 10.0, 2.0), ("2026-07-22", 10.0, 2.0),
             ("2026-07-23", 9.5, 2.0 * 10.0 / 9.5), ("2026-07-24", 9.4, 2.0 * 10.0 / 9.5)]
@@ -119,7 +119,7 @@ def test_known_dividend_same_source_unchanged(con):
 # 3. 基准切换 + 除权日同一天（换算须吸收真实事件）
 # ---------------------------------------------------------------------------
 def test_base_switch_with_dividend(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     # A 段 C_A=10：af=10×G；B 段 C_B=1.7：af=1.7×G；除息日 10→9.5
     g1 = 10.0 / 9.5
     rows = [("2026-07-22", 10.0, 10.0),
@@ -140,7 +140,7 @@ def test_base_switch_with_dividend(con):
 # 4. 同源代码波动不误报（大涨日 af 恒定；大缺口日双假设都不偏离才放行）
 # ---------------------------------------------------------------------------
 def test_large_price_moves_same_source_unchanged(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     # +10% 日（无事件、af 恒定）
     add_rows(con, "sh.600015", [("2026-01-05", 10.0, 5.0),
                                 ("2026-01-06", 11.0, 5.0)])
@@ -155,7 +155,7 @@ def test_large_price_moves_same_source_unchanged(con):
 # 5. 同源窗口重锚定（sh.600340 真实模式：sina→sina af 单日 ×3.448）
 # ---------------------------------------------------------------------------
 def test_same_source_reanchor_caught(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     rows = [("2026-10-14", 6.1, 5.0), ("2026-10-15", 6.0, 5.0),
             ("2026-10-16", 6.0, 5.0 * 3.448),      # 重锚定
             ("2026-10-17", 6.0, 5.0 * 3.448 * 0.290)]  # 再次重锚回（≈5.0）
@@ -171,7 +171,7 @@ def test_same_source_reanchor_caught(con):
 # 6. 基准切换 + 无记录送转（suspected 事件公式）
 # ---------------------------------------------------------------------------
 def test_base_switch_with_unrecorded_event(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     # 10 送 10（分红表无记录）：close 10→5，真实 G(d1)=2。
     # C_A=10、C_B=2.5：af(d0)=10×1=10.0，af(d1)=2.5×2=5.0
     # price_ratio=2.0（≥1.08→suspected）；af_move=0.5 → 双假设均偏离 → 触发
@@ -189,7 +189,7 @@ def test_base_switch_with_unrecorded_event(con):
 # 7. find_spurious_jumps 全市场扫描（多股合成库）
 # ---------------------------------------------------------------------------
 def test_find_spurious_jumps(con):
-    from lake.af_rebase import find_spurious_jumps
+    from af_rebase import find_spurious_jumps
     add_rows(con, "sh.000001", [("2026-10-20", 10.0, 3.0),
                                 ("2026-10-21", 10.1, 0.3)])   # 假跳变
     add_rows(con, "sh.000002", [("2026-10-20", 10.0, 3.0),
@@ -203,7 +203,7 @@ def test_find_spurious_jumps(con):
 # 8. qfq view 端到端：600018 复刻——修复前 -90% 假跌，修复后连续
 # ---------------------------------------------------------------------------
 def test_qfq_view_continuity_600018_replica(con):
-    from lake.af_rebase import rebase_stock_af
+    from af_rebase import rebase_stock_af
     rows = [("2026-09-15", 5.47, 16.987161),
             ("2026-09-16", 5.46, 1.747253),
             ("2026-09-17", 5.44, 1.747253)]

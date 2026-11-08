@@ -1,4 +1,10 @@
-"""lake.af_rebase —— adj_factor 基准对齐（v7.0.16）。
+"""af_rebase —— adj_factor 基准对齐（v7.0.16；v7.0.21 提升至仓库根共享模块）。
+
+模块位置说明：原 `lake/af_rebase.py`。因 `martingale` 包（timing/selection CLI
+预对齐护栏）也需调用本模块，而 test_lake_zero_import 断言两包零 import 耦合
+（lake↔martingale 平行、文件级解耦），故提升到仓库根成为共享模块：lake 与
+martingale 均可 import，互不依赖不变。纯 duckdb + stdlib，无 lake 包依赖。
+logger 名保留 "lake.af_rebase"（日志 grep 连续性）。
 
 背景（2026-10-26，sh.600018 上港集团 5 年分位=0.5% 假信号）：
 多源池（sina→tencent→tdx）按可用性**逐日**给每只股票选源（~2-10 只/天换源，

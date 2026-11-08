@@ -1464,7 +1464,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # 原值行（tushare 批量/t2 落库 af 原样语义）再归一化，破坏"原值落库"契约
     # （test_lake_v708_batch 2026-10-26 实锤）。失败不阻断增量（记痕，不静默）。
     try:
-        from lake.af_rebase import rebase_recent
+        from af_rebase import rebase_recent
         stats["af_rebase"] = rebase_recent(con, days=10)
     except Exception as exc:  # noqa: BLE001 - 对齐失败不阻断增量（记痕，不静默）
         log.error("incremental af 基准对齐失败（不阻断）: %s", exc)

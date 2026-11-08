@@ -1,4 +1,4 @@
-# stock-screener · v7.0.20（drawdown_martingale 单策略版）
+# stock-screener · v7.0.21（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -226,7 +226,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.20）
+## 10. 近期版本（v7.0.11 → v7.0.21）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -284,3 +284,15 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     Web 共用单一口径防漂移）；`martingale/touches.py` 纯函数模块（compute_touches
     / merge_events / dedupe_buys / quote_date_of）。状态机数学零改动（f6 红线
     守护）；approach_pct 仍为纯显示参数。
+- **v7.0.21**：af 基准假跳变防复发护栏（2026-11-08 大秦铁路 5 年分位 0.08%
+  假值复盘）——根因：11-04 tushare 批量超时 + sina 持续超时 → 多源池按可用性
+  换源 → **同一股票 af 序列中途换基准**（15% 假断崖；af 绝对尺度各源任意定义、
+  同股时间序列一致性才是不变量）→ qfq 断步 → 分位钉底。日增 `rebase_recent`
+  设计上次日才收口，窗口内跑的 timing/selection 快照会被污染。护栏：
+  - `martingale timing` / `selection` CLI 开跑前先执行同一幂等 `rebase_recent
+    (days=10)`（`_af_prealign`；命令本就持写连接；已对齐零写入、生产实测 +2s，
+    失败不阻断记痕）→ 快照恒基于已治愈序列（周末手动运维亦安全）；
+  - `run_lake_sync_daily.sh` selection/timing 步骤加 DuckDB 锁竞争重试（2026-11-08
+    实锤：湖进程退出瞬间锁未释放 → 两步 rc=1 回退旧快照）；
+  - 全市场核查：全史 `repair_all_af` 0 假跳变、无任何「qfq 分位钉底而 raw 正常」
+    异常股（残余最新 bar qfq≠raw 为无害恒定锚偏移，分位比较中自消）。

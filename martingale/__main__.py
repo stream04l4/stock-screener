@@ -178,6 +178,25 @@ def _cmd_pool(args) -> int:
     return 0
 
 
+def _af_prealign(con) -> None:
+    """af 基准预对齐护栏（v7.0.16 假跳变族，2026-11-08 大秦 0.08% 假分位复盘）。
+
+    selection/timing 在写连接上计算 10y 回测 / 5 年价格分位，均读 kline_daily_qfq
+    （=close×af/MAX(af)）。若最近一次湖增量换源写入了假基准跳变而尚未被
+    lake_backfill 前置对齐收口（日增 10 天窗口 + 次日才跑），本轮快照会被断步污染
+    （分位钉底 / 回测末日收益失真）。命令开跑前先做同一幂等对齐，保证快照恒基于
+    已治愈序列。已对齐时零写入（秒级）；失败不阻断（记痕，与 lake 日增同纪律）。
+    """
+    try:
+        from af_rebase import rebase_recent
+        rb = rebase_recent(con, days=10)
+        if rb.get("jump_pairs"):
+            print(f"af 预对齐：最近 10 天 {rb['stocks']} 股假基准跳变 → 已对齐"
+                  f"（{rb['rewritten']} 行改写）")
+    except Exception as exc:  # noqa: BLE001 - 对齐失败不阻断预计算（记痕，不静默）
+        print(f"警告: af 预对齐失败（不阻断，记痕）: {exc}", file=sys.stderr)
+
+
 def _cmd_selection(args) -> int:
     """候选池选股预计算：基础池逐股十年滚动回测 → 湖表 selection_backtest_10y。"""
     import duckdb
@@ -192,6 +211,7 @@ def _cmd_selection(args) -> int:
         return 3
     con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（与 Web 读并发安全窗口外）
     try:
+        _af_prealign(con)
         out = refresh_selection(con, sp, up, verbose=True)
     finally:
         con.close()
@@ -215,6 +235,7 @@ def _cmd_timing(args) -> int:
         return 3
     con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（同 selection 纪律）
     try:
+        _af_prealign(con)
         out = refresh_timing(con, up, tp, verbose=True)
         if args.no_push:
             res = {"n_new": None, "pushed": False, "error": None}
