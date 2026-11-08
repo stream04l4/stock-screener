@@ -1456,7 +1456,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             trow = tmap.get(c)
             timing_ok = bool((trow or {}).get("push_eligible"))
             # 逐条件 ✓/✗ 明细（含数值+阈值）：整体过/未过都列明哪条达成哪条未达
-            # （Joel 2026-11-08 定案；✓ 前缀 = push_eligible 总判定）
+            # （Joel 2026-11-08 定案；前端不再叠加总判定前缀，防 ✗✗ 误读）
             timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
         suggested = cls["suggested_amount"]

@@ -747,10 +747,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("买入·首仓");
     expect(w.text()).toContain("1.1");
     expect(w.text()).toContain("10.0");
-    // 时机门：逐条件 ✓/✗ 明细（整体过/未过都列明哪条达成哪条未达）；
+    // 时机门：逐条件 ✓/✗ 明细（无总判定前缀——全 ✓ 即过、任一 ✗ 即未过）；
     // 未过 → 时机未过（无动作/金额）
-    expect(w.text()).toContain("✓ ✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）");
-    expect(w.text()).toContain("✗ ✗ 5年分位 62.3%（需≤40%） · ✗ 股息率 2.10%（需≥4.5%）");
+    expect(w.text()).toContain("✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）");
+    expect(w.text()).toContain("✗ 5年分位 62.3%（需≤40%） · ✗ 股息率 2.10%（需≥4.5%）");
     expect(w.text()).toContain("时机未过");
     // 十年回测列：+88.5% · 6档（持仓神华）/ 无回测 → —
     expect(w.text()).toContain("+88.5% · 6档");

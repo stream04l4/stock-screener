@@ -87,7 +87,9 @@ function btText(s) {
 }
 function timingText(s) {
   if (s.held) return "—";
-  return (s.timing_ok ? "✓ " : "✗ ") + (s.timing_reasons || "");
+  // timing_reasons 已是逐条件 ✓/✗ 明细（每条带数值+阈值）——不再叠加
+  // 总判定前缀（全 ✓ 即过、任一 ✗ 即未过，前缀属冗余且易误读为两个条件）
+  return s.timing_reasons || "—";
 }
 function actionText(s) {
   if (!s.action) return "时机未过";
