@@ -1280,6 +1280,34 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
 SIG_HISTORY_WINDOW_DAYS = 90
 
 
+def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
+    """选股时机逐条件明细（仅展示用）：每条带数值 + 阈值 + ✓/✗。
+
+    selection_timing.reasons 只存*已满足*的条件（微信正文用），页面信息不足
+    ——Joel 2026-11-08 定案：无论整体过/未过，都要能看清**哪些条件已达成、
+    哪些未达成**（临近达标时更关键）。故由表内原始字段（pctile_window /
+    ttm_yield_pct / cond_*）+ config 阈值在此逐条拼 ✓/✗。无 timing 行 →
+    「无时机数据」（fail-closed 同口径）。
+    """
+    if not trow:
+        return "无时机数据"
+    parts: List[str] = []
+    p = trow.get("pctile_window")
+    ok1 = bool(trow.get("cond_price_low"))
+    v1 = "数据不足" if p is None else f"{p:.1f}%"
+    parts.append(f"{'✓' if ok1 else '✗'} {tp.price_window_years}年分位 "
+                 f"{v1}（需≤{tp.price_pctile_max:g}%）")
+    y = trow.get("ttm_yield_pct")
+    ok2 = bool(trow.get("cond_yield"))
+    v2 = "数据不足" if y is None else f"{y:.2f}%"
+    parts.append(f"{'✓' if ok2 else '✗'} 股息率 {v2}（需≥{tp.yield_min_pct:g}%）")
+    if getattr(tp, "below_ma250", False):
+        ok3 = bool(trow.get("cond_below_ma"))
+        v3 = "" if ok3 else "/数据不足"
+        parts.append(f"{'✓' if ok3 else '✗'} 低于{tp.ma_period}日线{v3}")
+    return " · ".join(parts)
+
+
 @app.get("/api/strategy_signals")
 def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     """策略信号中心（Joel 2026-11-07：我的持仓页新增信号模块）。
@@ -1296,7 +1324,9 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     - 时机门（v7.0.19 迭代）：非持仓股的买入信号须先过选股时机提醒口径
       （timing.push_eligible = ①价格分位 且 ②股息率，③启用时叠加，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
-      只展示价格状态 + timing_reasons；持仓股不受时机限制（持仓策略管加仓）。
+      只展示价格状态 + timing_reasons（**逐条件 ✓/✗ 明细**：每条带数值+阈值，
+      由 selection_timing 原始字段 + config 阈值拼出——整体过/未过都列明哪条
+      已达成哪条未达成；持仓股不受时机限制（持仓策略管加仓）。
       timing_ok/timing_reasons 逐股标注。
     - 十年回测参考（v7.0.19 迭代）：推荐买入股标注历史回测——bt_pnl_pct
       （10 年回测收益 %）/ bt_n_buys（回测触发档数），读 selection_backtest_10y；
@@ -1320,6 +1350,15 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy_name})
         cfg_path = str(cfg_file)
     user = _up_read()
+
+    # 时机阈值（仅拼「未达条件」文案用；配置错误已在 _load_pool_ctx 400，
+    # 此处兜底默认值防降级路径（湖锁定）仍可读）
+    try:
+        from martingale.config import load_config as _mload
+        _s0, _u0, tp_obj = _mload(cfg_path or str(CONFIG_PATH))
+    except Exception:  # noqa: BLE001
+        from martingale.config import TimingParams
+        tp_obj = TimingParams()
 
     from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
 
@@ -1416,8 +1455,9 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         if not held:
             trow = tmap.get(c)
             timing_ok = bool((trow or {}).get("push_eligible"))
-            timing_reasons = ((trow or {}).get("reasons")
-                              if trow else "无时机数据")
+            # 逐条件 ✓/✗ 明细（含数值+阈值）：整体过/未过都列明哪条达成哪条未达
+            # （Joel 2026-11-08 定案；✓ 前缀 = push_eligible 总判定）
+            timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
         suggested = cls["suggested_amount"]
         if not held:

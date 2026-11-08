@@ -221,16 +221,25 @@ SPOT = {
     "sh.600004": {"price": 37.0, "timestamp": "20261107093000"},
 }
 # 选股时机快照（selection_timing 口径）：600002 过提醒口径（买入信号放行），
-# 600004 未过（分位/股息不达标 → 买入信号抑制），600005 无行（fail-closed）
+# 600004 未过（分位/股息不达标 → 买入信号抑制，✗ 展示未达条件），600005 无行
+# （fail-closed）。cond_*/pctile_window/ttm_yield_pct 为原始字段（拼未达文案用）
 TIMING = {
     "sh.600001": {"ts_code": "sh.600001", "in_watchlist": True,
-                  "push_eligible": False, "reasons": "分位 35% / 股息 3.0%"},
+                  "push_eligible": False, "reasons": "分位 35% / 股息 3.0%",
+                  "cond_price_low": False, "cond_yield": False,
+                  "pctile_window": 35.0, "ttm_yield_pct": 3.0},
     "sh.600002": {"ts_code": "sh.600002", "in_watchlist": True,
-                  "push_eligible": True, "reasons": "5年分位 21% / 股息 4.6%"},
+                  "push_eligible": True, "reasons": "5年分位 21% / 股息 4.6%",
+                  "cond_price_low": True, "cond_yield": True,
+                  "pctile_window": 21.0, "ttm_yield_pct": 4.6},
     "sh.600003": {"ts_code": "sh.600003", "in_watchlist": True,
-                  "push_eligible": False, "reasons": "分位 48% / 股息 3.8%"},
+                  "push_eligible": False, "reasons": "分位 48% / 股息 3.8%",
+                  "cond_price_low": False, "cond_yield": False,
+                  "pctile_window": 48.0, "ttm_yield_pct": 3.8},
     "sh.600004": {"ts_code": "sh.600004", "in_watchlist": False,
-                  "push_eligible": False, "reasons": "分位 55% / 股息 2.0%"},
+                  "push_eligible": False, "reasons": "",
+                  "cond_price_low": False, "cond_yield": False,
+                  "pctile_window": 55.0, "ttm_yield_pct": 2.0},
 }
 # 十年回测（selection_backtest_10y 口径）
 BMAP = {
@@ -298,7 +307,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s2["held"] is False and s2["status"] == "active"
     assert s2["action"] == "buy" and s2["next_add_price_raw"] == 20.0
     assert s2["suggested_amount"] == round(10000.0 * 1.1 ** 2)
-    assert s2["timing_ok"] is True and "5年分位 21%" in s2["timing_reasons"]
+    assert s2["timing_ok"] is True
     assert s2["bt_pnl_pct"] == -5.0 and s2["bt_n_buys"] == 3
     # 持仓股 +2%（3% 带内）→ approaching
     s3 = by["sh.600003"]
@@ -308,7 +317,14 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s4["held"] is False and s4["status"] == "active"
     assert s4["next_add_price_raw"] == 40.0  # 触发价 = 首仓线（若误走 next 35.0 可区分）
     assert s4["action"] is None and s4["suggested_amount"] is None
-    assert s4["timing_ok"] is False and s4["timing_reasons"] == "分位 55% / 股息 2.0%"
+    assert s4["timing_ok"] is False
+    # 逐条件 ✓/✗ 明细（端点由原始字段 + config 阈值拼；strategy.yaml：
+    # 5 年窗口 / 分位≤40 / 股息≥4.5，③ 未启用）
+    assert s4["timing_reasons"] == \
+        "✗ 5年分位 55.0%（需≤40%） · ✗ 股息率 2.00%（需≥4.5%）"
+    # ✓ 行同样逐条件列明（整体过 = 每条 ✓）
+    assert s2["timing_reasons"] == \
+        "✓ 5年分位 21.0%（需≤40%） · ✓ 股息率 4.60%（需≥4.5%）"
     # 湖中无数据 → no_data（池内非持仓）
     s5 = by["sh.600005"]
     assert s5["status"] == "no_data" and s5["held"] is False and s5["price"] is None

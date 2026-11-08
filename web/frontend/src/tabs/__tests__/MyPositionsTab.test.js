@@ -79,12 +79,12 @@ const SIG = {
     { ts_code: "sh.600941", name: "中国移动", held: false, in_pos: false, k_level: 0,
       price: 70.0, next_add_price_raw: 72.36, status: "active", distance_pct: -3.26,
       action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06",
-      timing_ok: true, timing_reasons: "5年分位 21.9% / 股息 4.59%",
+      timing_ok: true, timing_reasons: "✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）",
       bt_pnl_pct: 45.2, bt_n_buys: 4 },
     { ts_code: "sh.600988", name: "江苏银行", held: false, in_pos: false, k_level: 0,
       price: 8.0, next_add_price_raw: 8.5, status: "active", distance_pct: -5.9,
       action: null, suggested_amount: null, n_history: 0, end_date: "2026-11-06",
-      timing_ok: false, timing_reasons: "分位 62% / 股息 2.1%",
+      timing_ok: false, timing_reasons: "✗ 5年分位 62.3%（需≤40%） · ✗ 股息率 2.10%（需≥4.5%）",
       bt_pnl_pct: null, bt_n_buys: null },
     { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
       price: 28.56, next_add_price_raw: 28.0, status: "approaching", distance_pct: 2.0,
@@ -747,9 +747,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("买入·首仓");
     expect(w.text()).toContain("1.1");
     expect(w.text()).toContain("10.0");
-    // 时机门：过 → ✓ + 原因；未过 → 时机未过（无动作/金额）
-    expect(w.text()).toContain("✓ 5年分位 21.9% / 股息 4.59%");
-    expect(w.text()).toContain("✗ 分位 62% / 股息 2.1%");
+    // 时机门：逐条件 ✓/✗ 明细（整体过/未过都列明哪条达成哪条未达）；
+    // 未过 → 时机未过（无动作/金额）
+    expect(w.text()).toContain("✓ ✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）");
+    expect(w.text()).toContain("✗ ✗ 5年分位 62.3%（需≤40%） · ✗ 股息率 2.10%（需≥4.5%）");
     expect(w.text()).toContain("时机未过");
     // 十年回测列：+88.5% · 6档（持仓神华）/ 无回测 → —
     expect(w.text()).toContain("+88.5% · 6档");
