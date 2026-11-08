@@ -80,38 +80,59 @@ function fmtWan(v) {
   return (v / 10000).toFixed(1);
 }
 // 分段 → 展示行（预渲染标签列；SimpleTable 单元格为纯文本）
+function btText(s) {
+  if (s.bt_pnl_pct === null || s.bt_pnl_pct === undefined) return "—";
+  const sign = s.bt_pnl_pct >= 0 ? "+" : "";
+  return sign + s.bt_pnl_pct + "% · " + (s.bt_n_buys ?? "—") + "档";
+}
+function timingText(s) {
+  if (s.held) return "—";
+  return (s.timing_ok ? "✓ " : "✗ ") + (s.timing_reasons || "");
+}
+function actionText(s) {
+  if (!s.action) return "时机未过";
+  if (s.held) return s.action === "buy" ? "买入·首仓" : "加仓";
+  // 非持仓统一「买入」：in_pos = 按策略当前状态加入（第 N 档）；否则首仓
+  return s.in_pos ? `买入·第${(s.k_level ?? 0) + 1}档` : "买入·首仓";
+}
 const sigShown = computed(() => {
   if (sigSel.value === "active") {
     return sigActive.value.map((s) => ({ ...s,
       status_tag: s.held ? "● 持仓" : "○ 非持仓",
-      action_label: s.action === "buy" ? "买入·首仓" : "加仓",
+      action_label: actionText(s),
       level_label: s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
-      amount_w: s.suggested_amount == null ? null : fmtWan(s.suggested_amount) }));
+      amount_w: s.suggested_amount == null ? "—" : fmtWan(s.suggested_amount),
+      bt_s: btText(s), timing_s: timingText(s) }));
   }
   if (sigSel.value === "approaching") {
     return sigApproach.value.map((s) => ({ ...s,
       status_tag: s.held ? "● 持仓" : "○ 非持仓",
       distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
-      level_label: s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）" }));
+      level_label: s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）",
+      bt_s: btText(s), timing_s: timingText(s) }));
   }
   return sigHistory.value.map((h) => ({ ...h,
     status_tag: h.held ? "● 持仓" : "○ 非持仓",
     level_label: levelLabel(h.level, h.first_of_round),
-    amount_w: fmtWan(h.amount) }));
+    amount_w: fmtWan(h.amount),
+    pushed_s: h.pushed ? "✓ 已推" : "—" }));
 });
 const SIG_ACTIVE_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true], ["next_add_price_raw", "触发价", true],
   ["action_label", "动作"], ["level_label", "档位"], ["amount_w", "建议金额(万)", true],
+  ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_APPROACH_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true], ["next_add_price_raw", "触发价", true],
   ["distance_s", "距触发", true], ["level_label", "档位"],
+  ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_HISTORY_COLS = [
   ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["level_label", "档位"], ["price", "触发价", true], ["amount_w", "金额(万)", true],
+  ["pushed_s", "微信推送"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -530,6 +551,9 @@ function pnlColor(v) {
       <p class="muted small">
         覆盖股票池 ∪ 我的持仓 · 信号区 = 下一档触发价 ·
         「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 3 }}% 以内
+        · 非持仓股买入信号须过选股时机（价格分位 且 股息率，见「时机」列）
+        · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
+        · 10年回测 = 策略十年回放
         <span v-if="sigData?.price_source === 'spot'">
           · 价源：实时行情{{ sigData.spot_time ? " " + sigData.spot_time : "" }}</span>
         <span v-else-if="sigData">· 价源：最新收盘（T+1）</span>

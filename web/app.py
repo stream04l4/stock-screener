@@ -51,6 +51,9 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "strategy.yaml"
 USER_POSITIONS_PATH = PROJECT_ROOT / "data" / "user_positions.json"
 # "我的持仓"实盘交易历史（v7.0.17）：追加式买卖登记日志，/data/ 已 gitignore
 USER_TRADES_PATH = PROJECT_ROOT / "data" / "my_trades.json"
+# 点位提醒微信推送去重状态（scripts/position_alert.py 原子写；信号中心只读，
+# 用于历史信号行标「已推送」）
+PUSH_ALERT_STATE_PATH = PROJECT_ROOT / "data" / "alerts" / "pushplus_alert_state.json"
 _TS_CODE_RE = re.compile(r"^[a-z]{2}\.\d{6}$")
 # v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
 BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
@@ -1272,6 +1275,11 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 策略信号中心（v7.0.19）：当前信号 / 即将进入信号区 / 历史信号 + 持仓·非持仓
 # ---------------------------------------------------------------------------
+# 历史信号保留窗口（天）：只保留近 N 日的状态机触发记录（Joel 2026-11-07
+# 定案——全量回放历史自 2000 年起动辄数千笔，页面无用且拖慢传输）
+SIG_HISTORY_WINDOW_DAYS = 90
+
+
 @app.get("/api/strategy_signals")
 def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     """策略信号中心（Joel 2026-11-07：我的持仓页新增信号模块）。
@@ -1285,8 +1293,19 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
       第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
       （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
       动作恒为买入·首仓、金额 initial_amount）。
+    - 时机门（v7.0.19 迭代）：非持仓股的买入信号须先过选股时机提醒口径
+      （timing.push_eligible = ①价格分位 且 ②股息率，③启用时叠加，读
+      selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
+      只展示价格状态 + timing_reasons；持仓股不受时机限制（持仓策略管加仓）。
+      timing_ok/timing_reasons 逐股标注。
+    - 十年回测参考（v7.0.19 迭代）：推荐买入股标注历史回测——bt_pnl_pct
+      （10 年回测收益 %）/ bt_n_buys（回测触发档数），读 selection_backtest_10y；
+      池外/无回测 → None。
     - history = 状态机历史触发逐笔（buys：日期/触发价/档位金额/档下标/是否本轮
-      首笔）全池汇总，日期降序（同日同股按档位先后）；
+      首笔/是否已推送微信），**仅保留近 SIG_HISTORY_WINDOW_DAYS 日**（全量回放
+      历史自 2000 年起动辄数千笔，页面无用），日期降序（同日同股按档位先后）；
+      pushed = 该档「代码|动作|档」前缀命中 scripts/position_alert.py 的推送去重态
+      （data/alerts/pushplus_alert_state.json）→ 已推送过微信点位提醒。
     - strategy / 价源 / 湖降级语义与 /api/my_positions 一致；分类走
       martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
       同一单一定义点，防口径漂移）。
@@ -1308,12 +1327,18 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     rows: Dict[str, Dict[str, Any]] = {}
     sp_obj = None
     universe: List[str] = []
+    tmap: Dict[str, Dict[str, Any]] = {}   # 选股时机（selection_timing 快照）
+    bmap: Dict[str, Dict[str, Any]] = {}   # 十年回测（selection_backtest_10y）
     try:
         _sp, _up, con, pool = _load_pool_ctx(cfg_path)
         sp_obj = _sp
         try:
             universe = sorted(set(pool.codes) | set(user.keys()))
             rows = _strategy_state_rows(_sp, con, universe, include_buys=True)
+            from martingale.selection import load_backtest_map
+            from martingale.timing import load_timing_map
+            tmap = load_timing_map(con)
+            bmap = load_backtest_map(con)
         finally:
             con.close()
     except (LakeLocked, LakeMissing, LakeInvalidFile):
@@ -1321,6 +1346,8 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         lake_locked = True
         rows = {}
         universe = sorted(user.keys())
+    as_of = max((r["end_date"] for r in rows.values() if r.get("end_date")),
+                default=None)
     if not universe:
         return {"as_of": None, "strategy": strategy_name, "lake_locked": lake_locked,
                 "approach_pct": DEFAULT_APPROACH_PCT, "price_source": "lake",
@@ -1339,6 +1366,23 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         spot = {}
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
+
+    # 微信推送状态（scripts/position_alert.py 点位提醒去重态，原子替换写）→
+    # 历史信号按「代码|动作|档下标」前缀匹配标「已推送」。读取失败按未推送
+    # 处理（只标注不影响主流程）。
+    pushed_keys: set = set()
+    try:
+        with open(PUSH_ALERT_STATE_PATH, "r", encoding="utf-8") as f:
+            pushed_keys = {str(k) for k in json.load(f).get("alerts", {})}
+    except (OSError, ValueError):
+        pushed_keys = set()
+    pushed_pfx = {k.rsplit("|", 1)[0] + "|" for k in pushed_keys}
+    # 历史信号保留窗口：近 N 日（Joel 2026-11-07 定案——不展示状态机自 2000
+    # 年起的全量回放历史，只留近期可核对的触发记录）
+    hist_cutoff: Optional[str] = None
+    if as_of:
+        hist_cutoff = (datetime.fromisoformat(as_of).date()
+                       - timedelta(days=SIG_HISTORY_WINDOW_DAYS)).isoformat()
 
     stocks: List[Dict[str, Any]] = []
     history: List[Dict[str, Any]] = []
@@ -1362,6 +1406,29 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
                    else (r or {}).get("first_level_raw"))
         cls = classify_signal(price, trigger, in_pos,
                               (r.get("k_level") or 0) if r else 0, sp_obj)
+        # 时机门（Joel 2026-11-07 定案）：非持仓股的买入信号须先过策略选股
+        # 时机提醒口径（①价格分位 且 ②股息率，③启用时叠加；selection_timing
+        # 预计算快照，O(1)）——到买入时机才给买入信号；持仓股不受时机限制
+        # （持仓策略负责加仓档）。无时机行（timing 未跑/池外）→ fail-closed
+        # 不给买入信号，只展示价格状态与原因。
+        timing_ok: Optional[bool] = None
+        timing_reasons: Optional[str] = None
+        if not held:
+            trow = tmap.get(c)
+            timing_ok = bool((trow or {}).get("push_eligible"))
+            timing_reasons = ((trow or {}).get("reasons")
+                              if trow else "无时机数据")
+        action = cls["action"]
+        suggested = cls["suggested_amount"]
+        if not held:
+            # 非持仓股的动作统一为「买入」（next 档对非持仓用户是加入策略的
+            # 买入位，不是加仓）；时机门未过 → 无动作（价格状态照展示）
+            if action is not None:
+                action = "buy"
+            if timing_ok is not True:
+                action = None
+                suggested = None
+        bt = bmap.get(c) or {}
         stocks.append({
             "ts_code": c,
             "name": (r or {}).get("name") or c,
@@ -1372,8 +1439,14 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             "next_add_price_raw": trigger,
             "status": cls["status"],
             "distance_pct": cls["distance_pct"],
-            "action": cls["action"],
-            "suggested_amount": cls["suggested_amount"],
+            "action": action,
+            "suggested_amount": suggested,
+            "timing_ok": timing_ok,
+            "timing_reasons": timing_reasons,
+            # 十年回测参考（推荐买入时展示；池外/无回测 → None）
+            "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)
+                           if bt.get("pnl_pct") is not None else None),
+            "bt_n_buys": bt.get("n_buys"),
             "n_history": len((r or {}).get("buys", [])),
             "end_date": (r or {}).get("end_date"),
         })
@@ -1390,10 +1463,15 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         else:
             n_nodata += 1
         for i, b in enumerate((r or {}).get("buys", [])):
+            if hist_cutoff is not None and b["date"] < hist_cutoff:
+                continue  # 超出保留窗口（不展示全量回放历史）
+            baction = "buy" if b["first_of_round"] else "add"
             history.append({
                 "ts_code": c, "name": (r or {}).get("name") or c, "held": held,
                 "date": b["date"], "price": b["price"], "amount": b["amount"],
                 "level": b["level"], "first_of_round": b["first_of_round"],
+                # 该档位是否已被微信点位提醒推送过（代码|动作|档 前缀匹配）
+                "pushed": f"{c}|{baction}|{b['level']}|" in pushed_pfx,
                 "_seq": i,
             })
     # 日期降序；稳定排序保留同日同股「档位先后」（先首仓后加仓）
@@ -1402,13 +1480,14 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     for h in history:
         del h["_seq"]
     return {
-        "as_of": max((r["end_date"] for r in rows.values() if r.get("end_date")), default=None),
+        "as_of": as_of,
         "strategy": strategy_name,
         "lake_locked": lake_locked,
         "approach_pct": DEFAULT_APPROACH_PCT,
         "price_source": price_source,
         "spot_time": spot_time,
         "n_stocks": len(universe),
+        "history_window_days": SIG_HISTORY_WINDOW_DAYS,
         "stocks": stocks,
         "history": history,
         "totals": {

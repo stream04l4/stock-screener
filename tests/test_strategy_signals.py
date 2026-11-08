@@ -6,12 +6,15 @@
   （active / approaching / idle / no_data；边界；approach_pct 可调）；
 - martingale.engine.run_stock buys 元组 5 元素标注（k 档下标 / first_of_round），
   前 3 元语义与历史一致（f6 红线由 test_f6_regression 守护）；
-- web /api/strategy_signals 端点：股票池 ∪ 账本、持仓/非持仓触发价口径分叉
-  （持仓=模拟 next 档；非持仓=首仓线）、history 日期降序（同日同股档位先后）、
+- web /api/strategy_signals 端点：股票池 ∪ 账本、触发价按 in_pos 分支
+  （in_pos=模拟 next 档；未 in_pos=首仓线）、**时机门**（非持仓股买入信号须
+  timing.push_eligible；持仓股不受限）、**十年回测标注**（bt_pnl_pct/bt_n_buys）、
+  history 仅近 90 天 + **微信推送标记**（代码|动作|档 前缀匹配去重态）、
   湖锁定降级、strategy 库名 400、空 universe。
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +29,8 @@ from fastapi import HTTPException  # noqa: E402
 
 import web.app as wapp  # noqa: E402
 import screener.data.tencent as tencent_mod  # noqa: E402
+import martingale.selection as sel_mod  # noqa: E402
+import martingale.timing as timing_mod  # noqa: E402
 from martingale.config import StrategyParams  # noqa: E402
 from martingale.engine import run_stock  # noqa: E402
 from martingale.signals import (  # noqa: E402
@@ -185,9 +190,10 @@ ROWS = {
                   "next_add_price_raw": 10.0, "first_level_raw": 12.0,
                   "end_date": "2026-11-06",
                   "buys": [
-                      {"date": "2026-01-02", "price": 10.5, "amount": 10000.0,
+                      # 日期落在 90 天保留窗口内（as_of 2026-11-06 → 2026-08-08）
+                      {"date": "2026-10-15", "price": 10.5, "amount": 10000.0,
                        "level": 0, "first_of_round": True},
-                      {"date": "2026-01-03", "price": 10.0, "amount": 11000.0,
+                      {"date": "2026-10-20", "price": 10.0, "amount": 11000.0,
                        "level": 1, "first_of_round": False},
                   ]},
     "sh.600002": {"name": "乙股", "last_price": 20.0, "in_pos": True, "k_level": 2,
@@ -197,7 +203,7 @@ ROWS = {
                   "next_add_price_raw": 30.0, "first_level_raw": 30.0,
                   "end_date": "2026-11-05",
                   "buys": [
-                      {"date": "2025-12-31", "price": 31.0, "amount": 100000.0,
+                      {"date": "2026-10-01", "price": 31.0, "amount": 100000.0,
                        "level": 0, "first_of_round": True},
                   ]},
     # 非持仓 + 未 in_pos：next(35.0) 与 first(40.0) 故意不同值——
@@ -214,11 +220,40 @@ SPOT = {
     "sh.600003": {"price": 30.6, "timestamp": "20261107093000"},
     "sh.600004": {"price": 37.0, "timestamp": "20261107093000"},
 }
+# 选股时机快照（selection_timing 口径）：600002 过提醒口径（买入信号放行），
+# 600004 未过（分位/股息不达标 → 买入信号抑制），600005 无行（fail-closed）
+TIMING = {
+    "sh.600001": {"ts_code": "sh.600001", "in_watchlist": True,
+                  "push_eligible": False, "reasons": "分位 35% / 股息 3.0%"},
+    "sh.600002": {"ts_code": "sh.600002", "in_watchlist": True,
+                  "push_eligible": True, "reasons": "5年分位 21% / 股息 4.6%"},
+    "sh.600003": {"ts_code": "sh.600003", "in_watchlist": True,
+                  "push_eligible": False, "reasons": "分位 48% / 股息 3.8%"},
+    "sh.600004": {"ts_code": "sh.600004", "in_watchlist": False,
+                  "push_eligible": False, "reasons": "分位 55% / 股息 2.0%"},
+}
+# 十年回测（selection_backtest_10y 口径）
+BMAP = {
+    "sh.600001": {"ts_code": "sh.600001", "pnl_pct": 0.885, "n_buys": 6},
+    "sh.600002": {"ts_code": "sh.600002", "pnl_pct": -0.05, "n_buys": 3},
+    "sh.600004": {"ts_code": "sh.600004", "pnl_pct": 0.12, "n_buys": 2},
+}
+# 微信点位提醒去重态（scripts/position_alert.py 口径 key = 代码|动作|档|触发价）
+PUSHED_STATE = {"alerts": {"sh.600001|add|1|10.0":
+                           {"date": "2026-10-20", "at": "2026-10-20T10:00:00",
+                            "price": 10.0, "name": "甲股"}}}
 
 
-def _wire(monkeypatch, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
-          lake_exc=None):
+def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
+          tmap=TIMING, bmap=BMAP, pushed=PUSHED_STATE, lake_exc=None):
     monkeypatch.setattr(wapp, "_up_read", lambda: dict(user))
+    monkeypatch.setattr(timing_mod, "load_timing_map", lambda con: dict(tmap))
+    monkeypatch.setattr(sel_mod, "load_backtest_map", lambda con: dict(bmap))
+    # 微信推送去重态 → 临时文件（pushed=None 表示无推送历史）
+    p = tmp_path / "push_state.json"
+    p.write_text("{}" if pushed is None else json.dumps(pushed, ensure_ascii=False),
+                 encoding="utf-8")
+    monkeypatch.setattr(wapp, "PUSH_ALERT_STATE_PATH", p)
 
     def _pool_ctx(cfg=None):
         return SP, None, SimpleNamespace(close=lambda: None), SimpleNamespace(codes=list(pool))
@@ -239,72 +274,107 @@ def _wire(monkeypatch, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
                             fetch=lambda codes: {c: spot[c] for c in codes if c in spot}))
 
 
-def test_strategy_signals_main_contract(monkeypatch):
-    _wire(monkeypatch)
+def test_strategy_signals_main_contract(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
     out = wapp.get_strategy_signals()
     assert out["strategy"] == "current"
     assert out["lake_locked"] is False
     assert out["approach_pct"] == DEFAULT_APPROACH_PCT == 3.0
+    assert out["history_window_days"] == 90
     assert out["price_source"] == "spot"
     assert out["as_of"] == "2026-11-06"
     assert out["n_stocks"] == 5  # 池 5（含湖中无数据的 600005）∪ 账本 2 ⊂ 池
 
     by = {s["ts_code"]: s for s in out["stocks"]}
-    # 持仓股 + in_pos：next 档口径 → 9.9 ≤ 10.0 → active 加仓
+    # 持仓股 + in_pos：next 档口径 → 9.9 ≤ 10.0 → active 加仓（持仓不受时机限制）
     s1 = by["sh.600001"]
     assert s1["held"] is True and s1["status"] == "active"
     assert s1["action"] == "add" and s1["next_add_price_raw"] == 10.0
     assert s1["suggested_amount"] == round(10000.0 * 1.1)
-    # 非持仓 + in_pos：同样走 next 档（从当前状态加入策略）→ 20.0 ≤ 20.0 → active 加仓
+    assert s1["timing_ok"] is None  # 持仓股不评估时机
+    assert s1["bt_pnl_pct"] == 88.5 and s1["bt_n_buys"] == 6
+    # 非持仓 + in_pos + 时机过：next 档、动作统一「买入」、金额按档
     s2 = by["sh.600002"]
     assert s2["held"] is False and s2["status"] == "active"
-    assert s2["action"] == "add" and s2["next_add_price_raw"] == 20.0
+    assert s2["action"] == "buy" and s2["next_add_price_raw"] == 20.0
     assert s2["suggested_amount"] == round(10000.0 * 1.1 ** 2)
+    assert s2["timing_ok"] is True and "5年分位 21%" in s2["timing_reasons"]
+    assert s2["bt_pnl_pct"] == -5.0 and s2["bt_n_buys"] == 3
     # 持仓股 +2%（3% 带内）→ approaching
     s3 = by["sh.600003"]
     assert s3["status"] == "approaching" and s3["distance_pct"] == pytest.approx(2.0)
-    # 非持仓 + 未 in_pos：首仓线口径（37.0 ≤ 40.0；若误走 next 35.0 会判 idle）
+    # 非持仓 + 未 in_pos + 时机未过：首仓线价格状态照展示，但买入信号被抑制
     s4 = by["sh.600004"]
     assert s4["held"] is False and s4["status"] == "active"
-    assert s4["action"] == "buy" and s4["next_add_price_raw"] == 40.0
-    assert s4["suggested_amount"] == 100000
+    assert s4["next_add_price_raw"] == 40.0  # 触发价 = 首仓线（若误走 next 35.0 可区分）
+    assert s4["action"] is None and s4["suggested_amount"] is None
+    assert s4["timing_ok"] is False and s4["timing_reasons"] == "分位 55% / 股息 2.0%"
     # 湖中无数据 → no_data（池内非持仓）
     s5 = by["sh.600005"]
     assert s5["status"] == "no_data" and s5["held"] is False and s5["price"] is None
+    assert s5["timing_ok"] is False and s5["timing_reasons"] == "无时机数据"
 
     t = out["totals"]
     assert t == {"n_stocks": 5, "n_active": 3, "n_approaching": 1, "n_idle": 0,
                  "n_no_data": 1, "n_active_held": 1, "n_active_unheld": 2,
                  "n_history": 3}
-    # history：日期降序；3 笔
+    # history：仅 90 天窗口内；日期降序；微信推送标记（甲股 add 第1档 已推）
     h = out["history"]
     assert [(x["date"], x["ts_code"]) for x in h] == [
-        ("2026-01-03", "sh.600001"), ("2026-01-02", "sh.600001"),
-        ("2025-12-31", "sh.600003"),
+        ("2026-10-20", "sh.600001"), ("2026-10-15", "sh.600001"),
+        ("2026-10-01", "sh.600003"),
     ]
+    assert [x["pushed"] for x in h] == [True, False, False]
     assert all(set(x.keys()) == {"ts_code", "name", "held", "date", "price",
-                                 "amount", "level", "first_of_round"} for x in h)
+                                 "amount", "level", "first_of_round", "pushed"}
+               for x in h)
     assert h[0]["held"] is True and h[2]["held"] is True
 
 
-def test_strategy_signals_history_same_day_level_order(monkeypatch):
+def test_strategy_signals_history_same_day_level_order(monkeypatch, tmp_path):
     """同日同股多档：稳定排序保留档位先后（先首仓后加仓）。"""
     rows = dict(ROWS)
     rows["sh.600001"] = dict(rows["sh.600001"], buys=[
-        {"date": "2026-01-02", "price": 10.5, "amount": 10000.0, "level": 0,
+        {"date": "2026-10-15", "price": 10.5, "amount": 10000.0, "level": 0,
          "first_of_round": True},
-        {"date": "2026-01-02", "price": 10.0, "amount": 11000.0, "level": 1,
+        {"date": "2026-10-15", "price": 10.0, "amount": 11000.0, "level": 1,
          "first_of_round": False},
     ])
-    _wire(monkeypatch, rows=rows)
+    _wire(monkeypatch, tmp_path, rows=rows)
     h = wapp.get_strategy_signals()["history"]
     assert [(x["ts_code"], x["level"]) for x in h if x["ts_code"] == "sh.600001"] \
         == [("sh.600001", 0), ("sh.600001", 1)]
 
 
-def test_strategy_signals_lake_locked_degrade(monkeypatch):
+def test_strategy_signals_history_window_90d(monkeypatch, tmp_path):
+    """超出 90 天保留窗口的老触发不进 history（as_of 2026-11-06 → 2026-08-08）。"""
+    rows = dict(ROWS)
+    rows["sh.600002"] = dict(rows["sh.600002"], buys=[
+        {"date": "2026-01-05", "price": 21.0, "amount": 10000.0, "level": 0,
+         "first_of_round": True},   # 窗口外 → 过滤
+        {"date": "2026-11-01", "price": 20.5, "amount": 11000.0, "level": 1,
+         "first_of_round": False},  # 窗口内 → 保留
+    ])
+    _wire(monkeypatch, tmp_path, rows=rows)
+    h = wapp.get_strategy_signals()["history"]
+    assert [(x["ts_code"], x["date"]) for x in h if x["ts_code"] == "sh.600002"] \
+        == [("sh.600002", "2026-11-01")]
+    assert wapp.get_strategy_signals()["totals"]["n_history"] == 4  # 3 + 1
+
+
+def test_strategy_signals_pushed_missing_file_ok(monkeypatch, tmp_path):
+    """推送状态文件损坏/缺失 → 全部未推送，不报错。"""
+    rows = dict(ROWS)
+    _wire(monkeypatch, tmp_path, pushed=None)
+    p = tmp_path / "push_state.json"
+    p.write_text("{bad json", encoding="utf-8")
+    out = wapp.get_strategy_signals()
+    assert all(x["pushed"] is False for x in out["history"])
+
+
+def test_strategy_signals_lake_locked_degrade(monkeypatch, tmp_path):
     """湖锁定 → 只列账本代码，全部 no_data，不 500。"""
-    _wire(monkeypatch, lake_exc=LakeLocked)
+    _wire(monkeypatch, tmp_path, lake_exc=LakeLocked)
     out = wapp.get_strategy_signals()
     assert out["lake_locked"] is True
     assert [s["ts_code"] for s in out["stocks"]] == ["sh.600001", "sh.600003"]
@@ -314,14 +384,14 @@ def test_strategy_signals_lake_locked_degrade(monkeypatch):
     assert out["as_of"] is None
 
 
-def test_strategy_signals_empty_universe(monkeypatch):
-    _wire(monkeypatch, pool=[], user={})
+def test_strategy_signals_empty_universe(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path, pool=[], user={})
     out = wapp.get_strategy_signals()
     assert out["n_stocks"] == 0 and out["stocks"] == [] and out["history"] == []
     assert out["totals"]["n_stocks"] == 0
 
 
-def test_strategy_signals_user_only_ledger_codes(monkeypatch):
+def test_strategy_signals_user_only_ledger_codes(monkeypatch, tmp_path):
     """账本里有池外股 → universe = 池 ∪ 账本，池外股照常出状态。"""
     user = dict(USER, **{"sz.000999": {"shares": 10.0, "cost_price": 1.0,
                                         "updated_at": "2026-11-07T00:00:00Z"}})
@@ -330,7 +400,7 @@ def test_strategy_signals_user_only_ledger_codes(monkeypatch):
                                         "next_add_price_raw": 5.0,
                                         "first_level_raw": 6.0,
                                         "end_date": "2026-11-06", "buys": []}})
-    _wire(monkeypatch, user=user, rows=rows,
+    _wire(monkeypatch, tmp_path, user=user, rows=rows,
           spot={**SPOT, "sz.000999": {"price": 5.9, "timestamp": "20261107093000"}})
     out = wapp.get_strategy_signals()
     assert out["n_stocks"] == 6
@@ -341,7 +411,7 @@ def test_strategy_signals_user_only_ledger_codes(monkeypatch):
 
 
 def test_strategy_signals_strategy_lib_400(monkeypatch, tmp_path):
-    _wire(monkeypatch)
+    _wire(monkeypatch, tmp_path)
     monkeypatch.setattr(wapp, "_strategy_path",
                         lambda name: tmp_path / (name + ".yaml"))
     with pytest.raises(HTTPException) as ei:
@@ -362,9 +432,9 @@ def test_strategy_signals_strategy_lib_400(monkeypatch, tmp_path):
     assert seen["cfg"] == str(lib)
 
 
-def test_strategy_signals_spot_fallback_lake_price(monkeypatch):
+def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):
     """实时行情失败（spot 空）→ 回退湖最后价，price_source=lake。"""
-    _wire(monkeypatch, spot={})
+    _wire(monkeypatch, tmp_path, spot={})
     out = wapp.get_strategy_signals()
     assert out["price_source"] == "lake"
     by = {s["ts_code"]: s for s in out["stocks"]}
