@@ -1,4 +1,4 @@
-# stock-screener · v7.0.26（drawdown_martingale 单策略版）
+# stock-screener · v7.0.27（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -232,7 +232,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.26）
+## 10. 近期版本（v7.0.11 → v7.0.27）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -370,6 +370,22 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.27**：策略编辑模式改动即时生效（2026-11-09 Joel 反馈「编辑模式改动
+  数值后好像实际没有生效重新扫描」）：
+  - **根因**：选股时机表（selection_timing）是预计算表，历史仅 11:30 UTC
+    lake-sync 刷新——编辑模式改 timing 参数（分位上限/窗口/首仓建仓回撤）
+    不重算，「今日选股」与信号中心时机门要次日才反映新值（持仓策略/门槛
+    参数本就是每请求现算，即时生效）。
+  - **修复**：`PUT /api/strategy`、`POST /api/strategy/import`、
+    `POST /api/strategies/{name}/load` 写盘成功后同步重算选股时机表
+    （`_rescan_timing_after_save`，实测 ~1s）；响应新增 `timing_rescan`
+    结果，前端保存提示显示「选股时机已重算（今日选股 N 只）」。
+  - **降级**：湖被锁（11:30 同步窗口，DuckDB 写连接立即报锁冲突、不挂起）
+    → 保存不受影响，`timing_rescan.refreshed=false`，新值于下次 11:30 同步
+    自动生效。
+  - **测试卫生**：三个 web 测试模块统一桩掉重算的湖写依赖（测试零写生产湖）。
+  - 验证：后端全量 + 前端 248 绿；线上实测「分位上限 40→30」保存 1.3s 内
+    今日选股 2→1（湖北能源 39.19%>30% 排除），恢复 40 → 2。
 - **v7.0.26**：选股策略梳理（2026-11-09 Joel 定案：「首仓建仓回撤应该放在选股
   策略里，从持仓策略里拿出来；选股策略里没用的都删掉，不要留着观察」）：
   - **首仓建仓回撤归入选股策略**：`first_drawdown_pct`（15%）自 strategy 段

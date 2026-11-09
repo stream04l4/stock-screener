@@ -1852,6 +1852,8 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
     3) .bak 备份（保留最近一份，shutil.copy2 保留 mtime）；
     4) ruamel round-trip 保留注释与排版写回（失败退回 safe_dump）。
     返回 (backup_path_str, sections)。
+    写盘成功后的「选股时机表重算」由各入口（put/import/load）调
+    _rescan_timing_after_save（v7.0.27）。
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
@@ -1882,10 +1884,41 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
     return str(bak_path), list(payload.keys())
 
 
+def _rescan_timing_after_save() -> Dict[str, Any]:
+    """v7.0.27：策略配置写盘成功后立即重算选股时机表（selection_timing）。
+
+    时机门 / 今日选股读的是预计算表（历史仅 11:30 UTC lake-sync 刷新）——
+    编辑模式改了 timing 参数（分位上限/窗口/首仓建仓回撤）不重算，新值要
+    次日才生效（Joel 2026-11-09 反馈「编辑改动后没有生效重新扫描」）。
+    重算 ~1s；失败（如 11:30 同步窗口湖被锁，DuckDB 写连接立即报锁冲突）
+    不影响保存结果 → 降级 refreshed=false，新值于下次 11:30 刷新自动生效。
+    """
+    try:
+        import duckdb
+
+        from martingale.config import load_config
+        from martingale.data import default_db_path
+        from martingale.timing import refresh_timing
+
+        _sp, up, tp = load_config(str(CONFIG_PATH))
+        p = default_db_path()
+        if not os.path.exists(p):
+            return {"refreshed": False, "reason": "数据湖不存在（新值下次同步生效）"}
+        con = duckdb.connect(p)  # 写连接：湖被锁时立即失败（已实测不挂起）
+        try:
+            out = refresh_timing(con, up, tp)
+        finally:
+            con.close()
+        return {"refreshed": True, "as_of": out.get("as_of"),
+                "n_watchlist": out.get("n_watchlist")}
+    except Exception as exc:  # noqa: BLE001 - 保存本身已成功，重算降级不阻断
+        return {"refreshed": False, "reason": str(exc)[:200]}
+
+
 @app.put("/api/strategy")
 def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
     backup, _ = _apply_strategy_write(payload)
-    return {"ok": True, "backup": backup}
+    return {"ok": True, "backup": backup, "timing_rescan": _rescan_timing_after_save()}
 
 
 @app.post("/api/strategy/import")
@@ -1896,7 +1929,8 @@ def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
         raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
     backup, sections = _apply_strategy_write(data)
-    return {"ok": True, "backup": backup, "sections": sections}
+    return {"ok": True, "backup": backup, "sections": sections,
+            "timing_rescan": _rescan_timing_after_save()}
 
 
 # ---------------------------------------------------------------------------
@@ -1976,7 +2010,7 @@ def load_strategy(name: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
     backup, _ = _apply_strategy_write(data)
-    return {"ok": True, "backup": backup}
+    return {"ok": True, "backup": backup, "timing_rescan": _rescan_timing_after_save()}
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,19 @@ import web.app as appmod  # noqa: E402
 REAL_CONFIG = PROJECT_ROOT / "config" / "strategy.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _rescan_safety(monkeypatch):
+    """v7.0.27：load/put 会触发「保存后重算选股时机表」→ 一律桩掉
+    refresh_timing（不写生产湖，保持本模块「生产零触碰」红线）。"""
+    from martingale import timing as mtiming
+
+    monkeypatch.setattr(
+        mtiming, "refresh_timing",
+        lambda con, up, tp, **kw: {"as_of": "2000-01-01", "n_codes": 3,
+                                   "n_watchlist": 1, "n_push": 1, "elapsed_s": 0.0},
+    )
+
+
 def _setup(tmp_path, monkeypatch) -> tuple[Path, Path]:
     """tmp config + tmp strategies dir（monkeypatch CONFIG_PATH / STRATEGIES_DIR，生产零触碰）。"""
     cfg_dir = tmp_path / "config"

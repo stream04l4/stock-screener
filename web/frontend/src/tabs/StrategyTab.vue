@@ -131,7 +131,13 @@ async function onSave() {
   saving.value = true;
   try {
     const res = await api("/api/strategy", { method: "PUT", body: JSON.stringify(payload) });
-    setMsg(`✓ 策略已保存（备份: ${String(res.backup).split("/").pop()}）`, "ok");
+    // v7.0.27：保存后后端同步重算选股时机表（~1s）；湖被锁时降级=下次 11:30 同步生效
+    const tr = res.timing_rescan;
+    const rescanNote = tr
+      ? (tr.refreshed ? `；选股时机已重算（今日选股 ${tr.n_watchlist} 只）`
+                      : `；选股时机稍后重算（${tr.reason}）`)
+      : "";
+    setMsg(`✓ 策略已保存（备份: ${String(res.backup).split("/").pop()}）${rescanNote}`, "ok");
     // D-W02：保存成功 → 经唯一入口退出编辑态，再刷新只读视图（旧版 setTimeout(loadStrategy,600)）
     setEditing(false);
     toast.toast("策略已更新");

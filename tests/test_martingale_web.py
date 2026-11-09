@@ -66,6 +66,23 @@ def tmp_config(tmp_path, monkeypatch):
     return dst
 
 
+@pytest.fixture(autouse=True)
+def _rescan_safety(monkeypatch):
+    """v7.0.27：web 测试一律桩掉「保存后重算选股时机表」的湖写。
+
+    只 stub refresh_timing（不写表）；duckdb 写连接只开在真实湖上瞬间
+    即关（refresh 已 no-op，无任何写入）——不碰 default_db_path，
+    免得污染本模块其他用真实湖只读连接的测试。
+    """
+    from martingale import timing as mtiming
+
+    monkeypatch.setattr(
+        mtiming, "refresh_timing",
+        lambda con, up, tp, **kw: {"as_of": "2000-01-01", "n_codes": 3,
+                                   "n_watchlist": 1, "n_push": 1, "elapsed_s": 0.0},
+    )
+
+
 def test_put_strategy_noop_byte_identical(tmp_config):
     payload = copy.deepcopy(wapp.get_strategy()["json"])
     before = tmp_config.read_bytes()
@@ -113,6 +130,49 @@ def test_put_strategy_valid_change_persists(tmp_config):
     # 注释保留（round-trip）：首行注释仍在
     first = tmp_config.read_text(encoding="utf-8").splitlines()[0]
     assert first.lstrip().startswith("#")
+
+
+def test_put_strategy_triggers_timing_rescan_with_new_params(tmp_config, monkeypatch):
+    """v7.0.27：保存后同步重算选股时机表，且重算吃的是**刚保存的新值**（读盘）。"""
+    import duckdb
+
+    from martingale import timing as mtiming
+
+    seen = {}
+
+    def fake_refresh(con, up, tp, **kw):
+        seen["tp"] = tp
+        return {"as_of": "2026-11-09", "n_codes": 3, "n_watchlist": 2,
+                "n_push": 2, "elapsed_s": 0.1}
+
+    class _FakeCon:
+        def close(self):  # noqa: D401
+            pass
+
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _FakeCon())  # 不碰生产湖
+    monkeypatch.setattr(mtiming, "refresh_timing", fake_refresh)
+    payload = copy.deepcopy(wapp.get_strategy()["json"])
+    payload["timing"]["price_pctile_max"] = 35.0  # 40 → 35
+    out = wapp.put_strategy(payload)
+    assert out["ok"] is True
+    assert out["timing_rescan"] == {"refreshed": True,
+                                    "as_of": "2026-11-09", "n_watchlist": 2}
+    assert seen["tp"].price_pctile_max == 35.0  # 重算用了新值而非旧缓存
+
+
+def test_put_strategy_rescan_degrades_on_lake_lock(tmp_config, monkeypatch):
+    """v7.0.27：湖被锁（11:30 同步窗口）→ 重算降级，保存本身成功。"""
+    import duckdb
+
+    def boom(*a, **k):
+        raise Exception("IO Error: Conflicting lock is held in PID 123")
+
+    monkeypatch.setattr(duckdb, "connect", boom)
+    payload = copy.deepcopy(wapp.get_strategy()["json"])
+    out = wapp.put_strategy(payload)
+    assert out["ok"] is True  # 保存不受影响
+    assert out["timing_rescan"]["refreshed"] is False
+    assert "Conflicting lock" in out["timing_rescan"]["reason"]
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,18 @@ def _setup_tmp_config(tmp_path, monkeypatch) -> Path:
     return target
 
 
+@pytest.fixture(autouse=True)
+def _rescan_safety(monkeypatch):
+    """v7.0.27：写路径测试一律桩掉「保存后重算选股时机表」（不写生产湖）。"""
+    from martingale import timing as mtiming
+
+    monkeypatch.setattr(
+        mtiming, "refresh_timing",
+        lambda con, up, tp, **kw: {"as_of": "2000-01-01", "n_codes": 3,
+                                   "n_watchlist": 1, "n_push": 1, "elapsed_s": 0.0},
+    )
+
+
 def _valid_payload() -> dict:
     """当前生产 yaml 的合法 payload（改一个值确保写盘路径真正执行）。"""
     p = yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
@@ -148,7 +160,7 @@ def test_put_response_shape(tmp_path, monkeypatch):
     new_val = int(yaml.safe_load(target.read_bytes())["strategy"]["base_add_amount"]) + 1
     payload = _valid_payload()
     res = appmod.put_strategy(copy.deepcopy(payload))
-    assert set(res.keys()) == {"ok", "backup"}
+    assert set(res.keys()) == {"ok", "backup", "timing_rescan"}  # v7.0.27：+ 重算结果
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
