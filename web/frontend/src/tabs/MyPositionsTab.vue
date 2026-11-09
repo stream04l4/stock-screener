@@ -74,7 +74,13 @@ const sigStocks = computed(() => sigData.value?.stocks || []);
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
          && (s.held || s.in_pos === false)));
-const sigApproach = computed(() => sigStocks.value.filter((s) => s.status === "approaching"));
+// 即将进入（v7.0.22，Joel 定案：「非持仓股即将进入买入时机，或持仓股即将
+// 触发加仓」）：价格带（3% 内临线）+ 时机门——持仓股照展示（加仓不受时机
+// 限制）；非持仓股须 timing_ok=true 才展示：时机未过（或无时机行 fail-
+// closed）的非持仓股即使价格临区也永远发不出买入信号（时机门只去动作），
+// 留在段里即噪音。
+const sigApproach = computed(() => sigStocks.value.filter(
+  (s) => s.status === "approaching" && (s.held || s.timing_ok === true)));
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 

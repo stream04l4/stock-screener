@@ -67,10 +67,11 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 
 // v7.0.19 策略信号中心 fixture：5 价格态 active（持仓加仓 + 非持仓首仓时机过 +
 // 非持仓首仓时机未过 + 非持仓模拟已建仓加仓档 active【不入当前信号段】）
-// + 1 touched（持仓盘中触碰已触回）/ 1 即将进入 / 4 历史（含微信推送标记 + 1 条触碰事件）
+// + 1 touched（持仓盘中触碰已触回）/ 3 即将进入（v7.0.22：持仓 1 + 非持仓时机
+// 过 1 + 非持仓时机未过 1【不入即将进入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 3,
-  price_source: "spot", spot_time: "20261107093000", n_stocks: 6,
+  price_source: "spot", spot_time: "20261107093000", n_stocks: 8,
   history_window_days: 90,
   stocks: [
     { ts_code: "sh.601088", name: "中国神华", held: true, in_pos: true, k_level: 1,
@@ -108,6 +109,22 @@ const SIG = {
       day_low: 27.9, distance_pct: 2.0,
       action: "add", suggested_amount: 10000, n_history: 1, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 30.1, bt_n_buys: 3 },
+    // v7.0.22 时机门入「即将进入」段：非持仓 + 时机达标 + 价格临区 → 展示
+    //（临区跌破即产生真实买入信号）
+    { ts_code: "sh.601328", name: "交通银行", held: false, in_pos: false, k_level: 0,
+      price: 7.55, next_add_price_raw: 7.40, status: "approaching", touched: false,
+      day_low: 7.5, distance_pct: 2.0,
+      action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06",
+      timing_ok: true, timing_reasons: "✓ 5年分位 33.5%（需≤40%） · ✓ 股息率 5.02%（需≥4.5%）",
+      bt_pnl_pct: null, bt_n_buys: null },
+    // v7.0.22 反例（中国海油实例）：非持仓（模拟已建仓 in_pos=true）+ 价格临区
+    // 但时机 ✗✗ → 永不产生买入信号（时机门只去动作）→ 不入「即将进入」段
+    { ts_code: "sh.600938", name: "中国海油", held: false, in_pos: true, k_level: 0,
+      price: 31.07, next_add_price_raw: 30.3159, status: "approaching", touched: false,
+      day_low: 30.8, distance_pct: 2.49,
+      action: null, suggested_amount: null, n_history: 10, end_date: "2026-11-06",
+      timing_ok: false, timing_reasons: "✗ 5年分位 85.7%（需≤40%） · ✗ 股息率 4.17%（需≥4.5%）",
+      bt_pnl_pct: 87.28, bt_n_buys: 10 },
   ],
   history: [
     { ts_code: "sh.601088", name: "中国神华", held: true, date: "2026-11-02",
@@ -120,7 +137,7 @@ const SIG = {
     { ts_code: "sh.600900", name: "长江电力", held: true, date: "2026-10-11",
       price: 29.0, amount: 100000, level: 0, first_of_round: true, pushed: false },
   ],
-  totals: { n_stocks: 6, n_active: 4, n_touched: 1, n_approaching: 1, n_idle: 0,
+  totals: { n_stocks: 8, n_active: 4, n_touched: 1, n_approaching: 3, n_idle: 0,
             n_no_data: 0, n_active_held: 1, n_active_unheld: 3, n_history: 4 },
 };
 const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approach_pct: 3,
@@ -757,9 +774,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("3% 以内"); // approach_pct
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
-    // 分段计数（当前 = active 3 + touched 1）
+    // 分段计数（当前 = active 3 + touched 1）；即将进入 = 价格临区 3 只中
+    // 时机门过滤掉非持仓时机未过 1 只（v7.0.22）→ 展示 2
     expect(w.text()).toContain("当前信号（4）");
-    expect(w.text()).toContain("即将进入（1）");
+    expect(w.text()).toContain("即将进入（2）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（11000→1.1万）+ 非持仓首仓（100000→10.0万）
     expect(w.text()).toContain("● 持仓");
@@ -795,7 +813,11 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     await segBtns()[1].trigger("click"); // 即将进入
     await flushPromises();
     expect(w.text()).toContain("2.0%"); // 距触发 distance_pct
-    expect(w.text()).toContain("长江电力"); // approaching 股在表内
+    expect(w.text()).toContain("长江电力"); // 持仓 approaching 股在表内
+    // v7.0.22 时机门：非持仓 + 时机达标（交通银行）展示；非持仓 + 时机未过
+    //（中国海油：分位 85.7% ✗✗）价格临区也不入段——永远发不出买入信号
+    expect(w.text()).toContain("交通银行");
+    expect(w.text()).not.toContain("中国海油");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // 历史日期降序：2026-11-02 在前，2026-10-11 在后
