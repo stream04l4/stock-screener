@@ -3,8 +3,8 @@
 
 契约（全离线，零真实湖/零网络）：
 - config：timing 段缺省 → 生产默认值；段存在时 5 键齐全 + 范围/类型校验；
-- refresh_timing：①分位/回撤计算、②股息边界、③年线开关与数据不足 fail-closed、
-  OR/AND 双口径、整表刷新幂等；
+- refresh_timing：①分位/回撤计算、②③ 参考展示列（v7.0.24 起不参与门）、
+  门 = ① 单条件（数据不足 fail-closed）、整表刷新幂等；
 - check_and_push 边沿语义：新触发才推、持续在买区不重推、掉出清除、再进入重推、
   推送失败不落状态（下轮重试）、缺 token 不推不炸；
 - Web GET /api/timing（fake 湖：命中排序/push_eligible 标记/空表 fail-closed）。
@@ -148,8 +148,8 @@ def test_config_timing_rejects_invalid(tmp_path, mutate, match):
 def test_refresh_timing_conditions():
     N = 300
     series = {
-        "a.1": [10.0] * N,                 # 分位 100（高位）+ 股息 5.0 → 仅②
-        "b.2": [20.0] * (N - 1) + [10.0],  # 分位 ≈0.3（低位）+ 股息 4.6 → ①② → push
+        "a.1": [10.0] * N,                 # 分位 100（高位）+ 股息 5.0 → ①✗ 不进门
+        "b.2": [20.0] * (N - 1) + [10.0],  # 分位 ≈0.3（低位）+ 股息 4.6 → ①✓ → 进门
         "c.3": [10.0] * N,                 # 高位 + 股息 3.0 → 无触发
     }
     con = make_lake(series, price_only=["d.4"])  # d.4 无 qfq（fail-closed）
@@ -157,22 +157,26 @@ def test_refresh_timing_conditions():
                member("c.3", 3.0), member("d.4", 6.0)]
     tp = make_tp()
     out = tm.refresh_timing(con, up=None, tp=tp, members=members)
-    assert out["n_codes"] == 4 and out["n_watchlist"] == 3 and out["n_push"] == 1
+    # v7.0.24：门 = ① 单条件 → 仅 b.2 进观察/提醒
+    assert out["n_codes"] == 4 and out["n_watchlist"] == 1 and out["n_push"] == 1
 
     rows = {r[0]: r for r in con.execute(f"SELECT * FROM {tm.TABLE}").fetchall()}
     # 列序: ts_code(0) name(1) as_of(2) close(3) pctile(4) dd(5) yield(6)
     #       ma(7) below_ma(8) c1(9) c2(10) c3(11) watch(12) push(13) reasons(14)
+    # a.1: ①✗ → 不进门（② 仅参考展示，不参与门）
     assert rows["a.1"][9] is False and rows["a.1"][10] is True
-    assert rows["a.1"][12] is True and rows["a.1"][13] is False
+    assert rows["a.1"][12] is False and rows["a.1"][13] is False
+    # b.2: ①✓ → 进门；reasons 只含 ①（②③ 不再进触发原因）
     assert rows["b.2"][9] is True and rows["b.2"][10] is True
     assert rows["b.2"][12] is True and rows["b.2"][13] is True
     assert abs(rows["b.2"][4] - 1 / N * 100) < 0.01      # 分位 ≈ 0.33%
     assert abs(rows["b.2"][5] - 50.0) < 1e-9             # 回撤 50%
-    assert "价格分位" in rows["b.2"][14] and "股息率" in rows["b.2"][14]
+    assert "价格分位" in rows["b.2"][14] and "股息率" not in rows["b.2"][14]
     assert rows["c.3"][12] is False and rows["c.3"][13] is False
-    # d.4 无 qfq → ① fail-closed False，② 命中
+    # d.4 无 qfq → ① fail-closed False（② 命中也不进门）
     assert rows["d.4"][9] is False and rows["d.4"][10] is True
     assert rows["d.4"][4] is None and rows["d.4"][5] is None
+    assert rows["d.4"][12] is False and rows["d.4"][13] is False
 
     # 整表刷新幂等（二次刷新不累积）
     tm.refresh_timing(con, up=None, tp=tp, members=members)
@@ -192,17 +196,18 @@ def test_refresh_timing_below_ma():
     tp = make_tp(below_ma250=True, ma_period=250)
     tm.refresh_timing(con, up=None, tp=tp, members=members)
     rows = {r[0]: r for r in con.execute(f"SELECT * FROM {tm.TABLE}").fetchall()}
-    # a.1: ①假 ②真 ③假 → watch 真、push 假（③关闸 AND）
+    # v7.0.24：门 = ① 单条件（③ 仅参考展示，不关闸）
+    # a.1: ①✗ → 不进门（③✗ 也不影响门，仅数据列展示）
     assert rows["a.1"][9] is False and rows["a.1"][10] is True and rows["a.1"][11] is False
-    assert rows["a.1"][12] is True and rows["a.1"][13] is False
-    # b.2: ①真 ②真 ③真 → push 真
+    assert rows["a.1"][12] is False and rows["a.1"][13] is False
+    # b.2: ①✓ → 进门（②③ 不参与判定）；reasons 只含 ①
     assert rows["b.2"][9] and rows["b.2"][10] and rows["b.2"][11]
     assert rows["b.2"][12] and rows["b.2"][13]
-    assert "低于250日线" in rows["b.2"][14]
-    # e.5: 数据不足 → ma None、③ NULL（不触发）；①分位 100 假、②真 → 仅 watch
+    assert "价格分位" in rows["b.2"][14] and "低于250日线" not in rows["b.2"][14]
+    # e.5: 数据不足 → ma None、③ NULL（不显示）；①✗ → 不进门
     assert rows["e.5"][7] is None and rows["e.5"][8] is None and rows["e.5"][11] is None
     assert rows["e.5"][9] is False and rows["e.5"][10] is True
-    assert rows["e.5"][12] is True and rows["e.5"][13] is False
+    assert rows["e.5"][12] is False and rows["e.5"][13] is False
     con.close()
 
 
@@ -217,10 +222,10 @@ def _lake_with_push(con):
                 "in_watchlist BOOLEAN, push_eligible BOOLEAN, reasons VARCHAR)")
     con.execute(f"INSERT INTO {tm.TABLE} VALUES "
                 "('b.2','测试股B','2026-10-23',10.0,0.33,50.0,4.6,NULL,NULL,"
-                "TRUE,TRUE,NULL,TRUE,TRUE,'价格分位；股息率')")
+                "TRUE,TRUE,NULL,TRUE,TRUE,'5年价格分位 0.3%（≤50%）')")
     con.execute(f"INSERT INTO {tm.TABLE} VALUES "
                 "('a.1','测试股A','2026-10-23',10.0,100.0,0.0,5.0,NULL,NULL,"
-                "FALSE,TRUE,NULL,TRUE,FALSE,'股息率')")
+                "FALSE,TRUE,NULL,FALSE,FALSE,'')")
 
 
 def test_push_edge_semantics(tmp_path):
@@ -233,7 +238,8 @@ def test_push_edge_semantics(tmp_path):
 
     # 1) 首跑：b.2 新触发 → 推 1 条 + 落状态
     res = tm.check_and_push(con, tp, state_path=sp, send_fn=send, token="tk")
-    assert res["n_watchlist"] == 2 and res["n_eligible"] == 1 and res["n_new"] == 1
+    # a.1 ①✗（v7.0.24 单条件门）→ 不在观察名单
+    assert res["n_watchlist"] == 1 and res["n_eligible"] == 1 and res["n_new"] == 1
     assert res["pushed"] is True and len(calls) == 1
     assert "测试股B" in calls[0][0] and "时机成熟（首仓待价）" in calls[0][1]
     st = json.loads(Path(sp).read_text(encoding="utf-8"))["codes"]
@@ -305,7 +311,7 @@ def test_push_dry_run(tmp_path):
 def test_render_message():
     rows = [{"ts_code": "sh.601006", "name": "大秦铁路", "as_of_date": "2026-10-23",
              "close": 4.52, "pctile_window": 21.9, "dd_window": 27.5,
-             "ttm_yield_pct": 4.59, "reasons": "5年价格分位 21.9%（≤40%）；股息率 4.59%（≥4.5%）"}]
+             "ttm_yield_pct": 4.59, "reasons": "5年价格分位 21.9%（≤40%）"}]
     title, content = tm.render_timing_message(rows, make_tp(price_window_years=5,
                                                             price_pctile_max=40.0,
                                                             yield_min_pct=4.5), 59)
@@ -337,23 +343,22 @@ def test_web_get_timing(web_timing):
     con = duckdb.connect(str(web_timing))
     con.execute(f"INSERT INTO {tm.TABLE} VALUES "
                 "('sh.600000','浦发银行','2026-10-23',10.0,20.0,30.0,5.0,NULL,NULL,"
-                "TRUE,TRUE,NULL,TRUE,TRUE,'①；②')")
+                "TRUE,TRUE,NULL,TRUE,TRUE,'5年价格分位 20.0%（≤40%）')")
     con.execute(f"INSERT INTO {tm.TABLE} VALUES "
                 "('sh.600001','测试甲','2026-10-23',10.0,80.0,5.0,4.6,NULL,NULL,"
-                "FALSE,TRUE,NULL,TRUE,FALSE,'②')")
+                "FALSE,TRUE,NULL,FALSE,FALSE,'')")
     con.execute(f"INSERT INTO {tm.TABLE} VALUES "
                 "('sh.600002','测试乙','2026-10-23',10.0,60.0,5.0,9.0,NULL,NULL,"
-                "FALSE,TRUE,NULL,TRUE,FALSE,'②')")
+                "FALSE,TRUE,NULL,FALSE,FALSE,'')")
     con.close()
     out = wapp.get_timing()
     assert out["as_of"] == "2026-10-23" and out["n_pool"] == 3
-    assert out["n_watchlist"] == 3 and out["n_push"] == 1
+    # v7.0.24 单条件门：①✗ 的两只（即便股息率高）不进观察名单
+    assert out["n_watchlist"] == 1 and out["n_push"] == 1
     assert out["params"]["price_pctile_max"] == 40.0
-    # push_eligible 优先 → 其次股息率降序
-    assert [r["ts_code"] for r in out["rows"]] == [
-        "sh.600000", "sh.600002", "sh.600001"]
+    assert [r["ts_code"] for r in out["rows"]] == ["sh.600000"]
     assert out["rows"][0]["push_eligible"] is True
-    assert out["rows"][0]["reasons"] == "①；②"
+    assert out["rows"][0]["reasons"] == "5年价格分位 20.0%（≤40%）"
 
 
 def test_web_get_timing_empty_table(web_timing):

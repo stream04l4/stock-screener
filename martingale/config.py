@@ -101,17 +101,19 @@ class UniverseParams:
 
 @dataclass(frozen=True)
 class TimingParams:
-    """选股时机参数（v7.0.13，Joel 2026-10-25 拍板；默认值 = 生产 yaml）。
+    """选股时机参数（v7.0.13 引入；v7.0.24 定案：时机门 = ① 单条件）。
 
     作用域 = 候选池成员（不是全市场、不是基础池）。
-    观察口径（页面"今日选股"）= 已启用条件的 **OR**；
-    提醒口径（PushPlus 微信）= ①且②（③启用时叠加），且仅**新触发**推
+    时机门（观察口径页面"今日选股" + 提醒口径 PushPlus 微信）
+    = ① 价格分位 ≤ price_pctile_max%，仅**新触发**推
     （边沿状态 data/alerts/timing_push_state.json；持续在买区不重推）。
+    ②③ v7.0.24 起降级为参考展示（不参与门；10 年回测结论：② 是总盈利
+    主要拖累且与池入场 G8"当前息率≥3%"同维冗余、③ 年线近乎无效）。
     """
     price_window_years: int = 5        # ① 价格低位窗口（年，滚动至最新 K线日）
-    price_pctile_max: float = 40.0     # ① 当前价处于近 N 年收盘分位 ≤ P%
-    yield_min_pct: float = 4.5         # ② TTM 股息率 ≥ Y%
-    below_ma250: bool = False          # ③ 年线条件开关（默认关）
+    price_pctile_max: float = 40.0     # ① 当前价处于近 N 年收盘分位 ≤ P%（时机门唯一条件）
+    yield_min_pct: float = 4.5         # ② TTM 股息率 ≥ Y%（v7.0.24 起参考展示，不参与门）
+    below_ma250: bool = False          # ③ 年线条件开关（v7.0.24 起参考展示，不参与门）
     ma_period: int = 250               # ③ 均线窗口（交易日）
 
 

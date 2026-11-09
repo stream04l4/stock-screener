@@ -997,9 +997,9 @@ def remove_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.get("/api/timing")
 def get_timing() -> Dict[str, Any]:
-    """今日选股：候选池内已启用时机条件的 OR 命中（in_watchlist）。
+    """今日选股：候选池内时机门（v7.0.24：① 价格分位单条件）命中（in_watchlist）。
 
-    - push_eligible = ①且②（③启用时叠加）——微信"新进入买入区"提醒口径；
+    - push_eligible = ①（与观察口径同条件）——微信"新进入买入区"提醒口径；
     - 湖表缺失（未跑过 timing 预计算）→ 空列表 + as_of=null（前端提示等待
       每日湖更新，fail-closed 不误导）；湖持锁/缺失 → 503（灌数中）。
     """
@@ -1228,13 +1228,11 @@ SIG_HISTORY_WINDOW_DAYS = 90
 
 
 def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
-    """选股时机逐条件明细（仅展示用）：每条带数值 + 阈值 + ✓/✗。
+    """选股时机明细（仅展示用）。
 
-    selection_timing.reasons 只存*已满足*的条件（微信正文用），页面信息不足
-    ——Joel 2026-11-08 定案：无论整体过/未过，都要能看清**哪些条件已达成、
-    哪些未达成**（临近达标时更关键）。故由表内原始字段（pctile_window /
-    ttm_yield_pct / cond_*）+ config 阈值在此逐条拼 ✓/✗。无 timing 行 →
-    「无时机数据」（fail-closed 同口径）。
+    v7.0.24 起时机门 = ① 单条件：① 带 ✓/✗ + 数值 + 阈值（门判定）；
+    ② 股息率 / ③ 年线为参考展示（仅数值，无 ✓/✗，不参与门）。
+    无 timing 行 → 「无时机数据」（fail-closed 同口径）。
     """
     if not trow:
         return "无时机数据"
@@ -1245,13 +1243,12 @@ def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
     parts.append(f"{'✓' if ok1 else '✗'} {tp.price_window_years}年分位 "
                  f"{v1}（需≤{tp.price_pctile_max:g}%）")
     y = trow.get("ttm_yield_pct")
-    ok2 = bool(trow.get("cond_yield"))
-    v2 = "数据不足" if y is None else f"{y:.2f}%"
-    parts.append(f"{'✓' if ok2 else '✗'} 股息率 {v2}（需≥{tp.yield_min_pct:g}%）")
+    if y is not None:
+        parts.append(f"股息率 {y:.2f}%（参考）")
     if getattr(tp, "below_ma250", False):
         ok3 = bool(trow.get("cond_below_ma"))
         v3 = "" if ok3 else "/数据不足"
-        parts.append(f"{'✓' if ok3 else '✗'} 低于{tp.ma_period}日线{v3}")
+        parts.append(f"低于{tp.ma_period}日线{v3}（参考）")
     return " · ".join(parts)
 
 
@@ -1276,12 +1273,11 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
       第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
       （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
       动作恒为买入·首仓、金额 initial_amount）。
-    - 时机门（v7.0.19 迭代）：非持仓股的买入信号须先过选股时机提醒口径
-      （timing.push_eligible = ①价格分位 且 ②股息率，③启用时叠加，读
+    - 时机门（v7.0.24 定案：① 价格分位单条件）：非持仓股的买入信号须先过
+      选股时机提醒口径（timing.push_eligible = ① 5年分位≤40%，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
-      只展示价格状态 + timing_reasons（**逐条件 ✓/✗ 明细**：每条带数值+阈值，
-      由 selection_timing 原始字段 + config 阈值拼出——整体过/未过都列明哪条
-      已达成哪条未达成；持仓股不受时机限制（持仓策略管加仓）。
+      只展示价格状态 + timing_reasons（① 带 ✓/✗ 数值+阈值；②③ 参考值）
+      （持仓股不受时机限制（持仓策略管加仓）。
       timing_ok/timing_reasons 逐股标注。
     - 十年回测参考（v7.0.19 迭代）：推荐买入股标注历史回测——bt_pnl_pct
       （10 年回测收益 %）/ bt_n_buys（回测触发档数），读 selection_backtest_10y；
@@ -1426,8 +1422,8 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         touched = (trigger is not None and day_low is not None
                    and _touches.quote_date_of(q.get("timestamp")) == ref_quote_date
                    and day_low <= trigger and cls["status"] != "active")
-        # 时机门（Joel 2026-11-07 定案）：非持仓股的买入信号须先过策略选股
-        # 时机提醒口径（①价格分位 且 ②股息率，③启用时叠加；selection_timing
+        # 时机门（v7.0.24 定案：① 价格分位单条件；②③ 降为参考展示）：非持仓股
+        # 的买入信号须先过策略选股时机提醒口径（5年分位≤40%；selection_timing
         # 预计算快照，O(1)）——到买入时机才给买入信号；持仓股不受时机限制
         # （持仓策略负责加仓档）。无时机行（timing 未跑/池外）→ fail-closed
         # 不给买入信号，只展示价格状态与原因。

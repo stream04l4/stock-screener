@@ -9,7 +9,7 @@
 - web /api/strategy_signals 端点：股票池 ∪ 账本、触发价（v7.0.23 定案：
   持仓股按 in_pos 分支 in_pos=next 档/未 in_pos=首仓线；**非持仓恒用首仓线**
   ——首仓 = 价跌破首仓线 且 时机✓，双条件）、**时机门**（非持仓股买入信号须
-  timing.push_eligible；持仓股不受限）、**十年回测标注**（bt_pnl_pct/bt_n_buys）、
+  timing.push_eligible = ① 5年分位≤40% 单条件（v7.0.24；持仓股不受限）、**十年回测标注**（bt_pnl_pct/bt_n_buys）、
   history 仅近 90 天 + **微信推送标记**（代码|动作|档 前缀匹配去重态）、
   湖锁定降级、strategy 库名 400、空 universe；
 - **v7.0.20 盘中触碰**：最新行情日最低价已触线、现价回出 → status=touched
@@ -335,13 +335,13 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s4["next_add_price_raw"] == 40.0  # 触发价 = 首仓线（若误走 next 35.0 可区分）
     assert s4["action"] is None and s4["suggested_amount"] is None
     assert s4["timing_ok"] is False
-    # 逐条件 ✓/✗ 明细（端点由原始字段 + config 阈值拼；strategy.yaml：
-    # 5 年窗口 / 分位≤40 / 股息≥4.5，③ 未启用）
+    # 时机明细（v7.0.24：① 为门条件带 ✓/✗；② 参考值；strategy.yaml：
+    # 5 年窗口 / 分位≤40）
     assert s4["timing_reasons"] == \
-        "✗ 5年分位 55.0%（需≤40%） · ✗ 股息率 2.00%（需≥4.5%）"
-    # ✓ 行同样逐条件列明（整体过 = 每条 ✓）
+        "✗ 5年分位 55.0%（需≤40%） · 股息率 2.00%（参考）"
+    # ✓ 行：① 过 = 门过（② 参考不参与判定）
     assert s2["timing_reasons"] == \
-        "✓ 5年分位 21.0%（需≤40%） · ✓ 股息率 4.60%（需≥4.5%）"
+        "✓ 5年分位 21.0%（需≤40%） · 股息率 4.60%（参考）"
     # 湖中无数据 → no_data（池内非持仓）
     s5 = by["sh.600005"]
     assert s5["status"] == "no_data" and s5["held"] is False and s5["price"] is None

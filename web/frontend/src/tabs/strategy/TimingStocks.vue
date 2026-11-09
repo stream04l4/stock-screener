@@ -1,9 +1,11 @@
 // 今日选股（v7.0.13，策略页签「选股策略」卡片内）。
-// - 数据：GET /api/timing（候选池 × 已启用时机条件的 OR 命中；读 selection_timing
-//   预计算表 O(1)，服务端排序 = 会提醒的优先 → 股息率降序 → 代码）。
-// - 双口径（与后端单一定义点 martingale/timing.py 一致）：
-//   本表 = 命中任意已启用条件（观察名单）；「买入区」徽标 = ①价格低位 且 ②高股息率
-//   （③年线启用时叠加）= 微信"新进入买入区"提醒口径（仅新触发推送，每日湖更新后自动检查）。
+// - 数据：GET /api/timing（候选池 × 时机门命中；v7.0.24 起 = ① 5年分位≤40%
+//   单条件，in_watchlist 与 push_eligible 同口径；读 selection_timing 预计算
+//   表 O(1)，服务端排序 = 会提醒的优先 → 股息率降序 → 代码）。
+// - 口径（与后端单一定义点 martingale/timing.py 一致，2026-11-09 回测定案）：
+//   本表 = ① 命中（观察名单 = 提醒口径）；「买入区」徽标 = ① 命中 = 微信
+//   "新进入买入区"提醒口径（仅新触发推送，每日湖更新后自动检查）。
+//   股息率 / 250 日线降为**参考展示**（数据列继续显示，不参与门判定）。
 // - 一键加入我的持仓：行内展开 股数/成本价（成本默认当前价）→ PUT /api/my_positions
 //   upsert（与「我的持仓」录入条同一端点/口径）→ 成功后 invalidate("my_positions")。
 // - 防御：as_of=null（timing 表未生成）→ 空表 + 等待提示；加载失败 → 一行错误。
@@ -58,12 +60,13 @@ function fmt(v, suffix = "") {
       <span v-else-if="data" class="ts-muted">等待每日湖更新（timing 表尚未生成）</span>
       <span v-if="loading" class="ts-muted">加载中…</span>
     </div>
-    <p class="ts-note">
-      列表 = 命中任意已启用条件（观察）；<b>买入区</b> = 价格低位且高股息率同时命中（微信只推<b>新触发</b>）。
-      确认后「加持仓」，持仓策略自动接管加仓档位。
-    </p>
     <p v-if="error" class="ts-err">今日选股加载失败：{{ error }}</p>
     <div v-else-if="data" class="tbl-wrap">
+      <p class="ts-note">
+        列表 = 命中时机门「{{ data.params.price_window_years }}年分位 ≤ {{ data.params.price_pctile_max }}%」（v7.0.24 单条件；
+        股息率为参考展示）。<b>买入区</b> = 时机门命中（微信只推<b>新触发</b>）。
+        确认后「加持仓」，持仓策略自动接管加仓档位。
+      </p>
       <table class="data">
         <thead>
           <tr>
@@ -71,14 +74,14 @@ function fmt(v, suffix = "") {
             <th class="num">现价</th>
             <th class="num">{{ data.params.price_window_years }}年分位%</th>
             <th class="num">{{ data.params.price_window_years }}年回撤%</th>
-            <th class="num">股息率%</th>
+            <th class="num">股息率%（参考）</th>
             <th>触发条件</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!data.rows.length">
             <td colspan="8" class="muted">
-              （当前无股票命中已启用的选股条件{{ data.as_of ? "" : "——等待每日湖更新" }}）
+              （当前无股票命中时机门（{{ data.params.price_window_years }}年分位≤{{ data.params.price_pctile_max }}%）{{ data.as_of ? "" : "——等待每日湖更新" }}）
             </td>
           </tr>
           <template v-for="r in data.rows" :key="r.ts_code">

@@ -5,16 +5,24 @@
 ∪ 手动）之上筛**买入时机**。选股 ≠ 买入——触发后由 Joel 决定是否买入，
 买入后录入「我的持仓」由持仓策略（martingale.strategy 参数段）接管档位。
 
-三个条件（TimingParams；页面可开关/调参）：
+条件项（TimingParams；页面可开关/调参）：
 - ① 价格低位：当前价处于近 price_window_years 年收盘价分位 ≤ price_pctile_max%
-  （前复权口径；分位 = 窗口内 ≤ 当前价的交易日占比）；
-- ② 股息率触发：最新 TTM 股息率 ≥ yield_min_pct%（候选池成员自带 ttm_yield_pct）；
-- ③ 年线下：当前价 < 近 ma_period 日均线（below_ma250 开关，默认关）。
+  （前复权口径；分位 = 窗口内 ≤ 当前价的交易日占比）——**时机门唯一条件**；
+- ② 股息率：最新 TTM 股息率 ≥ yield_min_pct%（候选池成员自带 ttm_yield_pct）——
+  v7.0.24 起参考展示，不参与门；
+- ③ 年线下：当前价 < 近 ma_period 日均线（below_ma250 开关，默认关）——
+  v7.0.24 起参考展示，不参与门。
 
-双口径：
-- 观察口径（页面「今日选股」）= 已启用条件的 **OR**（in_watchlist）；
-- 提醒口径（PushPlus 微信）= ①且②（③启用时叠加）（push_eligible），
-  且仅**新触发**推送——边沿状态 data/alerts/timing_push_state.json
+**时机门 = ① 单条件（v7.0.24，Joel 2026-11-09 定案）**：10 年回测（2016-01→2026-11，
+池 62 只，生产状态机逐笔复刻，48+106 组参数面）结论——② 是总盈利主要拖累
+（y=4.5 较 y=0 少 38~45%，且与池入场 G8"当前息率≥3%"同维冗余）、③ 年线近乎
+无效（±2%）、① 与 ② 同属"便宜程度"维度高度冗余 → ②③ 降级为参考展示
+（数据列/页面继续显示），**不再参与时机门**；门 = 5 年分位 ≤ 40%。
+
+双口径（v7.0.24 起均为 ① 单条件）：
+- 观察口径（页面「今日选股」）= ①（in_watchlist）；
+- 提醒口径（PushPlus 微信）= ①（push_eligible），且仅**新触发**推送——
+  边沿状态 data/alerts/timing_push_state.json
   （= 上轮 push_eligible 且已知的代码集；掉出买区后状态清除，
   再次进入 = 新触发可再推。持续在买区不重推。推送失败不落状态 → 下轮重试）。
 
@@ -58,8 +66,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     cond_price_low   BOOLEAN NOT NULL,   -- ① 触发（数据不足 → FALSE，fail-closed）
     cond_yield       BOOLEAN NOT NULL,   -- ② 触发（股息率缺失 → FALSE）
     cond_below_ma    BOOLEAN,            -- ③ 触发（开关关/数据不足 → NULL）
-    in_watchlist     BOOLEAN NOT NULL,   -- 观察口径：已启用条件 OR
-    push_eligible    BOOLEAN NOT NULL,   -- 提醒口径：①且②（③启用时叠加）
+    in_watchlist     BOOLEAN NOT NULL,   -- 观察口径：①（v7.0.24 单条件）
+    push_eligible    BOOLEAN NOT NULL,   -- 提醒口径：①（v7.0.24 单条件）
     reasons          VARCHAR             -- 触发原因（页面展示 + 微信正文）
 )
 """
@@ -90,7 +98,7 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
                    manual: Optional[Dict[str, Dict[str, Any]]] = None,
                    members: Optional[List[Member]] = None,
                    verbose: bool = False) -> Dict[str, Any]:
-    """候选池逐股算 ①②③ → 写入 selection_timing（整表刷新）。
+    """候选池逐股算 ①（门）+ ②③（参考展示）→ 写入 selection_timing（整表刷新）。
 
     :param con: **写**连接（每日作业在湖增量后独占执行；勿在 Web 请求路径调用）。
     :param members: 可注入（测试用）；缺省 build_candidate_pool(con, up, manual)。
@@ -133,21 +141,20 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
             pctile = sum(1 for x in ks if x <= cur_qfq) / len(ks) * 100.0
             dd = (1.0 - cur_qfq / max(ks)) * 100.0
         cond_price_low = (pctile is not None and pctile <= tp.price_pctile_max)
-        # ② 股息率（候选池成员自带；None → fail-closed False）
+        # ② 股息率（候选池成员自带；None → fail-closed False）——v7.0.24 起仅参考展示
         yld = m.ttm_yield_pct
         cond_yield = (yld is not None and yld >= tp.yield_min_pct)
-        # ③ 年线（前复权均线；前复权最新价 = 原始最新价，口径一致）
+        # ③ 年线（前复权均线；前复权最新价 = 原始最新价，口径一致）——v7.0.24 起仅参考展示
         ma = below = cond_below = None
         if tp.below_ma250 and ks:
             if len(ks) >= tp.ma_period:
                 ma = sum(ks[-tp.ma_period:]) / tp.ma_period
                 below = (ks[-1] < ma)
                 cond_below = below
-            # 数据不足 ma_period → 保持 None（不触发、不显示，fail-closed）
-        in_watch = bool(cond_price_low or cond_yield
-                        or (cond_below if tp.below_ma250 else False))
-        push_ok = bool(cond_price_low and cond_yield
-                       and (cond_below if tp.below_ma250 else True))
+            # 数据不足 ma_period → 保持 None（不显示，fail-closed）
+        # v7.0.24：时机门 = ① 单条件（②③ 降为参考展示，不参与门）
+        in_watch = bool(cond_price_low)
+        push_ok = bool(cond_price_low)
         if in_watch:
             n_watch += 1
         if push_ok:
@@ -157,10 +164,6 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
         if cond_price_low:
             parts.append(f"{tp.price_window_years}年价格分位 "
                          f"{pctile:.1f}%（≤{tp.price_pctile_max:g}%）")
-        if cond_yield:
-            parts.append(f"股息率 {yld:.2f}%（≥{tp.yield_min_pct:g}%）")
-        if tp.below_ma250 and cond_below:
-            parts.append(f"低于{tp.ma_period}日线")
         rows.append((
             c, m.name, str(latest),
             m.price_latest,
