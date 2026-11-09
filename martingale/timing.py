@@ -232,7 +232,12 @@ def save_edge_state(codes: Dict[str, Dict[str, Any]],
 
 def render_timing_message(rows: List[Dict[str, Any]], tp: TimingParams,
                           n_pool: int) -> tuple:
-    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。"""
+    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
+
+    v7.0.23 口径：时机成熟 = 首仓双条件之一（时机✓ + 价破首仓线），故措辞从
+    「新进入买入区」改为「时机成熟（首仓待价）」——价格到位后的首仓买入信号由
+    盘中「策略点位提醒」推送（scripts/position_alert.py 首仓通道）。
+    """
     names = []
     blocks: List[str] = []
     for r in rows:
@@ -248,15 +253,16 @@ def render_timing_message(rows: List[Dict[str, Any]], tp: TimingParams,
         if r.get("ttm_yield_pct") is not None:
             bits.append(f"股息率 {r['ttm_yield_pct']:.2f}%")
         blocks.append(
-            f"<p><b>{name}（{r['ts_code']}）</b> 新进入买入区</p>"
+            f"<p><b>{name}（{r['ts_code']}）</b> 时机成熟（首仓待价）</p>"
             f"<p>{' ｜ '.join(bits)}</p>"
             f"<p>触发：{r.get('reasons') or '-'}</p><hr/>")
     title = ("选股提醒：" + "、".join(names[:3]) +
              (" 等" if len(names) > 3 else "") +
-             f" 新进入买入区（{len(rows)} 只）")
+             f" 时机成熟（{len(rows)} 只）")
     footer = (f"<p style='color:#888;font-size:12px'>选股策略（候选池 {n_pool} 只）｜ "
               f"as_of {rows[0].get('as_of_date')} ｜ 仅新触发推送 ｜ "
-              f"决定买入请录入「我的持仓」由持仓策略接管</p>")
+              f"首仓 = 时机✓ 且 现价跌破首仓线，破线后盘中「策略点位提醒」推送首仓买入；"
+              f"建仓请录入「我的持仓」由持仓策略（越跌越买）接管</p>")
     return title, "".join(blocks) + footer
 
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import AbstractSet, Any, Dict, List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -52,36 +52,42 @@ def quote_date_of(timestamp: Optional[str]) -> Optional[str]:
     return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
 
 
-def trigger_price(row: Dict[str, Any]) -> Optional[float]:
-    """信号触发线（原始口径）：与 /api/strategy_signals 同一分支——
-    in_pos → next 档（持仓加仓线；非持仓 = 从当前状态加入策略的线）；
-    未 in_pos → 首仓线。"""
-    if row.get("in_pos"):
+def trigger_price(row: Dict[str, Any], held: bool = False) -> Optional[float]:
+    """信号触发线（原始口径）：与 /api/strategy_signals 同一分支（v7.0.23
+    Joel 定案「非持仓首仓 = 时机成熟 且 价已跌破首仓线，双条件」）——
+    持仓股：in_pos → next 档（加仓线）；未 in_pos → 首仓线（不变）；
+    非持仓股：**恒用首仓线**（首仓信号线；不再用模拟 next 档——时机门
+    （分位+股息）替代旧「非持仓 in_pos 取 next 档」的防幽灵机制，老股锚
+    高首仓线远低于市价时由时机门兜住，不产幽灵信号）。"""
+    if held and row.get("in_pos"):
         return row.get("next_add_price_raw")
     return row.get("first_level_raw")
 
 
-def touch_amount(sp, row: Dict[str, Any]) -> Optional[float]:
+def touch_amount(sp, row: Dict[str, Any], held: bool = False) -> Optional[float]:
     """触碰档的建议金额（与 classify_signal 同一口径）：
-    in_pos → base×growth^k；未 in_pos → 首仓 initial_amount。"""
+    持仓股 in_pos → base×growth^k（加仓）；否则 → 首仓 initial_amount
+    （非持仓触碰 = 首仓信号，v7.0.23）。"""
     if sp is None:
         return None
-    if row.get("in_pos"):
+    if held and row.get("in_pos"):
         return round(sp.base_add_amount * (sp.growth_ratio ** (row.get("k_level") or 0)))
     return sp.initial_amount
 
 
 def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, Any]],
-                    sp) -> List[Dict[str, Any]]:
+                    sp, held_codes: AbstractSet[str] = frozenset()) -> List[Dict[str, Any]]:
     """逐股判定「最新行情日已触碰」→ 事件列表（无排序保证，按 rows 顺序）。
 
     触碰 = 行情当日最低价 ≤ 触发线（与 classify_signal 的 active 判定同向：
     价到过线上即算触碰）。无行情/无触发线/低价缺失 → 不产事件（fail-closed）。
     事件 date = **该股行情日**（停牌股行情停在旧日 → 事件也落旧日，不污染当日）。
+    :param held_codes: 用户持仓代码集（决定触发线/档位/金额口径，v7.0.23）。
     """
     out: List[Dict[str, Any]] = []
     for c, row in rows.items():
-        trig = trigger_price(row)
+        held = c in held_codes
+        trig = trigger_price(row, held=held)
         q = spot.get(c) or {}
         low = q.get("low")
         if trig is None or low is None or trig <= 0 or low > trig:
@@ -89,15 +95,17 @@ def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, A
         d = quote_date_of(q.get("timestamp"))
         if d is None:
             continue
-        in_pos = bool(row.get("in_pos"))
+        # 档位/首笔标注按「对该用户是否是加仓」：持仓股 in_pos → 第 k 档加仓；
+        # 非持仓（或持仓未 in_pos）→ 首仓（level=0, first_of_round=True）
+        in_pos_eff = bool(row.get("in_pos")) and held
         out.append({
             "ts_code": c,
             "name": row.get("name") or c,
             "date": d,
-            "level": (row.get("k_level") or 0) if in_pos else 0,
-            "first_of_round": not in_pos,
+            "level": (row.get("k_level") or 0) if in_pos_eff else 0,
+            "first_of_round": not in_pos_eff,
             "level_price": trig,
-            "amount": touch_amount(sp, row),
+            "amount": touch_amount(sp, row, held=held),
             "low_price": round(float(low), 4),
             "price": q.get("price"),
         })

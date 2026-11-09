@@ -1402,19 +1402,21 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         price = (spot.get(c) or {}).get("price")
         if price is None and r is not None:
             price = r.get("last_price")
-        # 触发价口径（v7.0.19 定案）：按 in_pos 分支，与 held 无关——
-        # - in_pos（模拟持仓已建立）：模拟周期 next 档（next_add_price_raw），
-        #   动作 = 加仓第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线；
-        # - 未 in_pos（模拟尚未建仓）：首仓线（first_level_raw = 本周期
-        #   H×(1−first_drawdown)），动作 = 买入·首仓（金额 initial_amount）。
-        # 为什么非持仓股不能恒用首仓线：状态机自数据起点回放，老股的当前周期
-        # entry_high 可能锚在多年前高点（复权口径），周期一旦开始，首仓线即
-        # 远高于市价 → 恒假 active（幽灵信号）；此时可执行的只有 next 档。
+        # 触发价口径（v7.0.23 定案，Joel 2026-11-09：「非持仓首仓 = 时机成熟
+        # 且已距高点回撤到位，双条件」）：
+        # - 持仓股：in_pos → 模拟 next 档（加仓线）；未 in_pos → 首仓线（不变，
+        #   持仓策略加仓不受时机限制）；
+        # - 非持仓股：**恒用首仓线**（first_level_raw）——价跌破首仓线（距轮高
+        #   回撤 first_drawdown）= 「已距高点下跌到位」；时机门（timing_ok）=
+        #   「时机成熟」；两者都过才有买入·首仓信号。时机门同时兜住老股幽灵
+        #   信号（锚高老轮首仓线远低于市价 → 价条件恒真，靠分位>40% 拦住）。
+        #   建仓后由用户记入持仓账本 → 转持仓策略加仓档。
         in_pos = bool((r or {}).get("in_pos"))
-        trigger = ((r or {}).get("next_add_price_raw") if in_pos
-                   else (r or {}).get("first_level_raw"))
+        trigger = _touches.trigger_price(r or {}, held=held)
         k = (r.get("k_level") or 0) if r else 0
-        cls = classify_signal(price, trigger, in_pos, k, sp_obj)
+        # 非持仓的动作/金额按首仓口径（buy/initial）——simulate in_pos 仅持仓
+        # 股影响档位语义
+        cls = classify_signal(price, trigger, in_pos if held else False, k, sp_obj)
         # 盘中触碰（v7.0.20，Joel 2026-11-08：「盘中达成信号又涨回出区的，保留
         # 到当日，第二天移入历史信号」）：最新行情日最低价已触线、现价回出信号区
         # → 信号今日已发生，保留在当前段（status=touched）；行情日滚动后自动
@@ -1441,8 +1443,9 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         suggested = cls["suggested_amount"]
         if touched and action is None and sp_obj is not None:
             # 已触回（现价已高于触发线 → cls 无动作）：信号今日已发生，动作/
-            # 金额按 active 同口径补齐（in_pos=加仓 base×growth^k；否则首仓）
-            if in_pos:
+            # 金额按 active 同口径补齐（持仓股 in_pos=加仓 base×growth^k；
+            # 非持仓/未 in_pos=首仓 initial，v7.0.23）
+            if in_pos and held:
                 action = "add"
                 suggested = round(sp_obj.base_add_amount * (sp_obj.growth_ratio ** k))
             else:

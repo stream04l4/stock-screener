@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""持仓策略点位微信提醒（v7.0.11，Joel 2026-10-24："持仓到策略点位要提醒"）。
+"""策略点位微信提醒（v7.0.11 持仓通道；v7.0.23 增加非持仓首仓通道）。
 
-职责：交易时段每 10 分钟（systemd timer 驱动，见 stock-screener-alerts.timer）
-检查**用户持仓账本**里每只股票是否到达策略状态机的下一触发价位，触发则通过
-**推送加（PushPlus，微信公众号 pushplus 推送加）** 推到 Joel 的微信。
+两条策略线（v7.0.23 Joel 定案：建仓/加仓为两个独立策略），交易时段每 10 分钟
+（systemd timer 驱动，见 stock-screener-alerts.timer）通过**推送加（PushPlus，
+微信公众号 pushplus 推送加）** 推到 Joel 的微信：
 
-口径与 Web「我的持仓」页面信号**逐字一致**（共享 martingale.signals.build_signals
-+ web.app._strategy_state_rows 单一定义点）：
-- 现价 = 腾讯实时行情（批量一次调用）；行情失败回退湖最后价（只漏报不误报）；
-- 触发 = 现价 ≤ 下一档触发价（原始口径 raw，分红复权已除）；
-- in_pos（策略持仓第 k 档）→ "add"（加到 k+1 档，base×growth^k）；否则 "buy"
-  （首仓 initial_amount）。
+① 持仓股·加仓（越跌越买）：检查**用户持仓账本**里每只股票是否到达策略状态机
+   的下一触发价位（in_pos → 第 k+1 档，base×growth^k；未 in_pos → 首仓线）；
+② 非持仓股·首仓（双条件）：检查**候选池非持仓股**是否同时满足
+   a. 时机成熟：selection_timing.push_eligible（分位≤40% 且 股息≥4.5%，
+      无 timing 行 fail-closed 不推）；
+   b. 价格到位：现价 ≤ 首仓线（本轮高点回撤 15% 的线，first_level_raw）。
+   两者都过 = 首仓买入信号（initial_amount）。建仓后录入「我的持仓」→
+   自动转通道①。
+
+口径与 Web「策略信号中心」页面**同一单点**（martingale.touches.trigger_price
++ martingale.signals.build_signals + web.app._strategy_state_rows）：
+- 现价 = 腾讯实时行情（批量一次调用，池+持仓一次拉取）；行情失败回退湖最后价
+  （与持仓通道同策，只漏报不误报）；
+- 触发 = 现价 ≤ 触发线（原始口径 raw，分红复权已除）。
 
 推送加接口：POST http://www.pushplus.plus/send
   {"token": ..., "title": ..., "content": <html>, "template": "html"}
@@ -19,9 +27,10 @@
 
 去重（data/alerts/pushplus_alert_state.json，原子写）：
 - 键 = "code|action|k|触发价"——**同一点位同日最多推 1 条**；点位变化（加仓后
-  状态机推进）= 新键 → 可再推；推送失败不落状态 → 下次运行自动重试。
+  状态机推进 / 新一轮首仓线）= 新键 → 可再推；推送失败不落状态 → 下次运行
+  自动重试。
 
-退出码：0=正常（含无持仓/无触发/已去重）；2=配置错（PUSHPLUS_TOKEN 缺失）；
+退出码：0=正常（含无触发/已去重）；2=配置错（PUSHPLUS_TOKEN 缺失）；
 3=数据湖不可用（持锁/缺失——下轮自动重试）；4=推送加推送失败（下轮重试）。
 
 用法：
@@ -38,11 +47,15 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+
+from martingale import timing  # noqa: E402  (须在 sys.path 注入后)
+from martingale import touches  # noqa: E402
 
 PUSHPLUS_SEND_URL = "http://www.pushplus.plus/send"
 STATE_PATH = os.path.join(PROJECT_ROOT, "data", "alerts", "pushplus_alert_state.json")
@@ -119,7 +132,11 @@ def _alert_key(sig: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 def render_message(signals: List[Dict[str, Any]], sp_name: str,
                    price_source: str, spot_time: Optional[str]) -> tuple:
-    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。"""
+    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
+
+    v7.0.23：双通道聚合（持仓加仓 + 非持仓首仓）。首仓信号带 note（区分口径）
+    与 timing 明细（分位/股息率）；加仓信号无 note（持仓策略）。
+    """
     names = []
     blocks: List[str] = []
     for s in signals:
@@ -131,20 +148,26 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
                     f"{s['suggested_amount']:,.0f} 元"
                     if s.get("suggested_amount") else "建议加仓一档")
         else:
-            line1 = f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
+            line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
+                     + (f"（{s['note']}）" if s.get("note") else ""))
             tail = (f"首仓触发，约 {s['suggested_amount']:,.0f} 元"
                     if s.get("suggested_amount") else "首仓触发")
+        bits = [f"现价: <b>{s['price']:.3f}</b>",
+                f"触发价: {s['next_add_price']:.3f}"]
+        if s.get("pctile") is not None and s.get("ttm_yield") is not None:
+            bits.append(f"时机: 分位 {s['pctile']:.1f}% ｜ 股息率 {s['ttm_yield']:.2f}%")
         blocks.append(
             f"<p>{line1}</p>"
-            f"<p>现价: <b>{s['price']:.3f}</b> &nbsp; 触发价: {s['next_add_price']:.3f}</p>"
+            f"<p>{' &nbsp; '.join(bits)}</p>"
             f"<p>{tail}</p><hr/>")
-    title = ("持仓点位提醒：" + "、".join(names[:3]) +
+    title = ("策略点位提醒：" + "、".join(names[:3]) +
              (" 等" if len(names) > 3 else "") +
              f" 到达策略点位（{len(signals)} 只）")
     src = "腾讯实时行情" if price_source == "spot" else "湖最后收盘（实时行情缺失）"
     ts = f" {spot_time}" if spot_time else ""
     footer = (f"<p style='color:#888;font-size:12px'>行情: {src}{ts} ｜ "
-              f"策略: {sp_name} ｜ 同一点位每日仅提醒一次</p>")
+              f"策略: {sp_name} ｜ 持仓=越跌越买加仓 ｜ 非持仓首仓=时机✓且破首仓线 ｜ "
+              f"同一点位每日仅提醒一次</p>")
     return title, "".join(blocks) + footer
 
 
@@ -174,43 +197,48 @@ def run(force: bool = False, dry_run: bool = False,
         log.info("非交易时段（%s），跳过", _beijing_now().strftime("%Y-%m-%d %H:%M %A"))
         return 0
 
-    # 1) 用户持仓账本（空 → 无事可做）
+    # 1) 用户持仓账本（v7.0.23：账本空不再早退——候选池非持仓股仍有首仓通道）
     from web.app import _up_read, _strategy_state_rows
 
     user = _up_read()
-    if not user:
-        log.info("持仓账本为空，跳过")
-        return 0
-    codes = sorted(user.keys())
+    held_codes = sorted(user.keys())
 
-    # 2) 策略状态机行（湖只读；持锁/缺失 → 3，下轮重试）
+    # 2) 策略状态机行 + 时机表（湖只读；持锁/缺失 → 3，下轮重试）
     try:
         from web.app import _load_pool_ctx
 
         _sp, _up, con, pool = _load_pool_ctx()
         try:
-            rows = _strategy_state_rows(_sp, con, set(pool.codes) | set(codes))
+            universe = set(pool.codes) | set(held_codes)
+            if universe:
+                rows = _strategy_state_rows(_sp, con, sorted(universe))
+                tmap = timing.load_timing_map(con)
+            else:
+                rows, tmap = {}, {}
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）
         log.warning("数据湖不可用（下轮重试）: %s", exc)
         return 3
+    if not universe:
+        log.info("股票池与持仓账本均为空，跳过")
+        return 0
 
-    # 3) 实时行情（批量一次；失败回退湖最后价——只漏报不误报）
+    # 3) 实时行情（池+持仓批量一次；失败回退湖最后价——只漏报不误报）
     spot: Dict[str, Dict[str, Any]] = {}
     try:
         from screener.data.tencent import TencentClient
 
-        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(codes) or {}
+        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(sorted(universe)) or {}
     except Exception as exc:  # noqa: BLE001 - 行情失败不阻断（回退湖价）
         log.warning("腾讯实时行情失败（回退湖最后价）: %s", exc)
     price_source = ("spot" if any(v.get("price") is not None for v in spot.values())
                     else "lake")
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
 
-    # 4) 信号（与 Web 页面同一口径）
+    # 4a) 持仓通道：持仓股 → 下一档触发价（与 Web 页面同一口径）
     positions = []
-    for c in codes:
+    for c in held_codes:
         u = user[c] if isinstance(user[c], dict) else {}
         s = rows.get(c, {})
         last = s.get("last_price")
@@ -227,8 +255,38 @@ def run(force: bool = False, dry_run: bool = False,
     from martingale.signals import build_signals
 
     signals = build_signals(positions, _sp)
+
+    # 4b) 首仓通道（v7.0.23）：候选池非持仓股，双条件 = 时机成熟 且
+    # 现价 ≤ 首仓线（触发线恒为 first_level_raw，与页面 touches.trigger_price
+    # 非持仓分支同一单点）。时机门 fail-closed：无 timing 行/未达标 → 不推。
+    for c in sorted(set(pool.codes) - set(held_codes)):
+        r = rows.get(c) or {}
+        trig = touches.trigger_price(r, held=False)
+        if not trig:
+            continue
+        t = tmap.get(c) or {}
+        if not t.get("push_eligible"):
+            continue
+        price_now = (spot.get(c) or {}).get("price") or r.get("last_price")
+        if price_now is None or price_now > trig:
+            continue
+        signals.append({
+            "ts_code": c,
+            "name": r.get("name") or c,
+            "price": price_now,
+            "next_add_price": trig,
+            "k_level": 0,
+            "next_level": 1,
+            "suggested_amount": getattr(_sp, "initial_amount", None),
+            "action": "buy",
+            "note": "非持仓·首仓信号（时机✓）",
+            "pctile": t.get("pctile_window"),
+            "ttm_yield": t.get("ttm_yield_pct"),
+        })
+    signals.sort(key=lambda x: x.get("ts_code") or "")
     if not signals:
-        log.info("无触发（%d 只持仓检查完毕，price_source=%s）", len(codes), price_source)
+        log.info("无触发（持仓 %d 只 + 池内非持仓 %d 只检查完毕，price_source=%s）",
+                 len(held_codes), len(set(pool.codes) - set(held_codes)), price_source)
         return 0
 
     # 5) 去重（同日同点位不重推）

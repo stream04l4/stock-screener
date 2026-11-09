@@ -67,13 +67,14 @@ const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里�
 const sigStocks = computed(() => sigData.value?.stocks || []);
 // 当前信号 = active（现价在区内）+ touched（v7.0.20：今日已触线、现价回出——
 // 盘中达成过信号就保留到当日，次日行情日滚动后自动移出、移入历史段）
-// 且（v7.0.20 Joel 2026-11-08 定案）：仅含 持仓股（加仓信号）与非持仓股的
-// **买入信号**（in_pos=false → 触发线=首仓线）。非持仓但模拟已建仓（in_pos=true）
-// 的股票触发线是模拟加仓档——连建仓都未建，加仓信号不该出现在当前信号；
-// 其盘中触碰记录仍落「历史信号」（收盘 job 落盘事件）。
+// 且（v7.0.23 Joel 定案「非持仓首仓 = 时机成熟 且 价跌破首仓线，双条件」）：
+// 持仓股（加仓信号，不受时机限制）或非持仓股**时机达标**（timing_ok=true——
+// 非持仓信号 = 买入·首仓，时机未过/无时机行 fail-closed 不入段，与「即将进入」
+// 同一门）。旧 v7.0.20 的 in_pos 排除（非持仓模拟加仓档无意义）随口径废除：
+// 非持仓触发线已恒为首仓线，active 即真实首仓信号。
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
-         && (s.held || s.in_pos === false)));
+         && (s.held || s.timing_ok === true)));
 // 即将进入（v7.0.22，Joel 定案：「非持仓股即将进入买入时机，或持仓股即将
 // 触发加仓」）：价格带（3% 内临线）+ 时机门——持仓股照展示（加仓不受时机
 // 限制）；非持仓股须 timing_ok=true 才展示：时机未过（或无时机行 fail-
@@ -108,15 +109,15 @@ function timingText(s) {
 function actionText(s) {
   if (!s.action) return "时机未过";
   if (s.held) return s.action === "buy" ? "买入·首仓" : "加仓";
-  // 非持仓统一「买入」：in_pos = 按策略当前状态加入（第 N 档）；否则首仓
-  return s.in_pos ? `买入·第${(s.k_level ?? 0) + 1}档` : "买入·首仓";
+  // 非持仓统一「买入·首仓」（v7.0.23：触发线恒为首仓线，无「第N档加入」口径）
+  return "买入·首仓";
 }
 const sigShown = computed(() => {
   if (sigSel.value === "active") {
     return sigActive.value.map((s) => ({ ...s,
       status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
-      level_label: s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
+      level_label: s.held && s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
       amount_w: s.suggested_amount == null ? "—" : fmtWan(s.suggested_amount),
       day_low_s: s.day_low == null ? "—" : String(s.day_low),
       bt_s: btText(s), timing_s: timingText(s) }));
@@ -125,7 +126,7 @@ const sigShown = computed(() => {
     return sigApproach.value.map((s) => ({ ...s,
       status_tag: s.held ? "● 持仓" : "○ 非持仓",
       distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
-      level_label: s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）",
+      level_label: s.held && s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）",
       bt_s: btText(s), timing_s: timingText(s) }));
   }
   return sigHistory.value.map((h) => ({ ...h,

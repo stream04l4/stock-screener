@@ -43,18 +43,26 @@ SP = SimpleNamespace(name="drawdown_martingale", base_add_amount=10000,
                      growth_ratio=1.1, initial_amount=100000)
 
 
-def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None):
-    """全链路替身：web.app 三函数 + 腾讯 + requests.post + 时钟 + .env key。"""
+def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
+          user=None, pool_codes=None, rows=None, tmap=None):
+    """全链路替身：web.app 三函数 + 时机表 + 腾讯 + requests.post + 时钟 + .env key。"""
     import web.app as wapp
 
-    monkeypatch.setattr(wapp, "_up_read", lambda: dict(USER))
+    user = dict(USER) if user is None else user
+    pool_codes = list(pool_codes) if pool_codes is not None else ["sh.601728", "sh.601398"]
+    rows = dict(ROWS) if rows is None else rows
+    tmap = {} if tmap is None else tmap
+    monkeypatch.setattr(wapp, "_up_read", lambda: user)
     con = SimpleNamespace(close=lambda: None)
-    pool = SimpleNamespace(codes=["sh.601728", "sh.601398"])
+    pool = SimpleNamespace(codes=pool_codes)
     if lake_rc == "ok":
         monkeypatch.setattr(wapp, "_load_pool_ctx",
                             lambda cfg_path=None: (SP, None, con, pool))
         monkeypatch.setattr(wapp, "_strategy_state_rows",
-                            lambda sp, con2, codes: dict(ROWS))
+                            lambda sp, con2, codes: dict(rows))
+        import martingale.timing as tmod
+
+        monkeypatch.setattr(tmod, "load_timing_map", lambda con2: dict(tmap))
     else:
         def _boom(cfg_path=None):
             raise RuntimeError("数据湖被其他进程锁定（测试注入）")
@@ -249,3 +257,83 @@ def test_trading_window_gate(monkeypatch):
     assert pa.in_trading_window(at(15, 30)) is False    # 收盘后（15:05 前有效）
     assert pa.in_trading_window(at(14, 0, weekday_mon=5)) is False   # 周六
     # --force 由 run() 入口处理（此处只测纯函数）
+
+
+# ---------------------------------------------------------------------------
+# 3) 首仓通道（v7.0.23：非持仓股，双条件 = 时机✓ 且 现价 ≤ 首仓线）
+# ---------------------------------------------------------------------------
+# 600001 双条件全过 → 推；600002 价过时机✗ → 不推；600003 时机✓价未过 → 不推
+FIRST_POOL = ["sh.600001", "sh.600002", "sh.600003"]
+FIRST_ROWS = {
+    "sh.600001": {"name": "首仓达标", "last_price": 8.9, "in_pos": True,
+                  "k_level": 1, "next_add_price_raw": 8.0,
+                  "first_level_raw": 9.0},
+    "sh.600002": {"name": "时机未过", "last_price": 4.9, "in_pos": False,
+                  "k_level": 0, "next_add_price_raw": None,
+                  "first_level_raw": 5.0},
+    "sh.600003": {"name": "价格未过", "last_price": 10.5, "in_pos": False,
+                  "k_level": 0, "next_add_price_raw": None,
+                  "first_level_raw": 9.5},
+}
+FIRST_TMAP = {
+    "sh.600001": {"push_eligible": True, "pctile_window": 35.2,
+                  "ttm_yield_pct": 4.8},
+    "sh.600002": {"push_eligible": False, "pctile_window": 55.0,
+                  "ttm_yield_pct": 3.0},
+    "sh.600003": {"push_eligible": True, "pctile_window": 30.0,
+                  "ttm_yield_pct": 5.0},
+}
+FIRST_SPOT = {
+    "sh.600001": {"price": 8.90, "timestamp": "14:30:01"},
+    "sh.600002": {"price": 4.90, "timestamp": "14:30:01"},
+    "sh.600003": {"price": 10.50, "timestamp": "14:30:01"},
+}
+
+
+def _wire_first(monkeypatch, tmp_path, spot=None, tmap=None):
+    """空持仓账本 + 3 只池内非持仓股的默认替身（可覆盖 spot/tmap）。"""
+    spot = dict(FIRST_SPOT) if spot is None else spot
+    tmap = dict(FIRST_TMAP) if tmap is None else tmap
+    return _wire(monkeypatch, tmp_path, spot=spot, tmap=tmap, user={},
+                 pool_codes=FIRST_POOL, rows=FIRST_ROWS)
+
+
+def test_run_first_position_dual_condition(monkeypatch, tmp_path):
+    """双条件全过 → 推首仓信号（账本空也走——v7.0.23 不再早退）。"""
+    posts, state_path = _wire_first(monkeypatch, tmp_path)
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1, posts
+    body = posts[0]["json"]
+    content = body["content"]
+    assert "首仓达标" in content and "sh.600001" in content
+    assert "首仓线" in content and "非持仓·首仓信号" in content
+    assert "分位 35.2%" in content and "股息率 4.80%" in content
+    assert "约 100,000 元" in content                        # initial_amount
+    assert "时机未过" not in content and "价格未过" not in content  # 单条件不推
+    assert "策略点位提醒" in body["title"]
+    # 去重键：code|buy|0|首仓线
+    st = json.load(open(state_path, encoding="utf-8"))
+    assert "sh.600001|buy|0|9.0" in st["alerts"]
+    # 同日第二轮 → 去重不重推
+    rc2 = pa.run(force=True, state_path=state_path)
+    assert rc2 == 0 and len(posts) == 1
+
+
+def test_run_first_position_fail_closed_no_timing_row(monkeypatch, tmp_path):
+    """无 timing 行 → fail-closed：价破首仓线也不推。"""
+    posts, state_path = _wire_first(monkeypatch, tmp_path, tmap={})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert posts == [], "时机表缺行 fail-closed 不推（不误报）"
+
+
+def test_run_first_position_price_above_line_no_push(monkeypatch, tmp_path):
+    """时机✓ 但现价高于首仓线 → 不推（双条件缺一不成立）。"""
+    spot = dict(FIRST_SPOT)
+    spot["sh.600001"] = {"price": 9.20, "timestamp": "14:30:01"}
+    posts, state_path = _wire_first(
+        monkeypatch, tmp_path, spot=spot,
+        tmap={"sh.600001": dict(FIRST_TMAP["sh.600001"])})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0 and posts == []

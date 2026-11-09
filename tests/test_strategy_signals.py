@@ -6,8 +6,9 @@
   （active / approaching / idle / no_data；边界；approach_pct 可调）；
 - martingale.engine.run_stock buys 元组 5 元素标注（k 档下标 / first_of_round），
   前 3 元语义与历史一致（f6 红线由 test_f6_regression 守护）；
-- web /api/strategy_signals 端点：股票池 ∪ 账本、触发价按 in_pos 分支
-  （in_pos=模拟 next 档；未 in_pos=首仓线）、**时机门**（非持仓股买入信号须
+- web /api/strategy_signals 端点：股票池 ∪ 账本、触发价（v7.0.23 定案：
+  持仓股按 in_pos 分支 in_pos=next 档/未 in_pos=首仓线；**非持仓恒用首仓线**
+  ——首仓 = 价跌破首仓线 且 时机✓，双条件）、**时机门**（非持仓股买入信号须
   timing.push_eligible；持仓股不受限）、**十年回测标注**（bt_pnl_pct/bt_n_buys）、
   history 仅近 90 天 + **微信推送标记**（代码|动作|档 前缀匹配去重态）、
   湖锁定降级、strategy 库名 400、空 universe；
@@ -189,8 +190,8 @@ USER = {
     "sh.600001": {"shares": 100.0, "cost_price": 9.0, "updated_at": "2026-11-07T00:00:00Z"},
     "sh.600003": {"shares": 50.0, "cost_price": 31.0, "updated_at": "2026-11-07T00:00:00Z"},
 }
-# 触发价口径（v7.0.19）：按 in_pos 分支，与 held 无关——
-# in_pos → next_add_price_raw（加仓第 N 档）；未 in_pos → first_level_raw（首仓线）
+# 触发价口径（v7.0.23）：持仓股按 in_pos 分支（in_pos→next 档；未 in_pos→首仓线）；
+# 非持仓股恒用 first_level_raw（首仓线）——与 held 联动，不再单纯看 in_pos
 ROWS = {
     "sh.600001": {"name": "甲股", "last_price": 10.1, "in_pos": True, "k_level": 1,
                   "next_add_price_raw": 10.0, "first_level_raw": 12.0,
@@ -202,6 +203,9 @@ ROWS = {
                       {"date": "2026-10-20", "price": 10.0, "amount": 11000.0,
                        "level": 1, "first_of_round": False},
                   ]},
+    # 非持仓 + 模拟已建仓（in_pos k=2）：v7.0.23 非持仓恒走首仓线 30.0（不再
+    # 取 next 档 20.0）——价 20.0 ≤ 30.0 且时机✓ → active 买入·首仓（10 万）；
+    # next 20.0 / first 30.0 故意不同值，口径断言可区分
     "sh.600002": {"name": "乙股", "last_price": 20.0, "in_pos": True, "k_level": 2,
                   "next_add_price_raw": 20.0, "first_level_raw": 30.0,
                   "end_date": "2026-11-06", "buys": []},
@@ -314,11 +318,12 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s1["suggested_amount"] == round(10000.0 * 1.1)
     assert s1["timing_ok"] is None  # 持仓股不评估时机
     assert s1["bt_pnl_pct"] == 88.5 and s1["bt_n_buys"] == 6
-    # 非持仓 + in_pos + 时机过：next 档、动作统一「买入」、金额按档
+    # 非持仓 + 模拟已建仓 + 时机过（v7.0.23）：触发线 = 首仓线 30.0（非 next
+    # 档 20.0），动作统一「买入」、金额 = 首仓 10 万
     s2 = by["sh.600002"]
     assert s2["held"] is False and s2["status"] == "active"
-    assert s2["action"] == "buy" and s2["next_add_price_raw"] == 20.0
-    assert s2["suggested_amount"] == round(10000.0 * 1.1 ** 2)
+    assert s2["action"] == "buy" and s2["next_add_price_raw"] == 30.0
+    assert s2["suggested_amount"] == 100000
     assert s2["timing_ok"] is True
     assert s2["bt_pnl_pct"] == -5.0 and s2["bt_n_buys"] == 3
     # 持仓股 +2%（3% 带内）→ approaching
@@ -357,6 +362,66 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
                                  "amount", "level", "first_of_round", "pushed"}
                for x in h)
     assert h[0]["held"] is True and h[2]["held"] is True
+
+
+def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
+    """v7.0.23 非持仓首仓双条件（Joel 定案：时机成熟 且 价已跌破首仓线）：
+    非持仓 + 模拟已建仓（in_pos k=3）→ 触发线恒为**首仓线**（不再 next 档）：
+    - 己股 45.0 ≤ 首仓线 50.0 且时机✓ → active 买入·首仓（10 万；旧口径按
+      next 档 40.0 会判 idle——可区分）；
+    - 庚股 41.0 ≤ 50.0 → active（旧口径按 next 档会判 approaching——可区分）；
+    - 辛股 51.5 = 首仓线 +3% 带边 → approaching（临区预告）；
+    - 壬股 45.0 ≤ 50.0 但时机✗ → active 价格态照展示、无买入动作（双条件
+      缺一不成信号）。
+    建仓后由用户记入持仓账本 → 转持仓加仓档（本测不覆盖，持仓口径由主契约覆盖）。
+    """
+    def _row(code, name, price):
+        return {"name": name, "last_price": price, "in_pos": True, "k_level": 3,
+                "next_add_price_raw": 40.0, "first_level_raw": 50.0,
+                "end_date": "2026-11-06", "buys": []}
+    rows = {
+        "sh.600010": _row("sh.600010", "己股", 45.0),
+        "sh.600011": _row("sh.600011", "庚股", 41.0),
+        "sh.600012": _row("sh.600012", "辛股", 51.5),
+        "sh.600013": _row("sh.600013", "壬股", 45.0),
+    }
+    pool = list(rows)
+    spot = {c: {"price": r["last_price"], "timestamp": "20261107093000"}
+            for c, r in rows.items()}
+    def _trow(code, ok):
+        return {"ts_code": code, "in_watchlist": True,
+                "push_eligible": ok, "reasons": "x",
+                "cond_price_low": ok, "cond_yield": ok,
+                "pctile_window": 30.0 if ok else 60.0,
+                "ttm_yield_pct": 5.0 if ok else 3.0}
+    tmap = {"sh.600010": _trow("sh.600010", True),
+            "sh.600011": _trow("sh.600011", True),
+            "sh.600012": _trow("sh.600012", True),
+            "sh.600013": _trow("sh.600013", False)}
+    _wire(monkeypatch, tmp_path, rows=rows, pool=pool, user={}, spot=spot,
+          tmap=tmap, bmap={}, pushed=None)
+    out = wapp.get_strategy_signals()
+    by = {s["ts_code"]: s for s in out["stocks"]}
+    # 己股：价跌破首仓线 10% + 时机✓ → 首仓信号（金额 = initial 10 万，非按档）
+    j = by["sh.600010"]
+    assert j["status"] == "active" and j["held"] is False
+    assert j["next_add_price_raw"] == 50.0  # 触发线 = 首仓线（非 next 档 40.0）
+    assert j["action"] == "buy" and j["suggested_amount"] == 100000
+    assert j["timing_ok"] is True
+    # 庚股：更深跌破 → 同样 active（跌破深度不影响信号，只影响后续加仓档）
+    g = by["sh.600011"]
+    assert g["status"] == "active" and g["action"] == "buy"
+    # 辛股：首仓线上方 +3%（带边）→ approaching 临区预告
+    x = by["sh.600012"]
+    assert x["status"] == "approaching" and x["distance_pct"] == pytest.approx(3.0)
+    # 壬股：价条件过、时机✗ → 无买入动作（双条件缺一不成信号）
+    r_ = by["sh.600013"]
+    assert r_["status"] == "active" and r_["action"] is None
+    assert r_["suggested_amount"] is None and r_["timing_ok"] is False
+    # 汇总：active 3（600010/11/13，其中 600013 时机✗ 仅价格态）+ approaching 1
+    t = out["totals"]
+    assert t["n_active"] == 3 and t["n_approaching"] == 1
+    assert t["n_active_unheld"] == 3 and t["n_active_held"] == 0
 
 
 def test_strategy_signals_history_same_day_level_order(monkeypatch, tmp_path):
@@ -581,8 +646,11 @@ def test_touches_quote_date_of():
 
 
 def test_touches_compute_fail_closed_and_event_shape():
-    """无低/无触发线 → 不产事件（fail-closed）；事件档位/金额/首笔口径与
-    classify_signal 一致（in_pos → 加仓 base×growth^k；未 in_pos → 首仓）。"""
+    """无低/无触发线 → 不产事件（fail-closed）；事件档位/金额/首笔口径
+    （v7.0.23，held 维度）：
+    - 持仓股 in_pos → 加仓口径（next 档线，base×growth^k，第 k 档）；
+    - 非持仓（held_codes 外）→ 首仓口径（首仓线，initial，level=0 首笔）。
+    """
     rows = {
         "a": {"name": "A", "in_pos": True, "k_level": 1,
               "next_add_price_raw": 10.0, "first_level_raw": 12.0},
@@ -599,14 +667,25 @@ def test_touches_compute_fail_closed_and_event_shape():
         "c": {"price": 31.0, "timestamp": "20261106150000"},  # 无 low
         "d": {"price": 5.0, "low": 4.9, "timestamp": "20261106150000"},
     }
+    # 默认 held_codes 空（全非持仓）：a 走首仓线 12.0（9.9 触线）→ 首仓事件
     evs = touches_mod.compute_touches(rows, spot, SP)
     by = {e["ts_code"]: e for e in evs}
     assert set(by) == {"a", "b"}
-    assert by["a"]["date"] == "2026-11-06" and by["a"]["level"] == 1
-    assert by["a"]["first_of_round"] is False
-    assert by["a"]["amount"] == round(10000.0 * 1.1)
+    assert by["a"]["date"] == "2026-11-06" and by["a"]["level"] == 0
+    assert by["a"]["first_of_round"] is True
+    assert by["a"]["level_price"] == 12.0  # 非持仓 = 首仓线（非 next 档 10.0）
+    assert by["a"]["amount"] == 100000     # 首仓 initial（非按档 1.1 万）
     assert by["b"]["level"] == 0 and by["b"]["first_of_round"] is True
     assert by["b"]["amount"] == 100000 and by["b"]["low_price"] == 40.0
+    # a 属持仓 → 加仓口径：next 档 10.0（9.9 触线）、第 1 档、base×growth^1
+    evs_held = touches_mod.compute_touches(rows, spot, SP, held_codes={"a"})
+    by_held = {e["ts_code"]: e for e in evs_held}
+    assert set(by_held) == {"a", "b"}
+    assert by_held["a"]["level"] == 1 and by_held["a"]["first_of_round"] is False
+    assert by_held["a"]["level_price"] == 10.0
+    assert by_held["a"]["amount"] == round(10000.0 * 1.1)
+    # b 仍非持仓 → 口径不变
+    assert by_held["b"] == by["b"]
 
 
 def test_touches_merge_idempotent_and_window():

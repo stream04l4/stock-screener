@@ -235,7 +235,7 @@ def test_push_edge_semantics(tmp_path):
     res = tm.check_and_push(con, tp, state_path=sp, send_fn=send, token="tk")
     assert res["n_watchlist"] == 2 and res["n_eligible"] == 1 and res["n_new"] == 1
     assert res["pushed"] is True and len(calls) == 1
-    assert "测试股B" in calls[0][0] and "新进入买入区" in calls[0][1]
+    assert "测试股B" in calls[0][0] and "时机成熟（首仓待价）" in calls[0][1]
     st = json.loads(Path(sp).read_text(encoding="utf-8"))["codes"]
     # state = push_eligible 集（a.1 仅观察名单、不提醒 → 不入 state）
     assert set(st) == {"b.2"}
@@ -310,7 +310,7 @@ def test_render_message():
                                                             price_pctile_max=40.0,
                                                             yield_min_pct=4.5), 59)
     assert "大秦铁路" in title and "1 只" in title
-    assert "sh.601006" in content and "新进入买入区" in content
+    assert "sh.601006" in content and "时机成熟（首仓待价）" in content
     assert "5年分位 21.9%" in content and "候选池 59 只" in content
 
 

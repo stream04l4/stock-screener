@@ -95,8 +95,11 @@ def run(dry_run: bool = False) -> int:
         log.warning("行情整体失败（无当日 low，下轮重试，不清状态）")
         return 4
 
-    # 3) 触碰事件（date = 各股行情日；停牌股行情停在旧日 → 落旧日，不污染当日）
-    events = touches.compute_touches(rows, spot, _sp2)
+    # 3) 触碰事件（date = 各股行情日；停牌股行情停在旧日 → 落旧日，不污染当日）。
+    #    held_codes = 持仓账本：持仓股按加仓档口径、非持仓按首仓线口径（v7.0.23
+    #    与页面信号线同一分支 touches.trigger_price(row, held)）
+    events = touches.compute_touches(rows, spot, _sp2,
+                                     held_codes=frozenset(user))
     if not events:
         log.info("无触碰（%d 只检查完毕）", len(universe))
         return 0
