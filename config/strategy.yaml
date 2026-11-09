@@ -66,7 +66,7 @@ universe:                           # 股票池（全链 5 条件；漏斗 5556�
                                     #   lake 表 selection_backtest_10y）
   min_ttm_yield_pct: 3              # ⑧ TTM 股息率下限（%，最新估值日 valuation_daily）
   price_min_yuan: 2                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
-  price_max_yuan: 120               # ⑨ 股价区间上限（元；保证加仓手数粒度可控）
+  price_max_yuan: 100               # ⑨ 股价区间上限（元；保证加仓手数粒度可控）
 
 timing:                             # 选股时机（v7.0.13 引入；v7.0.24 定案：门 = ① 单条件；
                                     # v7.0.26 定案：②③ 彻底删除、首仓建仓回撤归入本段）
