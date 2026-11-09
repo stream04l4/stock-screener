@@ -5,7 +5,7 @@
 // - 添加/更新/删除：顶部录入条 + 行点击弹层编辑，PUT 单条 upsert（shares=0 删除）。
 // 数据按需加载（useLiveQuery，非日跑）→ 手动刷新按钮 invalidate。
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, reactive, ref } from "vue";
 import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
 import { invalidate } from "../live/queryRegistry.js";
@@ -16,36 +16,11 @@ import Modal from "../components/Modal.vue";
 const store = useTaskStore();
 
 // ---------------------------------------------------------------------------
-// 策略选择（策略应用）：状态机参考/加仓信号按所选策略参数计算
-// ---------------------------------------------------------------------------
-const stratSel = ref("current"); // "current"（活动策略 strategy.yaml）| 策略库名
-const lib = ref([]);             // 策略库条目（策略页"另存为"的快照）
-// 策略选择持久化（localStorage）：刷新/重开页面保留上次选择；
-// 先按 current 挂载（不发无效请求），lib 加载后校验再切换 → 触发重拉。
-const STRAT_LS_KEY = "ss.mypos.strategy";
-onMounted(async () => {
-  let saved = "";
-  try { saved = localStorage.getItem(STRAT_LS_KEY) || ""; } catch { saved = ""; }
-  try { lib.value = await api("/api/strategies"); } catch { lib.value = []; }
-  if (saved && saved !== "current" && lib.value.some((s) => s.name === saved)) {
-    stratSel.value = saved; // 库条目已删除 → 保持 current，静默回退
-  }
-});
-const stratLabel = computed(() => stratSel.value === "current" ? "当前策略" : stratSel.value);
-// 切换策略 → 失效缓存重拉（fetcher 闭包读 stratSel，带 ?strategy=）+ 记住选择
-watch(stratSel, (v) => {
-  invalidate("my_positions");
-  invalidate("strategy_signals");
-  try { localStorage.setItem(STRAT_LS_KEY, v); } catch { /* 隐私模式等：忽略 */ }
-});
-
-// ---------------------------------------------------------------------------
-// 数据（按需 + 手动刷新；?strategy= 策略选择）
+// 数据（按需 + 手动刷新；策略固定 = 当前策略 config/strategy.yaml，v7.0.29
+// 策略库退役——不再有 ?strategy= 快照选择）
 // ---------------------------------------------------------------------------
 const { data: myData, loading: myLoading, error: myError } =
-  useLiveQuery("my_positions",
-    () => api("/api/my_positions" + (stratSel.value !== "current"
-      ? "?strategy=" + encodeURIComponent(stratSel.value) : "")), {});
+  useLiveQuery("my_positions", () => api("/api/my_positions"), {});
 
 function refresh() {
   invalidate("my_positions");
@@ -55,13 +30,11 @@ function refresh() {
 // ---------------------------------------------------------------------------
 // 策略信号中心（v7.0.19）：当前信号 / 即将进入信号区 / 历史信号 + 持仓·非持仓
 // 数据 = /api/strategy_signals（股票池 ∪ 我的持仓，口径与 /api/my_positions 同一
-// 定义点）；策略选择与顶部 stratSel 联动；分段切换（active/approaching/history）。
+// 定义点）；策略固定 = 当前策略（v7.0.29）；分段切换（active/approaching/history）。
 // ---------------------------------------------------------------------------
 const sigSel = ref("active"); // active | approaching | history
 const { data: sigData, loading: sigLoading, error: sigError } =
-  useLiveQuery("strategy_signals",
-    () => api("/api/strategy_signals" + (stratSel.value !== "current"
-      ? "?strategy=" + encodeURIComponent(stratSel.value) : "")), {});
+  useLiveQuery("strategy_signals", () => api("/api/strategy_signals"), {});
 
 const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
 const sigStocks = computed(() => sigData.value?.stocks || []);
@@ -484,13 +457,7 @@ function pnlColor(v) {
   <section class="tab-panel active">
     <div class="my-toolbar">
       <h3>💼 我的持仓</h3>
-      <label class="strat-sel">
-        <span>策略应用</span>
-        <select v-model="stratSel">
-          <option value="current">当前策略</option>
-          <option v-for="s in lib" :key="s.name" :value="s.name">{{ s.name }}（{{ s.saved_at }}）</option>
-        </select>
-      </label>
+      <span class="muted small">策略应用：当前策略（strategy.yaml）</span>
       <button class="ghost-btn" @click="refresh">🔄 刷新</button>
     </div>
 
@@ -525,7 +492,7 @@ function pnlColor(v) {
     <!-- 买卖信号提示条（所选策略：现价 ≤ 下一触发价位；实时价判定，价源标注） -->
     <div v-if="myData && myData.signals && myData.signals.length" class="signal-banner">
       <div class="signal-title">
-        🔔 信号提示（{{ stratLabel }}）：{{ myData.signals.length }} 只达到触发价位
+        🔔 信号提示（当前策略）：{{ myData.signals.length }} 只达到触发价位
         <span class="muted small">
           · 价源：{{ myData.price_source === "spot" ? `实时行情${myData.spot_time ? " " + myData.spot_time : ""}` : "最新收盘（T+1）" }}
         </span>
@@ -570,7 +537,7 @@ function pnlColor(v) {
 
     <!-- 策略信号中心（v7.0.19）：当前信号 / 即将进入 / 历史信号 + 持仓·非持仓 -->
     <div class="card">
-      <h3>📡 策略信号（{{ stratLabel }}）</h3>
+      <h3>📡 策略信号（当前策略）</h3>
       <p class="muted small">
         覆盖股票池 ∪ 我的持仓 · 信号区 = 下一档触发价 ·
         「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 3 }}% 以内

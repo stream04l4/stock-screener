@@ -159,8 +159,7 @@ const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approa
   totals: { n_stocks: 0, n_active: 0, n_touched: 0, n_approaching: 0, n_idle: 0,
             n_no_data: 0, n_active_held: 0, n_active_unheld: 0, n_history: 0 } };
 
-function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }],
-                trades = [], signals = SIG_EMPTY) {
+function mockApi(my, trades = [], signals = SIG_EMPTY) {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path.startsWith("/api/my_positions") && (!opts || !opts.method || opts.method === "GET")) {
       return JSON.parse(JSON.stringify(my));
@@ -208,9 +207,6 @@ function mockApi(my, strategies = [{ name: "保守_低档", saved_at: "2026-10-2
       if (i < 0) { const e = new Error("record not found"); e.status = 404; throw e; }
       trades.splice(i, 1);
       return { ok: true, n: trades.length };
-    }
-    if (path === "/api/strategies") {
-      return JSON.parse(JSON.stringify(strategies));
     }
     if (path.startsWith("/api/strategy_signals")) {
       return JSON.parse(JSON.stringify(signals));
@@ -365,33 +361,6 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     w.unmount();
   });
 
-  it("策略选择持久化：挂载恢复 localStorage 选择 + 切换写回", async () => {
-    mockApi(MY);
-    localStorage.setItem("ss.mypos.strategy", "保守_低档");
-    const w = mk();
-    await flushPromises();
-    const sel = w.find(".strat-sel select");
-    // 恢复后请求带 ?strategy=（先 current 后切换重拉，两次都应出现）
-    await vi.waitFor(() =>
-      expect(apiMock.mock.calls.some(([p]) => p === "/api/my_positions?strategy=" + encodeURIComponent("保守_低档"))).toBe(true));
-    expect(sel.element.value).toBe("保守_低档");
-    // 切回 current → localStorage 更新
-    await sel.setValue("current");
-    await flushPromises();
-    expect(localStorage.getItem("ss.mypos.strategy")).toBe("current");
-    w.unmount();
-  });
-
-  it("持久化的策略已从库删除 → 静默回退当前策略（不发 ?strategy=）", async () => {
-    mockApi(MY, []); // 策略库为空
-    localStorage.setItem("ss.mypos.strategy", "已删除的策略");
-    const w = mk();
-    await flushPromises();
-    expect(w.find(".strat-sel select").element.value).toBe("current");
-    expect(apiMock.mock.calls.some(([p]) => p.startsWith("/api/my_positions?"))).toBe(false);
-    w.unmount();
-  });
-
   it("无信号 → 无提示条，信号列空", async () => {
     mockApi(MY);
     const w = mk();
@@ -401,20 +370,17 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     w.unmount();
   });
 
-  it("策略应用下拉：默认当前策略；切换策略库条目 → 重拉带 ?strategy=", async () => {
+  it("v7.0.29 策略固定当前：无下拉/不发 ?strategy=/不读 ss.mypos.strategy", async () => {
     mockApi(MY);
+    localStorage.setItem("ss.mypos.strategy", "保守_低档"); // 旧版残留选择
     const w = mk();
     await flushPromises();
-    const sel = w.find(".strat-sel select");
-    expect(sel.exists()).toBe(true);
-    expect(sel.element.value).toBe("current");
-    // 挂载后首次请求不带 strategy
-    expect(apiMock.mock.calls.some(([p]) => p === "/api/my_positions")).toBe(true);
-    // 切到策略库条目（mock 的 /api/strategies 返回两条）
-    await sel.setValue("保守_低档");
-    await flushPromises();
-    expect(apiMock.mock.calls.some(([p]) => p === "/api/my_positions?strategy=" + encodeURIComponent("保守_低档")))
-      .toBe(true);
+    expect(w.find(".strat-sel select").exists()).toBe(false);
+    expect(w.text()).toContain("策略应用：当前策略（strategy.yaml）");
+    expect(apiMock.mock.calls.some(([pth]) => pth.startsWith("/api/my_positions?"))).toBe(false);
+    expect(apiMock.mock.calls.some(([pth]) => pth.startsWith("/api/strategy_signals?"))).toBe(false);
+    expect(apiMock.mock.calls.some(([pth]) => pth === "/api/strategies")).toBe(false);
+    expect(localStorage.getItem("ss.mypos.strategy")).toBe("保守_低档"); // 组件不碰该键，原样保留
     w.unmount();
   });
 });
@@ -728,7 +694,7 @@ describe("MyPositionsTab · 弹层交易历史（v7.0.17）", () => {
   ];
 
   it("弹层打开 → 按当前股加载交易历史（买/卖标签 + 已实现盈亏 + 仅本股条目）", async () => {
-    mockApi(MY, undefined, JSON.parse(JSON.stringify(HISTORY)));
+    mockApi(MY, JSON.parse(JSON.stringify(HISTORY)));
     const w = mk();
     await flushPromises();
     const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
@@ -748,7 +714,7 @@ describe("MyPositionsTab · 弹层交易历史（v7.0.17）", () => {
   });
 
   it("删除（confirm）→ DELETE /api/my_trades/{id} + 列表刷新", async () => {
-    mockApi(MY, undefined, JSON.parse(JSON.stringify(HISTORY)));
+    mockApi(MY, JSON.parse(JSON.stringify(HISTORY)));
     const w = mk();
     await flushPromises();
     const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.601088"));
@@ -778,10 +744,9 @@ describe("MyPositionsTab · 弹层交易历史（v7.0.17）", () => {
 });
 
 describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
-  const STRATS = [{ name: "保守_低档", saved_at: "2026-10-22 17:48:00", size_bytes: 512 }];
 
   it("渲染卡片 + 三档分段计数 + 默认当前信号（持仓加仓/非持仓首仓 + 时机门 + 回测 + 价源）", async () => {
-    mockApi(MY, STRATS, [], SIG);
+    mockApi(MY, [], SIG);
     const w = mk();
     await flushPromises();
     // 卡片标题 + 覆盖说明 + 价源标注
@@ -827,7 +792,7 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
   });
 
   it("切「即将进入」显示距触发%；切「历史信号」按日期降序 + 档位标签（首仓/第N档）", async () => {
-    mockApi(MY, STRATS, [], SIG);
+    mockApi(MY, [], SIG);
     const w = mk();
     await flushPromises();
     const segBtns = () => w.findAll(".sig-seg button");
@@ -858,23 +823,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
 
   it("lake_locked 降级提示条（仅列账本）", async () => {
     const locked = { ...JSON.parse(JSON.stringify(SIG)), lake_locked: true };
-    mockApi(MY, STRATS, [], locked);
+    mockApi(MY, [], locked);
     const w = mk();
     await flushPromises();
     expect(w.text()).toContain("数据湖正被灌数进程占用");
-    w.unmount();
-  });
-
-  it("切换策略应用 → 带 ?strategy= 重拉信号数据", async () => {
-    mockApi(MY, STRATS, [], SIG);
-    const w = mk();
-    await flushPromises();
-    const before = apiMock.mock.calls.filter((c) => c[0].startsWith("/api/strategy_signals")).length;
-    await w.find(".strat-sel select").setValue("保守_低档");
-    await flushPromises();
-    const after = apiMock.mock.calls.filter((c) => c[0].startsWith("/api/strategy_signals"));
-    expect(after.length).toBeGreaterThan(before);
-    expect(after[after.length - 1][0]).toBe("/api/strategy_signals?strategy=" + encodeURIComponent("保守_低档"));
     w.unmount();
   });
 });

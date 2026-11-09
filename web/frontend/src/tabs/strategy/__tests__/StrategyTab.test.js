@@ -1,7 +1,7 @@
-// StrategyTab 组件回归（v7.0）：策略库（另存为/加载/删除）+ 23 字段页渲染 + 本地保存校验。
+// StrategyTab 组件回归（v7.0.29）：策略库退役（另存为/加载/删除已删，工具栏仅编辑/保存/取消）+ 字段页渲染 + 本地保存校验。
 //
 // mock 点：api client（零网络）+ queryRegistry.invalidate（隔离计数）。
-// useLiveQuery 走真实实现（happy-dom），"strategy"/"strategies" key 由 apiMock 按 path 分发。
+// useLiveQuery 走真实实现（happy-dom），"strategy" key 由 apiMock 按 path 分发。
 // StrategyTab 用 useToastStore()（pinia）→ mount 必须带 createPinia()；toast 断言直接读 store.msg。
 // 契约（v7）：
 // - 页面渲染 13 个字段行：strategy 8（name 隐藏）+ universe 5；lake/datasource 不渲染。
@@ -58,11 +58,6 @@ const STRATEGY_JSON = {
   datasource: { sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } },  // v7.0.18：baostock 段移除
 };
 
-const LIB = [
-  { name: "深回撤 v2", saved_at: "2026-09-18 10:00:00", size_bytes: 1234 },
-  { name: "策略_20260917_0900", saved_at: "2026-09-17 09:00:00", size_bytes: 1200 },
-];
-
 let putHandler = null; // PUT /api/strategy 的可变处理（默认成功）
 function mockApi() {
   apiMock.mockImplementation(async (path, opts = {}) => {
@@ -112,29 +107,6 @@ function mockApi() {
       if (putHandler) return putHandler(opts);
       return { ok: true, backup: "/tmp/config/strategy.yaml.bak" };
     }
-    if (path === "/api/strategies" && (!opts.method || opts.method === "GET")) {
-      return JSON.parse(JSON.stringify(LIB));
-    }
-    if (path === "/api/strategies" && opts.method === "POST") {
-      const name = JSON.parse(opts.body).name;
-      if (LIB.some((s) => s.name === name)) {
-        const e = new Error(JSON.stringify({ error: "strategy_exists", name }));
-        e.status = 409;
-        e.body = { detail: { error: "strategy_exists", name } };
-        throw e;
-      }
-      LIB.push({ name, saved_at: "2026-09-19 12:00:00", size_bytes: 999 });
-      return { name, path: `/tmp/strategies/${name}.yaml`, saved_at: "2026-09-19 12:00:00" };
-    }
-    if (/^\/api\/strategies\/.+\/load$/.test(path) && opts.method === "POST") {
-      return { ok: true, backup: "/tmp/config/strategy.yaml.bak" };
-    }
-    const dm = path.match(/^\/api\/strategies\/(.+)$/);
-    if (dm && opts.method === "DELETE") {
-      const i = LIB.findIndex((s) => s.name === decodeURIComponent(dm[1]));
-      if (i >= 0) LIB.splice(i, 1);
-      return null; // 204
-    }
     throw new Error("unmocked: " + path);
   });
 }
@@ -148,11 +120,6 @@ const mk = () => {
 const toastMsg = () => useToastStore(appPinia).msg;
 
 beforeEach(() => {
-  LIB.length = 0;
-  LIB.push(
-    { name: "深回撤 v2", saved_at: "2026-09-18 10:00:00", size_bytes: 1234 },
-    { name: "策略_20260917_0900", saved_at: "2026-09-17 09:00:00", size_bytes: 1200 },
-  );
   putHandler = null;
   vi.stubGlobal("confirm", vi.fn(() => true));
   apiMock.mockReset();
@@ -342,57 +309,18 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
   });
 });
 
-describe("策略库 · 另存为/加载/删除（机制沿用 v6.2.1 S1）", () => {
-  it("另存为：弹窗默认名 + 保存 → toast + 下拉刷新", async () => {
+describe("v7.0.29 · 策略库退役（工具栏仅 编辑/保存/取消）", () => {
+  it("无另存为/加载/删除控件；不请求 /api/strategies", async () => {
     const w = mk();
     await flushPromises();
-    await w.find("#btn-strategy-save-as").trigger("click");
-    const input = w.find("#input-saveas-name");
-    expect(input.exists()).toBe(true);
-    expect(input.element.value).toMatch(/^策略_\d{8}_\d{4}$/);
-    await input.setValue("我的深回撤 v2");
-    await w.find("#btn-saveas-confirm").trigger("click");
-    await flushPromises();
-    expect(toastMsg()).toContain("已保存到策略库：我的深回撤 v2");
+    expect(w.find("#btn-strategy-save-as").exists()).toBe(false);
+    expect(w.find("#select-strategy-load").exists()).toBe(false);
+    expect(w.find("#btn-strategy-delete").exists()).toBe(false);
     expect(w.find("#input-saveas-name").exists()).toBe(false);
-    w.unmount();
-  });
-
-  it("加载：选中 → confirm → POST load → toast + invalidate", async () => {
-    const w = mk();
-    await flushPromises();
-    await w.find("#select-strategy-load").setValue("深回撤 v2");
-    await flushPromises();
-    expect(window.confirm).toHaveBeenCalled();
-    expect(apiMock.mock.calls.some(([p]) => /\/load$/.test(p))).toBe(true);
-    expect(toastMsg()).toContain("已加载 深回撤 v2");
-    expect(invalidateMock).toHaveBeenCalledWith("strategy");
-    w.unmount();
-  });
-
-  it("删除：选中后 confirm → DELETE → 下拉刷新；confirm 取消 → 不发", async () => {
-    const w = mk();
-    await flushPromises();
-    expect(w.find("#btn-strategy-delete").attributes("disabled")).toBeDefined();
-    await w.find("#select-strategy-load").setValue("深回撤 v2");
-    await flushPromises();
-    expect(w.find("#btn-strategy-delete").attributes("disabled")).toBeUndefined();
-    const confirmSpy = vi.fn(() => true);
-    vi.stubGlobal("confirm", confirmSpy);
-    await w.find("#btn-strategy-delete").trigger("click");
-    await flushPromises();
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(apiMock.mock.calls.some(([p, o]) => (o || {}).method === "DELETE" && p.startsWith("/api/strategies/"))).toBe(true);
-    w.unmount();
-  });
-
-  it("编辑态下策略库三件套禁用", async () => {
-    const w = mk();
-    await flushPromises();
-    await w.find("#btn-strategy-edit").trigger("click");
-    expect(w.find("#btn-strategy-save-as").attributes("disabled")).toBeDefined();
-    expect(w.find("#select-strategy-load").attributes("disabled")).toBeDefined();
-    expect(w.find("#btn-strategy-delete").attributes("disabled")).toBeDefined();
+    expect(w.find("#btn-strategy-edit").exists()).toBe(true);
+    expect(w.find("#btn-strategy-save").exists()).toBe(true);
+    expect(w.find("#btn-strategy-cancel").exists()).toBe(true);
+    expect(apiMock.mock.calls.some(([pth]) => pth.startsWith("/api/strategies"))).toBe(false);
     w.unmount();
   });
 });

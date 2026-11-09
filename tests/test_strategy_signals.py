@@ -509,26 +509,19 @@ def test_strategy_signals_user_only_ledger_codes(monkeypatch, tmp_path):
     assert s["action"] == "buy" and s["next_add_price_raw"] == 6.0
 
 
-def test_strategy_signals_strategy_lib_400(monkeypatch, tmp_path):
+def test_strategy_signals_current_strategy_only(monkeypatch, tmp_path):
+    """v7.0.29 策略库退役：无 strategy 参数；_load_pool_ctx 恒缺省；响应 strategy='current'。"""
     _wire(monkeypatch, tmp_path)
-    monkeypatch.setattr(wapp, "_strategy_path",
-                        lambda name: tmp_path / (name + ".yaml"))
-    with pytest.raises(HTTPException) as ei:
-        wapp.get_strategy_signals(strategy="不存在")
-    assert ei.value.status_code == 400
-    # 存在 → cfg_path 透传到 _load_pool_ctx
-    lib = tmp_path / "保守_低档.yaml"
-    lib.write_text("strategy: {}\n", encoding="utf-8")
     seen = {}
 
-    def _ctx(cfg=None):
-        seen["cfg"] = cfg
+    def _ctx(cfg_path=None):
+        seen["cfg"] = cfg_path
         return SP, None, SimpleNamespace(close=lambda: None), SimpleNamespace(codes=list(POOL))
 
     monkeypatch.setattr(wapp, "_load_pool_ctx", _ctx)
-    out = wapp.get_strategy_signals(strategy="保守_低档")
-    assert out["strategy"] == "保守_低档"
-    assert seen["cfg"] == str(lib)
+    out = wapp.get_strategy_signals()
+    assert out["strategy"] == "current"
+    assert seen["cfg"] is None
 
 
 def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):

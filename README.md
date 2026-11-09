@@ -1,4 +1,4 @@
-# stock-screener · v7.0.28（drawdown_martingale 单策略版）
+# stock-screener · v7.0.29（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -150,7 +150,7 @@ systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改
 可搜索排序）+ 手动添加录入条）/ **选股策略**（v7.0.13 时机门参数（v7.0.24 起
 = ① 分位单条件；v7.0.26：②③ 删除 + 首仓建仓回撤移入）+
 **今日选股表**（时机门命中，「时机成熟」徽标 = ① 命中，每行一键加持仓））；
-参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
+参数编辑/校验；v7.0.29 起策略库退役，仅编辑当前策略）· **回测**（参数表单 + SSE 进度 + 结果区）·
 **数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
 
 主要 API：`/api/health` · **登录门禁（v7.0.14）**：`/api/login`（POST，写会话
@@ -163,7 +163,7 @@ cookie）· `/api/logout`（POST）· `/api/auth/me`（GET 当前用户，未登
 表缺失 → 空列表 fail-closed，湖持锁 → 503）·
 `/api/my_positions`（GET 账本+信号 / PUT upsert 单只，shares=0 删除）·
 `/api/positions`（同步全池）· `/api/bt/runs`（POST 触发 / GET 列表 / `{id}` status /
-`{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*` · 策略库 CRUD。
+`{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*`。
 回测 = 异步子进程（单任务 409 + pidfile 锁），进度 SSE（15s 心跳，断线 3 次降级 3s 轮询）。
 
 ## 6. 定时任务
@@ -371,6 +371,26 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.29**：**策略库退役**（2026-11-09 Joel 定案：「策略里面的策略另存为的功能
+  以及加载策略的功能删除掉，后续策略不太会大变了」「回测里的具体策略使用当前策略」）：
+  - **另存为/加载/删除/列表全删**：后端 `GET/POST/DELETE /api/strategies`、
+    `POST /api/strategies/{name}/load`、`SaveStrategyRequest`、`_sanitize_strategy_name`
+    /`_strategy_path`/`STRATEGIES_DIR` 全部移除；前端 StrategyTab 工具栏仅剩
+    【编辑/保存/取消】（删另存为弹窗、加载下拉、删除按钮），MyPositionsTab 删
+    「策略应用」下拉与 localStorage 快照选择（ss.mypos.strategy 残留静默忽略，
+    组件不再读写该键）。
+  - **回测/持仓/信号统一当前策略**：`/api/bt/runs` body 不再接受 `strategy`
+    字段（恒用 config/strategy.yaml，子进程不带 --config）；`/api/my_positions`
+    与 `/api/strategy_signals` 去掉 `?strategy=` 参数，响应固定
+    `strategy="current"`。BacktestTab 结果 meta 固定显示「策略 当前策略
+    （strategy.yaml）」。
+  - **保留**：`POST /api/strategy/import`（裸 yaml 文本导入当前策略，无 UI、
+    不涉策略库）与 config.py 老 yaml 兼容回退逻辑不变。
+  - **data/strategies/**（gitignore，本地快照）不再被任何代码读写，保留在盘上
+    作为 Joel 的历史参数存档。
+  - 验证：后端 609 全绿（基线 628，删 test_v621_strategy_library.py 24 用例，
+    test_martingale_web/test_strategy_signals 库相关用例改当前策略口径，净 -19）、
+    前端 240 绿、f6 回归不受影响（引擎零改动）。
 - **v7.0.28**：仓位口径全链统一为**手数 C 方案**（2026-11-09 Joel 拍板：「全部改
   为 c，包括策略页上面的说明等等相关部分都改为 c，按照 a 我没法实际执行」——
   金额 A / 固定一手 B / 递增手数 C 三版十年回测已交付，选 C）：

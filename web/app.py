@@ -4,7 +4,8 @@
 v7.0 定位（策略核心替换后）：
 - 查询/按需回测界面：/api/bt/runs* 族（异步 TaskManager + SSE）+ /api/positions
   + /api/pool（同步，全池 ~2s）；
-- strategy 读写/schema 校验 + 策略库（保留 v6.2 机制，schema 换 v7 slim）；
+- strategy 读写/schema 校验（策略库 v7.0.29 退役：另存为/列表/加载/删除全删，
+  回测/持仓/信号统一当前策略 config/strategy.yaml）；
 - 数据湖页签 /api/lake/*（lake router 原样挂载）；
 - 已删除：/api/runs 族（v6 日跑）、/api/backtest（多因子回测产物）、
   /api/stocks/{code}/detail（因子明细）、report md 解析器。
@@ -62,7 +63,6 @@ _TS_CODE_RE = re.compile(r"^[a-z]{2}\.\d{6}$")
 # v7 回测产物根（CLI 默认 out；Web 任务用 runs/<task_id> 子目录隔离）
 BT_OUT_DIR = OUTPUT_DIR / "backtest_martingale"
 BT_RUNS_DIR = BT_OUT_DIR / "runs"
-STRATEGIES_DIR = PROJECT_ROOT / "data" / "strategies"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DIST_DIR = WEB_DIR / "dist"   # Vue3+Vite 构建产物（`npm run build` @ web/frontend → ../dist）
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
@@ -345,7 +345,7 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "price_min_yuan": ("float", 0, 1e4),
         "price_max_yuan": ("float", 0, 1e5),
     },
-    # v7.0.13 选股时机（**可选段**：策略库旧快照无此段，PUT 缺省不报错）。
+    # v7.0.13 选股时机（**可选段**：v7.0.26 之前的老 yaml 无此段，PUT 缺省不报错）。
     # v7.0.26：first_drawdown_pct 自 strategy 段移入（首仓建仓回撤 = 选股时机
     # 参数）；② 股息率 / ③ 250 日线参数删除。
     "timing": {
@@ -372,7 +372,7 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
     if not isinstance(cfg, dict):
         return ["strategy 顶层必须是 JSON 对象(mapping)"]
 
-    # 1) key 齐全性（timing 段可选：策略库旧快照/老 yaml 无此段 → 用默认值，不报错）
+    # 1) key 齐全性（timing 段可选：v7.0.26 之前的老 yaml 无此段 → 用默认值，不报错）
     for section, fields in _STRATEGY_SCHEMA.items():
         if section not in cfg or not isinstance(cfg[section], dict):
             if section not in _OPTIONAL_SECTIONS:
@@ -645,29 +645,22 @@ def _infer_terminal_state(tail: List[str], done_markers: List[str]) -> str:
 # Pydantic 模型
 # ---------------------------------------------------------------------------
 class BtRunRequest(BaseModel):
-    """POST /api/bt/runs：{start?, end?, codes? | pool, strategy?}。
+    """POST /api/bt/runs：{start?, end?, codes? | pool}（v7.0.29 起固定当前策略）。
 
     - start/end: YYYY-MM-DD（缺省 = 各股数据起点/终点）；
     - codes: 逗号分隔字符串或数组（与 pool 互斥，都不给 = 股票池）；
     - pool: true 显式股票池（与 codes 同时给 → 400）；
-    - strategy: 策略库名（data/strategies/<name>.yaml，策略页"另存为"的快照）；
-      缺省/"current" = 当前活动策略 config/strategy.yaml；不存在 → 400。
+    - 策略 = 当前活动策略 config/strategy.yaml（策略库已退役，不再支持选快照）。
     """
     start: Optional[str] = None
     end: Optional[str] = None
     codes: Optional[Any] = None   # str 或 list[str]
     pool: Optional[bool] = None
-    strategy: Optional[str] = None
 
 
 class ImportStrategyRequest(BaseModel):
     """POST /api/strategy/import 请求体 {raw: <yaml 文本>}。"""
     raw: str
-
-
-class SaveStrategyRequest(BaseModel):
-    """POST /api/strategies 请求体 {name}（可缺省 → 默认名带时间戳）。"""
-    name: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -717,21 +710,12 @@ def _normalize_codes(codes: Any) -> List[str]:
 def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     """触发一次按需回测（子进程 python -m martingale backtest，SSE 推进度）。
 
-    strategy 语义（策略选择）：缺省/"current" = 活动策略 config/strategy.yaml；
-    策略库名 → 解析 data/strategies/<name>.yaml 并以 --config 传给引擎（不存在 → 400）。
+    策略固定 = 当前活动策略 config/strategy.yaml（v7.0.29：策略库退役）。
     """
     _validate_bt_dates(req.start, req.end)
     codes = _normalize_codes(req.codes)
     if codes and req.pool:
         raise HTTPException(status_code=400, detail="codes 与 pool 互斥（codes 优先，请二选一）")
-
-    strategy = (req.strategy or "").strip()
-    cfg_arg: Optional[str] = None
-    if strategy and strategy != "current":
-        cfg_path = _strategy_path(_sanitize_strategy_name(strategy))
-        if not cfg_path.is_file():
-            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy})
-        cfg_arg = str(cfg_path)
 
     cmd = [str(VENV_PYTHON), "-m", "martingale", "backtest"]
     if req.start:
@@ -740,8 +724,6 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
         cmd += ["--end", req.end]
     if codes:
         cmd += ["--codes", ",".join(codes)]
-    if cfg_arg:
-        cmd += ["--config", cfg_arg]
     # 无 --codes = 默认股票池（pool=true 显式同义）
     if not VENV_PYTHON.exists():
         raise HTTPException(status_code=500, detail=f"找不到 venv python: {VENV_PYTHON}")
@@ -750,8 +732,7 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     task_id = "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
     cmd += ["--out", str(BT_RUNS_DIR / task_id)]
     res = tm.start(cmd, {"start": req.start, "end": req.end,
-                         "codes": codes or None, "pool": bool(req.pool) or not codes,
-                         "strategy": strategy or "current"},
+                         "codes": codes or None, "pool": bool(req.pool) or not codes},
                    ["回测完成"], task_id=task_id)
     res["out_dir"] = str(BT_RUNS_DIR / task_id)
     return res
@@ -893,7 +874,8 @@ def _lake_or_raise() -> None:
 def _load_pool_ctx(cfg_path: Optional[str] = None):
     """配置 + 连接 + 候选池（/api/positions 与 /api/pool 共用）。
 
-    cfg_path 缺省 = 活动策略 config/strategy.yaml；策略库快照路径由调用方解析后传入。
+    cfg_path 缺省 = 活动策略 config/strategy.yaml（v7.0.29 策略库退役后恒为缺省；
+    参数保留仅为外部调用方/测试桩兼容）。
     v7.0.12：build_pool（基础 5 条件）→ build_candidate_pool（∩ 十年回测为正
     ∩ 股息率 ∩ 价格区间 ∪ 手动添加；G7 读预计算表 O(1)，请求路径零回测）。
     """
@@ -1105,13 +1087,12 @@ def _up_write(positions: Dict[str, Any]) -> None:
 
 
 @app.get("/api/my_positions")
-def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
+def get_my_positions() -> Dict[str, Any]:
     """我的持仓 = 用户账本（股数/成本）× 湖最新价 + 策略状态机参考（档/触发价）+ 加仓信号。
 
     - 只列用户账本里的代码；策略参考对池外股同样有效（状态机不挑池）。
     - 空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
-    - strategy：策略选择（同 /api/bt/runs 语义）——缺省/"current" = 活动策略
-      config/strategy.yaml；策略库名 → data/strategies/<name>.yaml；不存在 → 400。
+    - 策略固定 = 当前活动策略 config/strategy.yaml（v7.0.29：策略库退役）。
     - signals：买卖提示——现价已跌破所选策略的下一触发价位（v7.0.28 手数口径）：
       持仓中（in_pos，第 k 档）→ action="add"（加仓，first_lots+k×add_lots_step 手）；
       未持仓（never，k=0）→ action="buy"（首仓触发，first_lots 手）。
@@ -1120,15 +1101,8 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
       湖价恒高于触发价，故必须用实时价判定。
     """
     user = _up_read()
-    strategy_name = (strategy or "current").strip() or "current"
-    cfg_path: Optional[str] = None
-    if strategy_name != "current":
-        cfg_file = _strategy_path(_sanitize_strategy_name(strategy_name))
-        if not cfg_file.is_file():
-            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy_name})
-        cfg_path = str(cfg_file)
     if not user:
-        return {"as_of": None, "n": 0, "positions": [], "signals": [], "strategy": strategy_name,
+        return {"as_of": None, "n": 0, "positions": [], "signals": [], "strategy": "current",
                 "totals": {"market_value": 0, "cost": 0, "pnl": 0, "pnl_pct": None}}
     # 湖锁定/缺失 → 降级：只列账本（无价格/无策略参考），前端显示灌数提示条
     from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
@@ -1137,7 +1111,7 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     rows: Dict[str, Dict[str, Any]] = {}
     _sp = None
     try:
-        _sp, _up, con, pool = _load_pool_ctx(cfg_path)
+        _sp, _up, con, pool = _load_pool_ctx()
         try:
             rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())))
         finally:
@@ -1212,7 +1186,7 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
         "n": len(positions),
         "positions": positions,
         "signals": signals,
-        "strategy": strategy_name,
+        "strategy": "current",
         "price_source": price_source,
         "spot_time": spot_time,
         "totals": {
@@ -1251,7 +1225,7 @@ def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
 
 
 @app.get("/api/strategy_signals")
-def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
+def get_strategy_signals() -> Dict[str, Any]:
     """策略信号中心（Joel 2026-11-07：我的持仓页新增信号模块）。
 
     对 **股票池 ∪ 我的持仓** 逐股给「现价 vs 下一档触发价」的完整状态：
@@ -1290,26 +1264,19 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
       过线那天的触碰回放已记，不重复展示）；pushed = 该档「代码|动作|档」前缀
       命中 scripts/position_alert.py 的推送去重态（data/alerts/
       pushplus_alert_state.json）→ 已推送过微信点位提醒。
-    - strategy / 价源 / 湖降级语义与 /api/my_positions 一致；分类走
+    - 策略固定 = 当前活动策略（v7.0.29）；价源 / 湖降级语义与 /api/my_positions 一致；分类走
       martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
       同一单一定义点，防口径漂移）。
     """
     from martingale.signals import DEFAULT_APPROACH_PCT, classify_signal
 
-    strategy_name = (strategy or "current").strip() or "current"
-    cfg_path: Optional[str] = None
-    if strategy_name != "current":
-        cfg_file = _strategy_path(_sanitize_strategy_name(strategy_name))
-        if not cfg_file.is_file():
-            raise HTTPException(status_code=400, detail={"error": "strategy_not_found", "name": strategy_name})
-        cfg_path = str(cfg_file)
     user = _up_read()
 
     # 时机阈值（仅拼「未达条件」文案用；配置错误已在 _load_pool_ctx 400，
     # 此处兜底默认值防降级路径（湖锁定）仍可读）
     try:
         from martingale.config import load_config as _mload
-        _s0, _u0, tp_obj = _mload(cfg_path or str(CONFIG_PATH))
+        _s0, _u0, tp_obj = _mload(str(CONFIG_PATH))
     except Exception:  # noqa: BLE001
         from martingale.config import TimingParams
         tp_obj = TimingParams()
@@ -1323,7 +1290,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     tmap: Dict[str, Dict[str, Any]] = {}   # 选股时机（selection_timing 快照）
     bmap: Dict[str, Dict[str, Any]] = {}   # 十年回测（selection_backtest_10y）
     try:
-        _sp, _up, con, pool = _load_pool_ctx(cfg_path)
+        _sp, _up, con, pool = _load_pool_ctx()
         sp_obj = _sp
         try:
             universe = sorted(set(pool.codes) | set(user.keys()))
@@ -1342,7 +1309,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     as_of = max((r["end_date"] for r in rows.values() if r.get("end_date")),
                 default=None)
     if not universe:
-        return {"as_of": None, "strategy": strategy_name, "lake_locked": lake_locked,
+        return {"as_of": None, "strategy": "current", "lake_locked": lake_locked,
                 "approach_pct": DEFAULT_APPROACH_PCT, "price_source": "lake",
                 "spot_time": None, "n_stocks": 0, "stocks": [], "history": [],
                 "totals": {"n_stocks": 0, "n_active": 0, "n_touched": 0,
@@ -1533,7 +1500,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         del h["_seq"]
     return {
         "as_of": as_of,
-        "strategy": strategy_name,
+        "strategy": "current",
         "lake_locked": lake_locked,
         "approach_pct": DEFAULT_APPROACH_PCT,
         "price_source": price_source,
@@ -1839,7 +1806,7 @@ def get_strategy() -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
     raw = CONFIG_PATH.read_text(encoding="utf-8")
     data = yaml.safe_load(raw)
-    # v7.0.13：旧 yaml/策略库快照无 timing 段 → 用默认值补齐（前端选股策略卡片
+    # v7.0.13：v7.0.26 之前的老 yaml 无 timing 段 → 用默认值补齐（前端选股策略卡片
     # 恒渲染；下次 PUT 保存后 timing 段固化进 yaml）
     if isinstance(data, dict) and "timing" not in data:
         import dataclasses
@@ -1935,86 +1902,6 @@ def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
     backup, sections = _apply_strategy_write(data)
     return {"ok": True, "backup": backup, "sections": sections,
             "timing_rescan": _rescan_timing_after_save()}
-
-
-# ---------------------------------------------------------------------------
-# 策略库：本机命名保存 + 下拉加载 + 删除（data/strategies/*.yaml）
-# ---------------------------------------------------------------------------
-def _sanitize_strategy_name(name: str) -> str:
-    """策略名 → 安全文件名（去路径分隔符/..；空格→下划线；保留 CJK/字母数字/-_）。"""
-    s = str(name or "").strip()
-    s = s.replace("/", "_").replace("\\", "_")
-    s = s.replace("..", "")
-    s = s.replace(" ", "_")
-    out = "".join(ch for ch in s if ch.isalnum() or ch in "-_" or "\u4e00" <= ch <= "\u9fff")
-    return out
-
-
-def _strategy_path(name: str) -> Path:
-    return STRATEGIES_DIR / f"{name}.yaml"
-
-
-def _default_strategy_name() -> str:
-    return "策略_" + datetime.now().strftime("%Y%m%d_%H%M")
-
-
-@app.post("/api/strategies", status_code=201)
-def save_strategy(req: SaveStrategyRequest) -> Dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise HTTPException(status_code=404, detail="config/strategy.yaml 不存在")
-    name = _sanitize_strategy_name(req.name) if req.name else ""
-    if not name:
-        name = _default_strategy_name()
-    path = _strategy_path(name)
-    if path.exists():
-        raise HTTPException(status_code=409, detail={"error": "strategy_exists", "name": name})
-    STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(path, CONFIG_PATH.read_text(encoding="utf-8"))
-    return {
-        "name": name,
-        "path": str(path),
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-@app.get("/api/strategies")
-def list_strategies() -> List[Dict[str, Any]]:
-    if not STRATEGIES_DIR.is_dir():
-        return []
-    out: List[Dict[str, Any]] = []
-    for p in STRATEGIES_DIR.glob("*.yaml"):
-        if not p.is_file():
-            continue
-        st = p.stat()
-        out.append({
-            "name": p.stem,
-            "saved_at": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            "size_bytes": st.st_size,
-        })
-    out.sort(key=lambda x: x["saved_at"], reverse=True)
-    return out
-
-
-@app.delete("/api/strategies/{name}", status_code=204)
-def delete_strategy(name: str) -> Response:
-    path = _strategy_path(_sanitize_strategy_name(name))
-    if not (path.is_file()):
-        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
-    path.unlink()
-    return Response(status_code=204)
-
-
-@app.post("/api/strategies/{name}/load")
-def load_strategy(name: str) -> Dict[str, Any]:
-    path = _strategy_path(_sanitize_strategy_name(name))
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail={"error": "not_found", "name": name})
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
-    backup, _ = _apply_strategy_write(data)
-    return {"ok": True, "backup": backup, "timing_rescan": _rescan_timing_after_save()}
 
 
 # ---------------------------------------------------------------------------
