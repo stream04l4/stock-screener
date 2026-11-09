@@ -1,11 +1,11 @@
 // 今日选股（v7.0.13，策略页签「选股策略」卡片内）。
 // - 数据：GET /api/timing（候选池 × 时机门命中；v7.0.24 起 = ① 5年分位≤40%
-//   单条件，in_watchlist 与 push_eligible 同口径；读 selection_timing 预计算
-//   表 O(1)，服务端排序 = 会提醒的优先 → 股息率降序 → 代码）。
+//   单条件，in_watchlist 与 push_eligible 同值；读 selection_timing 预计算
+//   表 O(1)，服务端排序 = push_eligible 优先 → 股息率降序 → 代码）。
 // - 口径（与后端单一定义点 martingale/timing.py 一致，2026-11-09 回测定案）：
-//   本表 = ① 命中（观察名单 = 提醒口径）；「买入区」徽标 = ① 命中 = 微信
-//   "新进入买入区"提醒口径（仅新触发推送，每日湖更新后自动检查）。
-//   股息率 / 250 日线降为**参考展示**（数据列继续显示，不参与门判定）。
+//   本表 = 时机成熟（① 命中）观察名单（参考展示；股息率 / 250 日线不参与门）。
+//   **v7.0.25 起微信不再为本表独立推送**——只有时机没到价无意义；微信统一为
+//   「进入当前信号才推」（价破首仓线，盘中策略点位提醒）。
 // - 一键加入我的持仓：行内展开 股数/成本价（成本默认当前价）→ PUT /api/my_positions
 //   upsert（与「我的持仓」录入条同一端点/口径）→ 成功后 invalidate("my_positions")。
 // - 防御：as_of=null（timing 表未生成）→ 空表 + 等待提示；加载失败 → 一行错误。
@@ -63,8 +63,8 @@ function fmt(v, suffix = "") {
     <p v-if="error" class="ts-err">今日选股加载失败：{{ error }}</p>
     <div v-else-if="data" class="tbl-wrap">
       <p class="ts-note">
-        列表 = 命中时机门「{{ data.params.price_window_years }}年分位 ≤ {{ data.params.price_pctile_max }}%」（v7.0.24 单条件；
-        股息率为参考展示）。<b>买入区</b> = 时机门命中（微信只推<b>新触发</b>）。
+        本表 = 时机成熟（{{ data.params.price_window_years }}年分位 ≤ {{ data.params.price_pctile_max }}%）观察名单（股息率为参考展示）。
+        微信<b>不</b>为时机单独推送——价格跌破首仓线进入当前信号时，由盘中「策略点位提醒」推送首仓买入。
         确认后「加持仓」，持仓策略自动接管加仓档位。
       </p>
       <table class="data">
@@ -89,7 +89,7 @@ function fmt(v, suffix = "") {
               <td>{{ r.ts_code }}</td>
               <td>
                 {{ r.name }}
-                <span v-if="r.push_eligible" class="ts-badge">买入区</span>
+                <span v-if="r.push_eligible" class="ts-badge">时机成熟</span>
               </td>
               <td class="num">{{ fmt(r.close) }}</td>
               <td class="num">{{ fmt(r.pctile_window) }}</td>

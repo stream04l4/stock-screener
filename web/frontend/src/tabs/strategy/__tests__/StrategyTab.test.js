@@ -215,7 +215,7 @@ describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 
     // v7.0.13：选股策略卡片 = 今日选股表（GET /api/timing）——2026-10-26 调到股票池之前
     expect(groups[1].text()).toContain("今日选股");
     expect(groups[1].text()).toContain("大秦铁路");
-    expect(groups[1].text()).toContain("买入区");     // push_eligible 徽标
+    expect(groups[1].text()).toContain("时机成熟");   // push_eligible 徽标
     expect(groups[1].text()).toContain("加持仓");
     expect(groups[1].text()).toContain("2026-10-23");
     // v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条）

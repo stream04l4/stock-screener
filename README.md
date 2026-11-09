@@ -1,4 +1,4 @@
-# stock-screener · v7.0.24（drawdown_martingale 单策略版）
+# stock-screener · v7.0.25（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -63,15 +63,17 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 - **③ 年线之下【参考展示，默认关】**：当前价 < MA(ma_period)（默认 250）。
 
 **口径**（`martingale/timing.py` 单一定义点，v7.0.24 起观察/提醒同条件）：
-- **观察口径**（页面「今日选股」表）= ①（`in_watchlist`）；
-- **提醒口径**（微信 PushPlus）= ①（`push_eligible`），
-  且**仅新触发**：边沿状态 `data/alerts/timing_push_state.json`（上轮 eligible 集合；
-  掉出买区清除 → 再进入才重推；持续在买区不重推；**推送失败不落状态 → 下轮重试**）。
+- **页面口径**（「今日选股」表）= ①（`in_watchlist`；`push_eligible` 列保留
+  = ① 同值，仅页面徽标用）。
+- **推送纪律（v7.0.25，Joel 2026-11-09 定案）**：微信**不再**为时机独立推送
+  （旧「时机成熟（首仓待价）」通道 + 边沿状态 `timing_push_state.json` 已退役，
+  只有时机没到价无意义）。微信统一为**进入当前信号才推**（盘中「策略点位
+  提醒」：首仓 = 时机✓ 且 价破首仓线；加仓 = 价破档线）。
 - PE 估值分位经实测不加（池内 0 只低于自身 5y 20% 分位，无区分度）。
 
 **流程**：每日 lake-sync 后 `python -m martingale timing`（~1s 纯湖内计算，
-零网络零配额）→ 整表刷新湖表 `selection_timing`（PK ts_code）→ Web O(1) 读；
-失败不阻断（页面 fail-closed 空表 / 读旧快照，次日重算重推）。
+零网络零配额零推送）→ 整表刷新湖表 `selection_timing`（PK ts_code）→ Web O(1) 读；
+失败不阻断（页面 fail-closed 空表 / 读旧快照，次日重算）。
 生产首跑（as_of 10-23）：59 候选 → 观察 18 → 提醒 1（大秦铁路：
 5 年分位 21.9% / 回撤 27.5% / 股息 4.59%）。
 
@@ -83,7 +85,7 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 ```bash
 .venv/bin/python -m martingale pool                       # 打印候选池 + 全漏斗
 .venv/bin/python -m martingale selection                  # 候选池选股预计算（湖表刷新）
-.venv/bin/python -m martingale timing [--no-push] [--dry-run]  # 选股时机预计算 + 新触发微信提醒
+.venv/bin/python -m martingale timing                     # 选股时机预计算（v7.0.25 起不推送）
 .venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21 \
     --out /tmp/bt_out                                     # 全池回测
 .venv/bin/python -m martingale backtest --codes sh.601088,sz.000651 --out /tmp/bt2
@@ -95,8 +97,7 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
   （98 只 ~2s，纯湖内计算零网络零配额）；每日作业在湖增量后自动追加执行，
   失败不阻断（Web 候选池 ⑦ 读旧快照 fail-closed，次日重算）。
 - `timing` = 候选池逐股 ①分位 ②股息率 ③年线 → 整表刷新湖表 `selection_timing`
-  + 提醒口径新触发微信推送（边沿状态防重推）；`--no-push` 只算不推，
-  `--dry-run` 打印不落状态不推送。
+  （v7.0.25 起纯预计算不推送——微信统一为进入当前信号才推，策略点位提醒）。
 - 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
 - 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
 
@@ -146,7 +147,7 @@ systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改
 基础 5 条件 + 选股门槛字段 + 候选股全列表（59 只，10年回测%/股息率/最新价/来源，
 可搜索排序）+ 手动添加录入条）/ **选股策略**（v7.0.13 时机门参数（v7.0.24 起
 = ① 分位单条件；②③ 参考展示）+
-**今日选股表**（时机门命中，「买入区」徽标 = 提醒口径，每行一键加持仓））；
+**今日选股表**（时机门命中，「时机成熟」徽标 = ① 命中，每行一键加持仓））；
 参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
 **数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
 
@@ -230,7 +231,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.24）
+## 10. 近期版本（v7.0.11 → v7.0.25）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -368,3 +369,18 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.25**：微信推送统一为**「进入当前信号才推」**（2026-11-09 Joel
+  定案：「微信信号统一改为只有进入当前信号的才推送，不然只有时机到了没有
+  意义」）——**时机独立推送通道退役**：
+  - 背景：湖北能源（39.2% 分位 / 息率 3.48%）今早触发「时机成熟（首仓待价）」
+    推送，但其现价 4.31 距首仓线 4.0967 尚高 5.21% → 页面无信号，推送无
+    落地动作，Joel 判无意义。
+  - **改动**：`martingale/timing.py` 删 `check_and_push` / `render_timing_message`
+    / 边沿状态（`timing_push_state.json` 退役）；`_cmd_timing` 纯预计算
+    （删 `--no-push`/`--dry-run`）。微信仅剩「策略点位提醒」两条通道：
+    **首仓 = 时机✓ 且 价破首仓线**（position_alert 首仓通道）、**加仓 = 价破
+    档线**（position_alert 加仓通道）——即全部微信推送 = 进入当前信号事件。
+  - **页面**：今日选股表 = 时机成熟观察名单（参考展示）；徽标「买入区」→
+    「时机成熟」；说明行/卡片描述/strategyMeta 同步「微信不为时机单独推送」。
+    湖表 `push_eligible` 列保留（= ① 同值，仅页面徽标用）。
+  - 验证：后端全量回归绿、前端 248 绿、build 新版、线上 /api/timing 实测。

@@ -19,34 +19,30 @@
 无效（±2%）、① 与 ② 同属"便宜程度"维度高度冗余 → ②③ 降级为参考展示
 （数据列/页面继续显示），**不再参与时机门**；门 = 5 年分位 ≤ 40%。
 
-双口径（v7.0.24 起均为 ① 单条件）：
-- 观察口径（页面「今日选股」）= ①（in_watchlist）；
-- 提醒口径（PushPlus 微信）= ①（push_eligible），且仅**新触发**推送——
-  边沿状态 data/alerts/timing_push_state.json
-  （= 上轮 push_eligible 且已知的代码集；掉出买区后状态清除，
-  再次进入 = 新触发可再推。持续在买区不重推。推送失败不落状态 → 下轮重试）。
+**推送纪律（v7.0.25，Joel 2026-11-09 定案）**：微信**不再**为时机独立推送
+（"时机成熟（首仓待价）"通道已退役——只有时机没到价无意义）。微信统一为
+**进入当前信号才推**（盘中「策略点位提醒」：首仓 = 时机✓ 且 价破首仓线；
+加仓 = 价破档线）。本模块只做**预计算 + 页面参考展示**：
+- 页面「今日选股」= ① 命中（in_watchlist；push_eligible 列保留 = ①，同值）；
+- 破线后的买入信号 / 推送由 scripts/position_alert.py 首仓通道负责。
 
 预计算（每日离线，run_lake_sync_daily.sh 在 selection 之后驱动，亦可用
 `python -m martingale timing` 手动触发）：
 - refresh_timing(con_write, up, tp)：候选池逐股算 ①②③ → 湖表 selection_timing
-  （PK ts_code，整表刷新）；
-- check_and_push：读表 + 边沿状态 → PushPlus（唯一外部网络调用，失败记痕不阻断）。
-零回测、零行情、零 tushare 配额。
+  （PK ts_code，整表刷新）。零回测、零行情、零 tushare 配额、零推送。
 """
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
 import time
 from collections import defaultdict
-from datetime import date, datetime
-from typing import Any, Callable, Dict, List, Optional
+from datetime import date
+from typing import Any, Dict, List, Optional
 
 import duckdb
 
 from .config import TimingParams, UniverseParams
-from .pushplus import load_token, send as pushplus_send
 from .selection import TABLE as _BT_TABLE, Member, build_candidate_pool
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,16 +63,10 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     cond_yield       BOOLEAN NOT NULL,   -- ② 触发（股息率缺失 → FALSE）
     cond_below_ma    BOOLEAN,            -- ③ 触发（开关关/数据不足 → NULL）
     in_watchlist     BOOLEAN NOT NULL,   -- 观察口径：①（v7.0.24 单条件）
-    push_eligible    BOOLEAN NOT NULL,   -- 提醒口径：①（v7.0.24 单条件）
-    reasons          VARCHAR             -- 触发原因（页面展示 + 微信正文）
+    push_eligible    BOOLEAN NOT NULL,   -- = ①（v7.0.24 起与 in_watchlist 同值；v7.0.25 起无独立推送，仅页面展示）
+    reasons          VARCHAR             -- 触发原因（页面展示）
 )
 """
-
-EDGE_STATE_FILENAME = "timing_push_state.json"
-
-
-def default_edge_state_path() -> str:
-    return os.path.join(PROJECT_ROOT, "data", "alerts", EDGE_STATE_FILENAME)
 
 
 # ---------------------------------------------------------------------------
@@ -201,132 +191,3 @@ def load_timing_map(con) -> Dict[str, Dict[str, Any]]:
         row = dict(zip(cols, r))
         out[str(row["ts_code"])] = row
     return out
-
-
-# ---------------------------------------------------------------------------
-# 边沿状态 + PushPlus（新触发才推）
-# ---------------------------------------------------------------------------
-def load_edge_state(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """读边沿状态 → {ts_code: {as_of, at, reasons}}。缺失/损坏 → {}（不阻断）。"""
-    p = path or default_edge_state_path()
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        codes = d.get("codes") if isinstance(d, dict) else None
-        if not isinstance(codes, dict):
-            return {}
-        return {str(k): v for k, v in codes.items() if isinstance(v, dict)}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_edge_state(codes: Dict[str, Dict[str, Any]],
-                    path: Optional[str] = None) -> None:
-    p = path or default_edge_state_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "codes": codes,
-        }, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)  # 原子替换
-
-
-def render_timing_message(rows: List[Dict[str, Any]], tp: TimingParams,
-                          n_pool: int) -> tuple:
-    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
-
-    v7.0.23 口径：时机成熟 = 首仓双条件之一（时机✓ + 价破首仓线），故措辞从
-    「新进入买入区」改为「时机成熟（首仓待价）」——价格到位后的首仓买入信号由
-    盘中「策略点位提醒」推送（scripts/position_alert.py 首仓通道）。
-    """
-    names = []
-    blocks: List[str] = []
-    for r in rows:
-        name = r.get("name") or r["ts_code"]
-        names.append(name)
-        bits = []
-        if r.get("close") is not None:
-            bits.append(f"现价 <b>{r['close']:.2f}</b>")
-        if r.get("pctile_window") is not None:
-            bits.append(f"{tp.price_window_years}年分位 {r['pctile_window']:.1f}%")
-        if r.get("dd_window") is not None:
-            bits.append(f"回撤 {r['dd_window']:.1f}%")
-        if r.get("ttm_yield_pct") is not None:
-            bits.append(f"股息率 {r['ttm_yield_pct']:.2f}%")
-        blocks.append(
-            f"<p><b>{name}（{r['ts_code']}）</b> 时机成熟（首仓待价）</p>"
-            f"<p>{' ｜ '.join(bits)}</p>"
-            f"<p>触发：{r.get('reasons') or '-'}</p><hr/>")
-    title = ("选股提醒：" + "、".join(names[:3]) +
-             (" 等" if len(names) > 3 else "") +
-             f" 时机成熟（{len(rows)} 只）")
-    footer = (f"<p style='color:#888;font-size:12px'>选股策略（候选池 {n_pool} 只）｜ "
-              f"as_of {rows[0].get('as_of_date')} ｜ 仅新触发推送 ｜ "
-              f"首仓 = 时机✓ 且 现价跌破首仓线，破线后盘中「策略点位提醒」推送首仓买入；"
-              f"建仓请录入「我的持仓」由持仓策略（越跌越买）接管</p>")
-    return title, "".join(blocks) + footer
-
-
-def check_and_push(con, tp: TimingParams,
-                   state_path: Optional[str] = None,
-                   send_fn: Optional[Callable[[str, str, str], None]] = None,
-                   token: Optional[str] = None,
-                   dry_run: bool = False,
-                   verbose: bool = False) -> Dict[str, Any]:
-    """读 selection_timing + 边沿状态 → 新触发推送 PushPlus。
-
-    :param send_fn: 可注入（测试用）；缺省 martingale.pushplus.send。
-    :param token: 可注入；缺省 load_token()（.env PUSHPLUS_TOKEN）。
-    状态语义：state = 上轮 push_eligible 的代码集。新触发 = 本轮 eligible
-    且不在 state。掉出买区 → 从 state 清除（再进入 = 新触发）。
-    推送失败 → 不落状态 → 下轮重试（与 position_alert 同一纪律）。
-    返回 {n_watchlist, n_eligible, n_new, pushed, dry_run, error}。
-    """
-    tmap = load_timing_map(con)
-    eligible = [r for r in tmap.values() if r.get("push_eligible")]
-    watch = [r for r in tmap.values() if r.get("in_watchlist")]
-    state = load_edge_state(state_path)
-    new = [r for r in eligible if r["ts_code"] not in state]
-    res = {"n_watchlist": len(watch), "n_eligible": len(eligible),
-           "n_new": len(new), "pushed": False, "dry_run": dry_run,
-           "error": None}
-    if verbose:
-        print(f"[timing] watchlist={len(watch)} eligible={len(eligible)} "
-              f"new={len(new)}")
-
-    def _rewrite_state() -> None:
-        # state ← 本轮 eligible 全集（含已推/已知）：掉出者清除、再进入可重推
-        save_edge_state({
-            r["ts_code"]: {"as_of": str(r.get("as_of_date")),
-                           "at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                           "reasons": r.get("reasons") or ""}
-            for r in eligible
-        }, state_path)
-
-    if not new:
-        if not dry_run:
-            _rewrite_state()  # 同步清除掉出者（即使无新触发）
-        return res
-
-    if dry_run:
-        for r in new:
-            print(f"[timing][dry-run] 新触发: {r.get('name')}（{r['ts_code']}） "
-                  f"{r.get('reasons')}")
-        return res
-
-    send = send_fn or pushplus_send
-    tk = token if token is not None else load_token()
-    if tk is None:
-        res["error"] = "PUSHPLUS_TOKEN 缺失（.env 未配置；不落状态，配置后下轮重推）"
-        return res
-    title, content = render_timing_message(new, tp, len(watch) or len(tmap))
-    try:
-        send(tk, title, content)
-    except Exception as exc:  # noqa: BLE001 - 推送失败不落状态 → 下轮重试
-        res["error"] = f"pushplus 推送失败: {exc}"
-        return res
-    res["pushed"] = True
-    _rewrite_state()
-    return res

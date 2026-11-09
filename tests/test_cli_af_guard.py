@@ -108,7 +108,6 @@ def test_cmd_timing_prealigns_before_refresh(tmp_path, monkeypatch, capsys):
                                                                 below_ma250=False,
                                                                 ma_period=250)))
     monkeypatch.setattr(mmain, "default_db_path", lambda: str(p))
-    rc = mmain._cmd_timing(
-        argparse.Namespace(no_push=True, dry_run=True))
+    rc = mmain._cmd_timing(argparse.Namespace())
     assert rc == 0
     assert seen["aligned_before_refresh"] is True

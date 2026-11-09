@@ -222,11 +222,15 @@ def _cmd_selection(args) -> int:
 
 
 def _cmd_timing(args) -> int:
-    """选股时机预计算 + 新触发微信提醒（候选池逐股 ①价格分位 ②股息率 ③年线）。"""
+    """选股时机预计算（候选池逐股 ①价格分位 ②股息率 ③年线 → 湖表 selection_timing）。
+
+    v7.0.25：不再推送微信——微信统一为「进入当前信号才推」（盘中策略点位
+    提醒：首仓 = 时机✓ 且 价破首仓线；加仓 = 价破档线）。本步纯预计算。
+    """
     import duckdb
 
     from .data import default_db_path
-    from .timing import check_and_push, refresh_timing
+    from .timing import refresh_timing
 
     sp, up, tp = load_config(_default_config_path())
     p = default_db_path()
@@ -237,22 +241,12 @@ def _cmd_timing(args) -> int:
     try:
         _af_prealign(con)
         out = refresh_timing(con, up, tp, verbose=True)
-        if args.no_push:
-            res = {"n_new": None, "pushed": False, "error": None}
-        else:
-            res = check_and_push(con, tp, dry_run=args.dry_run, verbose=True)
     finally:
         con.close()
-    new_s = f"新触发 {res['n_new']} 只" if res.get("n_new") is not None else "未检查推送（--no-push）"
     print(f"timing 完成 · as_of={out['as_of']} · 候选池 {out['n_codes']} 只 · "
-          f"今日选股 {out['n_watchlist']} · 提醒口径 {out['n_push']} · "
-          f"{new_s} · 耗时 {out['elapsed_s']}s")
-    if res.get("pushed"):
-        print("微信提醒已推送（仅新触发）")
-    elif res.get("error"):
-        print(f"推送未发生: {res['error']}", file=sys.stderr)
-        return 4
-    print("提示：页面「选股策略」卡片即时可读（湖表 selection_timing）")
+          f"今日选股 {out['n_watchlist']} · 耗时 {out['elapsed_s']}s（v7.0.25 起不推送）")
+    print("提示：页面「选股策略」卡片即时可读（湖表 selection_timing）；"
+          "微信仅进入当前信号（价破线）时由盘中策略点位提醒推送")
     return 0
 
 
@@ -283,10 +277,7 @@ def main(argv=None) -> int:
     se.set_defaults(func=_cmd_selection)
 
     tm = sub.add_parser("timing",
-                        help="选股时机预计算+新触发微信提醒（候选池 ①价格分位 ②股息率 ③年线→湖表 selection_timing）")
-    tm.add_argument("--no-push", action="store_true", help="只算不推（不查边沿状态）")
-    tm.add_argument("--dry-run", action="store_true",
-                    help="算+打印新触发，不推送不落状态（手动验证用）")
+                        help="选股时机预计算（候选池 ①价格分位 ②股息率 ③年线→湖表 selection_timing；v7.0.25 起不推送）")
     tm.set_defaults(func=_cmd_timing)
 
     args = ap.parse_args(argv)

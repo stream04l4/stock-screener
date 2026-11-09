@@ -999,7 +999,8 @@ def remove_pool_manual(payload: Dict[str, Any]) -> Dict[str, Any]:
 def get_timing() -> Dict[str, Any]:
     """今日选股：候选池内时机门（v7.0.24：① 价格分位单条件）命中（in_watchlist）。
 
-    - push_eligible = ①（与观察口径同条件）——微信"新进入买入区"提醒口径；
+    - push_eligible = ①（与观察同值，页面徽标用）；v7.0.25 起时机**无独立
+      微信推送**——微信统一为「进入当前信号才推」（价破线，策略点位提醒）；
     - 湖表缺失（未跑过 timing 预计算）→ 空列表 + as_of=null（前端提示等待
       每日湖更新，fail-closed 不误导）；湖持锁/缺失 → 503（灌数中）。
     """
