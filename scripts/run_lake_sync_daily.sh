@@ -2,7 +2,7 @@
 # 数据湖 P3 每日增量（kline_daily 缺口 + valuation_daily 快照 + index_daily 近 N 日）。
 # 背景：v6 lake 切 primary 后，daily 增量此前只靠 Web「开始同步」按钮手工触发，
 # 09-23 无人点 → 湖停更 8 天（2026-10-01 排查确认；run_cron 选股 cron 同期也缺失）。
-# 本脚本职责（对齐 run_phase_c.sh 模式）：
+# 本脚本职责（早期 run_phase_c.sh 模式，该脚本已删）：
 #   1. 已有 lake_backfill 进程 → 跳过（防重叠双跑/防抢锁）
 #   2. 前台执行（cron 会话内），日志按日落盘 logs/lake_sync_YYYYMMDD.log
 #   3. 进程级超时 16.7h（v7.0.8 批量后正常 ~10-15min；超时是 tushare 全挂时
