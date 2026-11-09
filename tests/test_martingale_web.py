@@ -99,13 +99,13 @@ def test_put_strategy_rejects_bad_payload(tmp_config):
     with pytest.raises(HTTPException) as e1:
         wapp.put_strategy([1, 2])
     assert e1.value.status_code == 400
-    # 2) 越界：growth_ratio
+    # 2) 越界：first_lots
     p = copy.deepcopy(base)
-    p["strategy"]["growth_ratio"] = 0.5
+    p["strategy"]["first_lots"] = 0
     with pytest.raises(HTTPException) as e2:
         wapp.put_strategy(p)
     assert e2.value.status_code == 400
-    assert any("growth_ratio" in str(err) for err in e2.value.detail["errors"])
+    assert any("first_lots" in str(err) for err in e2.value.detail["errors"])
     # 3) 非法枚举：rearm_mode
     p = copy.deepcopy(base)
     p["strategy"]["rearm_mode"] = "whenever"
@@ -189,9 +189,9 @@ def test_validate_strategy_clean_on_real():
 
 def test_validate_strategy_error_messages():
     p = _valid_payload()
-    p["strategy"]["initial_amount"] = -1
+    p["strategy"]["first_lots"] = -1
     errs = wapp._validate_strategy(p)
-    assert any("initial_amount" in e for e in errs)
+    assert any("first_lots" in e for e in errs)
     p = _valid_payload()
     p["universe"]["industry_whitelist_csric2"] = ["xx"]
     assert wapp._validate_strategy(p)
@@ -598,7 +598,7 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert s["action"] == "add"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_amount"] == round(10000 * 1.1 ** 0)
+    assert s["suggested_lots"] == 1  # 第 k=0 档 = 1 手（v7.0.28）
     assert out["positions"][0]["spot_price"] == 40.0
 
 
@@ -657,7 +657,7 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert p0["in_pos"] is False and p0["k_level"] == 0
     assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
     assert out0["signals"] == []
-    # 实时价 70.0 ≤ 72.36 → buy 信号，建议金额 = initial_amount = 100000
+    # 实时价 70.0 ≤ 72.36 → buy 信号，建议手数 = first_lots = 1
     _mock_spot(monkeypatch, {"sh.600941": 70.0})
     out = wapp.get_my_positions(strategy="strict")
     assert len(out["signals"]) == 1
@@ -665,4 +665,4 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert s["ts_code"] == "sh.600941" and s["action"] == "buy"
     assert s["price"] == 70.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_amount"] == 100000  # initial_amount（变体 yaml 继承活动值）
+    assert s["suggested_lots"] == 1  # first_lots（变体 yaml 继承活动值）

@@ -64,15 +64,15 @@ def trigger_price(row: Dict[str, Any], held: bool = False) -> Optional[float]:
     return row.get("first_level_raw")
 
 
-def touch_amount(sp, row: Dict[str, Any], held: bool = False) -> Optional[float]:
-    """触碰档的建议金额（与 classify_signal 同一口径）：
-    持仓股 in_pos → base×growth^k（加仓）；否则 → 首仓 initial_amount
-    （非持仓触碰 = 首仓信号，v7.0.23）。"""
+def touch_lots(sp, row: Dict[str, Any], held: bool = False) -> Optional[int]:
+    """触碰档的建议手数（与 classify_signal 同一口径，v7.0.28 手数化）：
+    持仓股 in_pos → first_lots + k×add_lots_step（加仓）；
+    否则 → 首仓 first_lots 手（非持仓触碰 = 首仓信号，v7.0.23）。"""
     if sp is None:
         return None
     if held and row.get("in_pos"):
-        return round(sp.base_add_amount * (sp.growth_ratio ** (row.get("k_level") or 0)))
-    return sp.initial_amount
+        return int(sp.first_lots + (row.get("k_level") or 0) * sp.add_lots_step)
+    return int(sp.first_lots)
 
 
 def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, Any]],
@@ -105,7 +105,7 @@ def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, A
             "level": (row.get("k_level") or 0) if in_pos_eff else 0,
             "first_of_round": not in_pos_eff,
             "level_price": trig,
-            "amount": touch_amount(sp, row, held=held),
+            "lots": touch_lots(sp, row, held=held),
             "low_price": round(float(low), 4),
             "price": q.get("price"),
         })

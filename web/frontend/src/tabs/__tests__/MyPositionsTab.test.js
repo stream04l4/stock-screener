@@ -37,7 +37,7 @@ const MY_SIGNAL = {
   spot_time: "20261022150500",
   signals: [
     { ts_code: "sh.601088", name: "中国神华", price: 40.0, next_add_price: 42.07,
-      k_level: 0, next_level: 1, suggested_amount: 100000, action: "add" },
+      k_level: 0, next_level: 1, suggested_lots: 1, action: "add" },
   ],
 };
 
@@ -57,7 +57,7 @@ const MY_BUY = {
   ],
   signals: [
     { ts_code: "sh.600941", name: "中国移动", price: 70.0, next_add_price: 72.36,
-      k_level: 0, next_level: 1, suggested_amount: 100000, action: "buy" },
+      k_level: 0, next_level: 1, suggested_lots: 1, action: "buy" },
   ],
   totals: { market_value: 60000, cost: 50000, pnl: 10000, pnl_pct: 20.0 },
 };
@@ -80,12 +80,12 @@ const SIG = {
     { ts_code: "sh.601088", name: "中国神华", held: true, in_pos: true, k_level: 1,
       price: 40.0, next_add_price_raw: 42.07, status: "active", touched: false,
       day_low: 39.8, distance_pct: -4.9,
-      action: "add", suggested_amount: 11000, n_history: 2, end_date: "2026-11-06",
+      action: "add", suggested_lots: 2, n_history: 2, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 88.5, bt_n_buys: 6 },
     { ts_code: "sh.600941", name: "中国移动", held: false, in_pos: false, k_level: 0,
       price: 70.0, next_add_price_raw: 72.36, status: "active", touched: false,
       day_low: 69.5, distance_pct: -3.26,
-      action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06",
+      action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
       timing_ok: true, timing_reasons: "✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）",
       bt_pnl_pct: 45.2, bt_n_buys: 4 },
     // v7.0.23 反例（实例化）：非持仓 + 时机 ✗✗ → 价格态 active 也不入
@@ -93,20 +93,20 @@ const SIG = {
     { ts_code: "sh.600988", name: "江苏银行", held: false, in_pos: false, k_level: 0,
       price: 8.0, next_add_price_raw: 8.5, status: "active", touched: false,
       day_low: 7.9, distance_pct: -5.9,
-      action: null, suggested_amount: null, n_history: 0, end_date: "2026-11-06",
+      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
       timing_ok: false, timing_reasons: "✗ 5年分位 62.3%（需≤40%） · ✗ 股息率 2.10%（需≥4.5%）",
       bt_pnl_pct: null, bt_n_buys: null },
     { ts_code: "sh.601985", name: "中国核电", held: true, in_pos: true, k_level: 1,
       price: 10.2, next_add_price_raw: 10.0, status: "touched", touched: true,
       day_low: 9.96, distance_pct: 2.0,
-      action: "add", suggested_amount: 11000, n_history: 0, end_date: "2026-11-06",
+      action: "add", suggested_lots: 2, n_history: 0, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 12.3, bt_n_buys: 5 },
     // 非持仓 + 模拟已建仓（in_pos=true）+ 时机 ✗✗：不入当前信号段
     //（v7.0.23 时机门；触碰记录走历史）
     { ts_code: "sh.601899", name: "紫金矿业", held: false, in_pos: true, k_level: 2,
       price: 18.0, next_add_price_raw: 18.5, status: "active", touched: false,
       day_low: 17.9, distance_pct: -2.7,
-      action: null, suggested_amount: null, n_history: 0, end_date: "2026-11-06",
+      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
       timing_ok: false, timing_reasons: "✗ 5年分位 70.0%（需≤40%） · ✗ 股息率 1.50%（需≥4.5%）",
       bt_pnl_pct: null, bt_n_buys: null },
     // v7.0.23 正例（大秦铁路实例）：非持仓 + 模拟已建仓（in_pos=true k=3）
@@ -115,20 +115,20 @@ const SIG = {
     { ts_code: "sh.601006", name: "大秦铁路", held: false, in_pos: true, k_level: 3,
       price: 4.88, next_add_price_raw: 5.2811, status: "active", touched: false,
       day_low: 4.75, distance_pct: -7.59,
-      action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06",
+      action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
       timing_ok: true, timing_reasons: "✓ 5年分位 19.1%（需≤40%） · ✓ 股息率 4.58%（需≥4.5%）",
       bt_pnl_pct: 120.4, bt_n_buys: 7 },
     { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
       price: 28.56, next_add_price_raw: 28.0, status: "approaching", touched: false,
       day_low: 27.9, distance_pct: 2.0,
-      action: "add", suggested_amount: 10000, n_history: 1, end_date: "2026-11-06",
+      action: "add", suggested_lots: 1, n_history: 1, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 30.1, bt_n_buys: 3 },
     // v7.0.22 时机门入「即将进入」段：非持仓 + 时机达标 + 价格临区 → 展示
     //（临区跌破即产生真实买入信号）
     { ts_code: "sh.601328", name: "交通银行", held: false, in_pos: false, k_level: 0,
       price: 7.55, next_add_price_raw: 7.40, status: "approaching", touched: false,
       day_low: 7.5, distance_pct: 2.0,
-      action: "buy", suggested_amount: 100000, n_history: 0, end_date: "2026-11-06",
+      action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
       timing_ok: true, timing_reasons: "✓ 5年分位 33.5%（需≤40%） · ✓ 股息率 5.02%（需≥4.5%）",
       bt_pnl_pct: null, bt_n_buys: null },
     // v7.0.22 反例（中国海油实例）：非持仓（模拟已建仓 in_pos=true）+ 价格临区
@@ -136,20 +136,20 @@ const SIG = {
     { ts_code: "sh.600938", name: "中国海油", held: false, in_pos: true, k_level: 0,
       price: 31.07, next_add_price_raw: 30.3159, status: "approaching", touched: false,
       day_low: 30.8, distance_pct: 2.49,
-      action: null, suggested_amount: null, n_history: 10, end_date: "2026-11-06",
+      action: null, suggested_lots: null, n_history: 10, end_date: "2026-11-06",
       timing_ok: false, timing_reasons: "✗ 5年分位 85.7%（需≤40%） · ✗ 股息率 4.17%（需≥4.5%）",
       bt_pnl_pct: 87.28, bt_n_buys: 10 },
   ],
   history: [
     { ts_code: "sh.601088", name: "中国神华", held: true, date: "2026-11-02",
-      price: 43.1, amount: 11000, level: 1, first_of_round: false, pushed: true },
+      price: 43.1, amount: 43100, level: 1, first_of_round: false, pushed: true, lots: 2 },
     { ts_code: "sh.601985", name: "中国核电", held: true, date: "2026-11-05",
-      price: 10.0, amount: 11000, level: 1, first_of_round: false, pushed: false,
+      price: 10.0, amount: 20000, level: 1, first_of_round: false, pushed: false, lots: 2,
       source: "touch" },
     { ts_code: "sh.601088", name: "中国神华", held: true, date: "2026-10-20",
-      price: 45.0, amount: 100000, level: 0, first_of_round: true, pushed: false },
+      price: 45.0, amount: 45000, level: 0, first_of_round: true, pushed: false, lots: 1 },
     { ts_code: "sh.600900", name: "长江电力", held: true, date: "2026-10-11",
-      price: 29.0, amount: 100000, level: 0, first_of_round: true, pushed: false },
+      price: 29.0, amount: 29000, level: 0, first_of_round: true, pushed: false, lots: 1 },
   ],
   totals: { n_stocks: 9, n_active: 5, n_touched: 1, n_approaching: 3, n_idle: 0,
             n_no_data: 0, n_active_held: 1, n_active_unheld: 4, n_history: 4 },
@@ -328,7 +328,7 @@ describe("MyPositionsTab · 录入条", () => {
 });
 
 describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
-  it("有信号 → 红色提示条（名称/触发价/档位/建议金额）+ 表格信号列 🔔", async () => {
+  it("有信号 → 红色提示条（名称/触发价/档位/建议手数）+ 表格信号列 🔔", async () => {
     mockApi(MY_SIGNAL);
     const w = mk();
     await flushPromises();
@@ -341,7 +341,8 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     expect(w.text()).toContain("42.07"); // 触发价（原始口径）
     expect(w.text()).toContain("实时行情"); // 价源标注
     expect(w.text()).toContain("第 0 档 → 第 1 档");
-    expect(w.text()).toContain("¥10.0万"); // suggested_amount 100000 → 10.0万
+    expect(w.text()).toContain("1 手"); // v7.0.28 建议手数（k=0 加仓 = 1 手）
+    expect(w.text()).toContain("¥0.4万"); // 1 手×100 股×现价 40 → 0.4 万
     // 表格信号列
     expect(w.text()).toContain("🔔 加仓");
     w.unmount();
@@ -356,7 +357,8 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     expect(w.text()).toContain("中国移动");
     expect(w.text()).toContain("现价 70");
     expect(w.text()).toContain("首仓（第 1 档）");
-    expect(w.text()).toContain("建议买入 ≈ ¥10.0万");
+    expect(w.text()).toContain("1 手"); // v7.0.28 首仓 = 1 手
+    expect(w.text()).toContain("¥0.7万"); // 1 手×100 股×现价 70 → 0.7 万
     // 表格信号列：只有触发行有标记
     expect(w.text()).toContain("🔔 买入");
     expect(w.text()).not.toContain("🔔 加仓");
@@ -585,14 +587,14 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
   const buyBtn = (w) => w.findAll(".buy-bar button").find((b) => b.text() === "登记");
   const posts = () => apiMock.mock.calls.filter((c) => c[1] && c[1].method === "POST");
 
-  it("有信号 → 股数预填建议值（建议金额÷信号价取整手）+ 价格预填最新价", async () => {
-    mockApi(MY_SIGNAL); // sh.601088：suggested 100000 @ 现价 40.0 → 2500 股；last_price 33.9
+  it("有信号 → 股数预填建议值（建议手数×100）+ 价格预填最新价", async () => {
+    mockApi(MY_SIGNAL); // sh.601088：suggested_lots 1 → 100 股；last_price 33.9
     const w = mk();
     await flushPromises();
     await openRow(w);
     const ins = buyInputs(w);
     expect(ins).toHaveLength(2);
-    expect(ins[0].element.value).toBe("2500"); // floor(100000/100/40)*100
+    expect(ins[0].element.value).toBe("100"); // 1 手 × 100 股
     expect(ins[1].element.value).toBe("33.9"); // 最新价预填
     expect(w.find(".buy-preview").exists()).toBe(true);
     w.unmount();
@@ -794,13 +796,15 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("当前信号（4）");
     expect(w.text()).toContain("即将进入（2）");
     expect(w.text()).toContain("历史信号（4）");
-    // 默认 active：持仓加仓（11000→1.1万）+ 非持仓首仓（100000→10.0万）
+    // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
     expect(w.text()).toContain("● 持仓");
     expect(w.text()).toContain("○ 非持仓");
     expect(w.text()).toContain("加仓");
     expect(w.text()).toContain("买入·首仓");
-    expect(w.text()).toContain("1.1");
-    expect(w.text()).toContain("10.0");
+    expect(w.text()).toContain("2 手");
+    expect(w.text()).toContain("1 手");
+    expect(w.text()).toContain("0.8");
+    expect(w.text()).toContain("0.7");
     // 盘中触碰（v7.0.20）：已触回标注 + 日内低列（保留到当日，次日移入历史）
     expect(w.text()).toContain("· 已触回");
     expect(w.text()).toContain("日内低");

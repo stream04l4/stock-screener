@@ -10,9 +10,11 @@
 - 金额字段单位 = 元。
 
 schema（定案，勿增删）：
-- strategy: name / initial_amount / base_add_amount /
-  add_step_pct / growth_ratio / rearm_mode(bounce|newhigh) / rearm_pct /
+- strategy: name / lot_size / first_lots / add_lots_step /
+  add_step_pct / rearm_mode(bounce|newhigh) / rearm_pct /
   accounting(固定 cash，只读)
+  （v7.0.28：仓位口径切手数 C 方案（Joel 2026-11-09 拍板）——initial_amount /
+  base_add_amount / growth_ratio 删除，第 k 档买 first_lots + k×add_lots_step 手）
 - universe: industry_whitelist_csric2 / soe_keywords / min_total_mv_yi /
   min_consecutive_div_years / listing_min_trading_days
   （SOE 恒强制，不设开关——TL 拍板；全链 5 条件保留）
@@ -53,16 +55,20 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class StrategyParams:
-    """策略参数（pct 字段已转小数；金额单位元）。"""
+    """策略参数（pct 字段已转小数）。
+
+    仓位口径 = 手数（v7.0.28 C 方案）：第 k 档买 (first_lots + k×add_lots_step) 手，
+    1 手 = lot_size 股。不再使用金额 sizing（initial/base_add/growth_ratio 已删）。
+    """
     name: str                      # drawdown_martingale（固定）
-    initial_amount: float          # 初始投入金额：一次性首仓（占用 k=0 档，每股仅第一轮首买用）
-    base_add_amount: float         # 加仓基准金额：每轮首档（k=0）；第 k 档 = 基准×growth^k
+    lot_size: int                  # 1 手 = 多少股（A 股 100）
+    first_lots: int                # 首仓手数（每轮首档 k=0 买这么多手）
     first_drawdown: float          # 首仓建仓回撤（小数）：hfq ≤ H×(1−dd) 触发首仓（k=0）。
                                    # v7.0.26：yaml 键 first_drawdown_pct 居 timing 段
                                    # （首仓属选股时机）；本字段留在 StrategyParams 供
                                    # 引擎/档线计算使用（数学零改动，f6 基线不变）
     add_step: float                # 加仓步长（小数）：档线 H×(1−dd−k×step)
-    growth_ratio: float            # 加仓提升比率：第 k 档 = 基准×比率^k
+    add_lots_step: int             # 加仓手数增量：第 k 档 = first_lots + k×add_lots_step 手
     rearm_mode: str                # bounce | newhigh
     rearm_pct: float               # 高点刷新比例（小数；bounce 模式生效）
     accounting: str                # 固定 "cash"（只读）
@@ -160,15 +166,15 @@ def _strategy_section(cfg: Dict[str, Any]) -> StrategyParams:
     s = cfg.get("strategy")
     if not isinstance(s, dict):
         raise ConfigError("strategy.yaml 缺少 strategy 段")
-    for key in ("name", "initial_amount", "base_add_amount",
-                "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"):
+    for key in ("name", "lot_size", "first_lots", "add_lots_step",
+                "add_step_pct", "rearm_mode", "rearm_pct", "accounting"):
         if key not in s:
             raise ConfigError(f"strategy.{key} 缺失")
     name = str(s["name"])
     if name != STRATEGY_NAME:
         raise ConfigError(f"strategy.name 目前只支持 {STRATEGY_NAME!r}（当前 {name!r}）")
-    initial = _num(s["initial_amount"], "strategy.initial_amount", 1, 1e9)
-    base = _num(s["base_add_amount"], "strategy.base_add_amount", 1, 1e9)
+    lot_size = _int(s["lot_size"], "strategy.lot_size", 1, 10000)
+    first_lots = _int(s["first_lots"], "strategy.first_lots", 1, 10000)
     # 首仓建仓回撤：v7.0.26 起居 timing 段（首仓 = 选股时机参数；页面归「选股策略」）。
     # 兼容旧布局（策略库快照/老 yaml 无 timing 段）：回退读 strategy.first_drawdown_pct。
     t = cfg.get("timing")
@@ -181,7 +187,7 @@ def _strategy_section(cfg: Dict[str, Any]) -> StrategyParams:
             "首仓建仓回撤缺失：应配置 timing.first_drawdown_pct"
             "（旧布局 strategy.first_drawdown_pct 仅兼容无 timing 段的快照）")
     step = _num(s["add_step_pct"], "strategy.add_step_pct", 0.1, 50) / 100.0
-    growth = _num(s["growth_ratio"], "strategy.growth_ratio", 1.0, 10)
+    add_lots_step = _int(s["add_lots_step"], "strategy.add_lots_step", 0, 10000)
     mode = str(s["rearm_mode"])
     if mode not in REARM_MODES:
         raise ConfigError(f"strategy.rearm_mode 只能是 {'/'.join(REARM_MODES)}（当前 {mode!r}）")
@@ -193,8 +199,8 @@ def _strategy_section(cfg: Dict[str, Any]) -> StrategyParams:
     if dd + step >= 1.0:
         raise ConfigError("first_drawdown_pct + add_step_pct 必须 < 100")
     return StrategyParams(
-        name=name, initial_amount=initial, base_add_amount=base,
-        first_drawdown=dd, add_step=step, growth_ratio=growth,
+        name=name, lot_size=lot_size, first_lots=first_lots,
+        first_drawdown=dd, add_step=step, add_lots_step=add_lots_step,
         rearm_mode=mode, rearm_pct=rearm_pct, accounting=accounting,
     )
 

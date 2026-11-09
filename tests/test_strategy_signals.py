@@ -4,8 +4,8 @@
 契约（全离线，零真实网络/零生产数据）：
 - martingale.signals.classify_signal 纯函数四态口径
   （active / approaching / idle / no_data；边界；approach_pct 可调）；
-- martingale.engine.run_stock buys 元组 5 元素标注（k 档下标 / first_of_round），
-  前 3 元语义与历史一致（f6 红线由 test_f6_regression 守护）；
+- martingale.engine.run_stock buys 元组 6 元素标注（k 档下标 / first_of_round / lots
+  手数，v7.0.28），前 3 元语义与历史一致（f6 红线由 test_f6_regression 守护）；
 - web /api/strategy_signals 端点：股票池 ∪ 账本、触发价（v7.0.23 定案：
   持仓股按 in_pos 分支 in_pos=next 档/未 in_pos=首仓线；**非持仓恒用首仓线**
   ——首仓 = 价跌破首仓线 且 时机✓，双条件）、**时机门**（非持仓股买入信号须
@@ -45,8 +45,8 @@ from martingale.signals import (  # noqa: E402
 )
 from martingale.data import LakeLocked  # noqa: E402
 
-SP = SimpleNamespace(name="drawdown_martingale", base_add_amount=10000.0,
-                     growth_ratio=1.1, initial_amount=100000.0)
+SP = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=1,
+                     add_lots_step=1)  # v7.0.28 手数口径
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def test_classify_active_held_add():
     c = classify_signal(9.9, 10.0, True, 1, SP)
     assert c["status"] == "active"
     assert c["action"] == "add"
-    assert c["suggested_amount"] == round(10000.0 * 1.1 ** 1)
+    assert c["suggested_lots"] == 2  # 第 k=1 档 = 1 + 1×1 手
     assert c["distance_pct"] == pytest.approx(-1.0)
 
 
@@ -65,7 +65,7 @@ def test_classify_active_unheld_buy():
     c = classify_signal(20.0, 20.0, False, 0, SP)  # 触线当日（≤）也算 active
     assert c["status"] == "active"
     assert c["action"] == "buy"
-    assert c["suggested_amount"] == 100000
+    assert c["suggested_lots"] == 1  # 首仓 1 手
     assert c["distance_pct"] == 0.0
 
 
@@ -81,7 +81,7 @@ def test_classify_approaching_band_and_boundary():
     c = classify_signal(30.903, 30.0, True, 0, SP)
     assert c["status"] == "idle"
     assert c["action"] is None
-    assert c["suggested_amount"] is None
+    assert c["suggested_lots"] is None
 
 
 def test_classify_idle_far():
@@ -106,7 +106,7 @@ def test_classify_custom_approach_pct():
 def test_classify_sp_none_amounts_null():
     c = classify_signal(9.9, 10.0, True, 1, None)
     assert c["status"] == "active" and c["action"] == "add"
-    assert c["suggested_amount"] is None
+    assert c["suggested_lots"] is None
 
 
 def test_build_signals_unchanged_shape_and_sort():
@@ -125,11 +125,11 @@ def test_build_signals_unchanged_shape_and_sort():
     assert [s["ts_code"] for s in out] == ["sh.600001", "sz.000002"]  # 升序
     a = out[0]
     assert set(a.keys()) == {"ts_code", "name", "price", "next_add_price",
-                             "k_level", "next_level", "suggested_amount", "action"}
+                             "k_level", "next_level", "suggested_lots", "action"}
     assert a["action"] == "add" and a["next_level"] == 2
-    assert a["suggested_amount"] == round(10000.0 * 1.1)
+    assert a["suggested_lots"] == 2  # 第 k=1 档
     b = out[1]
-    assert b["action"] == "buy" and b["next_level"] == 1 and b["suggested_amount"] == 100000
+    assert b["action"] == "buy" and b["next_level"] == 1 and b["suggested_lots"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +141,8 @@ def _dates(*iso):
 
 
 def _params(**kw):
-    base = dict(name="drawdown_martingale", initial_amount=500.0, base_add_amount=1000.0,
-                first_drawdown=0.15, add_step=0.05, growth_ratio=1.0, rearm_mode="bounce",
+    base = dict(name="drawdown_martingale", lot_size=100, first_lots=1,
+                add_lots_step=1, first_drawdown=0.15, add_step=0.05, rearm_mode="bounce",
                 rearm_pct=0.15, accounting="cash")
     base.update(kw)
     return StrategyParams(**base)
@@ -158,10 +158,16 @@ def test_buys_annotation_ladder_and_first_of_round():
     assert len(buys) == 4
     assert [b[3] for b in buys] == [0, 1, 2, 3]            # 档下标
     assert [b[4] for b in buys] == [True, False, False, False]  # 仅首笔 first_of_round
-    assert buys[0][2] == pytest.approx(500.0)              # 首仓 initial
-    assert all(b[2] == pytest.approx(1000.0) for b in buys[1:])
-    # 前 3 元与历史 3 元组同语义
-    assert buys[0][:3] == (str(_dates("2020-01-02")[0]), 80.0, 500.0)
+    assert [b[5] for b in buys] == [1, 2, 3, 4]            # v7.0.28 手数阶梯
+    # 现金支出 = 股数×价×(1+comm)
+    comm = p.commission
+    assert buys[0][2] == pytest.approx(100.0 * 80.0 * (1 + comm))
+    assert all(b[2] == pytest.approx(b[5] * 100.0 * b[1] * (1 + comm))
+               for b in buys[1:])
+    # 前 3 元与历史 3 元组同语义（date, price, 现金支出）
+    assert buys[0][0] == str(_dates("2020-01-02")[0])
+    assert buys[0][1] == 80.0
+    assert buys[0][2] == pytest.approx(100.0 * 80.0 * (1 + comm))
 
 
 def test_buys_annotation_rearm_k_resets_but_first_of_round_stays_false():
@@ -178,8 +184,8 @@ def test_buys_annotation_rearm_k_resets_but_first_of_round_stays_false():
         None, p, verbose=False)
     assert [b[3] for b in buys] == [0, 1, 0, 1]
     assert [b[4] for b in buys] == [True, False, False, False]
-    assert buys[0][2] == pytest.approx(500.0)
-    assert all(b[2] == pytest.approx(1000.0) for b in buys[1:])
+    # v7.0.28：再武装后 k 归零 → 新轮重新 1/2 手起算
+    assert [b[5] for b in buys] == [1, 2, 1, 2]
     assert _stat["n_rearms"] == 1  # 发生了一次再武装
 
 
@@ -315,7 +321,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     s1 = by["sh.600001"]
     assert s1["held"] is True and s1["status"] == "active"
     assert s1["action"] == "add" and s1["next_add_price_raw"] == 10.0
-    assert s1["suggested_amount"] == round(10000.0 * 1.1)
+    assert s1["suggested_lots"] == 2  # 第 k=1 档 = 2 手
     assert s1["timing_ok"] is None  # 持仓股不评估时机
     assert s1["bt_pnl_pct"] == 88.5 and s1["bt_n_buys"] == 6
     # 非持仓 + 模拟已建仓 + 时机过（v7.0.23）：触发线 = 首仓线 30.0（非 next
@@ -323,7 +329,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     s2 = by["sh.600002"]
     assert s2["held"] is False and s2["status"] == "active"
     assert s2["action"] == "buy" and s2["next_add_price_raw"] == 30.0
-    assert s2["suggested_amount"] == 100000
+    assert s2["suggested_lots"] == 1  # 首仓 1 手
     assert s2["timing_ok"] is True
     assert s2["bt_pnl_pct"] == -5.0 and s2["bt_n_buys"] == 3
     # 持仓股 +2%（3% 带内）→ approaching
@@ -333,7 +339,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     s4 = by["sh.600004"]
     assert s4["held"] is False and s4["status"] == "active"
     assert s4["next_add_price_raw"] == 40.0  # 触发价 = 首仓线（若误走 next 35.0 可区分）
-    assert s4["action"] is None and s4["suggested_amount"] is None
+    assert s4["action"] is None and s4["suggested_lots"] is None
     assert s4["timing_ok"] is False
     # 时机明细（v7.0.24：① 为门条件带 ✓/✗；v7.0.26：② 参考值删除；
     # strategy.yaml：5 年窗口 / 分位≤40）
@@ -359,7 +365,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     ]
     assert [x["pushed"] for x in h] == [True, False, False]
     assert all(set(x.keys()) == {"ts_code", "name", "held", "date", "price",
-                                 "amount", "level", "first_of_round", "pushed"}
+                                 "amount", "lots", "level", "first_of_round", "pushed"}
                for x in h)
     assert h[0]["held"] is True and h[2]["held"] is True
 
@@ -406,7 +412,7 @@ def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
     j = by["sh.600010"]
     assert j["status"] == "active" and j["held"] is False
     assert j["next_add_price_raw"] == 50.0  # 触发线 = 首仓线（非 next 档 40.0）
-    assert j["action"] == "buy" and j["suggested_amount"] == 100000
+    assert j["action"] == "buy" and j["suggested_lots"] == 1
     assert j["timing_ok"] is True
     # 庚股：更深跌破 → 同样 active（跌破深度不影响信号，只影响后续加仓档）
     g = by["sh.600011"]
@@ -417,7 +423,7 @@ def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
     # 壬股：价条件过、时机✗ → 无买入动作（双条件缺一不成信号）
     r_ = by["sh.600013"]
     assert r_["status"] == "active" and r_["action"] is None
-    assert r_["suggested_amount"] is None and r_["timing_ok"] is False
+    assert r_["suggested_lots"] is None and r_["timing_ok"] is False
     # 汇总：active 3（600010/11/13，其中 600013 时机✗ 仅价格态）+ approaching 1
     t = out["totals"]
     assert t["n_active"] == 3 and t["n_approaching"] == 1
@@ -551,7 +557,7 @@ def test_strategy_signals_touch_current_retained(monkeypatch, tmp_path):
     s3 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600003")
     assert s3["status"] == "touched" and s3["touched"] is True
     assert s3["day_low"] == 29.9
-    assert s3["action"] == "add" and s3["suggested_amount"] == 10000
+    assert s3["action"] == "add" and s3["suggested_lots"] == 1  # 第 k=0 档
     assert s3["distance_pct"] == pytest.approx(2.0)  # 价格状态仍如实展示
     t = out["totals"]
     assert t["n_touched"] == 1 and t["n_approaching"] == 0 and t["n_active"] == 3
@@ -581,14 +587,14 @@ def test_strategy_signals_touch_unheld_timing_gate(monkeypatch, tmp_path):
     s4 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600004")
     assert s4["status"] == "touched" and s4["touched"] is True
     assert s4["timing_ok"] is False
-    assert s4["action"] is None and s4["suggested_amount"] is None
+    assert s4["action"] is None and s4["suggested_lots"] is None
     # 时机过 → 放行（买入 + 首仓 10 万）
     tmap_ok = dict(TIMING, **{"sh.600004": dict(TIMING["sh.600004"],
                                                 push_eligible=True)})
     _wire(monkeypatch, tmp_path, spot=spot, tmap=tmap_ok)
     out = wapp.get_strategy_signals()
     s4 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600004")
-    assert s4["action"] == "buy" and s4["suggested_amount"] == 100000
+    assert s4["action"] == "buy" and s4["suggested_lots"] == 1
 
 
 def test_strategy_signals_touch_history_merge_dedupe_window(monkeypatch, tmp_path):
@@ -674,16 +680,16 @@ def test_touches_compute_fail_closed_and_event_shape():
     assert by["a"]["date"] == "2026-11-06" and by["a"]["level"] == 0
     assert by["a"]["first_of_round"] is True
     assert by["a"]["level_price"] == 12.0  # 非持仓 = 首仓线（非 next 档 10.0）
-    assert by["a"]["amount"] == 100000     # 首仓 initial（非按档 1.1 万）
+    assert by["a"]["lots"] == 1            # 首仓 1 手（v7.0.28 手数口径）
     assert by["b"]["level"] == 0 and by["b"]["first_of_round"] is True
-    assert by["b"]["amount"] == 100000 and by["b"]["low_price"] == 40.0
+    assert by["b"]["lots"] == 1 and by["b"]["low_price"] == 40.0
     # a 属持仓 → 加仓口径：next 档 10.0（9.9 触线）、第 1 档、base×growth^1
     evs_held = touches_mod.compute_touches(rows, spot, SP, held_codes={"a"})
     by_held = {e["ts_code"]: e for e in evs_held}
     assert set(by_held) == {"a", "b"}
     assert by_held["a"]["level"] == 1 and by_held["a"]["first_of_round"] is False
     assert by_held["a"]["level_price"] == 10.0
-    assert by_held["a"]["amount"] == round(10000.0 * 1.1)
+    assert by_held["a"]["lots"] == 2  # 第 k=1 档 = 1 + 1×1 手
     # b 仍非持仓 → 口径不变
     assert by_held["b"] == by["b"]
 

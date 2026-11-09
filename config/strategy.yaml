@@ -2,7 +2,8 @@
 # stock-screener v7.0 策略配置（slim schema，2026-10-22；v7.0.12 扩展 universe 选股门槛）
 #
 # 结构：
-#   strategy:   持仓策略参数（深回撤金字塔加仓，9 键，含固定 name）
+#   strategy:   持仓策略参数（深回撤金字塔加仓·手数口径，9 键，含固定 name；
+#               v7.0.28 切手数 C 方案：lot_size/first_lots/add_lots_step 替代金额 sizing）
 #   universe:   股票池 5 条件 + 候选池选股门槛 5 键（v7.0.12；SOE 恒强制，不设开关）
 #   timing:     选股时机 5 键（v7.0.13；候选池内筛买入时机；段可缺省=默认值）
 #   lake:       数据湖配置（lake.config.lake_cfg() 读取；lake-sync 依赖，勿删）
@@ -12,18 +13,18 @@
 # 常量，TL 拍板不暴露——martingale/config.py 头部注释）。
 #
 # 单位约定：带 _pct 的字段存**整数百分数**（15 = 15%），config 层转小数供引擎；
-# 金额单位 = 元。
+# 仓位单位为手数（1 手 = lot_size 股，v7.0.28）。
 # =============================================================================
 
 strategy:                           # 深回撤金字塔加仓（唯一策略；参数 schema 定案）
   name: drawdown_martingale         # 策略名（固定；Web 只读展示）
-  initial_amount: 100000            # 初始投入金额（元）：一次性首仓，占用 k=0 档；
-                                    # 每股全策略仅第一次触发用（f6 验收值）
-  base_add_amount: 10000            # 加仓基准金额（元）：每轮首档(k=0)；
-                                    # 第 k 档 = base_add_amount × growth_ratio^k
+  # —— 仓位口径 = 手数（v7.0.28 C 方案，Joel 2026-11-09 拍板；替代金额 sizing）——
+  lot_size: 100                     # 1 手 = 100 股（A 股整手）
+  first_lots: 1                     # 首仓手数：每轮首档(k=0)买 1 手
+  add_lots_step: 1                  # 加仓手数增量：第 k 档 = first_lots + k×add_lots_step 手
+                                    # → 首仓1手/加仓2手/再加3手…（再武装后 k 归零重新从 1 手起）
   add_step_pct: 5                   # 加仓步长（%）：档线 H×(1−first_dd−k×step)；
                                     # first_dd 现居 timing 段（首仓属选股时机，v7.0.26）
-  growth_ratio: 1.1                 # 加仓提升比率：第 k 档 = 基准×比率^k
   rearm_mode: bounce                # 高点再武装模式：bounce（默认）| newhigh
   rearm_pct: 15                     # 高点刷新比例（%）：bounce 模式下价格 ≥ 本周期
                                     # 低点×(1+15%) 时重记高点并重置 k=0
@@ -65,7 +66,7 @@ universe:                           # 股票池（全链 5 条件；漏斗 5556�
                                     #   lake 表 selection_backtest_10y）
   min_ttm_yield_pct: 3              # ⑧ TTM 股息率下限（%，最新估值日 valuation_daily）
   price_min_yuan: 2                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
-  price_max_yuan: 120               # ⑨ 股价区间上限（元；保证 1 万加仓档 ≥1 手粒度）
+  price_max_yuan: 120               # ⑨ 股价区间上限（元；保证加仓手数粒度可控）
 
 timing:                             # 选股时机（v7.0.13 引入；v7.0.24 定案：门 = ① 单条件；
                                     # v7.0.26 定案：②③ 彻底删除、首仓建仓回撤归入本段）

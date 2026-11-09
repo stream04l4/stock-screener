@@ -10,11 +10,11 @@ function m(props) {
 
 describe("FieldEditor · FIELD_TYPE 分支渲染（v7 slim）", () => {
   it("int → number input step=1，值为 String(value)", () => {
-    const w = m({ section: "strategy", field: "initial_amount", value: 100000 });
+    const w = m({ section: "strategy", field: "first_lots", value: 1 });
     const input = w.find("input[type=number]");
     expect(input.exists()).toBe(true);
     expect(input.attributes("step")).toBe("1");
-    expect(input.element.value).toBe("100000");
+    expect(input.element.value).toBe("1");
   });
 
   it("float → number input step=any", () => {
@@ -22,8 +22,8 @@ describe("FieldEditor · FIELD_TYPE 分支渲染（v7 slim）", () => {
     const input = w.find("input[type=number]");
     expect(input.attributes("step")).toBe("any");
     expect(input.element.value).toBe("15");
-    const w2 = m({ section: "strategy", field: "growth_ratio", value: 1.1 });
-    expect(w2.find("input[type=number]").element.value).toBe("1.1");
+    const w2 = m({ section: "strategy", field: "add_step_pct", value: 5.5 });
+    expect(w2.find("input[type=number]").element.value).toBe("5.5");
   });
 
   it("enum2 → select(ENUM_OPTIONS)；当前值选中；值不在选项内时仍渲染选项列表", () => {
@@ -62,11 +62,11 @@ describe("FieldEditor · FIELD_TYPE 分支渲染（v7 slim）", () => {
   });
 
   it("标量 input 变更 → emit update {section, field, value:原始字符串}", async () => {
-    const w = m({ section: "strategy", field: "initial_amount", value: 100000 });
+    const w = m({ section: "strategy", field: "first_lots", value: 1 });
     const input = w.find("input[type=number]");
-    input.element.value = "200000";
+    input.element.value = "2";
     await input.trigger("input");
     const last = w.emitted("update").at(-1)[0];
-    expect(last).toEqual({ section: "strategy", field: "initial_amount", value: "200000" });
+    expect(last).toEqual({ section: "strategy", field: "first_lots", value: "2" });
   });
 });

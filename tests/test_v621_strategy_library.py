@@ -65,10 +65,10 @@ def _setup(tmp_path, monkeypatch) -> tuple[Path, Path]:
     return target, strat_dir
 
 
-def _payload_base_add(n: int) -> dict:
-    """当前生产 yaml 改 strategy.base_add_amount（触发真实改动）。"""
+def _payload_first_lots(n: int) -> dict:
+    """当前生产 yaml 改 strategy.first_lots（触发真实改动；v7.0.28 手数口径）。"""
     p = yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
-    p["strategy"]["base_add_amount"] = n
+    p["strategy"]["first_lots"] = n
     return p
 
 
@@ -192,20 +192,20 @@ def test_delete_missing_404(tmp_path, monkeypatch):
 
 def test_load_valid_restores_config_and_backs_up(tmp_path, monkeypatch):
     target, strat_dir = _setup(tmp_path, monkeypatch)
-    # 1) 快照 base_add_amount=10500（改 config → 保存）
-    p = _payload_base_add(10500)
+    # 1) 快照 first_lots=3（改 config → 保存）
+    p = _payload_first_lots(3)
     target.write_text(yaml.safe_dump(p, allow_unicode=True, sort_keys=False), encoding="utf-8")
     appmod.save_strategy(appmod.SaveStrategyRequest(name="snap77"))
-    # 2) 再把 config 改成 base_add_amount=10200（模拟后续编辑）
-    p2 = _payload_base_add(10200)
+    # 2) 再把 config 改成 first_lots=2（模拟后续编辑）
+    p2 = _payload_first_lots(2)
     target.write_text(yaml.safe_dump(p2, allow_unicode=True, sort_keys=False), encoding="utf-8")
     before_load = target.read_bytes()
-    # 3) 加载快照 → config 恢复为 base_add_amount=10500，.bak = 加载前内容
+    # 3) 加载快照 → config 恢复为 first_lots=3，.bak = 加载前内容
     res = appmod.load_strategy("snap77")
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-    assert reloaded["strategy"]["base_add_amount"] == 10500
+    assert reloaded["strategy"]["first_lots"] == 3
     assert Path(res["backup"]).read_bytes() == before_load
 
 
@@ -224,7 +224,7 @@ def test_load_invalid_yaml_400_no_write(tmp_path, monkeypatch):
 def test_load_missing_field_400_shares_put_validation(tmp_path, monkeypatch):
     """缺字段快照 → 复用 PUT 同一套 _validate_strategy（与 import/PUT 同错误）。"""
     target, strat_dir = _setup(tmp_path, monkeypatch)
-    p = _payload_base_add(10200)
+    p = _payload_first_lots(2)
     del p["strategy"]["add_step_pct"]
     strat_dir.mkdir()
     (strat_dir / "incomplete.yaml").write_text(
@@ -251,8 +251,8 @@ def test_load_missing_snapshot_404(tmp_path, monkeypatch):
 def test_load_and_put_share_validation(tmp_path, monkeypatch):
     """同一非法内容：load（经快照文件）与 PUT 都 400 且报同样的字段错误。"""
     target, strat_dir = _setup(tmp_path, monkeypatch)
-    p = _payload_base_add(10200)
-    del p["strategy"]["growth_ratio"]
+    p = _payload_first_lots(2)
+    del p["strategy"]["add_lots_step"]
     strat_dir.mkdir()
     (strat_dir / "bad.yaml").write_text(
         yaml.safe_dump(p, allow_unicode=True, sort_keys=False), encoding="utf-8")

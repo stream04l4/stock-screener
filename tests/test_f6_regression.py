@@ -4,8 +4,10 @@ per_stock 14 字段 + 逐笔买入时间表全部对齐。fixture = Joel 2026-10
 （/tmp/f6_* → 任务书 §1.4；tmpfs 易失，此 fixture 是 tester 的唯一基准）。
 
 f6 参数（config/strategy.yaml 生产值，逐位一致的前提）：
-initial=10000, first_amount=100000, dd=0.15, step=0.05, growth=1.1,
-ladder=high, rearm=bounce(0.15), accounting=cash, comm=3bps, stamp=5bps,
+lot_size=100, first_lots=1, add_lots_step=1（v7.0.28 手数 C 方案：第 k 档
+0 起 = first_lots+k×add_lots_step 手，再武装后 k 归零重新从 1 手起算；
+2026-11-09 按新 sizing 重新生成基线，触发时机与旧基线逐笔零 diff），
+dd=0.15, step=0.05, rearm=bounce(0.15), accounting=cash, comm=3bps, stamp=5bps,
 窗口 2016-01-04 → 2026-10-21。
 """
 from __future__ import annotations
@@ -87,9 +89,9 @@ def test_f6_buy_timeline(code, cfg, loaded):
     stat, buys = _run(cfg, loaded, code)
     fx_buys = _fixture_buys(code)
     assert stat["n_buys"] == len(fx_buys), (code, stat["n_buys"], len(fx_buys))
-    for (dt, price, amt, _k, _for), (f_dt, f_price, f_amt) in zip(buys, fx_buys):
+    for (dt, price, amt, _k, _for, _lots), (f_dt, f_price, f_amt) in zip(buys, fx_buys):
         assert dt == f_dt, (code, dt, f_dt)
         assert price == float(f_price), (code, dt, price, f_price)
         # summary 按整数千分位渲染（:,.0f）→ 金额按四舍五入对齐（float 幂次有 ulp 尾差）
-        # _k/_for = v7.0.19 新增档下标/本轮首笔标注，仅 Web 历史信号用，不参与 f6 对齐
+        # _k/_for/_lots = 档下标/本轮首笔/手数标注，仅 Web 历史信号用，不参与 f6 对齐
         assert round(amt) == int(f_amt.replace(",", "")), (code, dt, amt, f_amt)

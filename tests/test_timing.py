@@ -80,10 +80,10 @@ def _valid_yaml(with_timing: bool = True) -> str:
     y = f"""
 strategy:
   name: drawdown_martingale
-  initial_amount: 100000
-  base_add_amount: 10000
+  lot_size: 100
+  first_lots: 1
+  add_lots_step: 1
 {strategy_dd}  add_step_pct: 5
-  growth_ratio: 1.1
   rearm_mode: bounce
   rearm_pct: 15
   accounting: cash

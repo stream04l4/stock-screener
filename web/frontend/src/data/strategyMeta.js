@@ -36,8 +36,9 @@ export const EXCLUDED_SECTIONS = ["lake", "datasource"];
 export const SECTION_DESC = {
   strategy:
     "每只股票独立运作：从高点跌够「首次建仓回撤」建首仓，之后每再跌「加仓步长」加一档，" +
-    "金额按 base_add_amount×growth_ratio 阶梯递增，上不封顶、不卖出、无熔断。" +
-    "注意：首轮首仓占 k=0 档，所以首轮第一个加仓 = base_add_amount×growth_ratio；再武装后的新轮从 base_add_amount 起。",
+    "手数按 首仓 first_lots 手、每档 +add_lots_step 手 阶梯递增（第 k 档 = first_lots+k×add_lots_step 手），" +
+    "上不封顶、不卖出、无熔断。" +
+    "注意：再武装后档位归零，新轮从 first_lots 手重新起算。",
   universe:
     "候选池门槛 = 基础 5 条件（行业白名单、央国企、总市值下限、上市天数、连续分红）" +
     "叠加 3 道选股门槛（十年回测为正、股息率下限、股价区间）；入选 ≠ 买入信号，" +
@@ -54,10 +55,10 @@ export const SECTION_DESC = {
 // ---------------------------------------------------------------------------
 export const FIELD_LABELS = {
   "strategy.name": "策略标识",
-  "strategy.initial_amount": "首仓金额（元）",
-  "strategy.base_add_amount": "加仓基准金额（元）",
+  "strategy.lot_size": "每手股数",
+  "strategy.first_lots": "首仓手数",
+  "strategy.add_lots_step": "加仓手数增量",
   "strategy.add_step_pct": "加仓步长（%）",
-  "strategy.growth_ratio": "加仓递增比率",
   "strategy.rearm_mode": "高点再武装方式",
   "strategy.rearm_pct": "再武装反弹幅度（%）",
   "strategy.accounting": "成交口径（固定）",
@@ -83,14 +84,14 @@ export const FIELD_LABELS = {
 export const FIELD_DESC = {
   // ---- strategy ----
   "strategy.name": "固定标识，不可改。",
-  "strategy.initial_amount":
-    "首仓一次性投入的金额；它占掉 k=0 档，所以首轮第一个加仓是 基准×比率（不是基准本身）",
-  "strategy.base_add_amount":
-    "加仓的基准金额：第 k 档 = 基准×比率^k；再武装后的新轮从它开始加",
+  "strategy.lot_size":
+    "1 手 = 多少股；A 股整手固定 100，一般不用改",
+  "strategy.first_lots":
+    "首仓买几手（第 0 档）；当前 1 手",
+  "strategy.add_lots_step":
+    "每加一档多买几手：第 k 档 = first_lots + k×本值，即 1手→2手→3手……再武装后新轮从首仓手数重新起算",
   "strategy.add_step_pct":
     "建首仓后，每再跌这个比例加一档；跳空缺口一天可以连穿多档",
-  "strategy.growth_ratio":
-    "每档金额乘这个数：1.1 就是 1万 → 1.1万 → 1.21万……上不封顶",
   "strategy.rearm_mode":
     "什么时候把「高点」刷新、档位从头数：反弹重置=低点弹够幅度就刷新（新高可低于旧高）；仅创新高=必须创出新高才刷新",
   "strategy.rearm_pct":
@@ -130,10 +131,10 @@ export const FIELD_DESC = {
 export const FIELD_TYPE = {
   // strategy
   name: "str",              // 固定标识（页面不渲染，见 HIDDEN_FIELDS）
-  initial_amount: "int",
-  base_add_amount: "int",
+  lot_size: "int",
+  first_lots: "int",
+  add_lots_step: "int",
   add_step_pct: "float",
-  growth_ratio: "float",
   rearm_mode: "enum2",
   rearm_pct: "float",
   accounting: "readonly",

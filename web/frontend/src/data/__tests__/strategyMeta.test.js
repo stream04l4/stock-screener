@@ -56,13 +56,13 @@ describe("strategyMeta · v7 结构", () => {
     for (const s of EXCLUDED_SECTIONS) expect(all).not.toContain(s);
   });
 
-  it("SECTION_DESC 覆盖渲染的 3 段；strategy 段含 k=0 占档必附注", () => {
+  it("SECTION_DESC 覆盖渲染的 3 段；strategy 段含手数阶梯口径说明", () => {
     for (const k of Object.keys(SECTION_META)) {
       expect(typeof SECTION_DESC[k]).toBe("string");
       expect(SECTION_DESC[k].length).toBeGreaterThan(10);
     }
-    expect(SECTION_DESC.strategy).toContain("k=0");
-    expect(SECTION_DESC.strategy).toContain("base_add_amount×growth_ratio");
+    expect(SECTION_DESC.strategy).toContain("手数");
+    expect(SECTION_DESC.strategy).toContain("first_lots+k×add_lots_step");
   });
 
   it("HIDDEN_FIELDS = {strategy.name}（策略标识不作为字段行渲染）", () => {
@@ -75,10 +75,10 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
   it("FIELD_TYPE = 21 键（strategy 8 + universe 10 + timing 3），类型逐一断言", () => {
     const expected = {
       name: "str",
-      initial_amount: "int",
-      base_add_amount: "int",
+      lot_size: "int",
+      first_lots: "int",
+      add_lots_step: "int",
       add_step_pct: "float",
-      growth_ratio: "float",
       rearm_mode: "enum2",
       rearm_pct: "float",
       accounting: "readonly",
@@ -132,8 +132,8 @@ describe("strategyMeta · FIELD_DESC/FIELD_TYPE 全字段守卫（防未来加�
     for (const k of Object.keys(FIELD_DESC)) expect(rendered.has(k.split(".")[0])).toBe(true);
     expect(Object.keys(FIELD_DESC).length).toBe(topFields);
     expect(Object.keys(FIELD_TYPE).length).toBe(topFields);
-    // 关键 desc 非空（调研 ③ 草稿原文要点）
-    expect(FIELD_DESC["strategy.initial_amount"]).toContain("k=0");
+    // 关键 desc 非空（v7.0.28 手数口径）
+    expect(FIELD_DESC["strategy.first_lots"]).toContain("第 0 档");
     expect(FIELD_DESC["strategy.accounting"]).toContain("只读");
     expect(FIELD_DESC["universe.min_total_mv_yi"]).toContain("总市值");
     // v7.0.13 timing desc 关键点（v7.0.26：②③ 删除）
@@ -166,7 +166,7 @@ describe("displayValue · 按 FIELD_TYPE 分支（v7）", () => {
   });
 
   it("int/float/enum2/str → String(v)", () => {
-    expect(displayValue("strategy", "initial_amount", 100000)).toBe("100000");
+    expect(displayValue("strategy", "first_lots", 1)).toBe("1");
     expect(displayValue("timing", "first_drawdown_pct", 15)).toBe("15");
     expect(displayValue("strategy", "rearm_mode", "bounce")).toBe("bounce");
   });

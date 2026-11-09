@@ -17,10 +17,11 @@ PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(PROJECT, "martingale")
 
 # v7 阈值关键词（strategy 7 字段 + universe 5 键，均不得在代码里写字面量；
-# first_drawdown_pct v7.0.26 起居 timing 段，关键词守卫不变）
+# first_drawdown_pct v7.0.26 起居 timing 段，关键词守卫不变；
+# v7.0.28 手数口径：lot_size/first_lots/add_lots_step 替代金额 3 键）
 THRESHOLD_KEYWORDS = [
-    "initial_amount", "base_add_amount", "first_drawdown_pct", "add_step_pct",
-    "growth_ratio", "rearm_pct", "accounting",
+    "lot_size", "first_lots", "add_lots_step", "first_drawdown_pct", "add_step_pct",
+    "rearm_pct", "accounting",
     "min_total_mv_yi", "min_consecutive_div_years", "listing_min_trading_days",
 ]
 
@@ -63,8 +64,8 @@ def test_strategy_yaml_is_single_source_of_truth():
         cfg = yaml.safe_load(f)
 
     strategy_keys = {
-        "name", "initial_amount", "base_add_amount",
-        "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
+        "name", "lot_size", "first_lots",
+        "add_lots_step", "add_step_pct", "rearm_mode", "rearm_pct", "accounting",
     }
     universe_keys = {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",

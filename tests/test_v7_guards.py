@@ -143,8 +143,8 @@ def test_pyproject_v7_shape():
 def test_strategy_yaml_v7_schema_shape():
     cfg = yaml.safe_load((PROJECT_ROOT / "config" / "strategy.yaml").read_text(encoding="utf-8"))
     strat = set(cfg["strategy"].keys())
-    assert strat == {"name", "initial_amount", "base_add_amount",
-                     "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"}
+    assert strat == {"name", "lot_size", "first_lots", "add_lots_step",
+                     "add_step_pct", "rearm_mode", "rearm_pct", "accounting"}
     assert set(cfg["universe"].keys()) == {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
         "min_consecutive_div_years", "listing_min_trading_days",

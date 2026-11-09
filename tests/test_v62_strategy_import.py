@@ -13,9 +13,9 @@
 3) import 非法 yaml（语法错误）→ 400，不写盘；
 4) import 非 mapping（list）→ 400；
 5) import 缺字段（strategy.add_step_pct）→ 400 报 "缺少配置项: strategy.add_step_pct"；
-6) import 类型错误（initial_amount 改字符串）→ 400；
+6) import 类型错误（first_lots 改字符串）→ 400；
 7) PUT 响应形状 {"ok": True, "backup": str} + 写盘/备份；
-8) PUT 超范围（growth_ratio=-1）→ 400 {errors}，不写盘；
+8) PUT 超范围（add_lots_step=-1）→ 400 {errors}，不写盘；
 9) import 与 PUT 对同一非法 payload 报同样错误列表（校验一致性）。
 """
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _rescan_safety(monkeypatch):
 def _valid_payload() -> dict:
     """当前生产 yaml 的合法 payload（改一个值确保写盘路径真正执行）。"""
     p = yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
-    p["strategy"]["base_add_amount"] = int(p["strategy"]["base_add_amount"]) + 1  # 触发真实改动
+    p["strategy"]["first_lots"] = int(p["strategy"]["first_lots"]) + 1  # 触发真实改动
     return p
 
 
@@ -71,7 +71,7 @@ def _valid_payload() -> dict:
 def test_import_valid_yaml_200_writes_and_backs_up(tmp_path, monkeypatch):
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before_hash = target.read_bytes()
-    new_val = int(yaml.safe_load(before_hash)["strategy"]["base_add_amount"]) + 1
+    new_val = int(yaml.safe_load(before_hash)["strategy"]["first_lots"]) + 1
 
     payload = _valid_payload()
     raw = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
@@ -82,7 +82,7 @@ def test_import_valid_yaml_200_writes_and_backs_up(tmp_path, monkeypatch):
     assert "strategy" in res["sections"] and "universe" in res["sections"]
 
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-    assert reloaded["strategy"]["base_add_amount"] == new_val
+    assert reloaded["strategy"]["first_lots"] == new_val
 
     bak = Path(res["backup"])
     assert bak.exists()
@@ -138,16 +138,16 @@ def test_import_missing_field_400(tmp_path, monkeypatch):
 
 
 def test_import_type_error_400(tmp_path, monkeypatch):
-    """类型错误（initial_amount 改字符串）→ 400。"""
+    """类型错误（first_lots 改字符串）→ 400。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before = target.read_bytes()
     p = _valid_payload()
-    p["strategy"]["initial_amount"] = "ten-thousand"
+    p["strategy"]["first_lots"] = "two-lots"
     raw = yaml.safe_dump(p, allow_unicode=True, sort_keys=False)
     with pytest.raises(appmod.HTTPException) as ei:
         appmod.import_strategy(appmod.ImportStrategyRequest(raw=raw))
     assert ei.value.status_code == 400
-    assert any("strategy.initial_amount" in e for e in ei.value.detail["errors"])
+    assert any("strategy.first_lots" in e for e in ei.value.detail["errors"])
     assert target.read_bytes() == before
 
 
@@ -157,28 +157,28 @@ def test_import_type_error_400(tmp_path, monkeypatch):
 
 def test_put_response_shape(tmp_path, monkeypatch):
     target = _setup_tmp_config(tmp_path, monkeypatch)
-    new_val = int(yaml.safe_load(target.read_bytes())["strategy"]["base_add_amount"]) + 1
+    new_val = int(yaml.safe_load(target.read_bytes())["strategy"]["first_lots"]) + 1
     payload = _valid_payload()
     res = appmod.put_strategy(copy.deepcopy(payload))
     assert set(res.keys()) == {"ok", "backup", "timing_rescan"}  # v7.0.27：+ 重算结果
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
-    assert reloaded["strategy"]["base_add_amount"] == new_val
+    assert reloaded["strategy"]["first_lots"] == new_val
     assert Path(res["backup"]).exists()
 
 
 def test_put_out_of_range_400(tmp_path, monkeypatch):
-    """PUT 超范围（growth_ratio=-1）→ 400 {errors}，不写盘。"""
+    """PUT 超范围（add_lots_step=-1）→ 400 {errors}，不写盘。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     before = target.read_bytes()
     p = _valid_payload()
-    p["strategy"]["growth_ratio"] = -1
+    p["strategy"]["add_lots_step"] = -1
     with pytest.raises(appmod.HTTPException) as ei:
         appmod.put_strategy(p)
     assert ei.value.status_code == 400
     assert "errors" in ei.value.detail
-    assert any("growth_ratio" in e for e in ei.value.detail["errors"])
+    assert any("add_lots_step" in e for e in ei.value.detail["errors"])
     assert target.read_bytes() == before
 
 
@@ -190,7 +190,7 @@ def test_import_and_put_share_validation(tmp_path, monkeypatch):
     """同一非法 payload：import 与 PUT 都应 400 且报同样的字段错误。"""
     target = _setup_tmp_config(tmp_path, monkeypatch)
     p = _valid_payload()
-    del p["strategy"]["growth_ratio"]
+    del p["strategy"]["add_lots_step"]
 
     raw = yaml.safe_dump(p, allow_unicode=True, sort_keys=False)
     with pytest.raises(appmod.HTTPException) as ei_imp:

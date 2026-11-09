@@ -39,8 +39,8 @@ ROWS = {
     "sh.601398": {"name": "工商银行", "last_price": 8.55, "in_pos": True,
                   "k_level": 0, "next_add_price_raw": 8.0},
 }
-SP = SimpleNamespace(name="drawdown_martingale", base_add_amount=10000,
-                     growth_ratio=1.1, initial_amount=100000)
+SP = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=1,
+                     add_lots_step=1)  # v7.0.28 手数口径
 
 
 def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
@@ -122,13 +122,13 @@ def test_build_signals_add_buy_and_none():
     assert [s["ts_code"] for s in sig] == ["a.1", "b.2"]
     a = sig[0]
     assert (a["action"], a["next_level"]) == ("add", 2)
-    assert a["suggested_amount"] == 11000          # 10000×1.1^1
+    assert a["suggested_lots"] == 2                # 第 k=1 档 = 1+1×1 手
     b = sig[1]
     assert (b["action"], b["next_level"]) == ("buy", 1)
-    assert b["suggested_amount"] == 100000
-    # sp 缺省 → 金额 None 不报错
+    assert b["suggested_lots"] == 1                # 首仓 1 手
+    # sp 缺省 → 手数 None 不报错
     sig2 = build_signals(positions, None)
-    assert sig2[0]["suggested_amount"] is None
+    assert sig2[0]["suggested_lots"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     content = body["content"]
     assert "中国神华" in content and "sh.601728" in content
     assert "5.980" in content and "6.000" in content   # 现价/触发价
-    assert "约 11,000 元" in content                    # 建议加仓金额
+    assert "2 手" in content                           # 第 k=1 档 = 2 手（v7.0.28）
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
@@ -309,7 +309,7 @@ def test_run_first_position_dual_condition(monkeypatch, tmp_path):
     assert "首仓达标" in content and "sh.600001" in content
     assert "首仓线" in content and "非持仓·首仓信号" in content
     assert "分位 35.2%（低位）" in content          # v7.0.26：时机明细只剩分位
-    assert "约 100,000 元" in content                        # initial_amount
+    assert "1 手" in content                            # 首仓 first_lots=1 手（v7.0.28）
     assert "时机未过" not in content and "价格未过" not in content  # 单条件不推
     assert "策略点位提醒" in body["title"]
     # 去重键：code|buy|0|首仓线

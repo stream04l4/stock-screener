@@ -2,8 +2,8 @@
 """martingale.engine 状态机单测（纯数组合成数据，零网络零湖）。
 
 覆盖调研 ⑥ 自测面：首买/分档加仓/跳空一日多档/bounce rearm（创新低当日不触发）/
-newhigh rearm/first_amount 每股一次性/分红前一日收持仓/停牌顺延/除权推导 3 情形/
-再武装后 k 从 base 起。
+newhigh rearm/手数 sizing（v7.0.28：第 k 档 = first_lots+k×add_lots_step 手）/
+分红前一日收持仓/停牌顺延/除权推导 3 情形/再武装后 k 归零重新从 first_lots 手起。
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ def _dates(*iso):
 
 
 def _params(**kw):
-    base = dict(name="drawdown_martingale", initial_amount=1000.0, base_add_amount=1000.0,
-                first_drawdown=0.15, add_step=0.05, growth_ratio=1.0, rearm_mode="bounce",
+    base = dict(name="drawdown_martingale", lot_size=100, first_lots=1,
+                add_lots_step=1, first_drawdown=0.15, add_step=0.05, rearm_mode="bounce",
                 rearm_pct=0.15, accounting="cash")
     base.update(kw)
     return StrategyParams(**base)
@@ -44,16 +44,21 @@ def _run(p, sig, exec_c=None, exmap=None, dates=None):
 # 首买 + 分档加仓
 # ---------------------------------------------------------------------------
 
-def test_first_buy_uses_initial_and_laddering():
-    """H=100（bar0）。bar1 跌到 80：穿 k=0 档(85) 买 initial，同 bar 再穿 k=1 档(80) 买 base。
-    bar2 74 穿 k=2(75)，bar3 70 穿 k=3(70)。growth=1.0 → 除首笔外都是 1000。"""
-    p = _params(initial_amount=500.0, base_add_amount=1000.0)
+def test_first_buy_and_lot_laddering():
+    """H=100（bar0）。bar1 跌到 80：穿 k=0 档(85) 买 1 手，同 bar 再穿 k=1 档(80) 买 2 手。
+    bar2 74 穿 k=2(75) 买 3 手，bar3 70 穿 k=3(70) 买 4 手（C 方案手数阶梯）。"""
+    p = _params()
     stat, state, *_ , buys = _run(p, [100.0, 80.0, 74.0, 70.0])
     assert stat["n_buys"] == 4
-    assert stat["total_invested"] == pytest.approx(500.0 + 1000.0 * 3)
-    # 首笔 = initial（一次性首仓），其余 = base
-    assert buys[0][2] == pytest.approx(500.0)
-    assert all(a[2] == pytest.approx(1000.0) for a in buys[1:])
+    # v7.0.28 手数阶梯：1/2/3/4 手 × 100 股
+    assert [b[5] for b in buys] == [1, 2, 3, 4]
+    # 现金支出 = 股数 × 成交价 × (1+comm)
+    comm = p.commission
+    assert [b[2] for b in buys] == pytest.approx(
+        [100.0 * 80.0 * (1 + comm), 200.0 * 80.0 * (1 + comm),
+         300.0 * 74.0 * (1 + comm), 400.0 * 70.0 * (1 + comm)])
+    assert stat["total_invested"] == pytest.approx(sum(b[2] for b in buys))
+    assert state["shares"] == pytest.approx(100.0 * (1 + 2 + 3 + 4))
     assert stat["first_buy_date"].startswith("2020-01-02")
     assert stat["last_status"] == "open"
 
@@ -80,17 +85,18 @@ def test_gap_day_multi_level():
 # rearm 语义
 # ---------------------------------------------------------------------------
 
-def test_bounce_rearm_resets_k_and_uses_base_not_initial():
-    """first_amount 每股一次性：round1 首买=initial(500)；rearm 后再买=base(1000)。
+def test_bounce_rearm_resets_k_to_first_lots():
+    """rearm 后 k 归零 → 新轮从 first_lots(1) 手重新起算（v7.0.28 手数口径）。
     同时验证 rearm 后 k 从 0 重起（再跌到 新H×0.85 才买）。
     注意：不卖 → in_pos 恒真 → n_rounds=1（rearm 不开新轮次，只重置 k/H）。"""
-    p = _params(initial_amount=500.0, base_add_amount=1000.0, add_step=0.5)
-    # bar0 H=100；bar1 80 穿 k=0(85) 买 initial 500（k=1 线=35 不穿）
+    p = _params(add_step=0.5)
+    # bar0 H=100；bar1 80 穿 k=0(85) 买 1 手（k=1 线=35 不穿）
     # bar2 50（创新低，low=50，50<57.5 不反弹）；bar3 60：60≥50×1.15=57.5 → rearm H=60 k=0
-    # bar4 50：新 H 下 k=0 线=51 → 50≤51 → 买 base 1000（不是 initial）
+    # bar4 50：新 H 下 k=0 线=51 → 50≤51 → 新轮首档买 1 手（k 归零重新起算）
     stat, state, *_ , buys = _run(p, [100.0, 80.0, 50.0, 60.0, 50.0])
     assert stat["n_rearms"] == 1
-    assert [b[2] for b in buys] == pytest.approx([500.0, 1000.0])
+    assert [b[5] for b in buys] == [1, 1]  # 两轮首档都是 first_lots=1 手
+    assert [b[4] for b in buys] == [True, False]  # 首仓/加仓标注不随 rearm 重置
     assert stat["n_rounds"] == 1  # 不卖 → 单一持仓轮次贯穿全程
     # 再武装后 k 从 0 起：bar4 买的是新周期 k=0 档 → 买后 k_level=1
     assert state["k_level"] == 1
@@ -131,7 +137,7 @@ def test_cash_dividend_collected_on_prev_close_holding():
     exmap = {np.datetime64("2020-01-03", "D").astype("datetime64[ns]"): (1.0, 0.0)}
     stat, state, *_ = run_stock("t", d, np.array([100.0, 81.0, 82.0]),
                                 np.array([100.0, 81.0, 82.0]), exmap, p, verbose=False)
-    shares_after_buy = 1000.0 * (1 - p.commission) / 81.0
+    shares_after_buy = 100.0  # 首档 1 手 = 100 股（v7.0.28 手数 sizing）
     assert stat["n_buys"] == 1
     assert stat["dividends"] == pytest.approx(shares_after_buy * 1.0)
     assert state["cash_div"] == pytest.approx(shares_after_buy * 1.0)
@@ -144,7 +150,7 @@ def test_stk_div_adds_shares_proportionally():
     exmap = {np.datetime64("2020-01-03", "D").astype("datetime64[ns]"): (0.0, 2.0)}
     stat, state, *_ = run_stock("t", d, np.array([100.0, 81.0, 82.0]),
                                 np.array([100.0, 81.0, 82.0]), exmap, p, verbose=False)
-    s0 = 1000.0 * (1 - p.commission) / 81.0
+    s0 = 100.0  # 1 手 = 100 股
     assert state["shares"] == pytest.approx(s0 * 1.2)
     assert stat["dividends"] == 0.0
 
@@ -156,7 +162,7 @@ def test_suspended_exdate_rolls_to_resume_bar():
     exmap = {np.datetime64("2020-01-03", "D").astype("datetime64[ns]"): (1.0, 0.0)}
     stat, state, *_ = run_stock("t", d, np.array([100.0, 81.0, 82.0]),
                                 np.array([100.0, 81.0, 82.0]), exmap, p, verbose=False)
-    s0 = 1000.0 * (1 - p.commission) / 81.0
+    s0 = 100.0  # 1 手 = 100 股
     assert stat["n_buys"] == 1
     assert stat["dividends"] == pytest.approx(s0 * 1.0)  # 复牌日 bar 收取
 
@@ -187,12 +193,12 @@ def _af_run(exec_c, af, **kw):
 def test_implied_exdividend_stk_derived():
     """af 跳变 1.25、原始价按送转比例缺口（8.5→6.8）、无当日事件且 x10=2.5≥1
     → 推导 10 送 2.5（shares ×1.25）。"""
-    p = _params(initial_amount=1000.0, base_add_amount=1000.0, add_step=0.5)
+    p = _params(add_step=0.5)
     exec_c = [10.0, 10.0, 8.5, 8.5, 6.8, 6.8]
     af = [1.0, 1.0, 1.0, 1.0, 1.25, 1.25]
     stat, state, *_ = _af_run(exec_c, af)
     # bar2（sig 8.5）首买 initial 1000 @8.5
-    s0 = 1000.0 * (1 - p.commission) / 8.5
+    s0 = 100.0  # 1 手 = 100 股
     # bar4 推导 10 送 2.5 → shares ×1.25
     assert state["shares"] == pytest.approx(s0 * 1.25)
 
@@ -200,11 +206,11 @@ def test_implied_exdividend_stk_derived():
 def test_implied_exdividend_cash_backfill():
     """af 跳变 1.02、x10=0.2<1 且非整数组、无当日事件 → 推导为漏记现金分红
     （不送转、不加股；补记 pc×(ratio-1)/股）。"""
-    p = _params(initial_amount=1000.0, base_add_amount=1000.0, add_step=0.5)
+    p = _params(add_step=0.5)
     exec_c = [10.0, 10.0, 8.5, 8.5, 8.3333333333, 8.3333333333]
     af = [1.0, 1.0, 1.0, 1.0, 1.02, 1.02]
     stat, state, *_ = _af_run(exec_c, af)
-    s0 = 1000.0 * (1 - p.commission) / 8.5
+    s0 = 100.0  # 1 手 = 100 股
     # 推导现金 ≈ (af_ratio-1)×前收×shares：shares 不变、cash_div > 0
     assert state["shares"] == pytest.approx(s0)
     assert stat["dividends"] > 0
@@ -212,11 +218,11 @@ def test_implied_exdividend_cash_backfill():
 
 def test_factor_glitch_rejected():
     """af 跳变与原始价缺口不匹配（容差 5pp+30%）→ 因子 glitch，忽略（不加股不补现金）。"""
-    p = _params(initial_amount=1000.0, base_add_amount=1000.0, add_step=0.5)
+    p = _params(add_step=0.5)
     exec_c = [10.0, 8.4, 8.4, 8.4]
     af = [1.0, 1.0, 1.3, 1.3]
     stat, state, *_ = _af_run(exec_c, af)
-    s0 = 1000.0 * (1 - p.commission) / 8.4
+    s0 = 100.0  # 1 手 = 100 股
     assert state["shares"] == pytest.approx(s0)
     assert stat["dividends"] == 0.0
 

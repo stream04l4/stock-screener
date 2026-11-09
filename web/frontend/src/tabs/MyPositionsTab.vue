@@ -118,7 +118,9 @@ const sigShown = computed(() => {
       status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
       level_label: s.held && s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
-      amount_w: s.suggested_amount == null ? "—" : fmtWan(s.suggested_amount),
+      lots_s: s.suggested_lots == null ? "—" : `${s.suggested_lots} 手`,
+      amount_w: s.suggested_lots != null && s.price
+        ? fmtWan(s.suggested_lots * 100 * s.price) : "—",
       day_low_s: s.day_low == null ? "—" : String(s.day_low),
       bt_s: btText(s), timing_s: timingText(s) }));
   }
@@ -132,14 +134,16 @@ const sigShown = computed(() => {
   return sigHistory.value.map((h) => ({ ...h,
     status_tag: h.held ? "● 持仓" : "○ 非持仓",
     level_label: levelLabel(h.level, h.first_of_round),
+    lots_s: h.lots == null ? "—" : `${h.lots} 手`,
     amount_w: fmtWan(h.amount),
-    pushed_s: h.pushed ? "✓ 已推" : "—" }));
+    pushed_s: h.pushed ? "✓ 已推" : "—"}));
 });
 const SIG_ACTIVE_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true], ["next_add_price_raw", "触发价", true],
   ["day_low_s", "日内低", true],
-  ["action_label", "动作"], ["level_label", "档位"], ["amount_w", "建议金额(万)", true],
+  ["action_label", "动作"], ["level_label", "档位"], ["lots_s", "建议手数"],
+  ["amount_w", "参考金额(万)", true],
   ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_APPROACH_COLS = [
@@ -150,7 +154,8 @@ const SIG_APPROACH_COLS = [
 ];
 const SIG_HISTORY_COLS = [
   ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
-  ["level_label", "档位"], ["price", "触发价", true], ["amount_w", "金额(万)", true],
+  ["level_label", "档位"], ["price", "触发价", true],
+  ["lots_s", "手数"], ["amount_w", "金额(万)", true],
   ["pushed_s", "微信推送"],
 ];
 
@@ -290,7 +295,7 @@ function onRow(r) {
   edit.cost = String(r.cost_price ?? "");
   saveMsg.value = "";
   saveErr.value = "";
-  // 买入登记预填：该股有活跃信号 → 建议股数（建议金额÷现价取整手）；价格默认最新价
+  // 买入登记预填：该股有活跃信号 → 建议股数（建议手数×100，v7.0.28 手数口径）；价格默认最新价
   const s = activeSignal(r.ts_code);
   buy.shares = s ? suggestShares(s) : "";
   buy.price = r.last_price != null ? String(r.last_price) : "";
@@ -350,13 +355,10 @@ function activeSignal(code) {
   return (myData.value?.signals || []).find((s) => s.ts_code === code) || null;
 }
 
-// 建议股数：信号建议金额 ÷ 现价，向下取整到整手（100 股）
+// 建议股数：信号建议手数 × lot_size（v7.0.28 手数口径，A 股整手）
 function suggestShares(s) {
-  if (!s || s.suggested_amount == null) return "";
-  const p = s.price || (modalRow.value && modalRow.value.last_price);
-  if (!p) return "";
-  const n = Math.floor(s.suggested_amount / 100 / p) * 100;
-  return n >= 100 ? String(n) : "";
+  if (!s || s.suggested_lots == null) return "";
+  return String(s.suggested_lots * 100);
 }
 
 // 实时预览：买（正数）= 加权成本；卖（负数）= 减股数 + 已实现盈亏
@@ -535,8 +537,10 @@ function pnlColor(v) {
         <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
         <span>现价 {{ s.price }} ≤ 触发价 {{ s.next_add_price }}</span>
         <span>{{ s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档` }}</span>
-        <span v-if="s.suggested_amount != null">
-          建议{{ s.action === "buy" ? "买入" : "加仓" }} ≈ ¥{{ (s.suggested_amount / 10000).toFixed(1) }}万
+        <span v-if="s.suggested_lots != null">
+          建议{{ s.action === "buy" ? "买入" : "加仓" }}
+          <b>{{ s.suggested_lots }} 手</b>
+          <span v-if="s.price" class="muted small">≈ ¥{{ ((s.suggested_lots * 100 * s.price) / 10000).toFixed(1) }}万</span>
         </span>
       </div>
     </div>

@@ -1,4 +1,4 @@
-# stock-screener · v7.0.27（drawdown_martingale 单策略版）
+# stock-screener · v7.0.28（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -22,10 +22,11 @@ Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
   - `bounce`（默认）：价格 ≥ 本周期低点 L × (1+rearm_pct) → 重记 H = 当前价、重置 k=0。
     每 bar **先**更新 low_since_high **再**判反弹（创新低当日不触发）。
   - `newhigh`：仅创新高刷新 H。
-- **首仓**：hfq ≤ H×(1−first_drawdown_pct) → 买 `initial_amount`。
-  **每股一次性、全策略仅第一次触发使用**，占用 k=0 档；此后所有轮次首买用 `base_add_amount`。
-- **加仓**：每再跌 `add_step_pct` 一档（档线 H×(1−first_dd−k×step)，k=1,2,…）穿一档买一档，
-  金额 `base_add_amount × growth_ratio^k`，上不封顶；跳空一日穿多档。
+- **仓位口径 = 手数（v7.0.28 C 方案）**：1 手 = `lot_size` 股（A 股固定 100）。
+  首仓 = `first_lots` 手（k=0 档）；**加仓**每再跌 `add_step_pct` 一档（档线
+  H×(1−first_dd−k×step)，k=1,2,…）穿一档买一档，第 k 档（0 起）买
+  `first_lots + k×add_lots_step` 手（1→2→3→… 递增），上不封顶；跳空一日穿多档。
+  再武装（rearm）后 k 归零，新轮首买重新从 `first_lots` 手起算。
 - **不卖出、不封顶、无熔断**（无 exit/stop/max_position 参数）。
 - **分红**（cash 口径固定）：除息日前一日收盘持仓 × cash_dps 收现金，当日买入前执行；
   送转按比例加股；停牌期除权事件顺延复牌首个 bar。
@@ -100,7 +101,7 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 - `selection` = 基础池逐股十年滚动回测 → 整表刷新湖表 `selection_backtest_10y`
   （98 只 ~2s，纯湖内计算零网络零配额）；每日作业在湖增量后自动追加执行，
   失败不阻断（Web 候选池 ⑦ 读旧快照 fail-closed，次日重算）。
-- `timing` = 候选池逐股 ①分位 ②股息率 ③年线 → 整表刷新湖表 `selection_timing`
+- `timing` = 候选池逐股 ①分位（v7.0.26 起唯一时机条件）→ 整表刷新湖表 `selection_timing`
   （v7.0.25 起纯预计算不推送——微信统一为进入当前信号才推，策略点位提醒）。
 - 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
 - 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
@@ -110,10 +111,10 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | 段 | 键 | 说明 |
 |---|---|---|
 | strategy | name | 固定 `drawdown_martingale` |
-| | initial_amount | 首仓金额（每股一次性，k=0 档） |
-| | base_add_amount | 基础加仓金额 |
+| | lot_size | 每手股数（A 股固定 100） |
+| | first_lots | 首仓手数（k=0 档；再武装后新轮首买同此值） |
+| | add_lots_step | 加仓手数增量（第 k 档 = first_lots + k×add_lots_step 手） |
 | | add_step_pct | 每档加仓步长（% → 小数） |
-| | growth_ratio | 加仓金额增长比（第 k 档 = base × ratio^k） |
 | | rearm_mode | `bounce` \| `newhigh` |
 | | rearm_pct | bounce 反弹重记高点阈值（% → 小数） |
 | | accounting | 固定 `cash`（只读，Web 不可改） |
@@ -131,8 +132,8 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | first_drawdown_pct | 首仓建仓回撤（%，默认 15）；首仓线 = 本轮高点×(1−该值)；v7.0.26 自 strategy 段移入 |
 | lake / datasource.* | — | lake-sync / 补数专用，Web 只读不渲染 |
 
-**首轮 k=0 占档说明（必附注）**：首仓占用 k=0 档（金额 initial_amount），
-因此**首轮的第一个实际加仓 = base_add_amount × growth_ratio^1**。
+**手数口径说明（v7.0.28）**：金额 3 键（initial_amount/base_add_amount/growth_ratio）
+已删除——仓位一律以手数表达，参考金额 = 手数 × lot_size × 现价（前端派生展示）。
 佣金/印花税是引擎常量（comm=3bps / stamp=5bps），不在 schema 中。
 
 ## 5. Web（:9090，systemd user 服务）
@@ -370,6 +371,25 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.28**：仓位口径全链统一为**手数 C 方案**（2026-11-09 Joel 拍板：「全部改
+  为 c，包括策略页上面的说明等等相关部分都改为 c，按照 a 我没法实际执行」——
+  金额 A / 固定一手 B / 递增手数 C 三版十年回测已交付，选 C）：
+  - **sizing 切手数**：金额 3 键（initial_amount/base_add_amount/growth_ratio）
+    自 config schema / strategy.yaml / Web 校验 / 前端字段元数据全链路删除；
+    仓位 = 手数：1 手 = lot_size 股（A 股 100），首仓 = first_lots 手，
+    第 k 档（0 起）= first_lots + k×add_lots_step 手（1→2→3→…），再武装后
+    k 归零、新轮首买重新从 first_lots 手起算。生产值 lot_size=100 /
+    first_lots=1 / add_lots_step=1。
+  - **触发时机零改动**：买笔日期 / 档线 / 再武装状态机不变（f6 红线调整为
+    「触发时机零改动 + 金额切手数口径」；scratch 已验证 63/63 只池 A/B/C
+    三版买入日期序列逐笔一致）。
+  - **展示口径**：信号建议量统一 `suggested_lots`（手数）；参考金额 = 手数×100×
+    现价（前端派生展示，万单位）；买入登记股数预填 = 建议手数×100；持仓台账 /
+    信号中心 / 回测 buys.csv（加 lots 列）/ 微信推送（「建议加仓至第 N 档，X 手」
+    「首仓触发，X 手」）全部手数口径。
+  - **f6 基线重生成**：7 股买入笔数/日期/价格与 10-26 基线逐笔零 diff，仅金额
+    与汇总变化（各股新数字见 tests/fixtures/f6_baseline/README.md）。
+  - 验证：后端全量 + 前端 248 绿、f6 回归 14/14、线上重启实测。
 - **v7.0.27**：策略编辑模式改动即时生效（2026-11-09 Joel 反馈「编辑模式改动
   数值后好像实际没有生效重新扫描」）：
   - **根因**：选股时机表（selection_timing）是预计算表，历史仅 11:30 UTC

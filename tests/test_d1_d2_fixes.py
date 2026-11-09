@@ -72,18 +72,18 @@ def test_d1_noop_write_byte_identical(tmp_path, monkeypatch):
 
 
 def test_d1_single_value_change_diff_only_that_line(tmp_path, monkeypatch):
-    """真实改一个策略值（base_add_amount 10000→11000）→ diff 只含该行。"""
+    """真实改一个策略值（first_lots 1→2）→ diff 只含该行。"""
     target = _isolate(tmp_path, monkeypatch)
     orig_text = target.read_text(encoding="utf-8")
     payload = yaml.safe_load(orig_text)
-    old = int(payload["strategy"]["base_add_amount"])
-    new = old + 1000
-    payload["strategy"]["base_add_amount"] = new
+    old = int(payload["strategy"]["first_lots"])
+    new = old + 1
+    payload["strategy"]["first_lots"] = new
     _write_strategy_preserving_comments(payload)
 
     new_text = target.read_text(encoding="utf-8")
     reloaded = yaml.safe_load(new_text)
-    assert int(reloaded["strategy"]["base_add_amount"]) == new
+    assert int(reloaded["strategy"]["first_lots"]) == new
     # 其余字段不变
     for section in payload:
         for k, v in payload[section].items():
@@ -94,7 +94,7 @@ def test_d1_single_value_change_diff_only_that_line(tmp_path, monkeypatch):
     assert len(old_lines) == len(new_lines), "行数变化（不应增删行）"
     changed = [(i, a, b) for i, (a, b) in enumerate(zip(old_lines, new_lines), 1) if a != b]
     assert len(changed) == 1, f"应恰好 1 行变化，实际 {len(changed)}: {changed}"
-    assert "base_add_amount:" in changed[0][1] and "base_add_amount:" in changed[0][2]
+    assert "first_lots:" in changed[0][1] and "first_lots:" in changed[0][2]
 
     def _comment_lines(text):
         return sum(1 for ln in text.splitlines() if "#" in ln)
@@ -108,15 +108,15 @@ def test_d1_change_then_revert_byte_identical(tmp_path, monkeypatch):
     orig_text = target.read_text(encoding="utf-8")
     payload = yaml.safe_load(orig_text)
 
-    old_base = int(payload["strategy"]["base_add_amount"])
-    old_growth = float(payload["strategy"]["growth_ratio"])
-    payload["strategy"]["base_add_amount"] = old_base + 1000
-    payload["strategy"]["growth_ratio"] = round(old_growth + 0.05, 2)
+    old_step = int(payload["strategy"]["add_lots_step"])
+    old_rf = float(payload["datasource"]["rf"]["fallback_pct"])  # 生产 yaml 真 float
+    payload["strategy"]["add_lots_step"] = old_step + 1
+    payload["datasource"]["rf"]["fallback_pct"] = round(old_rf + 0.5, 2)
     _write_strategy_preserving_comments(payload)
 
     restore = yaml.safe_load(target.read_text(encoding="utf-8"))
-    restore["strategy"]["base_add_amount"] = old_base
-    restore["strategy"]["growth_ratio"] = old_growth
+    restore["strategy"]["add_lots_step"] = old_step
+    restore["datasource"]["rf"]["fallback_pct"] = old_rf
     _write_strategy_preserving_comments(restore)
 
     final_text = target.read_text(encoding="utf-8")

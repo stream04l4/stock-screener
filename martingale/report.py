@@ -3,7 +3,8 @@
 
 产物（out 目录）：
 - per_stock.csv   与参考实现逐列/逐位对齐（f6 回归比对基准；pnl_pct 为比率）
-- buys.csv        逐笔买入（ts_code,seq,date,price,amount）—— v7 新增
+- buys.csv        逐笔买入（ts_code,seq,date,price,amount,lots）—— v7 新增，
+                  v7.0.28 加 lots（本笔手数）列
 - equity_curve.csv 组合账本（与参考逐列对齐）
 - summary.md      人读摘要（买入时间表与参考格式一致；f6 回归比对基准之一）
 - status.json     机器读运行元信息（Web 结果页 / 排障）
@@ -69,8 +70,8 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
     A = lines.append
     A("# 马丁格尔深回撤加仓回测 summary")
     A("")
-    A(f"- 参数: initial_amount={sp.initial_amount:g}, base_add_amount={sp.base_add_amount:g}, "
-      f"growth_ratio={sp.growth_ratio:g}, first_drawdown_pct={sp.first_drawdown * 100:g}%, "
+    A(f"- 参数: lot_size={sp.lot_size}, first_lots={sp.first_lots}, "
+      f"add_lots_step={sp.add_lots_step}, first_drawdown_pct={sp.first_drawdown * 100:g}%, "
       f"add_step_pct={sp.add_step * 100:g}%, rearm_mode={sp.rearm_mode}, "
       f"rearm_pct={sp.rearm_pct * 100:g}%, accounting={sp.accounting}, "
       f"comm={sp.commission * 1e4:g}bps, stamp={sp.stamp * 1e4:g}bps")
@@ -138,7 +139,7 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
             A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {r['last_status']}, "
               f"最差浮亏 {float(r['min_unreal_pct']):.1%}")
             A("- 买入时间表:")
-            for bdate, bprice, bamt, _bk, _bor in buys_by_code.get(r["ts_code"], []):
+            for bdate, bprice, bamt, _bk, _bor, _blots in buys_by_code.get(r["ts_code"], []):
                 A(f"  - {bdate} @ {bprice:g} 买 {bamt:,.0f}")
     else:
         A("## Top / Bottom 10（按 pnl_pct，仅触发过的股票）")
@@ -175,13 +176,13 @@ def write_outputs(out_dir: str, sp, db_path: str, gdates: np.ndarray,
         for r in rows:
             w.writerow([_fmt(r[c]) for c in PER_STOCK_COLUMNS])
 
-    # buys.csv（逐笔；seq 从 1 起）
+    # buys.csv（逐笔；seq 从 1 起；v7.0.28 加 lots 列 = 本笔手数）
     with open(os.path.join(out_dir, "buys.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ts_code", "seq", "date", "price", "amount"])
+        w.writerow(["ts_code", "seq", "date", "price", "amount", "lots"])
         for c in sorted(buys_by_code):
-            for seq, (bdate, bprice, bamt, _bk, _bor) in enumerate(buys_by_code[c], start=1):
-                w.writerow([c, seq, bdate, repr(float(bprice)), repr(float(bamt))])
+            for seq, (bdate, bprice, bamt, _bk, _bor, blots) in enumerate(buys_by_code[c], start=1):
+                w.writerow([c, seq, bdate, repr(float(bprice)), repr(float(bamt)), int(blots)])
 
     # equity_curve.csv
     open_stocks = g_open
@@ -234,11 +235,11 @@ def write_outputs(out_dir: str, sp, db_path: str, gdates: np.ndarray,
         },
         "params": {
             "name": sp.name,
-            "initial_amount": sp.initial_amount,
-            "base_add_amount": sp.base_add_amount,
+            "lot_size": sp.lot_size,
+            "first_lots": sp.first_lots,
+            "add_lots_step": sp.add_lots_step,
             "first_drawdown_pct": sp.first_drawdown * 100,
             "add_step_pct": sp.add_step * 100,
-            "growth_ratio": sp.growth_ratio,
             "rearm_mode": sp.rearm_mode,
             "rearm_pct": sp.rearm_pct * 100,
             "accounting": sp.accounting,

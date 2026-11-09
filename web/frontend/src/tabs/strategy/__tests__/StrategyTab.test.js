@@ -29,10 +29,10 @@ const { useToastStore } = await import("../../../stores/toastStore.js");
 const STRATEGY_JSON = {
   strategy: {
     name: "drawdown_martingale",
-    initial_amount: 100000,
-    base_add_amount: 10000,
+    lot_size: 100,
+    first_lots: 1,
+    add_lots_step: 1,
     add_step_pct: 5,
-    growth_ratio: 1.1,
     rearm_mode: "bounce",
     rearm_pct: 15,
     accounting: "cash",
@@ -176,8 +176,8 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     // v7.0.26：② 股息率 / ③ 250 日线删除、首仓建仓回撤移入 timing
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
-      "首仓金额（元）", "加仓基准金额（元）", "加仓步长（%）",
-      "加仓递增比率", "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
+      "每手股数", "首仓手数", "加仓手数增量", "加仓步长（%）",
+      "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
       // v7.0.13 选股时机（v7.0.26：3 键）
       "价格分位窗口（年）【时机门条件①】", "价格低位分位上限（%）【时机门唯一条件】", "首仓建仓回撤（%）",
       // v7.0.12 股票池 + 候选池选股门槛
@@ -187,8 +187,8 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
-      "initial_amount", "base_add_amount", "add_step_pct",
-      "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
+      "lot_size", "first_lots", "add_lots_step", "add_step_pct",
+      "rearm_mode", "rearm_pct", "accounting",
       "price_window_years", "price_pctile_max", "first_drawdown_pct",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
@@ -201,8 +201,8 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     const all = w.text();
     expect(all).not.toContain("baostock_daily_budget");
     expect(all).not.toContain("daily_quota");
-    // 必附注在 strategy 段说明
-    expect(all).toContain("k=0");
+    // 手数阶梯口径说明在 strategy 段
+    expect(all).toContain("手数")
     // enum 值只读态显示通俗短名（bounce → 反弹重置），不是裸值
     const rearmRow = fields.find((f) => f.find(".s-key").attributes("title") === "rearm_mode");
     expect(rearmRow.find(".s-val").text()).toBe("反弹重置");
@@ -249,7 +249,7 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     // 进入编辑态
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    // strategy 5（int×2 + float×3；v7.0.26 首仓回撤移入 timing）
+    // strategy 5（int×3 + float×2；v7.0.28 手数口径）
     // + universe 7（v7.0.12：mv float + 3×int + 3×float）
     // + timing 3（v7.0.26：int×1 + float×2）= 15
     expect(w.findAll('input[type="number"]').length).toBe(15);
@@ -269,7 +269,7 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     await flushPromises();
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    // initial_amount 是第一个 number input
+    // lot_size 是第一个 number input
     const input = w.findAll('input[type="number"]')[0];
     await input.setValue("abc");
     await w.find("#btn-strategy-save").trigger("click");
@@ -305,12 +305,12 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     await flushPromises();
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    const input = w.findAll('input[type="number"]')[0]; // initial_amount
-    await input.setValue("200000");
+    const input = w.findAll('input[type="number"]')[0]; // lot_size
+    await input.setValue("200");
     await w.find("#btn-strategy-save").trigger("click");
     await flushPromises();
     expect(captured).toBeTruthy();
-    expect(captured.strategy.initial_amount).toBe(200000);
+    expect(captured.strategy.lot_size).toBe(200);
     // PUT full：lake/datasource/universe/timing 段完整带回（v7.0.18：lake 空段 null 原样回）
     expect(captured.lake).toBeNull();
     expect(captured.datasource).toEqual({ sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } });

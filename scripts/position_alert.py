@@ -7,14 +7,15 @@
 微信公众号 pushplus 推送加）** 推到 Joel 的微信：
 
 ① 持仓股·加仓（越跌越买）：检查**用户持仓账本**里每只股票是否到达策略状态机
-   的下一触发价位（in_pos → 第 k+1 档，base×growth^k；未 in_pos → 首仓线）；
+   的下一触发价位（in_pos → 第 k+1 档，(first_lots+k×add_lots_step) 手；
+   未 in_pos → 首仓线）；
 ② 非持仓股·首仓（双条件）：检查**候选池非持仓股**是否同时满足
    a. 时机成熟：selection_timing.push_eligible（5 年分位≤40% 单条件，
       v7.0.24 定案；无 timing 行 fail-closed 不推）；
    b. 价格到位：现价 ≤ 首仓线（本轮高点×(1−first_drawdown_pct)；该参数
       v7.0.26 起居 timing 段 = 选股策略）。
-   两者都过 = 首仓买入信号（initial_amount）。建仓后录入「我的持仓」→
-   自动转通道①。
+   两者都过 = 首仓买入信号（first_lots 手，v7.0.28 手数口径）。建仓后录入
+   「我的持仓」→ 自动转通道①。
 
 口径与 Web「策略信号中心」页面**同一单点**（martingale.touches.trigger_price
 + martingale.signals.build_signals + web.app._strategy_state_rows）：
@@ -145,14 +146,13 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
         names.append(name)
         if s["action"] == "add":
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>加仓线 第 {s['k_level']} 档</b>")
-            tail = (f"建议加仓至第 {s['next_level']} 档，约 "
-                    f"{s['suggested_amount']:,.0f} 元"
-                    if s.get("suggested_amount") else "建议加仓一档")
+            tail = (f"建议加仓至第 {s['next_level']} 档，{s['suggested_lots']} 手"
+                    if s.get("suggested_lots") else "建议加仓一档")
         else:
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
                      + (f"（{s['note']}）" if s.get("note") else ""))
-            tail = (f"首仓触发，约 {s['suggested_amount']:,.0f} 元"
-                    if s.get("suggested_amount") else "首仓触发")
+            tail = (f"首仓触发，{s['suggested_lots']} 手"
+                    if s.get("suggested_lots") else "首仓触发")
         bits = [f"现价: <b>{s['price']:.3f}</b>",
                 f"触发价: {s['next_add_price']:.3f}"]
         if s.get("pctile") is not None:
@@ -278,7 +278,7 @@ def run(force: bool = False, dry_run: bool = False,
             "next_add_price": trig,
             "k_level": 0,
             "next_level": 1,
-            "suggested_amount": getattr(_sp, "initial_amount", None),
+            "suggested_lots": getattr(_sp, "first_lots", None),
             "action": "buy",
             "note": "非持仓·首仓信号（时机✓）",
             "pctile": t.get("pctile_window"),

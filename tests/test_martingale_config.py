@@ -35,8 +35,9 @@ def test_load_real_config():
     assert 0 < p.first_drawdown < 1
     assert 0 < p.add_step < 1
     assert 0 < p.rearm_pct <= 1
-    # 金额 = 元（yaml 原值）
-    assert p.initial_amount == int(float(REAL_YAML.read_text().split("initial_amount:")[1].split()[0]))
+    # 手数 = yaml 原值（v7.0.28 手数口径）
+    assert p.lot_size == int(REAL_YAML.read_text().split("lot_size:")[1].split()[0])
+    assert (p.first_lots, p.add_lots_step) == (1, 1)
     # 佣金常量 3bps（引擎常量，不进 yaml）
     assert p.commission == COMMISSION_BPS / 1e4 == 3.0 / 1e4
     assert p.stamp == 5.0 / 1e4
@@ -57,8 +58,8 @@ def test_load_real_config():
 # ---------------------------------------------------------------------------
 
 def _params(**kw):
-    base = dict(name="drawdown_martingale", initial_amount=10000.0, base_add_amount=10000.0,
-                first_drawdown=0.15, add_step=0.05, growth_ratio=1.1, rearm_mode="bounce",
+    base = dict(name="drawdown_martingale", lot_size=100, first_lots=1,
+                add_lots_step=1, first_drawdown=0.15, add_step=0.05, rearm_mode="bounce",
                 rearm_pct=0.15, accounting="cash")
     base.update(kw)
     return StrategyParams(**base)
@@ -103,8 +104,8 @@ def test_missing_strategy_section(tmp_path):
 
 def test_missing_field(tmp_path):
     c = _cfg()
-    del c["strategy"]["growth_ratio"]
-    with pytest.raises(ConfigError, match="strategy.growth_ratio 缺失"):
+    del c["strategy"]["first_lots"]
+    with pytest.raises(ConfigError, match="strategy.first_lots 缺失"):
         load_config(_write(tmp_path, c))
 
 
@@ -156,13 +157,13 @@ def test_whitelist_empty(tmp_path):
 
 def test_range_violation(tmp_path):
     c = _cfg()
-    c["strategy"]["growth_ratio"] = 0.5  # < 1.0
+    c["strategy"]["first_lots"] = 0  # < 1
     with pytest.raises(ConfigError, match="超出范围"):
         load_config(_write(tmp_path, c))
 
 
-def test_type_violation_bool_is_not_num(tmp_path):
+def test_type_violation_bool_is_not_int(tmp_path):
     c = _cfg()
-    c["strategy"]["initial_amount"] = True
-    with pytest.raises(ConfigError, match="必须是数值"):
+    c["strategy"]["first_lots"] = True
+    with pytest.raises(ConfigError, match="必须是整数"):
         load_config(_write(tmp_path, c))

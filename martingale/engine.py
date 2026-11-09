@@ -6,8 +6,10 @@ f6 验收配置 = --ladder high --rearm bounce --rearm-pct 0.15 --exit none
 --stop-add-pct 0 --stop-out-pct 0 --max-position 0 --max-adds 99 --accounting cash
 --commission-bps 3 --stamp-bps 5。本引擎 = 该配置下参考代码的**行为等价删减**：
 - 只保留 high-ladder 分支（参考 L217-285 语义）：rearm（bounce 先更新 low 再判
-  反弹 / newhigh）→ 逐档 while 买入（先比档再买、跳空一日穿多档、档金额
-  base×growth^k、first_amount 一次性）；
+  反弹 / newhigh）→ 逐档 while 买入（先比档再买、跳空一日穿多档）；
+- 仓位 sizing（v7.0.28，Joel 2026-11-09 拍板 C 方案，替代原 金额×growth^k）：
+  第 k 档买 (first_lots + k×add_lots_step) 手 × lot_size 股，现金支出 =
+  股数×成交价×(1+comm)；再武装后 k 归零 → 新轮重新从 first_lots 手起；
 - exit=none/stop_add=0/stop_out=0/max_position=0 的分支整体不存在（规格：不卖、
   不封顶、无熔断，exit/stop/max_position 参数一并移除）；max_adds=99 在验收
   数据上从未触顶（单周期最大 k < 5），规格"上不封顶" → while True 严格等价；
@@ -132,12 +134,11 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
       为比率而非百分数；first/last_buy_date 为 datetime64[ns] 的 str，缺买为 ""）；
     - state: 当前持仓状态投影（status 子命令 / /api/positions 用）；
     - v_arr/c_arr/flag: 逐 bar 组合价值/成本/持仓标记；
-    - buys: [(date_str, price, amount, k, first_of_round), ...]
-      （date_str = datetime64[ns] 的 str，price = 原始成交价，amount = 档位金额，
-      k = 该笔触发的档下标 0 起（买入前值，未含本笔 +1），first_of_round = 是否
-      本轮首笔（首仓/再武装后重启）。前 3 元与历史 3 元组逐位一致——v7.0.19 为
-      Web 策略信号「历史信号」补 k/first_of_round 标注，状态机计算零改动；
-      消费方 report.py 已同步解包，buys.csv 列不变（f6 基线不受影响）。）
+    - buys: [(date_str, price, amount, k, first_of_round, lots), ...]
+      （date_str = datetime64[ns] 的 str，price = 原始成交价，amount = 本笔现金
+      支出（含佣金，v7.0.28 手数口径），k = 该笔触发的档下标 0 起（买入前值，
+      未含本笔 +1），first_of_round = 是否本轮首笔（首仓/再武装后重启），
+      lots = 本笔手数（v7.0.28）。消费方 report.py / state_rows 已同步解包。）
     """
     n = len(sig)
     comm = p.commission  # 3bps 买入佣金（引擎常量）
@@ -157,7 +158,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     first_buy_i = -1
     last_buy_i = -1
     min_unreal_pct = 0.0
-    buys: List[Tuple[str, float, float, int, bool]] = []
+    buys: List[Tuple[str, float, float, int, bool, int]] = []
 
     v_arr = np.zeros(n)
     c_arr = np.zeros(n)
@@ -252,11 +253,11 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
             level = entry_high * (1.0 - p.first_drawdown - k_level * p.add_step)
             if sprice > level + _EPS:
                 break
-            buy_amt = p.base_add_amount * (p.growth_ratio ** k_level)
+            n_lots = p.first_lots + k_level * p.add_lots_step   # C 方案：1/2/3…手
             first_of_round = not in_pos
-            if first_of_round and first_buy_i < 0:
-                buy_amt = p.initial_amount  # 全策略首仓（一次性），之后按常规阶梯
-            shares += buy_amt * (1.0 - comm) / price
+            buy_shares = float(n_lots * p.lot_size)
+            buy_amt = buy_shares * price * (1.0 + comm)  # 现金支出（含 3bps 佣金）
+            shares += buy_shares
             open_cost += buy_amt
             total_invested += buy_amt
             n_buys += 1
@@ -267,9 +268,10 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                 if first_buy_i < 0:
                     first_buy_i = i
             # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
-            # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）
+            # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）；
+            # n_lots = 本笔手数（v7.0.28 手数口径，Web 历史信号展示用）
             buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
-                         int(k_level), bool(first_of_round)))
+                         int(k_level), bool(first_of_round), int(n_lots)))
             k_level += 1
         val = shares * price + cash_div
         if in_pos and open_cost > 0.0:
@@ -396,10 +398,11 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
             rows[c]["next_rearm_price_raw"] = None
         if include_buys:
             # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
-            # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」）
+            # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」；
+            # lots=本笔手数 v7.0.28 手数口径）
             rows[c]["buys"] = [
                 {"date": str(b[0])[:10], "price": b[1], "amount": b[2],
-                 "level": b[3], "first_of_round": b[4]} for b in _buys
+                 "level": b[3], "first_of_round": b[4], "lots": b[5]} for b in _buys
             ]
             # 首仓线（本周期 H×(1−first_drawdown) 的原始口径）：策略信号中心对
             # **非持仓**股用它作触发价——未持仓用户可执行的信号是首仓，而非

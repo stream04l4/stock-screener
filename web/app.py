@@ -323,10 +323,11 @@ def _write_strategy_preserving_comments(payload: Dict[str, Any]) -> None:
 _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
     "strategy": {
         "name": ("enum", "drawdown_martingale", None),
-        "initial_amount": ("float", 1, 1e9),
-        "base_add_amount": ("float", 1, 1e9),
+        # v7.0.28 手数口径（C 方案）：替代 initial_amount/base_add_amount/growth_ratio
+        "lot_size": ("int", 1, 10000),
+        "first_lots": ("int", 1, 10000),
+        "add_lots_step": ("int", 0, 10000),
         "add_step_pct": ("float", 0.1, 50),
-        "growth_ratio": ("float", 1.0, 10),
         "rearm_mode": ("enum2", "bounce|newhigh", None),
         "rearm_pct": ("float", 1, 100),
         "accounting": ("enum", "cash", None),   # 固定 cash（只读；传其他值 → 400）
@@ -1111,9 +1112,9 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     - 空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
     - strategy：策略选择（同 /api/bt/runs 语义）——缺省/"current" = 活动策略
       config/strategy.yaml；策略库名 → data/strategies/<name>.yaml；不存在 → 400。
-    - signals：买卖提示——现价已跌破所选策略的下一触发价位：
-      持仓中（in_pos，第 k 档）→ action="add"（加仓一档，base×growth^k）；
-      未持仓（never，k=0）→ action="buy"（首仓触发，initial_amount）。
+    - signals：买卖提示——现价已跌破所选策略的下一触发价位（v7.0.28 手数口径）：
+      持仓中（in_pos，第 k 档）→ action="add"（加仓，first_lots+k×add_lots_step 手）；
+      未持仓（never，k=0）→ action="buy"（首仓触发，first_lots 手）。
       现价 = 腾讯实时行情（price_source="spot"）；行情失败回退湖最后价
       （price_source="lake"，只漏报不误报）。状态机「触线即买」→ 湖最后 bar 处
       湖价恒高于触发价，故必须用实时价判定。
@@ -1195,9 +1196,10 @@ def get_my_positions(strategy: Optional[str] = None) -> Dict[str, Any]:
     for pos in positions:
         p_now = (spot.get(pos["ts_code"]) or {}).get("price")
         pos["spot_price"] = p_now
-    # 信号：现价（实时优先）≤ 下一档触发价（原始口径）
-    # - in_pos（持仓中，第 k 档）→ "add"：加仓到第 k+1 档，金额 = base×growth^k
-    # - 未持仓（last_status=never，k=0）→ "buy"：首仓买入触发，金额 = initial_amount
+    # 信号：现价（实时优先）≤ 下一档触发价（原始口径，v7.0.28 手数）
+    # - in_pos（持仓中，第 k 档）→ "add"：加仓到第 k+1 档，
+    #   手数 = first_lots + k×add_lots_step
+    # - 未持仓（last_status=never，k=0）→ "buy"：首仓买入触发，手数 = first_lots
     # （状态机「触线即买」→ 湖最后 bar 处湖价恒高于触发价，必须实时价判定）
     # v7.0.11：口径抽至 martingale.signals.build_signals（微信点位提醒脚本共用，
     # 单一定义点防漂移）
@@ -1261,14 +1263,14 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
       约束（v7.0.20 Joel 2026-11-08 定案）= (active|touched) 且 (持仓 OR
       in_pos=false)**——非持仓但模拟已建仓（in_pos=true）的股票触发价 = 模拟
       加仓档（用户连建仓都未建），加仓信号不入当前信号；其盘中触碰事件仍由
-      收盘 job 落盘进 history 段。touched 行的动作/金额按 active 同口径补齐
-      （信号今日已发生）。
+      收盘 job 落盘进 history 段。touched 行的动作/手数按 active 同口径补齐
+      （信号今日已发生，v7.0.28 手数口径）。
     - held = 在用户账本（持仓），否则非持仓（池内非持仓股同样有策略参考——
       状态机不挑池）；触发价口径：按 in_pos 分支（与 held 无关）——
       in_pos（模拟持仓已建立）= 模拟周期 next 档（next_add_price_raw，加仓
       第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
       （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
-      动作恒为买入·首仓、金额 initial_amount）。
+      动作恒为买入·首仓、手数 = first_lots，v7.0.28）。
     - 时机门（v7.0.24 定案：① 价格分位单条件）：非持仓股的买入信号须先过
       选股时机提醒口径（timing.push_eligible = ① 5年分位≤40%，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
@@ -1432,17 +1434,17 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             # （Joel 2026-11-08 定案；前端不再叠加总判定前缀，防 ✗✗ 误读）
             timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
-        suggested = cls["suggested_amount"]
+        suggested = cls["suggested_lots"]
         if touched and action is None and sp_obj is not None:
             # 已触回（现价已高于触发线 → cls 无动作）：信号今日已发生，动作/
-            # 金额按 active 同口径补齐（持仓股 in_pos=加仓 base×growth^k；
-            # 非持仓/未 in_pos=首仓 initial，v7.0.23）
+            # 手数按 active 同口径补齐（持仓股 in_pos=加仓 first+k×step 手；
+            # 非持仓/未 in_pos=首仓 first_lots 手，v7.0.23/v7.0.28 手数口径）
             if in_pos and held:
                 action = "add"
-                suggested = round(sp_obj.base_add_amount * (sp_obj.growth_ratio ** k))
+                suggested = int(sp_obj.first_lots + k * sp_obj.add_lots_step)
             else:
                 action = "buy"
-                suggested = sp_obj.initial_amount
+                suggested = int(sp_obj.first_lots)
         if not held:
             # 非持仓股的动作统一为「买入」（next 档对非持仓用户是加入策略的
             # 买入位，不是加仓）；时机门未过 → 无动作（价格状态照展示）
@@ -1467,7 +1469,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
                         if day_low is not None else None),
             "distance_pct": cls["distance_pct"],
             "action": action,
-            "suggested_amount": suggested,
+            "suggested_lots": suggested,
             "timing_ok": timing_ok,
             "timing_reasons": timing_reasons,
             # 十年回测参考（推荐买入时展示；池外/无回测 → None）
@@ -1498,6 +1500,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
             history.append({
                 "ts_code": c, "name": (r or {}).get("name") or c, "held": held,
                 "date": b["date"], "price": b["price"], "amount": b["amount"],
+                "lots": b.get("lots"),   # v7.0.28 手数（本笔手数）
                 "level": b["level"], "first_of_round": b["first_of_round"],
                 # 该档位是否已被微信点位提醒推送过（代码|动作|档 前缀匹配）
                 "pushed": f"{c}|{baction}|{b['level']}|" in pushed_pfx,
@@ -1516,6 +1519,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         history.append({
             "ts_code": tc, "name": ev.get("name") or tc, "held": tc in user,
             "date": d, "price": ev.get("level_price"), "amount": ev.get("amount"),
+            "lots": ev.get("lots"),   # v7.0.28 手数（旧快照无此键 → None）
             "level": ev.get("level"), "first_of_round": bool(ev.get("first_of_round")),
             "pushed": f"{tc}|{ev_action}|{ev.get('level')}|" in pushed_pfx,
             "source": "touch", "_seq": 10 ** 6 + tseq,
