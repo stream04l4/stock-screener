@@ -43,10 +43,10 @@ export const SECTION_DESC = {
     "叠加 3 道选股门槛（十年回测为正、股息率下限、股价区间）；入选 ≠ 买入信号，" +
     "买不买看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。",
   timing:
-    "在候选池之上筛「何时买」：时机门 = 5年分位 ≤ 上限（v7.0.24 单条件）；" +
-    "股息率 / 年线之下为参考展示（不参与门）。" +
-    "下方「今日选股」= 时机成熟观察名单（参考展示）。" +
-    "微信不再为时机单独推送（v7.0.25）：价格跌破首仓线进入当前信号时，由盘中「策略点位提醒」推送首仓买入。",
+    "在候选池之上筛「何时首仓买入」：时机门 = 5年分位 ≤ 上限（v7.0.24 单条件）。" +
+    "首仓建仓回撤也归本策略（v7.0.26：首仓线 = 本轮高点×(1−该值)；加仓/再武装在「持仓策略」）。" +
+    "下方「今日选股」= 时机成熟观察名单。" +
+    "微信不为时机单独推送（v7.0.25）：价格跌破首仓线进入当前信号时，由盘中「策略点位提醒」推送首仓买入。",
 };
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,6 @@ export const FIELD_LABELS = {
   "strategy.name": "策略标识",
   "strategy.initial_amount": "首仓金额（元）",
   "strategy.base_add_amount": "加仓基准金额（元）",
-  "strategy.first_drawdown_pct": "首次建仓回撤（%）",
   "strategy.add_step_pct": "加仓步长（%）",
   "strategy.growth_ratio": "加仓递增比率",
   "strategy.rearm_mode": "高点再武装方式",
@@ -72,12 +71,10 @@ export const FIELD_LABELS = {
   "universe.min_ttm_yield_pct": "股息率下限 TTM（%）",
   "universe.price_min_yuan": "股价下限（元）",
   "universe.price_max_yuan": "股价上限（元）",
-  // v7.0.13 timing（选股时机）
+  // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、首仓建仓回撤移入
   "timing.price_window_years": "价格分位窗口（年）【时机门条件①】",
   "timing.price_pctile_max": "价格低位分位上限（%）【时机门唯一条件】",
-  "timing.yield_min_pct": "股息率参考线 TTM（%）【参考展示，不参与门】",
-  "timing.below_ma250": "叠加「年线之下」参考项",
-  "timing.ma_period": "年线周期（交易日）",
+  "timing.first_drawdown_pct": "首仓建仓回撤（%）",
 };
 
 // ---------------------------------------------------------------------------
@@ -90,8 +87,6 @@ export const FIELD_DESC = {
     "首仓一次性投入的金额；它占掉 k=0 档，所以首轮第一个加仓是 基准×比率（不是基准本身）",
   "strategy.base_add_amount":
     "加仓的基准金额：第 k 档 = 基准×比率^k；再武装后的新轮从它开始加",
-  "strategy.first_drawdown_pct":
-    "股价从高点回落这个比例，就建首仓（按前复权收盘价判断）",
   "strategy.add_step_pct":
     "建首仓后，每再跌这个比例加一档；跳空缺口一天可以连穿多档",
   "strategy.growth_ratio":
@@ -118,15 +113,14 @@ export const FIELD_DESC = {
   "universe.min_ttm_yield_pct": "最新估值日 TTM 股息率低于这个数 → 剔除",
   "universe.price_min_yuan": "最新收盘价低于这个价 → 剔除（远离退市风险区）",
   "universe.price_max_yuan": "最新收盘价高于这个价 → 剔除（保证加仓档位整手可行）",
-  // v7.0.13 timing（选股时机）；v7.0.24 起时机门 = ① 单条件，②③ 参考展示
+  // v7.0.13 timing（选股时机）；v7.0.24 起时机门 = ① 单条件；
+  // v7.0.26：② 股息率 / ③ 年线彻底删除、首仓建仓回撤自 strategy 段移入
   "timing.price_window_years":
     "时机门条件①的「近年」= 从最新 K线日往回数 N 年的前复权收盘价；当前价在其中的分位决定「是否低位」",
   "timing.price_pctile_max":
     "时机门条件①（唯一条件）：当前价处于近 N 年价格分位 ≤ 这个值 → 算「价格低位」（如 40 = 比近 5 年 6 成以上交易日都便宜）",
-  "timing.yield_min_pct": "条件②（v7.0.24 起参考展示，不参与时机门）：最新 TTM 股息率 ≥ 这个值 → 标记「高股息」",
-  "timing.below_ma250":
-    "条件③（可选，默认关，v7.0.24 起参考展示不参与门）：当前价低于年线才算低位",
-  "timing.ma_period": "年线 = 最近 N 个交易日收盘价均值（默认 250 = 一年线）",
+  "timing.first_drawdown_pct":
+    "股价从本轮高点回落这个比例，就建首仓（按前复权收盘价判断；首仓线 = 本轮高点×(1−该值)）",
 };
 
 // ---------------------------------------------------------------------------
@@ -138,7 +132,6 @@ export const FIELD_TYPE = {
   name: "str",              // 固定标识（页面不渲染，见 HIDDEN_FIELDS）
   initial_amount: "int",
   base_add_amount: "int",
-  first_drawdown_pct: "float",
   add_step_pct: "float",
   growth_ratio: "float",
   rearm_mode: "enum2",
@@ -155,12 +148,10 @@ export const FIELD_TYPE = {
   min_ttm_yield_pct: "float",
   price_min_yuan: "float",
   price_max_yuan: "float",
-  // v7.0.13 timing（选股时机）
+  // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、first_drawdown_pct 移入
   price_window_years: "int",
   price_pctile_max: "float",
-  yield_min_pct: "float",
-  below_ma250: "bool",
-  ma_period: "int",
+  first_drawdown_pct: "float",
 };
 
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。

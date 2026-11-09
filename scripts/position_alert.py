@@ -9,9 +9,10 @@
 ① 持仓股·加仓（越跌越买）：检查**用户持仓账本**里每只股票是否到达策略状态机
    的下一触发价位（in_pos → 第 k+1 档，base×growth^k；未 in_pos → 首仓线）；
 ② 非持仓股·首仓（双条件）：检查**候选池非持仓股**是否同时满足
-   a. 时机成熟：selection_timing.push_eligible（分位≤40% 且 股息≥4.5%，
-      无 timing 行 fail-closed 不推）；
-   b. 价格到位：现价 ≤ 首仓线（本轮高点回撤 15% 的线，first_level_raw）。
+   a. 时机成熟：selection_timing.push_eligible（5 年分位≤40% 单条件，
+      v7.0.24 定案；无 timing 行 fail-closed 不推）；
+   b. 价格到位：现价 ≤ 首仓线（本轮高点×(1−first_drawdown_pct)；该参数
+      v7.0.26 起居 timing 段 = 选股策略）。
    两者都过 = 首仓买入信号（initial_amount）。建仓后录入「我的持仓」→
    自动转通道①。
 
@@ -135,7 +136,7 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
     """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
 
     v7.0.23：双通道聚合（持仓加仓 + 非持仓首仓）。首仓信号带 note（区分口径）
-    与 timing 明细（分位/股息率）；加仓信号无 note（持仓策略）。
+    与 timing 明细（分位；v7.0.26 起股息率参考项删除）；加仓信号无 note（持仓策略）。
     """
     names = []
     blocks: List[str] = []
@@ -154,8 +155,8 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
                     if s.get("suggested_amount") else "首仓触发")
         bits = [f"现价: <b>{s['price']:.3f}</b>",
                 f"触发价: {s['next_add_price']:.3f}"]
-        if s.get("pctile") is not None and s.get("ttm_yield") is not None:
-            bits.append(f"时机: 分位 {s['pctile']:.1f}% ｜ 股息率 {s['ttm_yield']:.2f}%")
+        if s.get("pctile") is not None:
+            bits.append(f"时机: 分位 {s['pctile']:.1f}%（低位）")
         blocks.append(
             f"<p>{line1}</p>"
             f"<p>{' &nbsp; '.join(bits)}</p>"
@@ -281,7 +282,6 @@ def run(force: bool = False, dry_run: bool = False,
             "action": "buy",
             "note": "非持仓·首仓信号（时机✓）",
             "pctile": t.get("pctile_window"),
-            "ttm_yield": t.get("ttm_yield_pct"),
         })
     signals.sort(key=lambda x: x.get("ts_code") or "")
     if not signals:

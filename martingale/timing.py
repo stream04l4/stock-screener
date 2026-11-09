@@ -5,19 +5,20 @@
 ∪ 手动）之上筛**买入时机**。选股 ≠ 买入——触发后由 Joel 决定是否买入，
 买入后录入「我的持仓」由持仓策略（martingale.strategy 参数段）接管档位。
 
-条件项（TimingParams；页面可开关/调参）：
+条件项（TimingParams；页面可调参）：
 - ① 价格低位：当前价处于近 price_window_years 年收盘价分位 ≤ price_pctile_max%
-  （前复权口径；分位 = 窗口内 ≤ 当前价的交易日占比）——**时机门唯一条件**；
-- ② 股息率：最新 TTM 股息率 ≥ yield_min_pct%（候选池成员自带 ttm_yield_pct）——
-  v7.0.24 起参考展示，不参与门；
-- ③ 年线下：当前价 < 近 ma_period 日均线（below_ma250 开关，默认关）——
-  v7.0.24 起参考展示，不参与门。
+  （前复权口径；分位 = 窗口内 ≤ 当前价的交易日占比）——**时机门唯一条件**。
+- ② 股息率 / ③ 250 日线：**v7.0.26 彻底删除**（不再保留参考展示）。
 
 **时机门 = ① 单条件（v7.0.24，Joel 2026-11-09 定案）**：10 年回测（2016-01→2026-11，
 池 62 只，生产状态机逐笔复刻，48+106 组参数面）结论——② 是总盈利主要拖累
 （y=4.5 较 y=0 少 38~45%，且与池入场 G8"当前息率≥3%"同维冗余）、③ 年线近乎
-无效（±2%）、① 与 ② 同属"便宜程度"维度高度冗余 → ②③ 降级为参考展示
-（数据列/页面继续显示），**不再参与时机门**；门 = 5 年分位 ≤ 40%。
+无效（±2%）、① 与 ② 同属"便宜程度"维度高度冗余 → v7.0.24 先降参考展示，
+**v7.0.26（Joel 定案）连参考展示一并删除**；门 = 5 年分位 ≤ 40%。
+
+**首仓建仓回撤归入选股策略（v7.0.26，Joel 定案）**：first_drawdown_pct 自
+strategy 段移入 timing 段管理（首仓线 = 本轮高点×(1−该值)，属首仓买入时机；
+持仓策略段只保留加仓/再武装参数）。引擎数学零改动（经 StrategyParams 读取）。
 
 **推送纪律（v7.0.25，Joel 2026-11-09 定案）**：微信**不再**为时机独立推送
 （"时机成熟（首仓待价）"通道已退役——只有时机没到价无意义）。微信统一为
@@ -28,15 +29,13 @@
 
 预计算（每日离线，run_lake_sync_daily.sh 在 selection 之后驱动，亦可用
 `python -m martingale timing` 手动触发）：
-- refresh_timing(con_write, up, tp)：候选池逐股算 ①②③ → 湖表 selection_timing
+- refresh_timing(con_write, up, tp)：候选池逐股算 ① → 湖表 selection_timing
   （PK ts_code，整表刷新）。零回测、零行情、零 tushare 配额、零推送。
 """
 from __future__ import annotations
 
-import dataclasses
 import os
 import time
-from collections import defaultdict
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -56,14 +55,9 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     close            DOUBLE,             -- 最新收盘（原始价，= 候选池 price_latest）
     pctile_window    DOUBLE,             -- ① 当前价在近 N 年收盘分布的分位（0-100）
     dd_window        DOUBLE,             -- 近 N 年高点回撤（%）
-    ttm_yield_pct    DOUBLE,             -- ② 最新 TTM 股息率（%）
-    ma_value         DOUBLE,             -- ③ 近 ma_period 日均线（前复权）
-    below_ma         BOOLEAN,            -- ③ close < ma（ma 缺失 → NULL）
     cond_price_low   BOOLEAN NOT NULL,   -- ① 触发（数据不足 → FALSE，fail-closed）
-    cond_yield       BOOLEAN NOT NULL,   -- ② 触发（股息率缺失 → FALSE）
-    cond_below_ma    BOOLEAN,            -- ③ 触发（开关关/数据不足 → NULL）
     in_watchlist     BOOLEAN NOT NULL,   -- 观察口径：①（v7.0.24 单条件）
-    push_eligible    BOOLEAN NOT NULL,   -- = ①（v7.0.24 起与 in_watchlist 同值；v7.0.25 起无独立推送，仅页面展示）
+    push_eligible    BOOLEAN NOT NULL,   -- = ①（与 in_watchlist 同值；v7.0.25 起无独立推送，仅页面徽标）
     reasons          VARCHAR             -- 触发原因（页面展示）
 )
 """
@@ -73,6 +67,9 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 # 预计算：候选池逐股时机条件 → 湖表
 # ---------------------------------------------------------------------------
 def ensure_table(con) -> None:
+    # v7.0.26：schema 收缩（② 股息率 / ③ 年线列删除）→ 旧表须整表重建，
+    # 仅 CREATE IF NOT EXISTS 会残留旧列；本表每次全量刷新，drop 安全。
+    con.execute(f"DROP TABLE IF EXISTS {TABLE}")
     con.execute(_SCHEMA)
 
 
@@ -88,7 +85,10 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
                    manual: Optional[Dict[str, Dict[str, Any]]] = None,
                    members: Optional[List[Member]] = None,
                    verbose: bool = False) -> Dict[str, Any]:
-    """候选池逐股算 ①（门）+ ②③（参考展示）→ 写入 selection_timing（整表刷新）。
+    """候选池逐股算 ①（时机门唯一条件）→ 写入 selection_timing（整表刷新）。
+
+    v7.0.26：② 股息率 / ③ 250 日线计算与数据列一并删除（回测定案无用，
+    不留观察项）；分位 / 窗口回撤保留（页面展示 = 时机门本体）。
 
     :param con: **写**连接（每日作业在湖增量后独占执行；勿在 Web 请求路径调用）。
     :param members: 可注入（测试用）；缺省 build_candidate_pool(con, up, manual)。
@@ -131,18 +131,7 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
             pctile = sum(1 for x in ks if x <= cur_qfq) / len(ks) * 100.0
             dd = (1.0 - cur_qfq / max(ks)) * 100.0
         cond_price_low = (pctile is not None and pctile <= tp.price_pctile_max)
-        # ② 股息率（候选池成员自带；None → fail-closed False）——v7.0.24 起仅参考展示
-        yld = m.ttm_yield_pct
-        cond_yield = (yld is not None and yld >= tp.yield_min_pct)
-        # ③ 年线（前复权均线；前复权最新价 = 原始最新价，口径一致）——v7.0.24 起仅参考展示
-        ma = below = cond_below = None
-        if tp.below_ma250 and ks:
-            if len(ks) >= tp.ma_period:
-                ma = sum(ks[-tp.ma_period:]) / tp.ma_period
-                below = (ks[-1] < ma)
-                cond_below = below
-            # 数据不足 ma_period → 保持 None（不显示，fail-closed）
-        # v7.0.24：时机门 = ① 单条件（②③ 降为参考展示，不参与门）
+        # v7.0.24：时机门 = ① 单条件（②③ 参考展示）；v7.0.26：②③ 彻底删除
         in_watch = bool(cond_price_low)
         push_ok = bool(cond_price_low)
         if in_watch:
@@ -159,18 +148,14 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
             m.price_latest,
             round(pctile, 2) if pctile is not None else None,
             round(dd, 2) if dd is not None else None,
-            round(yld, 4) if yld is not None else None,
-            round(ma, 4) if ma is not None else None,
-            below,
-            cond_price_low, cond_yield, cond_below,
+            cond_price_low,
             in_watch, push_ok, "；".join(parts),
         ))
 
     con.execute(f"DELETE FROM {TABLE}")
     if rows:
         con.executemany(
-            f"INSERT INTO {TABLE} VALUES "
-            f"(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            f"INSERT INTO {TABLE} VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     out = {"as_of": str(latest), "n_codes": len(codes),
            "n_watchlist": n_watch, "n_push": n_push,
            "elapsed_s": round(time.time() - t0, 2)}

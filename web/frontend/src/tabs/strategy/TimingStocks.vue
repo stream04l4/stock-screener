@@ -1,9 +1,10 @@
 // 今日选股（v7.0.13，策略页签「选股策略」卡片内）。
 // - 数据：GET /api/timing（候选池 × 时机门命中；v7.0.24 起 = ① 5年分位≤40%
 //   单条件，in_watchlist 与 push_eligible 同值；读 selection_timing 预计算
-//   表 O(1)，服务端排序 = push_eligible 优先 → 股息率降序 → 代码）。
+//   表 O(1)，服务端排序 = 分位升序 → 代码）。
 // - 口径（与后端单一定义点 martingale/timing.py 一致，2026-11-09 回测定案）：
-//   本表 = 时机成熟（① 命中）观察名单（参考展示；股息率 / 250 日线不参与门）。
+//   本表 = 时机成熟（① 命中）观察名单。v7.0.26 起 ② 股息率 / ③ 250 日线
+//   彻底删除（不留观察项）；首仓建仓回撤归入选股策略参数。
 //   **v7.0.25 起微信不再为本表独立推送**——只有时机没到价无意义；微信统一为
 //   「进入当前信号才推」（价破首仓线，盘中策略点位提醒）。
 // - 一键加入我的持仓：行内展开 股数/成本价（成本默认当前价）→ PUT /api/my_positions
@@ -63,7 +64,7 @@ function fmt(v, suffix = "") {
     <p v-if="error" class="ts-err">今日选股加载失败：{{ error }}</p>
     <div v-else-if="data" class="tbl-wrap">
       <p class="ts-note">
-        本表 = 时机成熟（{{ data.params.price_window_years }}年分位 ≤ {{ data.params.price_pctile_max }}%）观察名单（股息率为参考展示）。
+        本表 = 时机成熟（{{ data.params.price_window_years }}年分位 ≤ {{ data.params.price_pctile_max }}%）观察名单。
         微信<b>不</b>为时机单独推送——价格跌破首仓线进入当前信号时，由盘中「策略点位提醒」推送首仓买入。
         确认后「加持仓」，持仓策略自动接管加仓档位。
       </p>
@@ -74,13 +75,12 @@ function fmt(v, suffix = "") {
             <th class="num">现价</th>
             <th class="num">{{ data.params.price_window_years }}年分位%</th>
             <th class="num">{{ data.params.price_window_years }}年回撤%</th>
-            <th class="num">股息率%（参考）</th>
             <th>触发条件</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!data.rows.length">
-            <td colspan="8" class="muted">
+            <td colspan="7" class="muted">
               （当前无股票命中时机门（{{ data.params.price_window_years }}年分位≤{{ data.params.price_pctile_max }}%）{{ data.as_of ? "" : "——等待每日湖更新" }}）
             </td>
           </tr>
@@ -94,7 +94,6 @@ function fmt(v, suffix = "") {
               <td class="num">{{ fmt(r.close) }}</td>
               <td class="num">{{ fmt(r.pctile_window) }}</td>
               <td class="num">{{ fmt(r.dd_window) }}</td>
-              <td class="num">{{ fmt(r.ttm_yield_pct) }}</td>
               <td class="ts-reasons">{{ r.reasons || "—" }}</td>
               <td class="ts-op">
                 <button v-if="!open[r.ts_code]" type="button" class="ts-btn"

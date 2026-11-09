@@ -18,7 +18,7 @@ describe("FieldEditor · FIELD_TYPE 分支渲染（v7 slim）", () => {
   });
 
   it("float → number input step=any", () => {
-    const w = m({ section: "strategy", field: "first_drawdown_pct", value: 15 });
+    const w = m({ section: "timing", field: "first_drawdown_pct", value: 15 });
     const input = w.find("input[type=number]");
     expect(input.attributes("step")).toBe("any");
     expect(input.element.value).toBe("15");

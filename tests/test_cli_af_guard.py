@@ -103,10 +103,7 @@ def test_cmd_timing_prealigns_before_refresh(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(mmain, "load_config", lambda path: (object(), object(),
                                                             TimingParams(
                                                                 price_window_years=1,
-                                                                price_pctile_max=50.0,
-                                                                yield_min_pct=4.5,
-                                                                below_ma250=False,
-                                                                ma_period=250)))
+                                                                price_pctile_max=50.0)))
     monkeypatch.setattr(mmain, "default_db_path", lambda: str(p))
     rc = mmain._cmd_timing(argparse.Namespace())
     assert rc == 0

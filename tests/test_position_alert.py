@@ -308,7 +308,7 @@ def test_run_first_position_dual_condition(monkeypatch, tmp_path):
     content = body["content"]
     assert "首仓达标" in content and "sh.600001" in content
     assert "首仓线" in content and "非持仓·首仓信号" in content
-    assert "分位 35.2%" in content and "股息率 4.80%" in content
+    assert "分位 35.2%（低位）" in content          # v7.0.26：时机明细只剩分位
     assert "约 100,000 元" in content                        # initial_amount
     assert "时机未过" not in content and "价格未过" not in content  # 单条件不推
     assert "策略点位提醒" in body["title"]

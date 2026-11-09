@@ -16,7 +16,8 @@ import re
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(PROJECT, "martingale")
 
-# v7 阈值关键词（strategy 8 字段 + universe 5 键，均不得在代码里写字面量）
+# v7 阈值关键词（strategy 7 字段 + universe 5 键，均不得在代码里写字面量；
+# first_drawdown_pct v7.0.26 起居 timing 段，关键词守卫不变）
 THRESHOLD_KEYWORDS = [
     "initial_amount", "base_add_amount", "first_drawdown_pct", "add_step_pct",
     "growth_ratio", "rearm_pct", "accounting",
@@ -62,19 +63,25 @@ def test_strategy_yaml_is_single_source_of_truth():
         cfg = yaml.safe_load(f)
 
     strategy_keys = {
-        "name", "initial_amount", "base_add_amount", "first_drawdown_pct",
+        "name", "initial_amount", "base_add_amount",
         "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
     }
     universe_keys = {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
         "min_consecutive_div_years", "listing_min_trading_days",
     }
+    timing_keys = {  # v7.0.26：②③ 删除、首仓建仓回撤移入
+        "price_window_years", "price_pctile_max", "first_drawdown_pct",
+    }
     strat = cfg.get("strategy", {})
     univ = cfg.get("universe", {})
+    tm_ = cfg.get("timing", {})
     missing_s = strategy_keys - set(strat)
     missing_u = universe_keys - set(univ)
+    missing_t = timing_keys - set(tm_)
     assert not missing_s, f"strategy.yaml strategy 段缺键: {sorted(missing_s)}"
     assert not missing_u, f"strategy.yaml universe 段缺键: {sorted(missing_u)}"
+    assert not missing_t, f"strategy.yaml timing 段缺键: {sorted(missing_t)}"
 
     # 枚举/固定值语义
     assert strat.get("name") == "drawdown_martingale", "strategy.name 必须为 drawdown_martingale"
@@ -90,6 +97,9 @@ def test_strategy_yaml_is_single_source_of_truth():
         assert isinstance(ds.get(sub), dict), f"datasource.{sub} 子段缺失（lake-sync 依赖）"
 
     # pct 字段必须为整数百分数（config.py 负责 /100 转小数）
-    for k in ("first_drawdown_pct", "add_step_pct", "rearm_pct"):
+    # v7.0.26：first_drawdown_pct 居 timing 段
+    for k in ("add_step_pct", "rearm_pct"):
         v = strat[k]
         assert isinstance(v, (int, float)) and 0 < v < 100, f"{k} 应为 (0,100) 内百分数: {v!r}"
+    v = tm_["first_drawdown_pct"]
+    assert isinstance(v, (int, float)) and 0 < v < 100, f"first_drawdown_pct 应为 (0,100) 内百分数: {v!r}"

@@ -25,13 +25,12 @@ vi.mock("../../../live/queryRegistry.js", async (orig) => ({
 const StrategyTab = (await import("../../StrategyTab.vue")).default;
 const { useToastStore } = await import("../../../stores/toastStore.js");
 
-// v7 slim 策略 JSON（strategy 9 键 + universe 10 键 + lake + datasource）
+// v7 slim 策略 JSON（strategy 8 键 + universe 10 键 + timing 3 键 + lake + datasource）
 const STRATEGY_JSON = {
   strategy: {
     name: "drawdown_martingale",
     initial_amount: 100000,
     base_add_amount: 10000,
-    first_drawdown_pct: 15,
     add_step_pct: 5,
     growth_ratio: 1.1,
     rearm_mode: "bounce",
@@ -53,9 +52,7 @@ const STRATEGY_JSON = {
   timing: {
     price_window_years: 5,
     price_pctile_max: 40,
-    yield_min_pct: 4.5,
-    below_ma250: false,
-    ma_period: 250,
+    first_drawdown_pct: 15,   // v7.0.26：首仓建仓回撤自 strategy 段移入
   },
   lake: null,   // v7.0.18：lake 段空（baostock_daily_budget 随渠道移除；yaml 无键 → None）
   datasource: { sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } },  // v7.0.18：baostock 段移除
@@ -80,20 +77,17 @@ function mockApi() {
     }
     if (path === "/api/timing" && (!opts.method || opts.method === "GET")) {
       return {
-        as_of: "2026-10-23", n_pool: 2, n_watchlist: 2, n_push: 1,
-        params: { price_window_years: 5, price_pctile_max: 40, yield_min_pct: 4.5,
-                  below_ma250: false, ma_period: 250 },
+        as_of: "2026-10-23", n_pool: 2, n_watchlist: 1, n_push: 1,
+        params: { price_window_years: 5, price_pctile_max: 40 },
         rows: [
           { ts_code: "sh.601006", name: "大秦铁路", as_of_date: "2026-10-23", close: 4.52,
-            pctile_window: 21.9, dd_window: 27.5, ttm_yield_pct: 4.59,
-            ma_value: null, below_ma: null, cond_price_low: true, cond_yield: true,
-            cond_below_ma: null, in_watchlist: true, push_eligible: true,
-            reasons: "5年价格分位 21.9%（≤40%）；股息率 4.59%（≥4.5%）" },
+            pctile_window: 21.9, dd_window: 27.5, cond_price_low: true,
+            in_watchlist: true, push_eligible: true,
+            reasons: "5年价格分位 21.9%（≤40%）" },
           { ts_code: "sh.601088", name: "中国神华", as_of_date: "2026-10-23", close: 50.2,
-            pctile_window: 88.0, dd_window: 5.0, ttm_yield_pct: 4.8,
-            ma_value: null, below_ma: null, cond_price_low: false, cond_yield: true,
-            cond_below_ma: null, in_watchlist: true, push_eligible: false,
-            reasons: "股息率 4.8%（≥4.5%）" },
+            pctile_window: 88.0, dd_window: 5.0, cond_price_low: false,
+            in_watchlist: false, push_eligible: false,
+            reasons: "" },
         ],
       };
     }
@@ -166,8 +160,8 @@ beforeEach(() => {
   mockApi();
 });
 
-describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 隐藏；lake/datasource 不渲染）", () => {
-  it("渲染 3 组（持仓策略/选股策略/股票池）；字段行 = 23；name 不出现为字段行", async () => {
+describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 隐藏；lake/datasource 不渲染）", () => {
+  it("渲染 3 组（持仓策略/选股策略/股票池）；字段行 = 20；name 不出现为字段行", async () => {
     const w = mk();
     await flushPromises();
     const groups = w.findAll(".s-group");
@@ -176,15 +170,16 @@ describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 
     expect(groups[1].text()).toContain("选股策略");
     expect(groups[2].text()).toContain("股票池");
     const fields = w.findAll(".s-field");
-    expect(fields.length).toBe(23);
+    expect(fields.length).toBe(20);
     // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
-    // 2026-10-26：选股策略（timing）调到股票池之前 → 字段序 = strategy 8 + timing 5 + universe 10
+    // 2026-10-26：选股策略（timing）调到股票池之前 → 字段序 = strategy 7 + timing 3 + universe 10
+    // v7.0.26：② 股息率 / ③ 250 日线删除、首仓建仓回撤移入 timing
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
-      "首仓金额（元）", "加仓基准金额（元）", "首次建仓回撤（%）", "加仓步长（%）",
+      "首仓金额（元）", "加仓基准金额（元）", "加仓步长（%）",
       "加仓递增比率", "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
-      // v7.0.13 选股时机
-      "价格分位窗口（年）【时机门条件①】", "价格低位分位上限（%）【时机门唯一条件】", "股息率参考线 TTM（%）【参考展示，不参与门】", "叠加「年线之下」参考项", "年线周期（交易日）",
+      // v7.0.13 选股时机（v7.0.26：3 键）
+      "价格分位窗口（年）【时机门条件①】", "价格低位分位上限（%）【时机门唯一条件】", "首仓建仓回撤（%）",
       // v7.0.12 股票池 + 候选池选股门槛
       "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
       "连续分红年数下限", "最少上市交易日",
@@ -192,10 +187,9 @@ describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
-      "initial_amount", "base_add_amount", "first_drawdown_pct", "add_step_pct",
+      "initial_amount", "base_add_amount", "add_step_pct",
       "growth_ratio", "rearm_mode", "rearm_pct", "accounting",
-      "price_window_years", "price_pctile_max", "yield_min_pct",
-      "below_ma250", "ma_period",
+      "price_window_years", "price_pctile_max", "first_drawdown_pct",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
       "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
@@ -255,10 +249,11 @@ describe("v7 · 23 字段页渲染（strategy 8 + universe 10 + timing 5；name 
     // 进入编辑态
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
-    // strategy 6（int×2 + float×4）+ universe 7（v7.0.12：mv float + 3×int + 3×float）
-    // + timing 4（v7.0.13：int×2 + float×2）= 17
-    expect(w.findAll('input[type="number"]').length).toBe(17);
-    // backtest_positive / below_ma250 是 bool select（不是 number input）
+    // strategy 5（int×2 + float×3；v7.0.26 首仓回撤移入 timing）
+    // + universe 7（v7.0.12：mv float + 3×int + 3×float）
+    // + timing 3（v7.0.26：int×1 + float×2）= 15
+    expect(w.findAll('input[type="number"]').length).toBe(15);
+    // backtest_positive 是 bool select（不是 number input）；rearm_mode 是 enum2 select
     expect(w.findAll(".s-field select").length).toBeGreaterThanOrEqual(2);
     // accounting 编辑态仍是只读展示（无 input，有 .s-readonly）
     const acctRowEdit = w.findAll(".s-field").find((f) => f.find(".s-key").attributes("title") === "accounting");
@@ -321,7 +316,7 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     expect(captured.datasource).toEqual({ sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } });
     expect(Object.keys(captured.universe)).toHaveLength(10); // v7.0.12：基础 5 + 门槛 5
     expect(captured.timing).toEqual({ price_window_years: 5, price_pctile_max: 40,
-      yield_min_pct: 4.5, below_ma250: false, ma_period: 250 }); // v7.0.13：时机段不丢
+      first_drawdown_pct: 15 }); // v7.0.26：时机段 3 键不丢
     expect(toastMsg()).toContain("策略已更新");
     expect(invalidateMock).toHaveBeenCalledWith("strategy");
     expect(w.find("#btn-strategy-save").classes()).toContain("hidden"); // 退出编辑态
@@ -332,7 +327,7 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     putHandler = () => {
       const e = new Error("validation");
       e.status = 400;
-      e.body = { detail: { errors: ["strategy.first_drawdown_pct=200 超出范围 [1,90]"] } };
+      e.body = { detail: { errors: ["timing.first_drawdown_pct=200 超出范围 [1,90]"] } };
       throw e;
     };
     const w = mk();

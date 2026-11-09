@@ -10,15 +10,17 @@
 - 金额字段单位 = 元。
 
 schema（定案，勿增删）：
-- strategy: name / initial_amount / base_add_amount / first_drawdown_pct /
+- strategy: name / initial_amount / base_add_amount /
   add_step_pct / growth_ratio / rearm_mode(bounce|newhigh) / rearm_pct /
   accounting(固定 cash，只读)
 - universe: industry_whitelist_csric2 / soe_keywords / min_total_mv_yi /
   min_consecutive_div_years / listing_min_trading_days
   （SOE 恒强制，不设开关——TL 拍板；全链 5 条件保留）
-- timing: price_window_years / price_pctile_max / yield_min_pct /
-  below_ma250 / ma_period（v7.0.13 选股时机；**段可缺省**——策略库旧快照
-  无此段，缺省 = 生产默认值，load_config 返回 triple）
+- timing: price_window_years / price_pctile_max / first_drawdown_pct
+  （v7.0.13 选股时机；v7.0.26：② 股息率 / ③ 250 日线删除、首仓建仓回撤
+  first_drawdown_pct 自 strategy 段移入；**段可缺省**——策略库旧快照
+  无此段，缺省 = 生产默认值且 first_drawdown_pct 回退读 strategy 段；
+  load_config 返回 triple）
 
 成本参数（佣金/印花税）不在 schema 内：引擎常量（见 engine.py 头部注释，
 TL 拍板：不进配置、不进 Web；3bps 买入佣金精确对齐 f6 已验收基线）。
@@ -55,7 +57,10 @@ class StrategyParams:
     name: str                      # drawdown_martingale（固定）
     initial_amount: float          # 初始投入金额：一次性首仓（占用 k=0 档，每股仅第一轮首买用）
     base_add_amount: float         # 加仓基准金额：每轮首档（k=0）；第 k 档 = 基准×growth^k
-    first_drawdown: float          # 首次回撤比例（小数）：hfq ≤ H×(1−dd) 建仓
+    first_drawdown: float          # 首仓建仓回撤（小数）：hfq ≤ H×(1−dd) 触发首仓（k=0）。
+                                   # v7.0.26：yaml 键 first_drawdown_pct 居 timing 段
+                                   # （首仓属选股时机）；本字段留在 StrategyParams 供
+                                   # 引擎/档线计算使用（数学零改动，f6 基线不变）
     add_step: float                # 加仓步长（小数）：档线 H×(1−dd−k×step)
     growth_ratio: float            # 加仓提升比率：第 k 档 = 基准×比率^k
     rearm_mode: str                # bounce | newhigh
@@ -107,14 +112,13 @@ class TimingParams:
     时机门（页面"今日选股"观察名单）= ① 价格分位 ≤ price_pctile_max%。
     v7.0.25 起时机无独立微信推送——微信统一为「进入当前信号才推」
     （价破线，盘中策略点位提醒）。
-    ②③ v7.0.24 起降级为参考展示（不参与门；10 年回测结论：② 是总盈利
-    主要拖累且与池入场 G8"当前息率≥3%"同维冗余、③ 年线近乎无效）。
+    v7.0.26：② 股息率 / ③ 250 日线参数**彻底删除**（回测定案无用，不留
+    观察项）；首仓建仓回撤（first_drawdown_pct）自 strategy 段移入 timing
+    段管理（首仓 = 选股时机；引擎经 StrategyParams.first_drawdown 读取，
+    数学零改动）。
     """
     price_window_years: int = 5        # ① 价格低位窗口（年，滚动至最新 K线日）
     price_pctile_max: float = 40.0     # ① 当前价处于近 N 年收盘分位 ≤ P%（时机门唯一条件）
-    yield_min_pct: float = 4.5         # ② TTM 股息率 ≥ Y%（v7.0.24 起参考展示，不参与门）
-    below_ma250: bool = False          # ③ 年线条件开关（v7.0.24 起参考展示，不参与门）
-    ma_period: int = 250               # ③ 均线窗口（交易日）
 
 
 def _require(cfg: Dict[str, Any], dotted: str) -> Any:
@@ -156,7 +160,7 @@ def _strategy_section(cfg: Dict[str, Any]) -> StrategyParams:
     s = cfg.get("strategy")
     if not isinstance(s, dict):
         raise ConfigError("strategy.yaml 缺少 strategy 段")
-    for key in ("name", "initial_amount", "base_add_amount", "first_drawdown_pct",
+    for key in ("name", "initial_amount", "base_add_amount",
                 "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"):
         if key not in s:
             raise ConfigError(f"strategy.{key} 缺失")
@@ -165,7 +169,17 @@ def _strategy_section(cfg: Dict[str, Any]) -> StrategyParams:
         raise ConfigError(f"strategy.name 目前只支持 {STRATEGY_NAME!r}（当前 {name!r}）")
     initial = _num(s["initial_amount"], "strategy.initial_amount", 1, 1e9)
     base = _num(s["base_add_amount"], "strategy.base_add_amount", 1, 1e9)
-    dd = _num(s["first_drawdown_pct"], "strategy.first_drawdown_pct", 1, 90) / 100.0
+    # 首仓建仓回撤：v7.0.26 起居 timing 段（首仓 = 选股时机参数；页面归「选股策略」）。
+    # 兼容旧布局（策略库快照/老 yaml 无 timing 段）：回退读 strategy.first_drawdown_pct。
+    t = cfg.get("timing")
+    if isinstance(t, dict) and "first_drawdown_pct" in t:
+        dd = _num(t["first_drawdown_pct"], "timing.first_drawdown_pct", 1, 90) / 100.0
+    elif "first_drawdown_pct" in s:
+        dd = _num(s["first_drawdown_pct"], "strategy.first_drawdown_pct", 1, 90) / 100.0
+    else:
+        raise ConfigError(
+            "首仓建仓回撤缺失：应配置 timing.first_drawdown_pct"
+            "（旧布局 strategy.first_drawdown_pct 仅兼容无 timing 段的快照）")
     step = _num(s["add_step_pct"], "strategy.add_step_pct", 0.1, 50) / 100.0
     growth = _num(s["growth_ratio"], "strategy.growth_ratio", 1.0, 10)
     mode = str(s["rearm_mode"])
@@ -225,26 +239,21 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
 
 
 def _timing_section(cfg: Dict[str, Any]) -> TimingParams:
-    """timing 段解析。**段可缺省**（策略库旧快照/老 yaml 无此段 → 生产默认值）；
-    段存在时 5 键必须齐全且过范围校验。"""
+    """timing 段解析。**段可缺省**（策略库旧快照/老 yaml 无此段 → 生产默认值；
+    此时首仓回撤回退读 strategy 段）；段存在时 3 键必须齐全且过范围校验。
+    v7.0.26：② 股息率 / ③ 250 日线参数删除（回测定案无用）；first_drawdown_pct
+    自 strategy 段移入（首仓建仓回撤 = 选股时机参数）。"""
     t = cfg.get("timing")
     if t is None:
         return TimingParams()
     if not isinstance(t, dict):
         raise ConfigError("strategy.yaml timing 段必须是映射(mapping)")
-    for key in ("price_window_years", "price_pctile_max", "yield_min_pct",
-                "below_ma250", "ma_period"):
+    for key in ("price_window_years", "price_pctile_max", "first_drawdown_pct"):
         if key not in t:
             raise ConfigError(f"timing.{key} 缺失")
     years = _int(t["price_window_years"], "timing.price_window_years", 1, 30)
     pct = _num(t["price_pctile_max"], "timing.price_pctile_max", 1, 100)
-    yld = _num(t["yield_min_pct"], "timing.yield_min_pct", 0, 30)
-    below = t["below_ma250"]
-    if not isinstance(below, bool):
-        raise ConfigError(f"timing.below_ma250 必须是布尔（当前 {below!r}）")
-    ma = _int(t["ma_period"], "timing.ma_period", 20, 1200)
-    return TimingParams(price_window_years=years, price_pctile_max=pct,
-                        yield_min_pct=yld, below_ma250=below, ma_period=ma)
+    return TimingParams(price_window_years=years, price_pctile_max=pct)
 
 
 def load_config(path: str) -> Tuple[StrategyParams, UniverseParams, TimingParams]:
@@ -260,4 +269,7 @@ def load_config(path: str) -> Tuple[StrategyParams, UniverseParams, TimingParams
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ConfigError("strategy.yaml 顶层必须是映射(mapping)")
-    return _strategy_section(cfg), _universe_section(cfg), _timing_section(cfg)
+    # timing 段校验先行（段存在时 3 键齐全——含 first_drawdown_pct；缺键报
+    # timing.* 而非被 strategy 段的 dd 缺失兜底消息抢先）
+    t = _timing_section(cfg)
+    return _strategy_section(cfg), _universe_section(cfg), t

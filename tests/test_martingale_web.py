@@ -46,12 +46,11 @@ def test_get_strategy_five_sections():
     keys = set(out["json"].keys())
     # v7 slim：strategy/universe/lake/datasource 四段（lake + datasource 必须保留）
     assert {"strategy", "universe", "lake", "datasource"} <= keys
-    assert len(out["json"]["strategy"]) == 9
+    assert len(out["json"]["strategy"]) == 8
     assert len(out["json"]["universe"]) == 10  # v7.0.12：5 基础条件 + 5 候选池门槛
-    # v7.0.13：timing 段 5 键（生产 yaml 已有；缺省时 GET 用默认值补齐）
+    # v7.0.13：timing 段 3 键（v7.0.26：②③ 删除、首仓建仓回撤移入；缺省时 GET 用默认值补齐）
     assert set(out["json"]["timing"].keys()) == {
-        "price_window_years", "price_pctile_max", "yield_min_pct",
-        "below_ma250", "ma_period"}
+        "price_window_years", "price_pctile_max", "first_drawdown_pct"}
     assert {"sina", "rf"} <= set(out["json"]["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
 
 
@@ -152,17 +151,18 @@ def test_validate_strategy_v7012_universe_gates():
 
 
 def test_validate_strategy_v7013_timing():
-    # v7.0.13：timing 字段进 PUT 校验（段可选，段存在时 5 键齐全 + 类型/范围）
+    # v7.0.13：timing 字段进 PUT 校验（段可选，段存在时 3 键齐全 + 类型/范围）
+    # v7.0.26：②③ 删除、first_drawdown_pct 移入
     p = _valid_payload()
-    p["timing"]["below_ma250"] = "yes"          # 非布尔
+    p["timing"]["first_drawdown_pct"] = 200       # 超范围
     errs = wapp._validate_strategy(p)
-    assert any("below_ma250" in e for e in errs)
+    assert any("first_drawdown_pct" in e for e in errs)
     p = _valid_payload()
     p["timing"]["price_pctile_max"] = 150       # 超范围
     assert any("price_pctile_max" in e for e in wapp._validate_strategy(p))
     p = _valid_payload()
-    p["timing"].pop("ma_period")                # 段存在但缺键
-    assert any("timing.ma_period" in e for e in wapp._validate_strategy(p))
+    p["timing"].pop("first_drawdown_pct")       # 段存在但缺键
+    assert any("timing.first_drawdown_pct" in e for e in wapp._validate_strategy(p))
     # 段整体缺省 → 合法（策略库旧快照兼容）
     p = _valid_payload()
     p.pop("timing")
@@ -563,7 +563,7 @@ def test_my_positions_strategy_switch_changes_reference(tmp_positions_file, bt_c
     lib = tmp_path / "strategies"
     lib.mkdir()
     cfg = _y.safe_load(wapp.CONFIG_PATH.read_text(encoding="utf-8"))
-    cfg["strategy"]["first_drawdown_pct"] = 10
+    cfg["timing"]["first_drawdown_pct"] = 10   # v7.0.26：dd 居 timing 段
     (lib / "loose.yaml").write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(wapp, "STRATEGIES_DIR", lib)
     out1 = wapp.get_my_positions(strategy="loose")
@@ -588,7 +588,7 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     lib = tmp_path / "strategies"
     lib.mkdir()
     cfg = _y.safe_load(wapp.CONFIG_PATH.read_text(encoding="utf-8"))
-    cfg["strategy"]["first_drawdown_pct"] = 25
+    cfg["timing"]["first_drawdown_pct"] = 25   # v7.0.26：dd 居 timing 段
     (lib / "strict.yaml").write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(wapp, "STRATEGIES_DIR", lib)
     _mock_spot(monkeypatch, {})  # 湖价回退：96.59 > 72.36 → 不误报

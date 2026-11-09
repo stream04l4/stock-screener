@@ -325,7 +325,6 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "name": ("enum", "drawdown_martingale", None),
         "initial_amount": ("float", 1, 1e9),
         "base_add_amount": ("float", 1, 1e9),
-        "first_drawdown_pct": ("float", 1, 90),
         "add_step_pct": ("float", 0.1, 50),
         "growth_ratio": ("float", 1.0, 10),
         "rearm_mode": ("enum2", "bounce|newhigh", None),
@@ -345,18 +344,18 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         "price_min_yuan": ("float", 0, 1e4),
         "price_max_yuan": ("float", 0, 1e5),
     },
-    # v7.0.13 选股时机（**可选段**：策略库旧快照无此段，PUT 缺省不报错）
+    # v7.0.13 选股时机（**可选段**：策略库旧快照无此段，PUT 缺省不报错）。
+    # v7.0.26：first_drawdown_pct 自 strategy 段移入（首仓建仓回撤 = 选股时机
+    # 参数）；② 股息率 / ③ 250 日线参数删除。
     "timing": {
         "price_window_years": ("int", 1, 30),
         "price_pctile_max": ("float", 1, 100),
-        "yield_min_pct": ("float", 0, 30),
-        "below_ma250": ("bool", None, None),
-        "ma_period": ("int", 20, 1200),
+        "first_drawdown_pct": ("float", 1, 90),
     },
 }
 
 # 所有必须出现的 (section, field) —— 「所有 key 必须齐全」。
-# timing 段**不在必选清单**（可缺省 → martingale.config 默认值）；段存在时 5 键须齐全。
+# timing 段**不在必选清单**（可缺省 → martingale.config 默认值）；段存在时 3 键须齐全。
 _REQUIRED_KEYS = [
     (s, f) for s, fields in _STRATEGY_SCHEMA.items()
     if s in ("strategy", "universe") for f in fields
@@ -433,11 +432,18 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
                         errors.append(f"{section}.{field} 项非法: {p!r}（应是非空字符串）")
 
     # 3) 跨字段语义
-    st = cfg.get("strategy", {})
-    if all(k in st for k in ("first_drawdown_pct", "add_step_pct")):
+    # v7.0.26：first_drawdown_pct 居 timing 段（旧布局兼容读 strategy 段）
+    st = cfg.get("strategy")
+    if not isinstance(st, dict):
+        st = {}
+    tm = cfg.get("timing")
+    if not isinstance(tm, dict):
+        tm = {}
+    dd_v = tm.get("first_drawdown_pct", st.get("first_drawdown_pct"))
+    if dd_v is not None and "add_step_pct" in st:
         try:
-            if float(st["first_drawdown_pct"]) + float(st["add_step_pct"]) >= 100:
-                errors.append("strategy.first_drawdown_pct + add_step_pct 必须 < 100")
+            if float(dd_v) + float(st["add_step_pct"]) >= 100:
+                errors.append("first_drawdown_pct + add_step_pct 必须 < 100")
         except (TypeError, ValueError):
             pass
     un = cfg.get("universe", {})
@@ -1022,9 +1028,8 @@ def get_timing() -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"数据湖不可用: {exc}")
 
     watch = [r for r in tmap.values() if r.get("in_watchlist")]
-    # 排序：会提醒的（push_eligible）优先 → 股息率降序 → 代码
-    watch.sort(key=lambda r: (not r.get("push_eligible"),
-                              -(r.get("ttm_yield_pct") or 0.0), r["ts_code"]))
+    # 排序：分位升序（越低越深）→ 代码
+    watch.sort(key=lambda r: (r.get("pctile_window") or 1e9, r["ts_code"]))
     as_of = next((str(r["as_of_date"]) for r in tmap.values()), None)
     return {
         "as_of": as_of,
@@ -1034,9 +1039,6 @@ def get_timing() -> Dict[str, Any]:
         "params": {
             "price_window_years": tp.price_window_years,
             "price_pctile_max": tp.price_pctile_max,
-            "yield_min_pct": tp.yield_min_pct,
-            "below_ma250": tp.below_ma250,
-            "ma_period": tp.ma_period,
         },
         "rows": watch,
     }
@@ -1231,8 +1233,8 @@ SIG_HISTORY_WINDOW_DAYS = 90
 def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
     """选股时机明细（仅展示用）。
 
-    v7.0.24 起时机门 = ① 单条件：① 带 ✓/✗ + 数值 + 阈值（门判定）；
-    ② 股息率 / ③ 年线为参考展示（仅数值，无 ✓/✗，不参与门）。
+    v7.0.24 起时机门 = ① 单条件（分位带 ✓/✗ + 数值 + 阈值）；
+    v7.0.26：② 股息率 / ③ 年线参考展示一并删除。
     无 timing 行 → 「无时机数据」（fail-closed 同口径）。
     """
     if not trow:
@@ -1243,13 +1245,6 @@ def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
     v1 = "数据不足" if p is None else f"{p:.1f}%"
     parts.append(f"{'✓' if ok1 else '✗'} {tp.price_window_years}年分位 "
                  f"{v1}（需≤{tp.price_pctile_max:g}%）")
-    y = trow.get("ttm_yield_pct")
-    if y is not None:
-        parts.append(f"股息率 {y:.2f}%（参考）")
-    if getattr(tp, "below_ma250", False):
-        ok3 = bool(trow.get("cond_below_ma"))
-        v3 = "" if ok3 else "/数据不足"
-        parts.append(f"低于{tp.ma_period}日线{v3}（参考）")
     return " · ".join(parts)
 
 
@@ -1277,7 +1272,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
     - 时机门（v7.0.24 定案：① 价格分位单条件）：非持仓股的买入信号须先过
       选股时机提醒口径（timing.push_eligible = ① 5年分位≤40%，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
-      只展示价格状态 + timing_reasons（① 带 ✓/✗ 数值+阈值；②③ 参考值）
+      只展示价格状态 + timing_reasons（① 带 ✓/✗ 数值+阈值；v7.0.26：②③ 删除）
       （持仓股不受时机限制（持仓策略管加仓）。
       timing_ok/timing_reasons 逐股标注。
     - 十年回测参考（v7.0.19 迭代）：推荐买入股标注历史回测——bt_pnl_pct
@@ -1423,7 +1418,7 @@ def get_strategy_signals(strategy: Optional[str] = None) -> Dict[str, Any]:
         touched = (trigger is not None and day_low is not None
                    and _touches.quote_date_of(q.get("timestamp")) == ref_quote_date
                    and day_low <= trigger and cls["status"] != "active")
-        # 时机门（v7.0.24 定案：① 价格分位单条件；②③ 降为参考展示）：非持仓股
+        # 时机门（v7.0.24 定案：① 价格分位单条件；v7.0.26：②③ 彻底删除）：非持仓股
         # 的买入信号须先过策略选股时机提醒口径（5年分位≤40%；selection_timing
         # 预计算快照，O(1)）——到买入时机才给买入信号；持仓股不受时机限制
         # （持仓策略负责加仓档）。无时机行（timing 未跑/池外）→ fail-closed

@@ -72,12 +72,11 @@ describe("strategyMeta · v7 结构", () => {
 });
 
 describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
-  it("FIELD_TYPE = 24 键（strategy 9 + universe 10 + timing 5），类型逐一断言", () => {
+  it("FIELD_TYPE = 21 键（strategy 8 + universe 10 + timing 3），类型逐一断言", () => {
     const expected = {
       name: "str",
       initial_amount: "int",
       base_add_amount: "int",
-      first_drawdown_pct: "float",
       add_step_pct: "float",
       growth_ratio: "float",
       rearm_mode: "enum2",
@@ -93,12 +92,10 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
       min_ttm_yield_pct: "float",
       price_min_yuan: "float",
       price_max_yuan: "float",
-      // v7.0.13 timing
+      // v7.0.13 timing（v7.0.26：②③ 删除、first_drawdown_pct 自 strategy 移入）
       price_window_years: "int",
       price_pctile_max: "float",
-      yield_min_pct: "float",
-      below_ma250: "bool",
-      ma_period: "int",
+      first_drawdown_pct: "float",
     };
     expect(FIELD_TYPE).toEqual(expected);
   });
@@ -139,9 +136,9 @@ describe("strategyMeta · FIELD_DESC/FIELD_TYPE 全字段守卫（防未来加�
     expect(FIELD_DESC["strategy.initial_amount"]).toContain("k=0");
     expect(FIELD_DESC["strategy.accounting"]).toContain("只读");
     expect(FIELD_DESC["universe.min_total_mv_yi"]).toContain("总市值");
-    // v7.0.13 timing desc 关键点
+    // v7.0.13 timing desc 关键点（v7.0.26：②③ 删除）
     expect(FIELD_DESC["timing.price_pctile_max"]).toContain("分位");
-    expect(FIELD_DESC["timing.yield_min_pct"]).toContain("股息率");
+    expect(FIELD_DESC["timing.first_drawdown_pct"]).toContain("首仓");
   });
 
   it("FIELD_LABELS 覆盖渲染段 yaml 全部字段（通俗名非空；条数=FIELD_TYPE；防未来加字段漏改名）", () => {
@@ -170,7 +167,7 @@ describe("displayValue · 按 FIELD_TYPE 分支（v7）", () => {
 
   it("int/float/enum2/str → String(v)", () => {
     expect(displayValue("strategy", "initial_amount", 100000)).toBe("100000");
-    expect(displayValue("strategy", "first_drawdown_pct", 15)).toBe("15");
+    expect(displayValue("timing", "first_drawdown_pct", 15)).toBe("15");
     expect(displayValue("strategy", "rearm_mode", "bounce")).toBe("bounce");
   });
 

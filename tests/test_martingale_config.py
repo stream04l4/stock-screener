@@ -47,9 +47,9 @@ def test_load_real_config():
     assert u.min_total_mv_yi >= 1
     assert u.min_consecutive_div_years >= 1
     assert 20 <= u.listing_min_trading_days <= 1200
-    # v7.0.13 timing：生产 yaml 段 = 拍板默认（5 年 / 40% / 4.5% / 年线关 / 250）
-    assert (t.price_window_years, t.price_pctile_max, t.yield_min_pct,
-            t.below_ma250, t.ma_period) == (5, 40.0, 4.5, False, 250)
+    # v7.0.26 timing：生产 yaml 段 = 3 键（5 年 / 40%；首仓建仓回撤亦归本段）
+    assert (t.price_window_years, t.price_pctile_max) == (5, 40.0)
+    assert p.first_drawdown == pytest.approx(0.15)  # 取自 timing 段
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ def test_rearm_mode_enum(tmp_path):
 
 def test_dd_plus_step_must_below_100(tmp_path):
     c = _cfg()
-    c["strategy"]["first_drawdown_pct"] = 60
+    c["timing"]["first_drawdown_pct"] = 60
     c["strategy"]["add_step_pct"] = 45
     with pytest.raises(ConfigError, match="< 100"):
         load_config(_write(tmp_path, c))

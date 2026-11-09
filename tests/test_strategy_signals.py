@@ -335,13 +335,13 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert s4["next_add_price_raw"] == 40.0  # 触发价 = 首仓线（若误走 next 35.0 可区分）
     assert s4["action"] is None and s4["suggested_amount"] is None
     assert s4["timing_ok"] is False
-    # 时机明细（v7.0.24：① 为门条件带 ✓/✗；② 参考值；strategy.yaml：
-    # 5 年窗口 / 分位≤40）
+    # 时机明细（v7.0.24：① 为门条件带 ✓/✗；v7.0.26：② 参考值删除；
+    # strategy.yaml：5 年窗口 / 分位≤40）
     assert s4["timing_reasons"] == \
-        "✗ 5年分位 55.0%（需≤40%） · 股息率 2.00%（参考）"
-    # ✓ 行：① 过 = 门过（② 参考不参与判定）
+        "✗ 5年分位 55.0%（需≤40%）"
+    # ✓ 行：① 过 = 门过
     assert s2["timing_reasons"] == \
-        "✓ 5年分位 21.0%（需≤40%） · 股息率 4.60%（参考）"
+        "✓ 5年分位 21.0%（需≤40%）"
     # 湖中无数据 → no_data（池内非持仓）
     s5 = by["sh.600005"]
     assert s5["status"] == "no_data" and s5["held"] is False and s5["price"] is None

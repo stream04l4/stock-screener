@@ -21,8 +21,8 @@ strategy:                           # 深回撤金字塔加仓（唯一策略；
                                     # 每股全策略仅第一次触发用（f6 验收值）
   base_add_amount: 10000            # 加仓基准金额（元）：每轮首档(k=0)；
                                     # 第 k 档 = base_add_amount × growth_ratio^k
-  first_drawdown_pct: 15            # 首次回撤比例（%）：hfq ≤ H×(1−15%) 建仓
-  add_step_pct: 5                   # 加仓步长（%）：档线 H×(1−first_dd−k×step)
+  add_step_pct: 5                   # 加仓步长（%）：档线 H×(1−first_dd−k×step)；
+                                    # first_dd 现居 timing 段（首仓属选股时机，v7.0.26）
   growth_ratio: 1.1                 # 加仓提升比率：第 k 档 = 基准×比率^k
   rearm_mode: bounce                # 高点再武装模式：bounce（默认）| newhigh
   rearm_pct: 15                     # 高点刷新比例（%）：bounce 模式下价格 ≥ 本周期
@@ -64,22 +64,23 @@ universe:                           # 股票池（全链 5 条件；漏斗 5556�
   backtest_window_years: 10         # ⑦ 回测窗口（滚动，截至最新 K线日；预计算见
                                     #   lake 表 selection_backtest_10y）
   min_ttm_yield_pct: 3              # ⑧ TTM 股息率下限（%，最新估值日 valuation_daily）
-  price_min_yuan: 3                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
-  price_max_yuan: 100               # ⑨ 股价区间上限（元；保证 1 万加仓档 ≥1 手粒度）
+  price_min_yuan: 2                 # ⑨ 股价区间下限（元；远离 1 元退市风险区）
+  price_max_yuan: 120               # ⑨ 股价区间上限（元；保证 1 万加仓档 ≥1 手粒度）
 
-timing:                             # 选股时机（v7.0.13 引入；v7.0.24 定案：门 = ① 单条件）
-  # 作用域 = 候选池成员（基础 5 条件 ∩ 选股 3 门槛 ∪ 手动），筛"何时买"；
-  # 入选 ≠ 买入——买后录入「我的持仓」由持仓策略（strategy 段）接管档位。
-  # 时机门（观察口径页面 + 提醒口径 PushPlus）= ① 价格分位 ≤ price_pctile_max，
-  # 仅**新触发**推送（持续在买区不重推；状态 data/alerts/
-  # timing_push_state.json）。②③ v7.0.24 起为参考展示（不参与门；10 年回测
-  # 结论：② 是总盈利主要拖累且与池入场 G8"当前息率≥3%"同维冗余、③ 年线
-  # 近乎无效、①② 同属"便宜程度"维度高度冗余）。
+timing:                             # 选股时机（v7.0.13 引入；v7.0.24 定案：门 = ① 单条件；
+                                    # v7.0.26 定案：②③ 彻底删除、首仓建仓回撤归入本段）
+  # 作用域 = 候选池成员（基础 5 条件 ∩ 选股 3 门槛 ∪ 手动），筛"何时首仓买入"；
+  # 入选 ≠ 买入——买后录入「我的持仓」由持仓策略（strategy 段）接管加仓档位。
+  # 时机门（页面观察口径）= ① 价格分位 ≤ price_pctile_max；v7.0.25 起时机**无
+  # 独立微信推送**（微信统一为「进入当前信号才推」）。② 股息率 / ③ 250 日线
+  # 已删除（10 年回测：② 是总盈利主要拖累且与池入场 G8"当前息率≥3%"同维冗余、
+  # ③ 年线近乎无效、①② 同属"便宜程度"维度高度冗余）。
+  # 首仓建仓回撤（first_drawdown_pct）：首仓线 = 本轮高点×(1−该值)，是首仓
+  # 买入时机参数（v7.0.26 从 strategy 段移入；引擎经 StrategyParams 读取，
+  # 数学零改动）。
   price_window_years: 5             # ① 价格低位窗口（年，滚动至最新 K线日）
   price_pctile_max: 40              # ① 当前价处于近 N 年收盘分位 ≤ 此值（%）【时机门唯一条件】
-  yield_min_pct: 4.5                # ② TTM 股息率 ≥ 此值（%）【参考展示，不参与门】
-  below_ma250: false                # ③ 年线条件开关【参考展示，不参与门】
-  ma_period: 250                    # ③ 均线窗口（交易日）
+  first_drawdown_pct: 15            # 首仓建仓回撤（%）：hfq ≤ H×(1−15%) 触发首仓（k=0）
 
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
   # v7.0.18：baostock_daily_budget 随 BaoStock 移除，键名泛化为 quota_budget_per_day

@@ -143,7 +143,7 @@ def test_pyproject_v7_shape():
 def test_strategy_yaml_v7_schema_shape():
     cfg = yaml.safe_load((PROJECT_ROOT / "config" / "strategy.yaml").read_text(encoding="utf-8"))
     strat = set(cfg["strategy"].keys())
-    assert strat == {"name", "initial_amount", "base_add_amount", "first_drawdown_pct",
+    assert strat == {"name", "initial_amount", "base_add_amount",
                      "add_step_pct", "growth_ratio", "rearm_mode", "rearm_pct", "accounting"}
     assert set(cfg["universe"].keys()) == {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
@@ -151,10 +151,9 @@ def test_strategy_yaml_v7_schema_shape():
         # v7.0.12 候选池选股门槛
         "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
         "price_min_yuan", "price_max_yuan"}
-    # v7.0.13 选股时机
+    # v7.0.13 选股时机（v7.0.26：②③ 删除、首仓建仓回撤移入）
     assert set(cfg["timing"].keys()) == {
-        "price_window_years", "price_pctile_max", "yield_min_pct",
-        "below_ma250", "ma_period"}
+        "price_window_years", "price_pctile_max", "first_drawdown_pct"}
     assert "lake" in cfg and "datasource" in cfg
     assert {"sina", "rf"} <= set(cfg["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
     # 旧 12 段不得回潮

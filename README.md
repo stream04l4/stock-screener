@@ -1,4 +1,4 @@
-# stock-screener · v7.0.25（drawdown_martingale 单策略版）
+# stock-screener · v7.0.26（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -51,16 +51,20 @@ fail-closed：缺行不入选）→ ⑧ **TTM 股息率≥3%** → ⑨ **价格 
 SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
 或名称含 soe_keywords 任一（国务院/国资委/汇金/财政部/国资）。
 
-## 2.5 选股时机（v7.0.13，候选池之上筛「何时买」；v7.0.24 起单条件门）
+## 2.5 选股时机（v7.0.13，候选池之上筛「何时首仓买入」；v7.0.24 起单条件门）
 
 候选池解决「买什么」，时机门解决「何时买」（Joel 2026-10-24 拍板，5 点全按
-推荐口径；**2026-11-09 v7.0.24 回测定案：门 = ① 单条件，②③ 降为参考展示**）：
+推荐口径；**2026-11-09 v7.0.24 回测定案：门 = ① 单条件**；**v7.0.26 定案：
+②③ 彻底删除、首仓建仓回撤归入本策略**）：
 
 - **① 价格低位【时机门唯一条件】**：当前价处近 N 年（默认 5）qfq 收盘
   **分位 ≤ price_pctile_max**（默认 40%）；
-- **② 股息率【参考展示，不参与门】**：TTM 股息率 ≥ yield_min_pct（默认 4.5%）
-  仅页面/推送明细展示；回测结论 = 主要盈利拖累且与池门槛 G8 同维冗余；
-- **③ 年线之下【参考展示，默认关】**：当前价 < MA(ma_period)（默认 250）。
+- **② 股息率 / ③ 250 日线：v7.0.26 彻底删除**（config 键、湖表列、页面列、
+  信号明细全移除，不留观察项；回测结论：② 是主要盈利拖累且与池门槛 G8
+  同维冗余、③ 年线近乎无效）。
+- **首仓建仓回撤（first_drawdown_pct，默认 15%）**：首仓线 = 本轮高点×(1−该值)。
+  v7.0.26 自「持仓策略」段移入「选股策略」段管理——首仓属买入时机；
+  引擎经 StrategyParams 读取，数学零改动。
 
 **口径**（`martingale/timing.py` 单一定义点，v7.0.24 起观察/提醒同条件）：
 - **页面口径**（「今日选股」表）= ①（`in_watchlist`；`push_eligible` 列保留
@@ -108,7 +112,6 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | strategy | name | 固定 `drawdown_martingale` |
 | | initial_amount | 首仓金额（每股一次性，k=0 档） |
 | | base_add_amount | 基础加仓金额 |
-| | first_drawdown_pct | 首档回撤阈值（% → 小数） |
 | | add_step_pct | 每档加仓步长（% → 小数） |
 | | growth_ratio | 加仓金额增长比（第 k 档 = base × ratio^k） |
 | | rearm_mode | `bounce` \| `newhigh` |
@@ -123,11 +126,9 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | backtest_window_years | ⑦ 回测窗口年数（滚动） |
 | | min_ttm_yield_pct | ⑧ TTM 股息率下限（%） |
 | | price_min_yuan / price_max_yuan | ⑨ 最新价区间（元） |
-| timing（**段可缺省**，缺省=默认值） | price_window_years | ① 价格分位窗口（年，默认 5） |
-| | price_pctile_max | ① 分位上限（%，默认 40） |
-| | yield_min_pct | ② TTM 股息率下限（%，默认 4.5） |
-| | below_ma250 | ③ 年线之下开关（默认 false） |
-| | ma_period | ③ 年线周期（交易日，默认 250） |
+| timing（**段可缺省**，缺省=默认值；旧快照无此段时 first_drawdown_pct 回退读 strategy 段） | price_window_years | ① 价格分位窗口（年，默认 5） |
+| | price_pctile_max | ① 分位上限（%，默认 40）【时机门唯一条件】 |
+| | first_drawdown_pct | 首仓建仓回撤（%，默认 15）；首仓线 = 本轮高点×(1−该值)；v7.0.26 自 strategy 段移入 |
 | lake / datasource.* | — | lake-sync / 补数专用，Web 只读不渲染 |
 
 **首轮 k=0 占档说明（必附注）**：首仓占用 k=0 档（金额 initial_amount），
@@ -146,7 +147,7 @@ systemctl --user restart stock-screener-web    # 前端 build 或 web/app.py 改
 **策略**（三组卡片：**持仓策略**（原「策略参数」，v7.0.13 改名）/ **股票池**（候选池：
 基础 5 条件 + 选股门槛字段 + 候选股全列表（59 只，10年回测%/股息率/最新价/来源，
 可搜索排序）+ 手动添加录入条）/ **选股策略**（v7.0.13 时机门参数（v7.0.24 起
-= ① 分位单条件；②③ 参考展示）+
+= ① 分位单条件；v7.0.26：②③ 删除 + 首仓建仓回撤移入）+
 **今日选股表**（时机门命中，「时机成熟」徽标 = ① 命中，每行一键加持仓））；
 参数编辑/校验/策略库快照）· **回测**（参数表单 + SSE 进度 + 结果区）·
 **数据湖**（v6 原样）。候选池不设独立页签（v7.0.12 按 Joel 要求收敛进策略页签）。
@@ -231,7 +232,7 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.25）
+## 10. 近期版本（v7.0.11 → v7.0.26）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
@@ -369,6 +370,23 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.26**：选股策略梳理（2026-11-09 Joel 定案：「首仓建仓回撤应该放在选股
+  策略里，从持仓策略里拿出来；选股策略里没用的都删掉，不要留着观察」）：
+  - **首仓建仓回撤归入选股策略**：`first_drawdown_pct`（15%）自 strategy 段
+    移入 timing 段（yaml/config schema/Web 校验/前端卡片全链路）；首仓线 =
+    本轮高点×(1−该值) 属首仓买入时机，持仓策略段只保留加仓/再武装参数。
+    引擎经 `StrategyParams.first_drawdown` 读取——**状态机数学零改动**（f6
+    红线不受影响）；策略库旧快照（无 timing 段、dd 在 strategy 段）回退兼容。
+  - **② 股息率 / ③ 250 日线彻底删除**（v7.0.24 的参考展示一并移除，不留观察项）：
+    config 键（`yield_min_pct`/`below_ma250`/`ma_period`）、湖表列
+    （`ttm_yield_pct`/`ma_value`/`below_ma`/`cond_yield`/`cond_below_ma`，
+    selection_timing 收缩为 10 列、刷表改 drop+重建）、今日选股表「股息率%（参考）」
+    列、信号时机明细「· 股息率 x%（参考）」、微信首仓消息股息率明细——全部
+    移除。选股策略参数 = 3 键：分位窗口 / 分位上限 / 首仓建仓回撤。
+  - **页面**：策略页字段 23→20（持仓策略 7 + 选股策略 3 + 股票池 10）；
+    我的持仓信号模块脚注同步。
+  - 验证：后端全量 + 前端 248 绿、f6 红线零 diff、线上 /api/timing +
+    策略信号实测。
 - **v7.0.25**：微信推送统一为**「进入当前信号才推」**（2026-11-09 Joel
   定案：「微信信号统一改为只有进入当前信号的才推送，不然只有时机到了没有
   意义」）——**时机独立推送通道退役**：
