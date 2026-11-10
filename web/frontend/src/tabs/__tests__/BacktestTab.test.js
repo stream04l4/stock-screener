@@ -236,4 +236,54 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
     expect(w.text()).toContain("2/101");
     w.unmount();
   });
+
+  it("v7.0.33 展示收敛：per_stock 全精度 float → 2 位小数；ISO 日期截 T 后", async () => {
+    // 真实产物精度（output/.../per_stock.csv 实值）：引擎写全精度 float +
+    // ISO 时间戳，展示层须截断（排序/搜索仍走原值，此处只验展示）。
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1",
+                 meta: { start: null, end: null, codes: null, pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify({
+        ...RESULTS,
+        per_stock: [{
+          ts_code: "sz.302132", name: "中航成飞", n_bars: 3843, n_rounds: 1,
+          n_rearms: 118, n_buys: 125, total_invested: 887013.0240999996,
+          final_assets: 4207827.437903744, dividends: 79359.52794443406,
+          total_pnl: 3320814.4138037446, pnl_pct: 3.743816971766769,
+          min_unreal_pct: -0.3369759158631754,
+          first_buy_date: "2010-09-29T00:00:00.000000000",
+          last_buy_date: "2026-07-08T00:00:00.000000000",
+          last_status: "open", end_date: "2026-11-10T00:00:00.000000000",
+        }],
+        buys: [{ ts_code: "sz.302132", seq: 1, date: "2010-09-29T00:00:00.000000000",
+                 price: 32.6, amount: 3260.978 }],
+      }));
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    const t = w.text();
+    // 金额/百分比 → 2 位小数
+    expect(t).toContain("887013.02");
+    expect(t).toContain("4207827.44");
+    expect(t).toContain("3.74");
+    expect(t).toContain("-0.34");
+    // 全精度长小数不得出现
+    expect(t).not.toContain("887013.0240999996");
+    expect(t).not.toContain("3.743816971766769");
+    expect(t).not.toContain("3260.978");
+    expect(t).toContain("3260.98");
+    // 日期截 T 后
+    expect(t).toContain("2010-09-29");
+    expect(t).not.toContain("T00:00:00");
+    // 整数列不受影响
+    expect(t).toContain("3843");
+    w.unmount();
+  });
 });

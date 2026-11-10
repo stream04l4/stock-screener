@@ -70,20 +70,32 @@ watch(
 
 // ---------------------------------------------------------------------------
 // 表格列（per_stock / buys）
+// v7.0.33：数值展示收敛小数位（Joel 反馈「小数点后位数太多」）——引擎产物是
+// 全精度 float（如 887013.0240999996 / 3.743816971766769），展示层截断：
+// 金额/价格 2 位、百分比 2 位、日期列截 ISO 的 T 后部分。排序/搜索仍用原值。
 // ---------------------------------------------------------------------------
+const fmt2 = (v) => {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return isNaN(n) ? String(v) : n.toFixed(2);
+};
+const fmtDate = (v) => {
+  const s = String(v);
+  const i = s.indexOf("T");
+  return i > 0 ? s.slice(0, i) : s;
+};
 const PER_STOCK_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["n_bars", "bar数", true],
   ["n_rounds", "轮次", true], ["n_rearms", "再武装", true], ["n_buys", "买入笔数", true],
-  ["total_invested", "总投入", true], ["final_assets", "期末资产", true],
-  ["dividends", "累计分红", true], ["total_pnl", "总盈亏", true],
-  ["pnl_pct", "盈亏%", true], ["min_unreal_pct", "最低浮盈%", true],
-  ["first_buy_date", "首买日"], ["last_buy_date", "末买日"],
-  ["last_status", "末状态"], ["end_date", "期末"],
+  ["total_invested", "总投入", true, fmt2], ["final_assets", "期末资产", true, fmt2],
+  ["dividends", "累计分红", true, fmt2], ["total_pnl", "总盈亏", true, fmt2],
+  ["pnl_pct", "盈亏%", true, fmt2], ["min_unreal_pct", "最低浮盈%", true, fmt2],
+  ["first_buy_date", "首买日", false, fmtDate], ["last_buy_date", "末买日", false, fmtDate],
+  ["last_status", "末状态"], ["end_date", "期末", false, fmtDate],
 ];
 
 const BUYS_COLS = [
-  ["ts_code", "代码"], ["seq", "序", true], ["date", "日期"],
-  ["price", "成交价", true], ["amount", "金额", true],
+  ["ts_code", "代码"], ["seq", "序", true], ["date", "日期", false, fmtDate],
+  ["price", "成交价", true, fmt2], ["amount", "金额", true, fmt2],
 ];
 
 // ---------------------------------------------------------------------------

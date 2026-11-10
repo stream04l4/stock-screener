@@ -50,6 +50,15 @@ function onSort(key) {
 function cell(r, key) {
   const v = r[key];
   if (v === null || v === undefined || v === "") return "—";
+  // v7.0.33：列定义可选第 4 项 = 展示格式化函数（[key, label, isNum?, fmt?]）。
+  // 只改展示：搜索/排序仍走原值（num() 读 r[key] 原始值）。
+  const col = props.cols.find((c) => c[0] === key);
+  if (col && typeof col[3] === "function") {
+    try {
+      const s = col[3](v);
+      if (s !== null && s !== undefined) return String(s);
+    } catch (e) { /* fmt 异常 → 回退原样展示 */ }
+  }
   return String(v);
 }
 
