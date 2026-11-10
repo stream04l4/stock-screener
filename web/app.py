@@ -1466,6 +1466,11 @@ def get_strategy_signals() -> Dict[str, Any]:
             "action": action,
             "suggested_lots": suggested,
             "timing_ok": timing_ok,
+            # v7.0.31（C 案，Joel 定案）：5 年分位数值——前端「即将进入」段
+            # 对非持仓股按 ≤50% 展示（timing 40% 门未过但价格临区 = 最有提前
+            # 量价值的信号；持仓股不受时机限制 → None）
+            "timing_pctile": ((tmap.get(c) or {}).get("pctile_window")
+                              if not held else None),
             "timing_reasons": timing_reasons,
             # 十年回测参考（推荐买入时展示；池外/无回测 → None）
             "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)

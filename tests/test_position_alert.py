@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
-"""test_position_alert —— v7.0.11：持仓策略点位微信提醒。
+"""test_position_alert —— 持仓策略点位微信提醒（v7.0.31：实时时机 + 补推兜底）。
 
 契约（全离线，零真实网络/零生产数据）：
 - martingale.signals.build_signals 纯函数口径（add/buy/不触发/排序）；
-- position_alert.run() 管道：账本→湖状态机行→实时价→信号→去重→webhook→状态落盘；
-  账本/湖/腾讯/webhook 全部 monkeypatch 替身；
-- 去重：同日同点位不重推；隔日可再推；推送失败不落状态（可重试）；
-- 退出码：0 正常 / 2 缺 key / 3 湖不可用 / 4 推送失败。
+- position_alert.run() 管道：账本→湖状态机行→实时价→实时分位→信号→去重/补推
+  →webhook→状态落盘；账本/湖/腾讯/webhook 全部 monkeypatch 替身；
+- v7.0.31 时机门 = 实时分位（live_pctile_map 替身，非前夜 timing 快照）；
+- 去重 + 补推兜底（Joel 定案）：推过永不重推（alerts）；未推成功留 pending
+  自动重推，信号日非当日标「（补推，信号日 …）」；pending 超 30 天老化；
+- 退出码：0 正常 / 2 缺 key 或配置错 / 3 湖不可用 / 4 推送失败（下轮重试）。
+
+注：price_pctile_max 阈值取真实 config/strategy.yaml（生产单点，测试不复制）。
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -43,15 +48,26 @@ SP = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=1,
                      add_lots_step=1)  # v7.0.28 手数口径
 
 
+def _now():
+    return datetime.fromisoformat(FAKE_NOW)
+
+
 def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
-          user=None, pool_codes=None, rows=None, tmap=None):
-    """全链路替身：web.app 三函数 + 时机表 + 腾讯 + requests.post + 时钟 + .env key。"""
+          user=None, pool_codes=None, rows=None, tmap=None,
+          touch_state=None):
+    """全链路替身：web.app 三函数 + 实时分位 + 触碰状态 + 腾讯 +
+    requests.post + 时钟 + .env key。
+
+    tmap（v7.0.31 起语义 = 实时分位 {code: pct}，缺/None = fail-closed）；
+    touch_state = signal_touch 落盘状态替身（首仓信号日来源，隔离生产文件）。
+    """
     import web.app as wapp
 
     user = dict(USER) if user is None else user
     pool_codes = list(pool_codes) if pool_codes is not None else ["sh.601728", "sh.601398"]
     rows = dict(ROWS) if rows is None else rows
     tmap = {} if tmap is None else tmap
+    touch_state = {} if touch_state is None else touch_state
     monkeypatch.setattr(wapp, "_up_read", lambda: user)
     con = SimpleNamespace(close=lambda: None)
     pool = SimpleNamespace(codes=pool_codes)
@@ -59,10 +75,16 @@ def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
         monkeypatch.setattr(wapp, "_load_pool_ctx",
                             lambda cfg_path=None: (SP, None, con, pool))
         monkeypatch.setattr(wapp, "_strategy_state_rows",
-                            lambda sp, con2, codes: dict(rows))
+                            lambda sp, con2, codes, **kw: dict(rows))
         import martingale.timing as tmod
 
-        monkeypatch.setattr(tmod, "load_timing_map", lambda con2: dict(tmap))
+        # v7.0.31：run() 消费 live_pctile_map（实时分位），不再读前夜快照
+        monkeypatch.setattr(tmod, "live_pctile_map",
+                            lambda con2, codes, prices, tp2: dict(tmap))
+        import martingale.touches as ttouch
+
+        monkeypatch.setattr(ttouch, "load_state",
+                            lambda *a, **k: dict(touch_state))
     else:
         def _boom(cfg_path=None):
             raise RuntimeError("数据湖被其他进程锁定（测试注入）")
@@ -94,8 +116,7 @@ def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
     import requests
 
     monkeypatch.setattr(requests, "post", fake_post)
-    monkeypatch.setattr(pa, "_beijing_now",
-                        lambda: __import__("datetime").datetime.fromisoformat(FAKE_NOW))
+    monkeypatch.setattr(pa, "_beijing_now", _now)
     # .env key：monkeypatch 读取器（不碰真实 .env）
     monkeypatch.setattr(pa, "_load_env_key",
                         lambda name: "test-key-123" if name == "PUSHPLUS_TOKEN" else None)
@@ -132,7 +153,7 @@ def test_build_signals_add_buy_and_none():
 
 
 # ---------------------------------------------------------------------------
-# 2) run() 管道
+# 2) run() 管道（持仓加仓通道）
 # ---------------------------------------------------------------------------
 def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     posts, state_path = _wire(monkeypatch, tmp_path)
@@ -150,32 +171,32 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
-    # 状态落盘（键含 点位+k+动作）
+    # 状态落盘（键含 点位+k+动作；v7.0.31：alerts/pending 双区）
     st = json.load(open(state_path, encoding="utf-8"))
     assert "sh.601728|add|1|6.0" in st["alerts"]
+    assert st["pending"] == {}, "推送成功后 pending 清空"
 
     # 同日第二轮 → 去重不重推
     rc2 = pa.run(force=True, state_path=state_path)
     assert rc2 == 0
-    assert len(posts) == 1, "同日同点位不得重推"
+    assert len(posts) == 1, "已推点位不得重推"
 
 
-def test_run_repushes_next_day(monkeypatch, tmp_path):
+def test_run_no_repush_after_pushed(monkeypatch, tmp_path):
+    """v7.0.31：推成功过的点位永不重推（替代旧「隔日可再推」语义）。"""
     posts, state_path = _wire(monkeypatch, tmp_path)
     assert pa.run(force=True, state_path=state_path) == 0
     assert len(posts) == 1
-    # 次日（点位未变）→ 可再推一次（每日提醒语义）
-    import datetime as dt
-
-    next_day = dt.datetime.fromisoformat(FAKE_NOW) + dt.timedelta(days=1)
+    next_day = _now() + timedelta(days=1)
     monkeypatch.setattr(pa, "_beijing_now", lambda: next_day)
     assert pa.run(force=True, state_path=state_path) == 0
-    assert len(posts) == 2, "隔日同点位应再推（每日一次提醒）"
+    assert len(posts) == 1, "已推 → 次日不重推（新档位/新点位才是新键）"
 
 
-def test_run_push_failure_no_state_writable(monkeypatch, tmp_path):
+def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):
+    """v7.0.31 补推兜底：推送失败 → pending 落盘（first_seen 保住）→ 次日
+    信号仍当前 → 重推并标「（补推，信号日 …）」；成功后移入 alerts。"""
     posts, state_path = _wire(monkeypatch, tmp_path)
-
     import requests
 
     def _boom(url, json=None, timeout=None):  # noqa: A002
@@ -184,7 +205,50 @@ def test_run_push_failure_no_state_writable(monkeypatch, tmp_path):
     monkeypatch.setattr(requests, "post", _boom)
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 4, "推送失败退出码 4"
-    assert not os.path.exists(state_path), "推送失败不得落状态（下轮重试）"
+    st = json.load(open(state_path, encoding="utf-8"))
+    assert st["alerts"] == {}, "推送失败不落 alerts"
+    pend = st["pending"]["sh.601728|add|1|6.0"]
+    assert pend["first_seen"] == "2026-10-26"
+
+    # 次日信号仍当前 → 重推 + 补推标注（恢复成功推送桩）
+    next_day = _now() + timedelta(days=1)
+    monkeypatch.setattr(pa, "_beijing_now", lambda: next_day)
+
+    class _Resp2:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"code": 200, "msg": "success", "data": "test-uuid"}
+
+    def _ok(url, json=None, timeout=None):  # noqa: A002
+        posts.append({"url": url, "json": json})
+        return _Resp2()
+
+    monkeypatch.setattr(requests, "post", _ok)
+    rc2 = pa.run(force=True, state_path=state_path)
+    assert rc2 == 0
+    assert len(posts) == 1, "未推成功 → 下轮自动重推"
+    content = posts[0]["json"]["content"]
+    assert "(补推，信号日 2026-10-26)" in content
+    st2 = json.load(open(state_path, encoding="utf-8"))
+    assert "sh.601728|add|1|6.0" in st2["alerts"]
+    assert st2["pending"] == {}
+
+
+def test_run_pending_ttl_prune(monkeypatch, tmp_path):
+    """v7.0.31：pending 超 30 天未推 → 信号过期老化移除（无触发也执行）。"""
+    posts, state_path = _wire(monkeypatch, tmp_path,
+                              spot={"sh.601728": {"price": 6.50, "timestamp": "14:30:01"},
+                                    "sh.601398": {"price": 8.50, "timestamp": "14:30:01"}})
+    old = (_now() - timedelta(days=40)).strftime("%Y-%m-%d")
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump({"alerts": {},
+                   "pending": {"x.1|buy|0|1.0": {"first_seen": old, "name": "X"}}}, f)
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0 and posts == []
+    st = json.load(open(state_path, encoding="utf-8"))
+    assert st["pending"] == {}, "超 TTL 的 pending 老化移除"
 
 
 def test_run_lake_unavailable_rc3(monkeypatch, tmp_path):
@@ -217,7 +281,7 @@ def test_run_dry_run_no_push_no_state(monkeypatch, tmp_path):
     rc = pa.run(force=True, dry_run=True, state_path=state_path)
     assert rc == 0
     assert posts == []
-    assert not os.path.exists(state_path)
+    assert not os.path.exists(state_path), "dry-run 不落任何状态（含 pending）"
 
 
 def test_run_empty_ledger_rc0(monkeypatch, tmp_path):
@@ -240,6 +304,22 @@ def test_missing_key_rc2(monkeypatch, tmp_path):
     assert posts == []
 
 
+def test_run_rows_include_buys_caliber(monkeypatch, tmp_path):
+    """v7.0.31 口径守卫（山煤国际实案）：run() 必须 include_buys=True 取行——
+    first_level_raw 只在该口径附行；缺了它非持仓股首仓线恒 None，首仓推送
+    通道结构性全关（Web 显示 11.2478、推送侧 None 的口径漂移）。"""
+    calls = []
+    posts, state_path = _wire(monkeypatch, tmp_path)
+    import web.app as wapp
+
+    monkeypatch.setattr(wapp, "_strategy_state_rows",
+                        lambda sp, con2, codes, **kw: (calls.append(kw),
+                                                       dict(ROWS))[1])
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert calls and calls[-1].get("include_buys") is True
+
+
 def test_trading_window_gate(monkeypatch):
     """时段门：周六跳过；周一 14:30 放行；周一 12:00 午休跳过。"""
     import datetime as dt
@@ -260,9 +340,10 @@ def test_trading_window_gate(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3) 首仓通道（v7.0.23：非持仓股，双条件 = 时机✓ 且 现价 ≤ 首仓线）
+# 3) 首仓通道（v7.0.23 双条件；v7.0.31 时机 = 实时分位 ≤40%）
 # ---------------------------------------------------------------------------
-# 600001 双条件全过 → 推；600002 价过时机✗ → 不推；600003 时机✓价未过 → 不推
+# 600001 双条件全过 → 推；600002 价过时机✗（55%>40%）→ 不推；
+# 600003 时机✓（30%）价未过 → 不推
 FIRST_POOL = ["sh.600001", "sh.600002", "sh.600003"]
 FIRST_ROWS = {
     "sh.600001": {"name": "首仓达标", "last_price": 8.9, "in_pos": True,
@@ -275,14 +356,7 @@ FIRST_ROWS = {
                   "k_level": 0, "next_add_price_raw": None,
                   "first_level_raw": 9.5},
 }
-FIRST_TMAP = {
-    "sh.600001": {"push_eligible": True, "pctile_window": 35.2,
-                  "ttm_yield_pct": 4.8},
-    "sh.600002": {"push_eligible": False, "pctile_window": 55.0,
-                  "ttm_yield_pct": 3.0},
-    "sh.600003": {"push_eligible": True, "pctile_window": 30.0,
-                  "ttm_yield_pct": 5.0},
-}
+FIRST_TMAP = {"sh.600001": 35.2, "sh.600002": 55.0, "sh.600003": 30.0}
 FIRST_SPOT = {
     "sh.600001": {"price": 8.90, "timestamp": "14:30:01"},
     "sh.600002": {"price": 4.90, "timestamp": "14:30:01"},
@@ -290,16 +364,17 @@ FIRST_SPOT = {
 }
 
 
-def _wire_first(monkeypatch, tmp_path, spot=None, tmap=None):
-    """空持仓账本 + 3 只池内非持仓股的默认替身（可覆盖 spot/tmap）。"""
+def _wire_first(monkeypatch, tmp_path, spot=None, tmap=None, touch_state=None):
+    """空持仓账本 + 3 只池内非持仓股的默认替身（可覆盖 spot/tmap/touch_state）。"""
     spot = dict(FIRST_SPOT) if spot is None else spot
     tmap = dict(FIRST_TMAP) if tmap is None else tmap
     return _wire(monkeypatch, tmp_path, spot=spot, tmap=tmap, user={},
-                 pool_codes=FIRST_POOL, rows=FIRST_ROWS)
+                 pool_codes=FIRST_POOL, rows=FIRST_ROWS,
+                 touch_state=touch_state)
 
 
 def test_run_first_position_dual_condition(monkeypatch, tmp_path):
-    """双条件全过 → 推首仓信号（账本空也走——v7.0.23 不再早退）。"""
+    """实时时机✓ + 价破首仓线 → 推首仓信号（账本空也走——v7.0.23 不再早退）。"""
     posts, state_path = _wire_first(monkeypatch, tmp_path)
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
@@ -308,7 +383,7 @@ def test_run_first_position_dual_condition(monkeypatch, tmp_path):
     content = body["content"]
     assert "首仓达标" in content and "sh.600001" in content
     assert "首仓线" in content and "非持仓·首仓信号" in content
-    assert "分位 35.2%（低位）" in content          # v7.0.26：时机明细只剩分位
+    assert "分位 35.2%（低位·实时）" in content      # v7.0.31：实时分位标注
     assert "1 手" in content                            # 首仓 first_lots=1 手（v7.0.28）
     assert "时机未过" not in content and "价格未过" not in content  # 单条件不推
     assert "策略点位提醒" in body["title"]
@@ -320,12 +395,12 @@ def test_run_first_position_dual_condition(monkeypatch, tmp_path):
     assert rc2 == 0 and len(posts) == 1
 
 
-def test_run_first_position_fail_closed_no_timing_row(monkeypatch, tmp_path):
-    """无 timing 行 → fail-closed：价破首仓线也不推。"""
+def test_run_first_position_fail_closed_no_live_pctile(monkeypatch, tmp_path):
+    """无实时分位数据 → fail-closed：价破首仓线也不推。"""
     posts, state_path = _wire_first(monkeypatch, tmp_path, tmap={})
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
-    assert posts == [], "时机表缺行 fail-closed 不推（不误报）"
+    assert posts == [], "实时分位缺失 fail-closed 不推（不误报）"
 
 
 def test_run_first_position_price_above_line_no_push(monkeypatch, tmp_path):
@@ -333,7 +408,31 @@ def test_run_first_position_price_above_line_no_push(monkeypatch, tmp_path):
     spot = dict(FIRST_SPOT)
     spot["sh.600001"] = {"price": 9.20, "timestamp": "14:30:01"}
     posts, state_path = _wire_first(
-        monkeypatch, tmp_path, spot=spot,
-        tmap={"sh.600001": dict(FIRST_TMAP["sh.600001"])})
+        monkeypatch, tmp_path, spot=spot, tmap={"sh.600001": 35.2})
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0 and posts == []
+
+
+def test_run_first_position_backfill_from_touch_date(monkeypatch, tmp_path):
+    """v7.0.31 补推：触碰落盘日（10-24）早于当日（10-26）→ 首推即标
+    「（补推，信号日 2026-10-24）」（前夜快照盲区场景：价格早已破线）。"""
+    posts, state_path = _wire_first(
+        monkeypatch, tmp_path,
+        touch_state={"sh.600001": {"date": "2026-10-24", "level_price": 9.0}})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1, posts
+    content = posts[0]["json"]["content"]
+    assert "(补推，信号日 2026-10-24)" in content
+
+
+def test_run_first_position_same_day_touch_no_backfill_tag(monkeypatch, tmp_path):
+    """触碰落盘日 = 当日 → 正常信号，不标补推。"""
+    posts, state_path = _wire_first(
+        monkeypatch, tmp_path,
+        touch_state={"sh.600001": {"date": "2026-10-26", "level_price": 9.0}})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1
+    # 只查行内补推标注（页脚说明文字恒含「补推」二字，不算）
+    assert "(补推，信号日" not in posts[0]["json"]["content"]

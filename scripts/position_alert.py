@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""策略点位微信提醒（v7.0.11 持仓通道；v7.0.23 增加非持仓首仓通道）。
+"""策略点位微信提醒（v7.0.11 持仓通道；v7.0.23 增加非持仓首仓通道；
+v7.0.31 实时时机 + 补推兜底）。
 
 两条策略线（v7.0.23 Joel 定案：建仓/加仓为两个独立策略），交易时段每 10 分钟
 （systemd timer 驱动，见 stock-screener-alerts.timer）通过**推送加（PushPlus，
@@ -10,8 +11,11 @@
    的下一触发价位（in_pos → 第 k+1 档，(first_lots+k×add_lots_step) 手；
    未 in_pos → 首仓线）；
 ② 非持仓股·首仓（双条件）：检查**候选池非持仓股**是否同时满足
-   a. 时机成熟：selection_timing.push_eligible（5 年分位≤40% 单条件，
-      v7.0.24 定案；无 timing 行 fail-closed 不推）；
+   a. 时机成熟：**实时分位** ≤ price_pctile_max（v7.0.31 Joel 定案 A：以
+      现价替换 5 年前复权窗口末值重算——前夜收盘快照会漏「价格破线 + 分位
+      破线同日达成」：快照当晚才刷、推送窗口 15:05 已关；山煤国际
+      2026-11-10 实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）；
+      无数据 fail-closed 不推；
    b. 价格到位：现价 ≤ 首仓线（本轮高点×(1−first_drawdown_pct)；该参数
       v7.0.26 起居 timing 段 = 选股策略）。
    两者都过 = 首仓买入信号（first_lots 手，v7.0.28 手数口径）。建仓后录入
@@ -27,12 +31,17 @@
   {"token": ..., "title": ..., "content": <html>, "template": "html"}
   返回 {"code": 200, ...} 即成功（token 在 .env：PUSHPLUS_TOKEN）。
 
-去重（data/alerts/pushplus_alert_state.json，原子写）：
-- 键 = "code|action|k|触发价"——**同一点位同日最多推 1 条**；点位变化（加仓后
-  状态机推进 / 新一轮首仓线）= 新键 → 可再推；推送失败不落状态 → 下次运行
-  自动重试。
+去重 + 补推兜底（data/alerts/pushplus_alert_state.json，原子写，v7.0.31
+Joel 定案：「所有信号都要标注，未成功推送的重复推送」）：
+- 键 = "code|action|k|触发价"。**推成功过的点位永不重推**（点位变化——加仓
+  后状态机推进 / 新一轮首仓线——= 新键 → 可再推）；
+- alerts = 已推点位（Web 历史信号 pushed 标注读它的键）；pending = 应推未
+  推成功的信号（first_seen = 首次成为当前信号之日）——信号仍当前时每轮
+  自动重推，信号日非当日 → 消息标注「（补推，信号日 …）」；pending 条目
+  PENDING_TTL_DAYS 天未推即老化移除（信号已过期，Web 标注仍显示未推）；
+- 推送失败不落 alerts（留 pending）→ 下轮自动重试。
 
-退出码：0=正常（含无触发/已去重）；2=配置错（PUSHPLUS_TOKEN 缺失）；
+退出码：0=正常（含无触发/已去重）；2=配置错（PUSHPLUS_TOKEN 缺失/策略配置）；
 3=数据湖不可用（持锁/缺失——下轮自动重试）；4=推送加推送失败（下轮重试）。
 
 用法：
@@ -48,7 +57,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -61,6 +70,8 @@ from martingale import touches  # noqa: E402
 
 PUSHPLUS_SEND_URL = "http://www.pushplus.plus/send"
 STATE_PATH = os.path.join(PROJECT_ROOT, "data", "alerts", "pushplus_alert_state.json")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config", "strategy.yaml")
+PENDING_TTL_DAYS = 30  # 未推信号 pending 老化（信号过期；Web 标注仍显示未推）
 
 log = logging.getLogger("position_alert")
 
@@ -103,13 +114,21 @@ def in_trading_window(now: Optional[datetime] = None) -> bool:
 # 状态文件（去重）
 # ---------------------------------------------------------------------------
 def _load_state() -> Dict[str, Dict[str, Any]]:
+    """读推送状态 → {"alerts": {key: 已推点位}, "pending": {key: 应推未推}}。
+
+    v7.0.31：alerts = 已推成功（Web 历史信号 pushed 标注读它的键）；pending =
+    应推未推成功的信号（first_seen = 首次成为当前信号之日，补推标注 + TTL）。
+    旧文件无 pending 键 → {}。
+    """
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             d = json.load(f)
-        al = d.get("alerts")
-        return al if isinstance(al, dict) else {}
     except (OSError, ValueError):
-        return {}
+        return {"alerts": {}, "pending": {}}
+    al = d.get("alerts")
+    pd = d.get("pending")
+    return {"alerts": al if isinstance(al, dict) else {},
+            "pending": pd if isinstance(pd, dict) else {}}
 
 
 def _save_state(state: Dict[str, Dict[str, Any]]) -> None:
@@ -117,7 +136,9 @@ def _save_state(state: Dict[str, Dict[str, Any]]) -> None:
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"updated_at": _beijing_now().isoformat(timespec="seconds"),
-                   "alerts": state}, f, ensure_ascii=False, indent=1)
+                   "alerts": state.get("alerts", {}),
+                   "pending": state.get("pending", {})},
+                  f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE_PATH)  # 原子替换，防半截状态
 
 
@@ -127,6 +148,27 @@ def _alert_key(sig: Dict[str, Any]) -> str:
     加仓成交后状态机推进 → 触发价/k 变化 → 新键可再推；同日同点位不重推。
     """
     return f"{sig['ts_code']}|{sig['action']}|{sig['k_level']}|{sig['next_add_price']}"
+
+
+def _prune_pending(pending: Dict[str, Dict[str, Any]],
+                   alerts: Dict[str, Dict[str, Any]],
+                   today: str) -> bool:
+    """pending 卫生（v7.0.31）：已推键移除；first_seen 超 TTL → 信号过期移除。
+
+    返回是否有变更（调用方按需落盘）。
+    """
+    changed = False
+    for k in list(pending):
+        if k in alerts:
+            del pending[k]
+            changed = True
+            continue
+        fs = (pending[k] or {}).get("first_seen")
+        if fs and (date.fromisoformat(today)
+                   - date.fromisoformat(fs)).days > PENDING_TTL_DAYS:
+            del pending[k]
+            changed = True
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +195,14 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
                      + (f"（{s['note']}）" if s.get("note") else ""))
             tail = (f"首仓触发，{s['suggested_lots']} 手"
                     if s.get("suggested_lots") else "首仓触发")
+        if s.get("delayed"):
+            # v7.0.31 补推兜底：信号日非当日（前几轮应推未推成功/时机当晚才
+            # 达成）→ 显式标注，避免当成新信号误读
+            line1 += f" <span style='color:#c00'>(补推，信号日 {s['first_seen']})</span>"
         bits = [f"现价: <b>{s['price']:.3f}</b>",
                 f"触发价: {s['next_add_price']:.3f}"]
         if s.get("pctile") is not None:
-            bits.append(f"时机: 分位 {s['pctile']:.1f}%（低位）")
+            bits.append(f"时机: 分位 {s['pctile']:.1f}%（低位·实时）")
         blocks.append(
             f"<p>{line1}</p>"
             f"<p>{' &nbsp; '.join(bits)}</p>"
@@ -167,8 +213,8 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
     src = "腾讯实时行情" if price_source == "spot" else "湖最后收盘（实时行情缺失）"
     ts = f" {spot_time}" if spot_time else ""
     footer = (f"<p style='color:#888;font-size:12px'>行情: {src}{ts} ｜ "
-              f"策略: {sp_name} ｜ 持仓=越跌越买加仓 ｜ 非持仓首仓=时机✓且破首仓线 ｜ "
-              f"同一点位每日仅提醒一次</p>")
+              f"策略: {sp_name} ｜ 持仓=越跌越买加仓 ｜ 非持仓首仓=实时分位≤40%且破首仓线 ｜ "
+              f"同一点位仅推一次，未推成功自动补推（标注信号日）</p>")
     return title, "".join(blocks) + footer
 
 
@@ -197,6 +243,15 @@ def run(force: bool = False, dry_run: bool = False,
     if not in_trading_window() and not force:
         log.info("非交易时段（%s），跳过", _beijing_now().strftime("%Y-%m-%d %H:%M %A"))
         return 0
+    today = _beijing_now().strftime("%Y-%m-%d")
+
+    # 0) 策略配置预检（与 signal_touch 同口径：配置错 = 退出码 2）→ 时机参数
+    from martingale.config import load_config
+    try:
+        _sp_cfg, _up_cfg, tp = load_config(CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001 - ConfigError
+        log.error("策略配置错误: %s", exc)
+        return 2
 
     # 1) 用户持仓账本（v7.0.23：账本空不再早退——候选池非持仓股仍有首仓通道）
     from web.app import _up_read, _strategy_state_rows
@@ -204,24 +259,29 @@ def run(force: bool = False, dry_run: bool = False,
     user = _up_read()
     held_codes = sorted(user.keys())
 
-    # 2) 策略状态机行 + 时机表（湖只读；持锁/缺失 → 3，下轮重试）
+    # 2) 策略状态机行（湖只读；持锁/缺失 → 3，下轮重试）
     try:
         from web.app import _load_pool_ctx
 
         _sp, _up, con, pool = _load_pool_ctx()
-        try:
-            universe = set(pool.codes) | set(held_codes)
-            if universe:
-                rows = _strategy_state_rows(_sp, con, sorted(universe))
-                tmap = timing.load_timing_map(con)
-            else:
-                rows, tmap = {}, {}
-        finally:
-            con.close()
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）
         log.warning("数据湖不可用（下轮重试）: %s", exc)
         return 3
+    try:
+        universe = set(pool.codes) | set(held_codes)
+        # include_buys=True 必须与 Web 同口径（v7.0.31 山煤国际实案）：
+        # first_level_raw 只在 include_buys=True 时附行——缺了它非持仓股
+        # 首仓触发线恒 None，首仓推送通道结构性全关（Web 显示首仓线、
+        # 推送侧却拿不到线 = 口径漂移）
+        rows = (_strategy_state_rows(_sp, con, sorted(universe),
+                                     include_buys=True)
+                if universe else {})
+    except Exception as exc:  # noqa: BLE001
+        con.close()
+        log.warning("数据湖不可用（下轮重试）: %s", exc)
+        return 3
     if not universe:
+        con.close()
         log.info("股票池与持仓账本均为空，跳过")
         return 0
 
@@ -233,6 +293,23 @@ def run(force: bool = False, dry_run: bool = False,
         spot = TencentClient(timeout=5.0, max_attempts=1).fetch(sorted(universe)) or {}
     except Exception as exc:  # noqa: BLE001 - 行情失败不阻断（回退湖价）
         log.warning("腾讯实时行情失败（回退湖最后价）: %s", exc)
+    # 3b) 实时分位（v7.0.31 A 案，Joel 定案）：现价（spot，无行情回退湖最后
+    #     收盘）替换 5 年前复权窗口末值重算——修「破线 + 分位破线同日达成」
+    #     被前夜快照漏推的结构性盲区。算完即关连接。
+    price_map: Dict[str, Optional[float]] = {}
+    for c in universe:
+        p = (spot.get(c) or {}).get("price")
+        if p is None:
+            p = (rows.get(c) or {}).get("last_price")
+        price_map[c] = p
+    try:
+        live_pct: Dict[str, Optional[float]] = timing.live_pctile_map(
+            con, sorted(universe), price_map, tp)
+    except Exception as exc:  # noqa: BLE001 - 分位失败 → 首仓通道 fail-closed
+        log.warning("实时分位计算失败（首仓通道 fail-closed）: %s", exc)
+        live_pct = {}
+    finally:
+        con.close()
     price_source = ("spot" if any(v.get("price") is not None for v in spot.values())
                     else "lake")
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
@@ -256,21 +333,27 @@ def run(force: bool = False, dry_run: bool = False,
     from martingale.signals import build_signals
 
     signals = build_signals(positions, _sp)
+    for sig in signals:
+        sig["sig_date"] = today  # 加仓信号日 = 当日（档位当前已到达）
 
-    # 4b) 首仓通道（v7.0.23）：候选池非持仓股，双条件 = 时机成熟 且
+    # 4b) 首仓通道（v7.0.23）：候选池非持仓股，双条件 = 实时时机成熟 且
     # 现价 ≤ 首仓线（触发线恒为 first_level_raw，与页面 touches.trigger_price
-    # 非持仓分支同一单点）。时机门 fail-closed：无 timing 行/未达标 → 不推。
+    # 非持仓分支同一单点）。v7.0.31：时机 = 实时分位（非前夜快照）；
+    # fail-closed：无分位数据/未达标 → 不推。
+    touch_state = touches.load_state()  # 补推兜底：信号日 = 触碰落盘日（如有）
     for c in sorted(set(pool.codes) - set(held_codes)):
         r = rows.get(c) or {}
         trig = touches.trigger_price(r, held=False)
         if not trig:
             continue
-        t = tmap.get(c) or {}
-        if not t.get("push_eligible"):
+        pct = live_pct.get(c)
+        if pct is None or pct > tp.price_pctile_max:
             continue
         price_now = (spot.get(c) or {}).get("price") or r.get("last_price")
         if price_now is None or price_now > trig:
             continue
+        ev = touch_state.get(c) or {}
+        ev_date = ev.get("date")
         signals.append({
             "ts_code": c,
             "name": r.get("name") or c,
@@ -280,49 +363,73 @@ def run(force: bool = False, dry_run: bool = False,
             "next_level": 1,
             "suggested_lots": getattr(_sp, "first_lots", None),
             "action": "buy",
-            "note": "非持仓·首仓信号（时机✓）",
-            "pctile": t.get("pctile_window"),
+            "note": "非持仓·首仓信号（实时时机✓）",
+            "pctile": round(pct, 1),
+            "sig_date": ev_date if ev_date and ev_date <= today else today,
         })
     signals.sort(key=lambda x: x.get("ts_code") or "")
+
+    # 5) 去重 + 补推兜底（v7.0.31）：已推（alerts）永不重推；未推 → 重推
+    state = _load_state()
+    alerts, pending = state["alerts"], state["pending"]
+    dirty = _prune_pending(pending, alerts, today)
     if not signals:
+        if dirty:
+            _save_state(state)
         log.info("无触发（持仓 %d 只 + 池内非持仓 %d 只检查完毕，price_source=%s）",
                  len(held_codes), len(set(pool.codes) - set(held_codes)), price_source)
         return 0
-
-    # 5) 去重（同日同点位不重推）
-    state = _load_state()
-    today = _beijing_now().strftime("%Y-%m-%d")
     to_push = []
     for sig in signals:
         k = _alert_key(sig)
-        prev = state.get(k)
-        if prev and prev.get("date") == today:
-            log.info("去重: %s 今早已推（%s）", k, prev.get("at"))
+        if k in alerts:
+            log.info("去重: %s 已推送过（%s），不重推", k, (alerts[k] or {}).get("at"))
             continue
+        pend = pending.get(k) or {}
+        sig_date = sig.get("sig_date") or today
+        first_seen = min(pend.get("first_seen") or sig_date, sig_date)
+        sig["first_seen"] = first_seen
+        sig["delayed"] = first_seen < today
         to_push.append((k, sig))
     if not to_push:
-        log.info("全部触发今早已推过，跳过")
+        if dirty:
+            _save_state(state)
+        log.info("全部触发均已推送过，跳过")
         return 0
-
-    # 6) 推送（聚合一条）
+    # 6) 渲染 + dry-run 出口（不落任何状态）
     title, content = render_message([s for _, s in to_push], getattr(_sp, "name", "策略"),
                                     price_source, spot_time)
-    log.info("触发 %d 条（%s），标题: %s", len(to_push), price_source, title)
+    n_delayed = sum(1 for _, s in to_push if s.get("delayed"))
+    log.info("触发 %d 条（%s%s），标题: %s", len(to_push), price_source,
+             f"，补推 {n_delayed}" if n_delayed else "", title)
     if dry_run:
         log.info("dry-run：不推送不落状态")
         return 0
+    # 6b) 应推未推信号先记账并落盘（推送前——推送中途崩溃也保住 first_seen；
+    # 成功后移入 alerts 并从 pending 移除）
+    for k, sig in to_push:
+        p = dict(pending.get(k) or {})
+        p["first_seen"] = sig["first_seen"]
+        p["name"] = sig.get("name")
+        pending[k] = p
+    try:
+        _save_state(state)
+    except OSError as exc:
+        log.warning("pending 预落盘失败（不影响推送）: %s", exc)
     try:
         assert key is not None   # dry_run 时 key 可缺（上方已拦截非 dry_run 缺 key）
         push_pushplus(key, title, content)
-    except Exception as exc:  # noqa: BLE001 - 推送失败不落状态 → 下轮重试
+    except Exception as exc:  # noqa: BLE001 - 推送失败不落 alerts（留 pending 重试）
         log.error("推送加推送失败（不落状态，下轮重试）: %s", exc)
         return 4
 
-    # 7) 落状态（原子写）
+    # 7) 落状态（原子写：alerts += 已推；pending -= 已推）
     at = _beijing_now().isoformat(timespec="seconds")
     for k, sig in to_push:
-        state[k] = {"date": today, "at": at, "price": sig["price"],
-                    "name": sig.get("name")}
+        alerts[k] = {"date": today, "at": at, "price": sig["price"],
+                     "name": sig.get("name"),
+                     "signal_date": sig.get("first_seen")}
+        pending.pop(k, None)
     try:
         _save_state(state)
     except OSError as exc:

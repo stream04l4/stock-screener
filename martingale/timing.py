@@ -164,6 +164,65 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
     return out
 
 
+def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
+                    tp) -> Dict[str, Optional[float]]:
+    """实时分位（v7.0.31）：以当前价替换 5 年前复权窗口末值重算分位①。
+
+    微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
+    收盘快照滞后一天——「价格破线 + 分位破 40%」同日达成时，快照只在当晚
+    刷新、推送窗口（15:05 止）早已关闭 → 结构性漏推（山煤国际 2026-11-10
+    实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）。窗口与
+    refresh_timing 同一口径（kline_daily_qfq、近 N 年、截至湖最新 bar）；
+    现价（原始价）按该股**自身末 bar** 因子折前复权（qfq_now = price ×
+    last_qfq/last_raw；当日除权事件不影响昨日因子，误差 ~bp 级/1200 bar）。
+
+    :param prices: {code: 当前原始价（spot；无行情时传湖最后收盘）}；
+      缺/None/≤0 → 该股 None。
+    :return: {code: 分位(0-100) | None}；无 qfq 序列/bar 不足/无因子 →
+      None（fail-closed，调用方按「时机未过」处理）。
+    """
+    if not codes:
+        return {}
+    latest = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+    if latest is None:
+        return {c: None for c in codes}
+    start = str(_years_ago(latest, tp.price_window_years))
+    fmt = ", ".join(["?"] * len(codes))
+    con.execute(
+        f"SELECT ts_code, close FROM kline_daily_qfq "
+        f"WHERE ts_code IN ({fmt}) AND date >= ? ORDER BY ts_code, date",
+        [*codes, start])
+    series: Dict[str, List[float]] = {}
+    for c, cl in con.fetchall():
+        if cl is not None:
+            series.setdefault(str(c), []).append(float(cl))
+    # 各股自身末 bar 的 raw→qfq 因子
+    con.execute(
+        f"SELECT k.ts_code, k.close AS raw, h.close AS qfq "
+        f"FROM kline_daily k "
+        f"JOIN kline_daily_qfq h USING (ts_code, date) "
+        f"JOIN (SELECT ts_code, MAX(date) AS md FROM kline_daily "
+        f"      WHERE ts_code IN ({fmt}) GROUP BY ts_code) m "
+        f"  ON m.ts_code = k.ts_code AND m.md = k.date "
+        f"WHERE k.ts_code IN ({fmt}) AND k.close > 0",
+        list(codes) + list(codes))
+    fac: Dict[str, float] = {}
+    for c, raw, qfq in con.fetchall():
+        if raw and qfq:
+            fac[str(c)] = float(qfq) / float(raw)
+    out: Dict[str, Optional[float]] = {}
+    for c in codes:
+        ks = series.get(str(c))
+        p = prices.get(c)
+        f = fac.get(str(c))
+        if not ks or len(ks) < 2 or p is None or p <= 0 or not f:
+            out[c] = None
+            continue
+        cur = float(p) * f
+        out[c] = sum(1 for x in ks if x <= cur) / len(ks) * 100.0
+    return out
+
+
 def load_timing_map(con) -> Dict[str, Dict[str, Any]]:
     """预计算表 → {ts_code: 行}。表不存在/为空 → {}（fail-closed 全不触发）。"""
     try:

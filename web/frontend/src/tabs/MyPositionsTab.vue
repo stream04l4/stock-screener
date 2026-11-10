@@ -68,13 +68,16 @@ const sigStocks = computed(() => sigData.value?.stocks || []);
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
          && (s.held || s.timing_ok === true)));
-// 即将进入（v7.0.22，Joel 定案：「非持仓股即将进入买入时机，或持仓股即将
-// 触发加仓」）：价格带（3% 内临线）+ 时机门——持仓股照展示（加仓不受时机
-// 限制）；非持仓股须 timing_ok=true 才展示：时机未过（或无时机行 fail-
-// closed）的非持仓股即使价格临区也永远发不出买入信号（时机门只去动作），
-// 留在段里即噪音。
+// 即将进入（v7.0.22 定案；v7.0.31 Joel 定案 C：非持仓股分位放宽到 ≤50%
+// 展示——40% 时机门未过但价格已临区的股票 = 最有提前量价值的信号，标
+// 「时机未过」明细；原「timing_ok 才展示」会让这类股票在时机翻转前完全
+// 不可见，翻转当晚才突然出信号（山煤国际 2026-11-10 实案））：价格带
+// （5% 内临线）——持仓股照展示（加仓不受时机限制）；非持仓股须
+// timing_pctile ≤ 50（无分位数据 fail-closed 不展示）。
 const sigApproach = computed(() => sigStocks.value.filter(
-  (s) => s.status === "approaching" && (s.held || s.timing_ok === true)));
+  (s) => s.status === "approaching"
+         && (s.held || (typeof s.timing_pctile === "number"
+                        && s.timing_pctile <= 50))));
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 
@@ -562,6 +565,8 @@ function pnlColor(v) {
         股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
         {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号区 = 下一档触发价 ·
         「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 5 }}% 以内
+        （持仓股照列；非持仓股须 5 年分位 ≤50%——40% 时机门未过但价格已临区，标
+        「未过（分位 X%）」，见「时机」列）
         · 当前 = 现价在区内 或 今日已触线（「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史）；
         仅持仓加仓信号 + 非持仓买入信号（首仓线），非持仓模拟已建仓的加仓档不入当前信号（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）

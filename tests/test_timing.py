@@ -182,3 +182,62 @@ def test_refresh_timing_conditions():
     tm.refresh_timing(con, up=None, tp=tp, members=members)
     assert con.execute(f"SELECT COUNT(*) FROM {tm.TABLE}").fetchone()[0] == 4
     con.close()
+
+
+# ---------------------------------------------------------------------------
+# 3) v7.0.31 live_pctile_map：实时分位（推送盘中门，Joel 定案 A）
+# ---------------------------------------------------------------------------
+def test_live_pctile_replaces_last_bar_and_factors():
+    """现价替换窗口末值重算分位 + 自身末 bar 因子折 qfq；缺价/无序列 → None。"""
+    from datetime import date, timedelta
+
+    N = 10
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE kline_daily (ts_code VARCHAR, date DATE, close DOUBLE)")
+    con.execute("""CREATE TABLE kline_daily_qfq (ts_code VARCHAR, date DATE,
+               open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+               volume DOUBLE, amount DOUBLE, pct_chg DOUBLE, is_st INTEGER)""")
+    start = date(2025, 10, 24)
+    # e.1：qfq 序列 1..10（无除权 → raw==qfq，因子 1.0）
+    for i in range(N):
+        d = str(start + timedelta(days=i))
+        v = float(i + 1)
+        con.execute("INSERT INTO kline_daily_qfq VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                    ["e.1", d, v, v, v, v])
+        con.execute("INSERT INTO kline_daily VALUES (?, ?, ?)", ["e.1", d, v])
+    # e.2：末 bar 除权——raw 20 / qfq 10（因子 0.5）；qfq 序列 1..10
+    for i in range(N):
+        d = str(start + timedelta(days=i))
+        v = float(i + 1)
+        raw = v if i < N - 1 else 20.0
+        con.execute("INSERT INTO kline_daily_qfq VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                    ["e.2", d, v, v, v, v])
+        con.execute("INSERT INTO kline_daily VALUES (?, ?, ?)", ["e.2", d, raw])
+    # f.3：只有 kline_daily 无 qfq 序列（fail-closed）
+    con.execute("INSERT INTO kline_daily VALUES (?, ?, ?)",
+                ["f.3", str(start + timedelta(days=N - 1)), 10.0])
+    tp = make_tp(price_window_years=1, price_pctile_max=40.0)
+    out = tm.live_pctile_map(con, ["e.1", "e.2", "f.3"],
+                             {"e.1": 4.0, "e.2": 8.0, "f.3": 9.9}, tp)
+    # e.1 @4.0：10 个 bar 里 4 个 ≤4 → 40%
+    assert abs(out["e.1"] - 4.0 / N * 100) < 1e-9
+    # e.2 @raw 8.0：×因子 0.5 → cur=4.0 → 同样 40%
+    assert abs(out["e.2"] - 4.0 / N * 100) < 1e-9
+    # e.2 现价高于末 bar raw（20）→ cur=10 → 100%
+    out2 = tm.live_pctile_map(con, ["e.2"], {"e.2": 20.0}, tp)
+    assert abs(out2["e.2"] - 100.0) < 1e-9
+    # f.3 无 qfq 序列 → None（fail-closed）
+    assert out["f.3"] is None
+    con.close()
+
+
+def test_live_pctile_missing_price_and_empty():
+    """缺价/非正价 → None（fail-closed）；空 codes → {}。"""
+    con = make_lake({"a.1": [1.0, 2.0, 3.0, 4.0, 5.0]})
+    tp = make_tp(price_window_years=1, price_pctile_max=40.0)
+    out = tm.live_pctile_map(con, ["a.1"], {"a.1": None}, tp)
+    assert out == {"a.1": None}
+    out2 = tm.live_pctile_map(con, ["a.1"], {"a.1": 0.0}, tp)
+    assert out2 == {"a.1": None}
+    assert tm.live_pctile_map(con, [], {}, tp) == {}
+    con.close()
