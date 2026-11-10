@@ -134,14 +134,10 @@ const sources = computed(() => {
   }));
 });
 
-// 连通性三态（✓可达/✗不可达/—未探测；复用 availMark 口径）
+// 连通性三态（✓/✗/—未探测；✓✗ 已表意，不重复「可达/不可达」——11-10 Joel review）
 function availMark(a) {
   if (a === null || a === undefined) return "—";
   return a ? "✓" : "✗";
-}
-function connWord(a) {
-  if (a === null || a === undefined) return "未探测";
-  return a ? "可达" : "不可达";
 }
 // 字段组 → chip 短名（brief："T2 日K线·OHLCV+amount(主源)" 形式；模板内联使用）
 // v6.3.3：补 holders（后端 SOURCE_CAPABILITIES.sina 回填 T6 后前端 chips 不再裸显英文）
@@ -250,7 +246,7 @@ function fmtLatency(ms) {
             <div v-if="s.enabled !== false" class="lake-spp-conn">
               <div class="lake-spp-conn-line">
                 <span class="lake-spp-avail" :class="{ ok: s.available === true, bad: s.available === false }">
-                  本机 {{ availMark(s.available) }} {{ connWord(s.available) }}
+                  本机 {{ availMark(s.available) }}<template v-if="s.available === null"> 未探测</template>
                 </span>
                 <span class="muted small mono" v-if="s.latency_ms != null"> · {{ fmtLatency(s.latency_ms) }}</span>
               </div>

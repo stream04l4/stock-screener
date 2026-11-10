@@ -75,9 +75,9 @@ describe("SourcePoolPanel：adapters 三态", () => {
     const byName = {};
     for (const c of cards) byName[c.find("b").text()] = c;
     expect(byName.sina.find(".lake-spp-avail").classes()).toContain("ok");
-    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓ 可达");
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓");
     expect(byName.tencent.find(".lake-spp-avail").classes()).toContain("bad");
-    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗ 不可达");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗");
     expect(byName.tdx.find(".lake-spp-avail").text().trim()).toBe("本机 — 未探测");
     // v1.2：旧形态（无 sg 字段）→ SG 备用档三态占位「—」
     expect(byName.sina.find(".lake-spp-sg").text().trim()).toBe("SG备用 —");
@@ -220,19 +220,19 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(w.findAll(".lake-spp-adapter").length).toBe(4);
   });
 
-  it("卡内四行：连通性（本机✓可达/✗不可达/—未探测 + 各自 latency 分行）+ 探测时间", () => {
+  it("卡内四行：连通性（本机✓/✗/—未探测 + 各自 latency 分行）+ 探测时间", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const byName = cardsBy(w);
-    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓ 可达");
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓");
     // v1.2 修订（11-10 Joel review）：本机/SG 分两行，延迟各归各——
     // 本机行=latency_ms(320ms)，SG 行=sg_latency_ms(900ms)
     const sinaLines = byName.sina.findAll(".lake-spp-conn-line");
     expect(sinaLines.length).toBe(2);
-    expect(sinaLines[0].text()).toContain("本机 ✓ 可达");
+    expect(sinaLines[0].text()).toContain("本机 ✓");
     expect(sinaLines[0].text()).toContain("320ms");
     expect(sinaLines[1].text()).toContain("SG备用 ✓");
     expect(sinaLines[1].text()).toContain("900ms");
-    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗ 不可达");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗");
     expect(byName.adata_f10.find(".lake-spp-avail").text().trim()).toBe("本机 — 未探测");
     // 行4 探测时间（probed_at / 未探测）
     expect(byName.sina.text()).toContain("探测：2026-09-17T08:00:00");
@@ -326,7 +326,7 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     const w = mountPanel({ pool: makePool() });   // makePool 只有 adapters，无 sources
     expect(w.findAll(".lake-spp-adapter").length).toBe(4);
     const byName = cardsBy(w);
-    expect(byName.sina.text()).toContain("✓ 可达");
+    expect(byName.sina.text()).toContain("本机 ✓");
     expect(byName.sina.text()).toContain("配额：无官方配额");   // rate_limit=null → 占位
   });
 });
