@@ -260,7 +260,7 @@ onMounted(loadHistory);
             {{ historyLabel(r) }}
           </option>
         </select>
-        <button id="btn-bt-history-refresh" class="muted" @click="loadHistory" title="刷新列表">🔄</button>
+        <button id="btn-bt-history-refresh" class="ghost-btn" @click="loadHistory" title="刷新列表">🔄 刷新</button>
       </div>
       <div v-if="historyErr" class="msg-err">{{ historyErr }}</div>
     </div>

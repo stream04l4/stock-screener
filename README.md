@@ -1,4 +1,4 @@
-# stock-screener · v7.0.36（drawdown_martingale 单策略版）
+# stock-screener · v7.0.37（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -371,6 +371,17 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.37**：回测页统一排版（2026-11-10 Joel「把回测页面的字体之类的统一
+  排版一下」）：
+  - 回测表单区此前 `.bt-form-grid`/`.f-row`/`.radio` 无 CSS 定义 → 浏览器默认
+    布局（date 输入原生尺寸、radio 挤行、select 无边框），与其他页签 13px
+    控件语言不一致；本次补齐：两列网格、控件 13px/8px 圆角/1px --line 边框、
+    标签 13px 定宽列（历史运行 60px 防折行）、代码输入等宽字体、radio
+    accent-color 统一
+  - 历史运行刷新按钮 class `muted`（仅变色）→ `ghost-btn`（全站幽灵按钮
+    语言），文案 🔄 → 🔄 刷新
+  - 纯展示层，零状态机/数据改动；前端 251 绿，线上浏览器实测计算样式 +
+    截图核对（标签单行、对齐、无溢出）
 - **v7.0.36**：分红余额优先出资（2026-11-10 Joel 定案「有分红盈余要优先用
   分红来投入，分红不够了再从外部投入」）：
   - 买入决策零改动（状态机不看出资 → buy 时间表逐位一致，f6 buy 断言 7/7
