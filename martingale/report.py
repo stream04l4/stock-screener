@@ -89,23 +89,23 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
         nr = np.array([int(r["n_rounds"]) for r in triggered], dtype=float)
         A(f"- 轮次: mean={nr.mean():.2f}, max={nr.max():.0f}")
     A("")
-    A("## 收益（触发过的股票，pnl_pct = 总盈亏/总投入）")
+    A("## 收益（触发过的股票，pnl_pct = 总盈亏/外部净投入；v7.0.36 分红余额优先出资）")
     if len(tp):
         A(f"- 股票数: {len(tp)}")
         A(f"- 胜率(pnl>0): {(tp > 0).mean():.1%}")
         A(f"- mean={tp.mean():.1%}, median={np.median(tp):.1%}")
         for q in (1, 5, 25, 75, 95, 99):
             A(f"- p{q}={np.quantile(tp, q / 100):.1%}")
-        A(f"- 总投入: {sum(float(r['total_invested']) for r in triggered):,.0f}")
+        A(f"- 总投入(外部净): {sum(float(r['total_invested']) for r in triggered):,.0f}")
         A(f"- 最终资产: {sum(float(r['final_assets']) for r in triggered):,.0f}")
         tv = sum(float(r["total_pnl"]) for r in triggered)
         ti = sum(float(r["total_invested"]) for r in triggered)
         A(f"- 总盈亏: {tv:,.0f} ({tv / ti:.1%})")
-        td = sum(float(r["dividends"]) for r in triggered)
+        td = sum(float(r.get("div_pool", 0.0)) for r in triggered)
         if tv > 0:
-            A(f"- 其中分红: {td:,.0f} ({td / tv:.1%}) | 股价增长: {tv - td:,.0f} ({(tv - td) / tv:.1%})")
+            A(f"- 其中分红余额: {td:,.0f} ({td / tv:.1%}) | 股价增长: {tv - td:,.0f} ({(tv - td) / tv:.1%})")
         else:
-            A(f"- 其中分红: {td:,.0f}（总盈亏为负，拆分见个股）")
+            A(f"- 其中分红余额: {td:,.0f}（总盈亏为负，拆分见个股）")
         mu = np.array([float(r["min_unreal_pct"]) for r in triggered])
         A(f"- 最差浮亏(min_unreal_pct): p1={np.quantile(mu, 0.01):.1%}, min={mu.min():.1%}")
     A("")
@@ -129,14 +129,17 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
             A("")
             A(f"### {r['name']} ({r['ts_code']}) — 总盈亏 {float(r['total_pnl']):+,.0f} "
               f"({float(r['pnl_pct']):+.1%})")
-            A(f"- 总投入: {float(r['total_invested']):,.0f} → 最终资产: {float(r['final_assets']):,.0f} "
-              f"(持仓 {float(r['final_assets']) - float(r['dividends']):,.0f} "
-              f"+ 分红现金 {float(r['dividends']):,.0f})")
+            pool = float(r.get("div_pool", 0.0))
+            A(f"- 总投入(外部净): {float(r['total_invested']):,.0f} → 最终资产: "
+              f"{float(r['final_assets']):,.0f} (持仓 {float(r['final_assets']) - pool:,.0f} "
+              f"+ 分红余额 {pool:,.0f})")
+            A(f"- 累计收到分红 {float(r['dividends']):,.0f}（v7.0.36：余额优先出资，"
+              f"未投出部分留在余额）")
             if float(r["total_pnl"]) > 0:
                 A(f"- 拆分: 股价增长 {float(r['price_pnl']):+,.0f} "
                   f"({float(r['price_pnl']) / float(r['total_pnl']):.1%})"
-                  f" + 分红 {float(r['dividends']):+,.0f} "
-                  f"({float(r['dividends']) / float(r['total_pnl']):.1%})")
+                  f" + 分红余额 {pool:+,.0f} "
+                  f"({pool / float(r['total_pnl']):.1%})")
             A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {r['last_status']}, "
               f"最差浮亏 {float(r['min_unreal_pct']):.1%}")
             # v7.0.35：年度汇总替代买入时间表（Joel 2026-11-10：回测结果区已有
@@ -144,12 +147,12 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
             # 分红盈余/股价盈亏/年底总资产）
             annual = r.get("annual") or []
             if annual:
-                A("- 年度汇总（cash 口径：投入=当年放进来/投入的新钱，外部投入=买入"
-                  "现金支出含费，分红投入=分红再投入（当前口径恒 0，列保留）；"
-                  "分红盈余=当年现金分红单列（不投入）；股价盈亏=持仓市值变化"
-                  "（含新购股份）；年底总资产=市值+累计分红现金。恒等式：年底"
-                  "总资产=年初总资产+股价盈亏+分红盈余——投入已转为市值含在"
-                  "股价盈亏内，不另加（否则重复计算））:")
+                A("- 年度汇总（v7.0.36 分红优先出资：分红投入=当年买入中由分红余额"
+                  "出资的部分；外部投入=剩余外部出资；分红盈余=分红余额净变动"
+                  "（收到−投出，余额跨年结转）；股价盈亏=持仓市值变化（含新购股份）；"
+                  "年底总资产=市值+分红余额。恒等式：年底总资产=年初总资产+股价盈亏"
+                  "+分红盈余——投入（外部+分红）已转为市值含在股价盈亏内，不另加"
+                  "（否则重复计算））:")
                 A("")
                 A("| 年份 | 外部投入 | 分红投入 | 分红盈余 | 股价盈亏 | 年底总资产 |")
                 A("|---|---|---|---|---|---|")

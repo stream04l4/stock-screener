@@ -123,43 +123,44 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
 
 
 def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
-                    buys: List[Tuple]) -> List[Dict[str, float]]:
-    """v7.0.35 年度汇总（仅报告字段：进 summary.md 个股明细，不进 f6 字段集 /
-    per_stock.csv；状态机数学零改动）。列语义（Joel 2026-11-10 定案版）：
-    - 外部投入(Y) = 当年买入 Σamount（含佣金 = 实际现金支出）
-    - 分红投入(Y) = cash 口径不投入 → 恒 0（列保留：若未来切再投入口径，
-      此处 = 当年分红 − 分红盈余）
-    - 分红盈余(Y) = 当年累计分红现金增量（cash 口径 = 当年分红全额）
-    - 股价盈亏(Y) = 持仓市值变化 = (v−cd)末 − (v−cd)初（含新购股份价值；
-      投入的钱已转为市值，就含在这一项里）
-    - 年底总资产(Y) = 市值 + 累计分红现金 = v_arr 年末值（与 final_assets 同口径）
+                    du_arr: np.ndarray, ext_by_year: Dict[int, float],
+                    div_by_year: Dict[int, float]) -> List[Dict[str, float]]:
+    """v7.0.36 年度汇总（仅报告字段：进 summary.md 个股明细，不进 f6 字段集 /
+    per_stock.csv；买入决策零改动，仅出资归属变化）。列语义（Joel 2026-11-10
+    定案 v2：分红盈余优先出资，不够再外部投入）：
+    - 外部投入(Y) = 当年买入中外部出资部分（Σamount 含佣金 − 分红出资）
+    - 分红投入(Y) = 当年买入中分红余额出资部分（余额不够部分走外部）
+    - 分红盈余(Y) = 分红余额净变动 = (收到−投出)；余额跨年结转
+    - 股价盈亏(Y) = 持仓市值变化 = (v−余额)末 − (v−余额)初（含新购股份价值；
+      投入的钱——无论外部还是分红——已转为市值，都含在这一项里）
+    - 年底总资产(Y) = 市值 + 分红余额 = v_arr 年末值
     恒等式：资产(年末) = 资产(年初) + 股价盈亏 + 分红盈余（投入不另加——
     会重复计算）；Σ(股价盈亏+分红盈余) = 期末总资产（telescoping）。
-    无持仓且无投入/分红的年份跳过（建仓前全零无信息量）。
+    无持仓且无投入/分红变动的年份跳过（建仓前全零无信息量）。
     """
     n = len(dates)
     if not n:
         return []
-    inv: Dict[int, float] = {}
-    for b in buys:
-        y = int(str(b[0])[:4])
-        inv[y] = inv.get(y, 0.0) + float(b[2])
     years = np.datetime_as_string(dates, unit="Y").astype(int)
     yearly: Dict[int, tuple] = {}
     for i in range(n):
-        yearly[int(years[i])] = (float(v_arr[i]), float(cd_arr[i]))
+        yearly[int(years[i])] = (float(v_arr[i]), float(cd_arr[i]), float(du_arr[i]))
     out: List[Dict[str, float]] = []
-    prev_v = prev_cd = 0.0
+    prev_v = prev_cd = prev_du = 0.0
     for y in sorted(yearly):
-        v_end, cd_end = yearly[y]
-        invested = inv.get(y, 0.0)
-        div_surplus = cd_end - prev_cd
-        price_pnl = (v_end - cd_end) - (prev_v - prev_cd)
-        if prev_v > 0.0 or invested > 0.0 or div_surplus > 0.0:
-            out.append({"year": int(y), "invested_ext": invested,
-                        "invested_div": 0.0, "div_surplus": div_surplus,
+        v_end, cd_end, du_end = yearly[y]
+        pool_end = cd_end - du_end
+        pool_prev = prev_cd - prev_du
+        invested_ext = ext_by_year.get(y, 0.0)
+        invested_div = div_by_year.get(y, 0.0)
+        div_surplus = pool_end - pool_prev
+        price_pnl = (v_end - pool_end) - (prev_v - pool_prev)
+        if (prev_v > 0.0 or invested_ext > 0.0 or invested_div > 0.0
+                or div_surplus > 0.0):
+            out.append({"year": int(y), "invested_ext": invested_ext,
+                        "invested_div": invested_div, "div_surplus": div_surplus,
                         "price_pnl": price_pnl, "end_assets": v_end})
-        prev_v, prev_cd = v_end, cd_end
+        prev_v, prev_cd, prev_du = v_end, cd_end, du_end
     return out
 
 
@@ -173,9 +174,12 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     返回 (stat, state, v_arr, c_arr, flag, buys)：
     - stat: 与参考实现 per_stock.csv 字段**逐位对齐**的统计（pnl_pct/min_unreal_pct
       为比率而非百分数；first/last_buy_date 为 datetime64[ns] 的 str，缺买为 ""）；
-      另含报告专用键 annual（v7.0.35 年汇总，不进 f6 字段集/per_stock.csv 列）；
-    - state: 当前持仓状态投影（status 子命令 / /api/positions 用）；
-    - v_arr/c_arr/flag: 逐 bar 组合价值/成本/持仓标记；
+      v7.0.36 起 total_invested=外部净投入（分红余额优先出资，缺口外部）、
+      price_pnl=市值−外部净投入、pnl_pct=总盈亏/外部净投入；dividends=累计收到
+      （口径不变）；另含报告专用键 div_pool/annual（不进 f6 字段集/per_stock.csv
+      列）；
+    - state: 当前持仓状态投影（status 子命令 / /api/positions 用；cash_div=分红余额）；
+    - v_arr/c_arr/flag: 逐 bar 组合价值/外部净成本/持仓标记；
     - buys: [(date_str, price, amount, k, first_of_round, lots), ...]
       （date_str = datetime64[ns] 的 str，price = 原始成交价，amount = 本笔现金
       支出（含佣金，v7.0.28 手数口径），k = 该笔触发的档下标 0 起（买入前值，
@@ -188,13 +192,18 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     in_pos = False
     shares = 0.0
     open_cost = 0.0        # 当前持有仓位的成本
-    total_invested = 0.0
+    gross_cost = 0.0       # Σ买入成本（毛额；v7.0.36 起仅作参照，stat 报外部净额）
     entry_high = 0.0       # high 模式：滚动高点
     k_level = 0            # 当前阶梯已触发级数
     n_rearms = 0
     low_since_high = 0.0   # bounce 模式：当前高点设定以来的最低价
     realized = 0.0         # 本策略不卖 → 恒 0（字段保留）
-    cash_div = 0.0
+    cash_div = 0.0         # v7.0.36：分红余额（收到累计 − 分红优先出资投出）
+    div_total = 0.0        # v7.0.36：累计收到分红（口径不变，stat["dividends"]）
+    du_cum = 0.0           # v7.0.36：累计分红出资（年汇总 du_arr 用）
+    ext_running = 0.0      # v7.0.36：累计外部净投入（余额优先出资的缺口部分）
+    ext_by_year: Dict[int, float] = {}
+    div_by_year: Dict[int, float] = {}
     n_buys = 0
     n_rounds = 0
     first_buy_i = -1
@@ -205,7 +214,8 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     v_arr = np.zeros(n)
     c_arr = np.zeros(n)
     flag = np.zeros(n, dtype=np.int8)
-    cd_arr = np.zeros(n)   # v7.0.35：逐 bar 累计分红现金（仅年汇总报告用，非状态量）
+    cd_arr = np.zeros(n)   # v7.0.35：逐 bar 累计收到分红（仅年汇总报告用）
+    du_arr = np.zeros(n)   # v7.0.36：逐 bar 累计分红出资（仅年汇总报告用）
 
     # —— 隐含除权还原（参考 L154-202 逐行移植）——
     # 湖内 stk_div 多数为空 → 从 hfq 因子跳变推导除权事件：
@@ -270,6 +280,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                 cash, stk = ev
                 if cash:
                     cash_div += shares * cash
+                    div_total += shares * cash
                 if stk:
                     shares += shares * stk / 10.0
         # 2) 再武装：newhigh=创新高; bounce=较本周期低点反弹 rearm_pct
@@ -300,9 +311,20 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
             first_of_round = not in_pos
             buy_shares = float(n_lots * p.lot_size)
             buy_amt = buy_shares * price * (1.0 + comm)  # 现金支出（含 3bps 佣金）
+            # v7.0.36：分红余额优先出资，缺口外部（Joel 2026-11-10 定案）——
+            # 买入决策不看出资（状态机零改动，buy 时间表与 v7.0.35 逐位一致），
+            # 仅出资归属/净值口径变化：外部净投入 = Σcost − 分红出资
+            div_part = min(buy_amt, cash_div)
+            ext_part = buy_amt - div_part
+            cash_div -= div_part
+            ext_running += ext_part
+            du_cum += div_part
+            _y = int(str(dates[i])[:4])
+            ext_by_year[_y] = ext_by_year.get(_y, 0.0) + ext_part
+            div_by_year[_y] = div_by_year.get(_y, 0.0) + div_part
             shares += buy_shares
             open_cost += buy_amt
-            total_invested += buy_amt
+            gross_cost += buy_amt
             n_buys += 1
             last_buy_i = i
             if first_of_round:
@@ -316,38 +338,44 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
             buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
                          int(k_level), bool(first_of_round), int(n_lots)))
             k_level += 1
-        val = shares * price + cash_div
-        if in_pos and open_cost > 0.0:
-            u = (val - open_cost) / open_cost
+        val = shares * price + cash_div  # cash_div = 分红余额（v7.0.36）
+        # v7.0.36：浮亏口径 = 净值(市值+分红余额) − 外部净投入，对外部出资的回报
+        if in_pos and ext_running > 0.0:
+            u = (val - ext_running) / ext_running
             if u < min_unreal_pct:
                 min_unreal_pct = u
         v_arr[i] = val
-        cd_arr[i] = cash_div
-        c_arr[i] = open_cost if in_pos else 0.0
+        cd_arr[i] = div_total
+        du_arr[i] = du_cum
+        c_arr[i] = ext_running if in_pos else 0.0  # v7.0.36：成本轴=外部净投入
         flag[i] = 1 if in_pos else 0
 
-    final_assets = shares * float(exec_c[-1]) + cash_div
-    total_pnl = realized + shares * float(exec_c[-1]) + cash_div - open_cost
+    final_assets = shares * float(exec_c[-1]) + cash_div  # 市值 + 分红余额
+    # v7.0.36：总盈亏 = 净值 − 外部净投入（与旧口径绝对额恒等：
+    # M + 余额 − E = M + Σd − Σcost，分红出资在分子分母同时消去）
+    total_pnl = realized + shares * float(exec_c[-1]) + cash_div - ext_running
     stat = {
         "ts_code": ts_code,
         "n_bars": n,
         "n_rounds": n_rounds,
         "n_rearms": n_rearms,
         "n_buys": n_buys,
-        "total_invested": total_invested,
+        "total_invested": float(ext_running),  # v7.0.36：外部净投入（分红优先出资）
         "realized_pnl": realized,
         "final_assets": final_assets,
-        "dividends": cash_div,               # cash 口径（固定）
-        "price_pnl": total_pnl - cash_div,
+        "dividends": float(div_total),          # 累计收到分红（口径不变）
+        "div_pool": float(cash_div),            # v7.0.36 报告专用键：分红余额
+        "price_pnl": total_pnl - cash_div,      # 股价增长 = 市值 − 外部净投入
         "total_pnl": total_pnl,
-        "pnl_pct": (total_pnl / total_invested) if total_invested > 0 else np.nan,
+        "pnl_pct": (total_pnl / ext_running) if ext_running > 0 else np.nan,
         "min_unreal_pct": min_unreal_pct,
         "first_buy_date": str(dates[first_buy_i]) if first_buy_i >= 0 else "",
         "last_buy_date": str(dates[last_buy_i]) if last_buy_i >= 0 else "",
         "last_status": "open" if in_pos else ("closed" if n_rounds else "never"),
         "end_date": str(dates[-1]),
         # v7.0.35 年汇总（报告专用；f6 字段集/per_stock.csv 列不受影响）
-        "annual": _annual_summary(dates, v_arr, cd_arr, buys),
+        "annual": _annual_summary(dates, v_arr, cd_arr, du_arr, ext_by_year,
+                                  div_by_year),
     }
     last_price = float(exec_c[-1]) if n else 0.0
     state = {
@@ -358,8 +386,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         "avg_cost": (float(open_cost) / shares) if shares > 0 else 0.0,
         "last_price": last_price,
         "market_value": float(shares * last_price),
-        "cash_div": float(cash_div),
-        "unreal_pct": ((final_assets - open_cost) / open_cost) if open_cost > 0 else 0.0,
+        "cash_div": float(cash_div),  # v7.0.36：分红余额（已扣分红优先出资）
+        "unreal_pct": ((final_assets - ext_running) / ext_running)
+        if ext_running > 0 else 0.0,
         "entry_high": float(entry_high),
         "low_since_high": float(low_since_high),
         "k_level": int(k_level),

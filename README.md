@@ -1,4 +1,4 @@
-# stock-screener · v7.0.35（drawdown_martingale 单策略版）
+# stock-screener · v7.0.36（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -371,6 +371,24 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.36**：分红余额优先出资（2026-11-10 Joel 定案「有分红盈余要优先用
+  分红来投入，分红不够了再从外部投入」）：
+  - 买入决策零改动（状态机不看出资 → buy 时间表逐位一致，f6 buy 断言 7/7
+    过）；仅出资归属变化：每笔 cost 先扣分红余额，缺口计外部净投入；余额
+    跨年结转
+  - 口径：total_invested=外部净投入 E；final_assets=市值+分红余额；
+    total_pnl=净值−E（与旧口径绝对额恒等：M+Σd−C，分红出资在分子分母同时
+    消去）；pnl_pct=总盈亏/E（分母变小 → 收益率更高，同绝对收益更少外部钱）；
+    dividends=累计收到（口径不变）；min_unreal_pct/unreal_pct 对外部净投入；
+    成本轴 c_arr=外部净投入
+  - 年度汇总：分红投入列=当年买入中余额出资部分（不再是恒 0）；分红盈余=
+    余额净变动（收到−投出，跨年结转）
+  - f6 基线更新（6/7 只受影响；sh.600900 无分红零 diff）：total_invested↓
+    =Σ分红出资、final_assets↓同额、pnl_pct↑、min_unreal_pct 略深、
+    total_pnl 不变（1 例 1e-14 ulp 尾差）
+  - 验证：新专测 test_dividend_priority_funding（出资归属/恒等式/恒等恒量/
+    state 投影/成本轴一致 7 组断言）；sz.302132 真实回测实样（分红 79,360
+    全额转投入、余额清零、总盈亏 +3,320,814 不变、收益率 374%→411%）
 - **v7.0.35**：回测 summary.md 个股明细改年度汇总（2026-11-10 Joel 定案「回测
   里已经有买入时间表了，摘要里的个股明细就不需要再列一遍买入时间表了。改成
   个股每年的外部投入、分红再投入（或盈余）以及盈利情况汇总」；同日修订列

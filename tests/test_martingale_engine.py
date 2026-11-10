@@ -222,6 +222,52 @@ def test_annual_summary_never_triggered_empty():
     assert stat["annual"] == []
 
 
+def test_dividend_priority_funding():
+    """v7.0.36：分红余额优先出资，缺口外部（Joel 2026-11-10 定案）。
+    2020: 80 连买 2 档 300 股（C=E=24007.2），年末 25200；
+    2021-01-01 分红 1.0/股 → 余额 300；2021-01-02 70 连买 2 档 700 股
+    （C=49011.5，首笔 300 由余额出资，余额清零，ext=48711.5）。
+    买入决策不看出资 → 时间表/笔数/金额与无出资规则时逐位一致。
+    """
+    p = _params()
+    d = _dates("2020-01-01", "2020-01-02", "2020-01-03", "2021-01-01", "2021-01-02")
+    exmap = {np.datetime64("2021-01-01", "D").astype("datetime64[ns]"): (1.0, 0.0)}
+    sig = np.array([100.0, 80.0, 84.0, 82.0, 70.0])
+    stat, state, v_arr, c_arr, flag, buys = run_stock(
+        "t", d, sig, sig, exmap, p, verbose=False)
+    # 1) 买入时间表与出资规则无关（4 笔，金额含 3bps）
+    assert [b[2] for b in buys] == pytest.approx(
+        [100 * 80 * 1.0003, 200 * 80 * 1.0003, 300 * 70 * 1.0003, 400 * 70 * 1.0003])
+    # 2) 出资归属：外部净投入 = Σcost − 分红出资(300)
+    c_total = 100 * 80 * 1.0003 + 200 * 80 * 1.0003 + 300 * 70 * 1.0003 + 400 * 70 * 1.0003
+    assert stat["total_invested"] == pytest.approx(c_total - 300.0)
+    assert stat["dividends"] == pytest.approx(300.0)      # 累计收到（口径不变）
+    assert stat["div_pool"] == pytest.approx(0.0)          # 余额全部出资
+    # 3) 总盈亏绝对额与旧口径恒等（M + Σd − C），余额在分子分母同时消去
+    m_end = 1000 * 70.0
+    assert stat["final_assets"] == pytest.approx(m_end)
+    assert stat["total_pnl"] == pytest.approx(m_end + 300.0 - c_total)
+    assert stat["pnl_pct"] == pytest.approx((m_end + 300.0 - c_total) / (c_total - 300.0))
+    # 4) 年度汇总：2021 分红投入=300；盈余=余额净变动=收到300−投出300=0
+    a21 = stat["annual"][1]
+    assert a21["invested_div"] == pytest.approx(300.0)
+    assert a21["div_surplus"] == pytest.approx(0.0)
+    assert a21["invested_ext"] == pytest.approx(300 * 70 * 1.0003 + 400 * 70 * 1.0003 - 300.0)
+    assert a21["price_pnl"] == pytest.approx(m_end - 300 * 84.0)
+    assert a21["end_assets"] == pytest.approx(m_end)
+    # 5) 恒等式 + telescoping
+    a20 = stat["annual"][0]
+    assert a21["end_assets"] == pytest.approx(
+        a20["end_assets"] + a21["price_pnl"] + a21["div_surplus"])
+    assert sum(a["price_pnl"] + a["div_surplus"] for a in stat["annual"]) \
+        == pytest.approx(stat["final_assets"])
+    # 6) state 投影：浮亏口径 = 净值 − 外部净投入
+    assert state["cash_div"] == pytest.approx(0.0)
+    assert state["unreal_pct"] == pytest.approx((m_end - (c_total - 300.0)) / (c_total - 300.0))
+    # 7) 净值/成本轴一致：v_arr − c_arr = 净值 − 外部净投入（末值 = total_pnl）
+    assert v_arr[-1] - c_arr[-1] == pytest.approx(stat["total_pnl"])
+
+
 # ---------------------------------------------------------------------------
 # 隐含除权推导（af_ratio 算法）
 # ---------------------------------------------------------------------------
