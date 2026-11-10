@@ -63,12 +63,27 @@ const RESULTS = {
   run_meta: { window: { start: "2018-03-01", end: "2026-10-21" }, n_codes: 2, elapsed_s: 1.2 },
 };
 
+// ---- v7.0.34 历史回测列表 fixture（实值取自 output/.../status.json 结构）----
+const HISTORY_RUNS = [
+  { task_id: "bt_20261110_140739_4a63", generated_at: "2026-11-10T14:07:39Z",
+    window_start: "2010-08-27", window_end: "2026-11-10", n_dates: 3843,
+    n_stocks: 1, n_triggered: 1, n_buys_total: 125,
+    params: { first_drawdown_pct: 15.0, add_step_pct: 5.0, rearm_mode: "bounce" } },
+  { task_id: "bt_20261022_100811_630d", generated_at: null,
+    window_start: null, window_end: null, n_dates: null,
+    n_stocks: null, n_triggered: null, n_buys_total: null, params: {} },
+];
+
 let sse = null;
 function mockApi() {
   apiMock.mockImplementation(async (path, opts = {}) => {
     if (path === "/api/bt/runs" && opts.method === "POST") {
       return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1",
                meta: { start: null, end: null, codes: null, pool: true } };
+    }
+    if (path.startsWith("/api/bt/runs?")) return { runs: HISTORY_RUNS, total: HISTORY_RUNS.length };
+    if (path === "/api/bt/results/bt_20261110_140739_4a63") {
+      return JSON.parse(JSON.stringify({ ...RESULTS, task_id: "bt_20261110_140739_4a63" }));
     }
     if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
     throw new Error("unmocked: " + path + " " + (opts.method || "GET"));
@@ -173,7 +188,8 @@ describe("BacktestTab · 表单与触发", () => {
   it("无策略下拉；POST body 不带 strategy 键；不请求 /api/strategies", async () => {
     const w = mk();
     await flushPromises();
-    expect(w.find("select").exists()).toBe(false);
+    // v7.0.34 后页面有历史回测下拉——守卫范围限定参数表单（策略选择退役语义）
+    expect(w.find(".bt-form select").exists()).toBe(false);
     await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
     const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
@@ -284,6 +300,37 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
     expect(t).not.toContain("T00:00:00");
     // 整数列不受影响
     expect(t).toContain("3843");
+    w.unmount();
+  });
+});
+
+describe("BacktestTab · 历史回测结果（v7.0.34）", () => {
+  it("onMounted 拉 /api/bt/runs 列表 → 下拉 2 项（完整 + 运行中/不完整）", async () => {
+    const w = mk();
+    await flushPromises();
+    const sel = w.find("#bt-history-select");
+    expect(sel.exists()).toBe(true);
+    const opts = w.findAll("#bt-history-select option");
+    expect(opts.length).toBe(3); // 占位 + 2 历史
+    expect(w.text()).toContain("2026-11-10 14:07 · 1 股 · 2010-08-27~2026-11-10");
+    expect(w.text()).toContain("运行中/不完整");
+    w.unmount();
+  });
+
+  it("选中历史 → GET /api/bt/results/{id} → 结果区渲染 + 【历史产物】标记", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("#bt-history-select").setValue("bt_20261110_140739_4a63");
+    for (let i = 0; i < 8; i++) await flushPromises();
+    expect(apiMock.mock.calls.some(([p]) => p === "/api/bt/results/bt_20261110_140739_4a63"))
+      .toBe(true);
+    const t = w.text();
+    expect(t).toContain("回测结果");
+    expect(t).toContain("【历史产物】");
+    expect(t).toContain("中国神华"); // 历史结果的 per_stock 行
+    expect(t).toContain("产物 bt_20261110_140739_4a63");
+    // 下拉复位（可再次选择）
+    expect(w.find("#bt-history-select").element.value).toBe("");
     w.unmount();
   });
 });

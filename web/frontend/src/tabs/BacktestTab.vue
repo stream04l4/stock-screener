@@ -5,7 +5,8 @@
 // → done → GET /api/bt/results/{id}（taskStore.fetchResults，缓存 lastResults 供查询页复用）。
 // echarts = npm 依赖（锁 5.6.0），动态 import 独立 chunk。
 <script setup>
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { api } from "../api/client.js";
 import { useToastStore } from "../stores/toastStore.js";
 import { useTaskStore } from "../stores/taskStore.js";
 import SimpleTable from "../components/SimpleTable.vue";
@@ -61,6 +62,7 @@ watch(
     resultsError.value = "";
     try {
       results.value = await store.fetchResults(tid);
+      loadedFromHistory.value = false; // 新回测产物覆盖历史视图
     } catch (e) {
       resultsError.value = "结果加载失败：" + e.message;
     }
@@ -152,6 +154,7 @@ const metaText = computed(() => {
   const m = d.run_meta || {};
   const w = m.window || {};
   return (
+    (loadedFromHistory.value ? "【历史产物】" : "") +
     `窗口 ${w.start || "各股数据起点"} ~ ${w.end || "数据终点"} · ` +
     `标的 ${m.n_codes ?? (d.per_stock || []).length} 只 · ` +
     `策略 当前策略（strategy.yaml） · ` +
@@ -159,6 +162,51 @@ const metaText = computed(() => {
     `产物 ${d.task_id}`
   );
 });
+
+// ---------------------------------------------------------------------------
+// 历史回测结果（v7.0.34，Joel 2026-11-10）：GET /api/bt/runs 列表 + 选中加载
+// GET /api/bt/results/{id} 填入同一结果区（与 SSE done 同形状，纯只读）。
+// 不碰 taskStore（新回测完成仍按原链路覆盖结果区）。
+// ---------------------------------------------------------------------------
+const historyRuns = ref([]);
+const historySel = ref("");
+const historyErr = ref("");
+const loadedFromHistory = ref(false);
+
+function historyLabel(r) {
+  const t = r.generated_at ? r.generated_at.replace("T", " ").slice(0, 16) : r.task_id;
+  const w = `${r.window_start || "?"}~${r.window_end || "?"}`;
+  const n = r.n_stocks != null ? `${r.n_stocks} 股` : "运行中/不完整";
+  return `${t} · ${n} · ${w}`;
+}
+
+async function loadHistory() {
+  historyErr.value = "";
+  try {
+    const d = await api("/api/bt/runs?limit=50");
+    historyRuns.value = d.runs || [];
+  } catch (e) {
+    historyErr.value = "历史列表加载失败：" + e.message;
+  }
+}
+
+async function onHistoryLoad() {
+  const tid = historySel.value;
+  if (!tid) return;
+  historyErr.value = "";
+  try {
+    const d = await api("/api/bt/results/" + tid);
+    results.value = d;
+    loadedFromHistory.value = true;
+    historySel.value = "";
+    const el = document.querySelector(".bt-results");
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) {
+    historyErr.value = "历史结果加载失败：" + e.message;
+  }
+}
+
+onMounted(loadHistory);
 </script>
 
 <template>
@@ -198,6 +246,24 @@ const metaText = computed(() => {
 
     <!-- 进度（SSE 驱动；跨页签保活） -->
     <TaskProgress />
+
+    <!-- 历史回测结果（v7.0.34）：只读加载，不碰运行中任务 -->
+    <div class="card bt-history">
+      <h3>📜 历史回测结果</h3>
+      <p class="muted small">加载过往回测产物到下方结果区（只读；不影响运行中任务）。</p>
+      <div class="f-row">
+        <span>历史运行</span>
+        <select id="bt-history-select" v-model="historySel" @change="onHistoryLoad"
+                :disabled="historyRuns.length === 0">
+          <option value="" disabled>选择一次过往回测…</option>
+          <option v-for="r in historyRuns" :key="r.task_id" :value="r.task_id">
+            {{ historyLabel(r) }}
+          </option>
+        </select>
+        <button id="btn-bt-history-refresh" class="muted" @click="loadHistory" title="刷新列表">🔄</button>
+      </div>
+      <div v-if="historyErr" class="msg-err">{{ historyErr }}</div>
+    </div>
 
     <!-- 结果区 -->
     <div v-if="resultsError" class="msg-err">{{ resultsError }}</div>

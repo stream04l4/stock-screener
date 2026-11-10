@@ -437,6 +437,68 @@ def test_bt_run_uses_active_config_only(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/bt/runs 历史回测列表（v7.0.34，Joel 2026-11-10「历史回测结果读取」）
+# ---------------------------------------------------------------------------
+def _mk_run(base: Path, tid: str, with_status: bool = True, corrupt: bool = False):
+    import json
+    d = base / tid
+    d.mkdir(parents=True)
+    if with_status:
+        sj = d / "status.json"
+        if corrupt:
+            sj.write_text("{broken json", encoding="utf-8")
+        else:
+            sj.write_text(json.dumps({
+                "generated_at": "2026-11-10T14:07:39Z",
+                "window": {"start": "2010-08-27", "end": "2026-11-10", "n_dates": 3843},
+                "params": {"first_drawdown_pct": 15.0},
+                "n_stocks": 1, "n_triggered": 1, "n_buys_total": 125,
+            }), encoding="utf-8")
+    return d
+
+
+def test_bt_runs_list_sorted_desc_and_fields(monkeypatch, tmp_path):
+    """task_id 降序（时间戳序）；status.json 字段映射；非 bt_* 目录忽略。"""
+    monkeypatch.setattr(wapp, "BT_RUNS_DIR", tmp_path / "runs")
+    _mk_run(wapp.BT_RUNS_DIR, "bt_20261022_100811_630d")
+    _mk_run(wapp.BT_RUNS_DIR, "bt_20261110_140739_4a63")
+    (wapp.BT_RUNS_DIR / "not_a_run").mkdir()   # 非 bt_* → 忽略
+    out = wapp.bt_runs_list()
+    assert out["total"] == 2
+    assert [r["task_id"] for r in out["runs"]] == [
+        "bt_20261110_140739_4a63", "bt_20261022_100811_630d"]
+    r0 = out["runs"][0]
+    assert r0["generated_at"] == "2026-11-10T14:07:39Z"
+    assert r0["window_start"] == "2010-08-27"
+    assert r0["n_stocks"] == 1
+    assert r0["params"] == {"first_drawdown_pct": 15.0}
+
+
+def test_bt_runs_list_incomplete_and_corrupt(monkeypatch, tmp_path):
+    """无 status.json（运行中）与损坏的 status.json → generated_at=None，仍列出。"""
+    monkeypatch.setattr(wapp, "BT_RUNS_DIR", tmp_path / "runs")
+    _mk_run(wapp.BT_RUNS_DIR, "bt_20261110_200000_aaaa", with_status=False)
+    _mk_run(wapp.BT_RUNS_DIR, "bt_20261110_210000_bbbb", corrupt=True)
+    out = wapp.bt_runs_list()
+    assert out["total"] == 2
+    assert all(r["generated_at"] is None for r in out["runs"])
+    assert all(r["params"] == {} for r in out["runs"])
+
+
+def test_bt_runs_list_empty_and_limit(monkeypatch, tmp_path):
+    """空目录 → 空列表；limit 截断 + 非法值回退 30。"""
+    monkeypatch.setattr(wapp, "BT_RUNS_DIR", tmp_path / "runs")
+    wapp.BT_RUNS_DIR.mkdir()
+    assert wapp.bt_runs_list() == {"runs": [], "total": 0}
+    for i in range(5):
+        _mk_run(wapp.BT_RUNS_DIR, f"bt_20261110_10000{i}_{i:04x}")
+    out = wapp.bt_runs_list(limit=2)
+    assert len(out["runs"]) == 2 and out["total"] == 5
+    assert len(wapp.bt_runs_list(limit=0)["runs"]) == 5  # 非法 → 默认 30 ≥ 5
+    assert len(wapp.bt_runs_list(limit=999)["runs"]) == 5  # 上限截断到总数
+
+
+# ---------------------------------------------------------------------------
 # /api/stocks/search 模糊搜索（v7.0.3）：代码/中文名/拼音首字母/全拼 + 503/400 分支
 # ---------------------------------------------------------------------------
 

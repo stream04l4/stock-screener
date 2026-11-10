@@ -745,6 +745,52 @@ def bt_run_status(task_id: str) -> Dict[str, Any]:
     return tm.status(task_id)
 
 
+@app.get("/api/bt/runs")
+def bt_runs_list(limit: int = 30) -> Dict[str, Any]:
+    """历史回测列表（v7.0.34，Joel 2026-11-10：「回测页面最好有个历史回测
+    结果读取功能」）：扫描 BT_RUNS_DIR 各产物目录的 status.json 摘要。
+
+    只读零副作用；task_id 含时间戳 → 降序 = 最新在前。运行中/不完整（无
+    status.json）的任务 generated_at=None，前端标「运行中/不完整」。
+    limit 上限 100（防一次拉太宽）。
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 30
+    if limit < 1:
+        limit = 30
+    limit = min(limit, 100)
+    runs: List[Dict[str, Any]] = []
+    if BT_RUNS_DIR.is_dir():
+        for d in BT_RUNS_DIR.iterdir():
+            if not d.is_dir() or not re.fullmatch(r"bt_[A-Za-z0-9_]+", d.name):
+                continue
+            meta = None
+            sj = d / "status.json"
+            if sj.exists():
+                try:
+                    meta = json.loads(sj.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001 - status.json 损坏 → 按不完整展示
+                    meta = None
+            if not isinstance(meta, dict):
+                meta = {}
+            w = meta.get("window") or {}
+            runs.append({
+                "task_id": d.name,
+                "generated_at": meta.get("generated_at"),
+                "window_start": w.get("start"),
+                "window_end": w.get("end"),
+                "n_dates": w.get("n_dates"),
+                "n_stocks": meta.get("n_stocks"),
+                "n_triggered": meta.get("n_triggered"),
+                "n_buys_total": meta.get("n_buys_total"),
+                "params": meta.get("params") or {},
+            })
+    runs.sort(key=lambda r: r["task_id"], reverse=True)
+    return {"runs": runs[:limit], "total": len(runs)}
+
+
 @app.get("/api/bt/results/{task_id}")
 def bt_results(task_id: str) -> Dict[str, Any]:
     """回测产物 → JSON（per_stock / buys / equity_curve / summary / status）。"""

@@ -1,4 +1,4 @@
-# stock-screener · v7.0.33（drawdown_martingale 单策略版）
+# stock-screener · v7.0.34（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -371,6 +371,18 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.34**：回测页历史回测结果读取（2026-11-10 Joel 定案「回测页面最好
+  有个历史回测结果读取功能」）：
+  - 后端 `GET /api/bt/runs?limit=`（只读，上限 100）：扫 BT_RUNS_DIR 各产物
+    目录的 status.json 摘要（窗口/标的数/参数），task_id 时间戳降序；运行中/
+    不完整（无 status.json）generated_at=None。
+  - 前端回测页新增「📜 历史回测结果」卡：onMounted 拉列表 → 下拉选择
+    （时间 · N 股 · 窗口）→ 选中即 `GET /api/bt/results/{id}` 填入同一结果区
+    （与 SSE done 同形状复用展示，meta 行加【历史产物】标记）；不碰
+    taskStore，新回测完成仍按原链路覆盖。
+  - 验证：后端 3 新用例（排序/字段映射/不完整+损坏/空目录+limit）、
+    前端 251 绿（新增列表+加载 2 用例；v7.0.29「无策略下拉」守卫限定到
+    .bt-form 内）、线上实测 6 次历史回测列出、101 股历史产物 1.5s 加载。
 - **v7.0.33**：回测结果个股汇总展示收敛（2026-11-10 Joel 反馈「个股汇总的数值
   保留小数点后位数太多了」）：
   - 引擎产物是全精度 float（如 887013.0240999996 / 3.743816971766769）+
