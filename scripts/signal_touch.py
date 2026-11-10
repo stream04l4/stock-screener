@@ -114,7 +114,7 @@ def run(dry_run: bool = False) -> int:
     for e in events:
         print(f"  {e['date']} {e['ts_code']} {e['name']} "
               f"{'首仓' if e['first_of_round'] else '第' + str(e['level']) + '档'} "
-              f"line={e['level_price']} low={e['low_price']} amount={e['amount']}")
+              f"line={e['level_price']} low={e['low_price']} lots={e['lots']}")
     return 0
 
 
