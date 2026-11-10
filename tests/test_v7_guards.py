@@ -47,7 +47,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # v7.0.21（7f7b2ba）：af_rebase 提升至仓库根共享模块（跨包护栏调用），基线前移。
 # v7.0.31（b1221da）：删除 v6.1 退役一次性迁移 migrate_conflict_col.py（Joel
 # 拍板；生产库早已补列，无再跑场景），lake/ 有意变更，基线前移。
-BASELINE = "b1221da"
+# 数据湖页 v1.1+v1.2（5bb4630，2026-11-10）：source_pool.py 7 源能力表 +
+# web_api.py SG 双通道探测（Gate 1 并行任务），lake/ 有意变更，基线前移。
+BASELINE = "5bb4630"
 
 
 def _git(*args) -> str:
