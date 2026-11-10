@@ -8,7 +8,8 @@
 import { computed, reactive, ref } from "vue";
 import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
-import { invalidate } from "../live/queryRegistry.js";
+import { invalidate, peek } from "../live/queryRegistry.js";
+import { inTradingWindow } from "../live/tradingWindow.js";
 import { useTaskStore } from "../stores/taskStore.js";
 import SimpleTable from "../components/SimpleTable.vue";
 import Modal from "../components/Modal.vue";
@@ -16,13 +17,30 @@ import Modal from "../components/Modal.vue";
 const store = useTaskStore();
 
 // ---------------------------------------------------------------------------
-// 数据（按需 + 手动刷新；策略固定 = 当前策略 config/strategy.yaml，v7.0.29
-// 策略库退役——不再有 ?strategy= 快照选择）
+// 数据（v7.0.30 实时刷新：交易时段内 30s 自动轮询——后端对「股票池 ∪ 持仓」
+// 取腾讯实时价，前端零维护；非交易时段不发请求、保留最近数据。首载恒取一次。
+// 策略固定 = 当前策略 config/strategy.yaml，v7.0.29 策略库退役。）
 // ---------------------------------------------------------------------------
+const POLL_MS = 30000;
+// 时段门取数：交易时段 或 尚无缓存（首载）→ 走网络；非时段有缓存 → 直接返回
+// 缓存（registry 记 at=now，轮询空转零网络）。手动刷新按钮经 forceKeys 强制
+// 走网络（invalidate 不清缓存，只打过期标记——不强制的话非时段手刷会拿到旧缓存）。
+const forceKeys = new Set();
+function gatedFetch(key, url) {
+  return () => {
+    if (forceKeys.delete(key)) return api(url);
+    if (inTradingWindow() || peek(key) === undefined) return api(url);
+    return Promise.resolve(peek(key));
+  };
+}
+
 const { data: myData, loading: myLoading, error: myError } =
-  useLiveQuery("my_positions", () => api("/api/my_positions"), {});
+  useLiveQuery("my_positions", gatedFetch("my_positions", "/api/my_positions"),
+               { interval: POLL_MS });
 
 function refresh() {
+  forceKeys.add("my_positions");
+  forceKeys.add("strategy_signals");
   invalidate("my_positions");
   invalidate("strategy_signals");
 }
@@ -34,7 +52,9 @@ function refresh() {
 // ---------------------------------------------------------------------------
 const sigSel = ref("active"); // active | approaching | history
 const { data: sigData, loading: sigLoading, error: sigError } =
-  useLiveQuery("strategy_signals", () => api("/api/strategy_signals"), {});
+  useLiveQuery("strategy_signals",
+               gatedFetch("strategy_signals", "/api/strategy_signals"),
+               { interval: POLL_MS });
 
 const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
 const sigStocks = computed(() => sigData.value?.stocks || []);
@@ -539,8 +559,9 @@ function pnlColor(v) {
     <div class="card">
       <h3>📡 策略信号（当前策略）</h3>
       <p class="muted small">
-        覆盖股票池 ∪ 我的持仓 · 信号区 = 下一档触发价 ·
-        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 3 }}% 以内
+        股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
+        {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号区 = 下一档触发价 ·
+        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 5 }}% 以内
         · 当前 = 现价在区内 或 今日已触线（「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史）；
         仅持仓加仓信号 + 非持仓买入信号（首仓线），非持仓模拟已建仓的加仓档不入当前信号（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
@@ -549,6 +570,7 @@ function pnlColor(v) {
         <span v-if="sigData?.price_source === 'spot'">
           · 价源：实时行情{{ sigData.spot_time ? " " + sigData.spot_time : "" }}</span>
         <span v-else-if="sigData">· 价源：最新收盘（T+1）</span>
+        <span>· 交易时段 30s 自动刷新（非时段停轮询，手动刷新随时可用）</span>
       </p>
       <div v-if="sigData?.lake_locked" class="lake-backfill">
         ⏳ 数据湖正被灌数进程占用——策略参考暂不可用（仅列账本代码）；灌数结束后刷新。

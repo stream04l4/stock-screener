@@ -48,9 +48,11 @@ def test_get_strategy_five_sections():
     assert {"strategy", "universe", "lake", "datasource"} <= keys
     assert len(out["json"]["strategy"]) == 8
     assert len(out["json"]["universe"]) == 10  # v7.0.12：5 基础条件 + 5 候选池门槛
-    # v7.0.13：timing 段 3 键（v7.0.26：②③ 删除、首仓建仓回撤移入；缺省时 GET 用默认值补齐）
+    # v7.0.13：timing 段（v7.0.26：②③ 删除、首仓建仓回撤移入；v7.0.30：+
+    # approach_pct 显示带 / spot_preselect_pct 实时取价预筛带，web 侧口径）
     assert set(out["json"]["timing"].keys()) == {
-        "price_window_years", "price_pctile_max", "first_drawdown_pct"}
+        "price_window_years", "price_pctile_max", "first_drawdown_pct",
+        "approach_pct", "spot_preselect_pct"}
     assert {"sina", "rf"} <= set(out["json"]["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
 
 

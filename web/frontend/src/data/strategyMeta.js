@@ -76,6 +76,9 @@ export const FIELD_LABELS = {
   "timing.price_window_years": "价格分位窗口（年）【时机门条件①】",
   "timing.price_pctile_max": "价格低位分位上限（%）【时机门唯一条件】",
   "timing.first_drawdown_pct": "首仓建仓回撤（%）",
+  // v7.0.30 web 侧口径（状态机/回测/微信推送不消费）
+  "timing.approach_pct": "即将进入显示带（%）",
+  "timing.spot_preselect_pct": "实时取价预筛带（%）",
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +125,11 @@ export const FIELD_DESC = {
     "时机门条件①（唯一条件）：当前价处于近 N 年价格分位 ≤ 这个值 → 算「价格低位」（如 40 = 比近 5 年 6 成以上交易日都便宜）",
   "timing.first_drawdown_pct":
     "股价从本轮高点回落这个比例，就建首仓（按前复权收盘价判断；首仓线 = 本轮高点×(1−该值)）",
+  // v7.0.30 web 侧口径（状态机/回测/微信推送均不消费）
+  "timing.approach_pct":
+    "信号页「即将进入」展示带：现价在触发价上方 (1+该值%) 以内 → 列入即将进入。只改展示分区，不影响信号/推送（v7.0.30 定案 3→5）",
+  "timing.spot_preselect_pct":
+    "信号页实时取价预筛带：只对「持仓 ∪ 湖最后收盘距触发线 ≤ 该值%」的股票取腾讯实时价，其余用最新收盘（>该值当天不可能触线，主板跌停制度兜底）。微信推送仍取全量",
 };
 
 // ---------------------------------------------------------------------------
@@ -153,6 +161,9 @@ export const FIELD_TYPE = {
   price_window_years: "int",
   price_pctile_max: "float",
   first_drawdown_pct: "float",
+  // v7.0.30 web 侧口径
+  approach_pct: "float",
+  spot_preselect_pct: "float",
 };
 
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。

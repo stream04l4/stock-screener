@@ -122,9 +122,20 @@ class TimingParams:
     观察项）；首仓建仓回撤（first_drawdown_pct）自 strategy 段移入 timing
     段管理（首仓 = 选股时机；引擎经 StrategyParams.first_drawdown 读取，
     数学零改动）。
+    v7.0.30：新增 web 侧两参数（approach_pct 显示带 / spot_preselect_pct
+    实时取价预筛带），状态机/回测/微信推送均不消费。
     """
     price_window_years: int = 5        # ① 价格低位窗口（年，滚动至最新 K线日）
     price_pctile_max: float = 40.0     # ① 当前价处于近 N 年收盘分位 ≤ P%（时机门唯一条件）
+    # 「即将进入信号区」显示带（百分数，非小数）：纯 web 展示口径，状态机/
+    # 回测/微信推送均不消费。v7.0.30 起从 yaml timing.approach_pct 读取
+    # （缺键默认 5.0；老 yaml 兼容）。
+    approach_pct: float = 5.0
+    # 实时取价预筛带（百分数，非小数）：web 信号页只对「持仓 ∪ 湖最后收盘
+    # 距触发线 ≤ 本值%」取腾讯实时价（v7.0.30 Joel 定案 10——主板跌停制度
+    # 下 >10% 当天不可能触线）。纯 web 取价口径；微信推送脚本仍取全量。
+    # 缺键默认 10.0（老 yaml 兼容）。
+    spot_preselect_pct: float = 10.0
 
 
 def _require(cfg: Dict[str, Any], dotted: str) -> Any:
@@ -259,7 +270,14 @@ def _timing_section(cfg: Dict[str, Any]) -> TimingParams:
             raise ConfigError(f"timing.{key} 缺失")
     years = _int(t["price_window_years"], "timing.price_window_years", 1, 30)
     pct = _num(t["price_pctile_max"], "timing.price_pctile_max", 1, 100)
-    return TimingParams(price_window_years=years, price_pctile_max=pct)
+    # approach_pct：v7.0.30 新增，**可选键**（老 yaml/策略库历史快照无此键 →
+    # 默认 5.0；POST /api/strategy/import 的裸 yaml 因此不被强制升级）
+    approach = _num(t.get("approach_pct", 5.0), "timing.approach_pct", 0, 100)
+    # spot_preselect_pct：v7.0.30 新增，**可选键**（默认 10.0，同上兼容逻辑）
+    preselect = _num(t.get("spot_preselect_pct", 10.0),
+                     "timing.spot_preselect_pct", 0, 100)
+    return TimingParams(price_window_years=years, price_pctile_max=pct,
+                        approach_pct=approach, spot_preselect_pct=preselect)
 
 
 def load_config(path: str) -> Tuple[StrategyParams, UniverseParams, TimingParams]:

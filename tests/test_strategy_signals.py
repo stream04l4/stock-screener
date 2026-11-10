@@ -70,15 +70,17 @@ def test_classify_active_unheld_buy():
 
 
 def test_classify_approaching_band_and_boundary():
-    # 触发价上方 2%（默认带 3% 内）→ approaching
+    # 触发价上方 2%（默认带 5% 内）→ approaching
     c = classify_signal(30.6, 30.0, True, 0, SP)
     assert c["status"] == "approaching"
     assert c["action"] == "add"  # approaching 也预告动作
     assert c["distance_pct"] == pytest.approx(2.0)
-    # 恰好带边（+3%）→ 仍 approaching
-    assert classify_signal(30.9, 30.0, True, 0, SP)["status"] == "approaching"
-    # 刚出带（+3.01%）→ idle
-    c = classify_signal(30.903, 30.0, True, 0, SP)
+    # +4%（v7.0.30 放宽后入带；旧 3% 带为 idle——带宽生效断言）
+    assert classify_signal(31.2, 30.0, True, 0, SP)["status"] == "approaching"
+    # 恰好带边（+5%）→ 仍 approaching
+    assert classify_signal(31.5, 30.0, True, 0, SP)["status"] == "approaching"
+    # 刚出带（+5.01%）→ idle
+    c = classify_signal(31.503, 30.0, True, 0, SP)
     assert c["status"] == "idle"
     assert c["action"] is None
     assert c["suggested_lots"] is None
@@ -223,8 +225,9 @@ ROWS = {
                        "level": 0, "first_of_round": True},
                   ]},
     # 非持仓 + 未 in_pos：next(35.0) 与 first(40.0) 故意不同值——
-    # 口径必须走首仓线 40.0（若误走 next 35.0：37.0 > 35×1.03 → idle，断言可区分）
-    "sh.600004": {"name": "丁股", "last_price": 45.0, "in_pos": False, "k_level": 0,
+    # 口径必须走首仓线 40.0（若误走 next 35.0：37.0 > 35×1.03 → idle，断言可区分）。
+    # last_price 43.0 = 首仓线 +7.5%（v7.0.30 预筛带 ≤10% 内 → 取实时价 37.0）
+    "sh.600004": {"name": "丁股", "last_price": 43.0, "in_pos": False, "k_level": 0,
                   "next_add_price_raw": 35.0, "first_level_raw": 40.0,
                   "end_date": "2026-11-06", "buys": []},
     # sh.600005 在池但湖中无数据（ROWS 无此行）→ no_data
@@ -310,7 +313,7 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     out = wapp.get_strategy_signals()
     assert out["strategy"] == "current"
     assert out["lake_locked"] is False
-    assert out["approach_pct"] == DEFAULT_APPROACH_PCT == 3.0
+    assert out["approach_pct"] == DEFAULT_APPROACH_PCT == 5.0
     assert out["history_window_days"] == 90
     assert out["price_source"] == "spot"
     assert out["as_of"] == "2026-11-06"
@@ -390,6 +393,9 @@ def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
         "sh.600011": _row("sh.600011", "庚股", 41.0),
         "sh.600012": _row("sh.600012", "辛股", 51.5),
         "sh.600013": _row("sh.600013", "壬股", 45.0),
+        # 癸股 52.0 = 首仓线 +4%：v7.0.30 的 5% 带内 → approaching（旧 3% 带
+        # 为 idle——证明 yaml timing.approach_pct=5 已接入端点分类）
+        "sh.600014": _row("sh.600014", "癸股", 52.0),
     }
     pool = list(rows)
     spot = {c: {"price": r["last_price"], "timestamp": "20261107093000"}
@@ -403,7 +409,8 @@ def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
     tmap = {"sh.600010": _trow("sh.600010", True),
             "sh.600011": _trow("sh.600011", True),
             "sh.600012": _trow("sh.600012", True),
-            "sh.600013": _trow("sh.600013", False)}
+            "sh.600013": _trow("sh.600013", False),
+            "sh.600014": _trow("sh.600014", True)}
     _wire(monkeypatch, tmp_path, rows=rows, pool=pool, user={}, spot=spot,
           tmap=tmap, bmap={}, pushed=None)
     out = wapp.get_strategy_signals()
@@ -417,17 +424,88 @@ def test_strategy_signals_unheld_first_level_rule(monkeypatch, tmp_path):
     # 庚股：更深跌破 → 同样 active（跌破深度不影响信号，只影响后续加仓档）
     g = by["sh.600011"]
     assert g["status"] == "active" and g["action"] == "buy"
-    # 辛股：首仓线上方 +3%（带边）→ approaching 临区预告
+    # 辛股：首仓线上方 +3%（5% 带内；旧 3% 带边）→ approaching 临区预告
     x = by["sh.600012"]
     assert x["status"] == "approaching" and x["distance_pct"] == pytest.approx(3.0)
+    # 癸股：+4%（5% 带内）→ approaching（旧 3% 带为 idle）
+    g2 = by["sh.600014"]
+    assert g2["status"] == "approaching" and g2["distance_pct"] == pytest.approx(4.0)
+    assert g2["action"] == "buy" and g2["suggested_lots"] == 1
     # 壬股：价条件过、时机✗ → 无买入动作（双条件缺一不成信号）
     r_ = by["sh.600013"]
     assert r_["status"] == "active" and r_["action"] is None
     assert r_["suggested_lots"] is None and r_["timing_ok"] is False
-    # 汇总：active 3（600010/11/13，其中 600013 时机✗ 仅价格态）+ approaching 1
+    # 汇总：active 3（600010/11/13，其中 600013 时机✗ 仅价格态）+ approaching 2
     t = out["totals"]
-    assert t["n_active"] == 3 and t["n_approaching"] == 1
+    assert t["n_active"] == 3 and t["n_approaching"] == 2
     assert t["n_active_unheld"] == 3 and t["n_active_held"] == 0
+    assert t["n_stocks"] == 5
+
+
+def test_strategy_signals_spot_preselect_10pct(monkeypatch, tmp_path):
+    """v7.0.30 实时取价预筛带（Joel 定案 10%）：取价集合 = 持仓 ∪ 湖最后收盘
+    距触发线 ≤10%（含边界；线下方全部含）。>10% 的不取实时——价回退湖最后
+    收盘、状态恒 idle（主板跌停制度下当天不可能触线；漏取窗口由微信推送
+    通道兜底，position_alert 仍取全量）。
+
+    - 甲 10.0 vs 首仓线 10.0（+0%）→ 取
+    - 乙 11.0 vs 10.0（+10%，边界含）→ 取
+    - 丙 11.1 vs 10.0（+11%）→ 不取 → 价回退 11.1（湖）→ idle
+    - 丁 9.0 vs 10.0（−10%，线下方）→ 取（实时 9.9 → active）
+    - 戊 20.0 vs 10.0（+100%）但**持仓** → 无条件取
+    """
+    def _row(code, name, last, first):
+        return {"name": name, "last_price": last, "in_pos": False, "k_level": 0,
+                "next_add_price_raw": first, "first_level_raw": first,
+                "end_date": "2026-11-06", "buys": []}
+    rows = {
+        "sh.700001": _row("sh.700001", "甲股", 10.0, 10.0),
+        "sh.700002": _row("sh.700002", "乙股", 11.0, 10.0),
+        "sh.700003": _row("sh.700003", "丙股", 11.1, 10.0),
+        "sh.700004": _row("sh.700004", "丁股", 9.0, 10.0),
+        "sh.700005": _row("sh.700005", "戊股", 20.0, 10.0),
+    }
+    pool = list(rows)
+    user = {"sh.700005": {"shares": 100.0, "cost_price": 10.0,
+                          "updated_at": "2026-11-07T00:00:00Z"}}
+    # 实时价故意与湖价不同值（丙股若被误取会显示 9.0 而非回退 11.1，可区分）
+    spot = {
+        "sh.700001": {"price": 10.2, "timestamp": "20261107093000"},
+        "sh.700002": {"price": 10.9, "timestamp": "20261107093000"},
+        "sh.700003": {"price": 9.0, "timestamp": "20261107093000"},
+        "sh.700004": {"price": 9.9, "timestamp": "20261107093000"},
+        "sh.700005": {"price": 19.0, "timestamp": "20261107093000"},
+    }
+    tmap = {c: {"ts_code": c, "in_watchlist": True, "push_eligible": True,
+                "reasons": "x", "cond_price_low": True, "cond_yield": True,
+                "pctile_window": 30.0, "ttm_yield_pct": 5.0} for c in rows}
+    _wire(monkeypatch, tmp_path, rows=rows, pool=pool, user=user, spot=spot,
+          tmap=tmap, bmap={}, pushed=None)
+    # 捕获 fetch 实参（_wire 已装 TencentClient mock → 覆盖为记录版）
+    fetched = []
+    def _fake_tencent(**kw):
+        return SimpleNamespace(
+            fetch=lambda codes: (fetched.extend(codes),
+                                 {c: spot[c] for c in codes if c in spot})[1])
+    monkeypatch.setattr(tencent_mod, "TencentClient", _fake_tencent)
+
+    out = wapp.get_strategy_signals()
+    # 取价集合 = 甲/乙/丁/戊（丙 +11% 被预筛掉；戊持仓无条件取）
+    assert sorted(fetched) == ["sh.700001", "sh.700002", "sh.700004", "sh.700005"]
+    assert out["spot_fetched"] == 4 and out["n_stocks"] == 5
+    by = {s["ts_code"]: s for s in out["stocks"]}
+    # 丙股：未取实时 → 价回退湖最后收盘 11.1，+11% 出 5% 展示带 → idle
+    c = by["sh.700003"]
+    assert c["price"] == 11.1 and c["status"] == "idle"
+    # 丁股：线下方取实时 9.9 ≤ 10.0 → active
+    d = by["sh.700004"]
+    assert d["price"] == 9.9 and d["status"] == "active"
+    # 戊股：持仓无条件取实时 19.0（vs 首仓线 10.0，+90% → idle 但价是实时的）
+    e = by["sh.700005"]
+    assert e["price"] == 19.0 and e["held"] is True
+    # 乙股：+10% 边界取到实时 10.9（+9.1% > 5% 带 → idle；仅证取价边界含）
+    b = by["sh.700002"]
+    assert b["price"] == 10.9 and b["status"] == "idle"
 
 
 def test_strategy_signals_history_same_day_level_order(monkeypatch, tmp_path):

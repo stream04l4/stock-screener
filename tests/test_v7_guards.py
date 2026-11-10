@@ -151,9 +151,11 @@ def test_strategy_yaml_v7_schema_shape():
         # v7.0.12 候选池选股门槛
         "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
         "price_min_yuan", "price_max_yuan"}
-    # v7.0.13 选股时机（v7.0.26：②③ 删除、首仓建仓回撤移入）
+    # v7.0.13 选股时机（v7.0.26：②③ 删除、首仓建仓回撤移入；v7.0.30：+
+    # approach_pct 显示带 / spot_preselect_pct 实时取价预筛带，均 web 侧口径）
     assert set(cfg["timing"].keys()) == {
-        "price_window_years", "price_pctile_max", "first_drawdown_pct"}
+        "price_window_years", "price_pctile_max", "first_drawdown_pct",
+        "approach_pct", "spot_preselect_pct"}
     assert "lake" in cfg and "datasource" in cfg
     assert {"sina", "rf"} <= set(cfg["datasource"].keys())  # v7.0.18：baostock 段随渠道移除
     # 旧 12 段不得回潮

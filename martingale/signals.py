@@ -19,10 +19,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 # 「即将进入信号区」显示阈值（百分数）：现价高于下一档触发价且在
-# trigger×(1+3%) 以内 → approaching。
+# trigger×(1+approach_pct%) 以内 → approaching。
 # **显示参数，非策略阈值**：不影响状态机任何决策/成交金额（schema 定案勿增删，
-# 不进 config/strategy.yaml、不进 Web 配置）——只决定股票出现在哪个展示分区。
-DEFAULT_APPROACH_PCT = 3.0
+# 不进 Web 配置）——只决定股票出现在哪个展示分区。v7.0.30 起生产值来自
+# config/strategy.yaml 的 timing.approach_pct（缺键回退本默认值 5.0）。
+DEFAULT_APPROACH_PCT = 5.0
 
 
 def classify_signal(price: Optional[float], trigger: Optional[float],

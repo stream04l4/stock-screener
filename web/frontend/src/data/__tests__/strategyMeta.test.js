@@ -72,7 +72,7 @@ describe("strategyMeta · v7 结构", () => {
 });
 
 describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
-  it("FIELD_TYPE = 21 键（strategy 8 + universe 10 + timing 3），类型逐一断言", () => {
+  it("FIELD_TYPE = 23 键（strategy 8 + universe 10 + timing 5），类型逐一断言", () => {
     const expected = {
       name: "str",
       lot_size: "int",
@@ -96,6 +96,9 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
       price_window_years: "int",
       price_pctile_max: "float",
       first_drawdown_pct: "float",
+      // v7.0.30 web 侧口径
+      approach_pct: "float",
+      spot_preselect_pct: "float",
     };
     expect(FIELD_TYPE).toEqual(expected);
   });

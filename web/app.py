@@ -1268,7 +1268,7 @@ def get_strategy_signals() -> Dict[str, Any]:
       martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
       同一单一定义点，防口径漂移）。
     """
-    from martingale.signals import DEFAULT_APPROACH_PCT, classify_signal
+    from martingale.signals import classify_signal
 
     user = _up_read()
 
@@ -1310,28 +1310,55 @@ def get_strategy_signals() -> Dict[str, Any]:
                 default=None)
     if not universe:
         return {"as_of": None, "strategy": "current", "lake_locked": lake_locked,
-                "approach_pct": DEFAULT_APPROACH_PCT, "price_source": "lake",
+                "approach_pct": tp_obj.approach_pct,
+                "spot_preselect_pct": tp_obj.spot_preselect_pct,
+                "spot_fetched": 0, "price_source": "lake",
                 "spot_time": None, "n_stocks": 0, "stocks": [], "history": [],
                 "totals": {"n_stocks": 0, "n_active": 0, "n_touched": 0,
                            "n_approaching": 0,
                            "n_idle": 0, "n_no_data": 0, "n_active_held": 0,
                            "n_active_unheld": 0, "n_history": 0}}
+    # 实时价取价集合（v7.0.30，Joel 定案）：持仓 ∪ 湖最后收盘价距触发线 ≤
+    # spot_preselect_pct%（默认 10，Joel：「大于10%的一定不会在当天达标」）。
+    # 精确边界：主板跌停 −10% 下，昨收 +x% 的股当日最低可到 (1+x)×0.9−1，
+    # x=10% → −1.0%（恰破线），x∈(10%, 11.11%] + 当日跌停是仅剩的漏取窗口
+    # （大市值央国企主板股单日跌停本身极罕见）；该窗口的信号由微信推送兜底
+    # ——position_alert.py 仍取全 池∪持仓（推送通道零漏），次日 11:30 批量
+    # 落库后 web 展示恢复。其余 >10% 的股价回退湖最后收盘（状态恒 idle；
+    # 5% 展示带远于 10%，「即将进入」展示不受影响）。持仓股无条件取
+    # （浮盈/加仓信号不限距离）。收窄只作用于 web 页面实时覆盖。
+    from martingale import touches as _touches
+    fetch_codes: List[str] = []
+    # 湖锁定 → 全部 no_data（无触发价），不取行情（与历史降级行为一致）
+    if not lake_locked:
+        for c in universe:
+            if c in user:
+                fetch_codes.append(c)
+                continue
+            r = rows.get(c)
+            if r is None:
+                continue  # 湖中无数据 → no_data，无触发价，不必取行情
+            trig = _touches.trigger_price(r, held=False)
+            last = r.get("last_price")
+            if trig is None or last is None:
+                continue
+            if (last - trig) / trig * 100.0 <= tp_obj.spot_preselect_pct:
+                fetch_codes.append(c)
     # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
-    # 只漏报不误报；湖中无数据的代码无触发价，直接 no_data，不必取行情）
+    # 只漏报不误报）
     spot: Dict[str, Dict[str, Any]] = {}
     try:
         from screener.data.tencent import TencentClient
         spot = TencentClient(timeout=5.0, max_attempts=1).fetch(
-            [c for c in universe if c in rows]) or {}
+            fetch_codes) or {}
     except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
         spot = {}
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
     # 最新行情日（v7.0.20 盘中触碰判定基准）：全池最大 quote_date——停牌股行情
     # 停在旧日，day_low 是旧日数据，不得算「今日触碰」；只有行情日=最新日才算
-    from martingale import touches as _touches
     quote_dates = [_touches.quote_date_of((v or {}).get("timestamp"))
-                   for v in spot.values()]
+                  for v in spot.values()]
     ref_quote_date = max((d for d in quote_dates if d), default=None)
 
     # 微信推送状态（scripts/position_alert.py 点位提醒去重态，原子替换写）→
@@ -1377,7 +1404,8 @@ def get_strategy_signals() -> Dict[str, Any]:
         k = (r.get("k_level") or 0) if r else 0
         # 非持仓的动作/金额按首仓口径（buy/initial）——simulate in_pos 仅持仓
         # 股影响档位语义
-        cls = classify_signal(price, trigger, in_pos if held else False, k, sp_obj)
+        cls = classify_signal(price, trigger, in_pos if held else False, k, sp_obj,
+                              approach_pct=tp_obj.approach_pct)
         # 盘中触碰（v7.0.20，Joel 2026-11-08：「盘中达成信号又涨回出区的，保留
         # 到当日，第二天移入历史信号」）：最新行情日最低价已触线、现价回出信号区
         # → 信号今日已发生，保留在当前段（status=touched）；行情日滚动后自动
@@ -1502,9 +1530,11 @@ def get_strategy_signals() -> Dict[str, Any]:
         "as_of": as_of,
         "strategy": "current",
         "lake_locked": lake_locked,
-        "approach_pct": DEFAULT_APPROACH_PCT,
+        "approach_pct": tp_obj.approach_pct,
+        "spot_preselect_pct": tp_obj.spot_preselect_pct,
         "price_source": price_source,
         "spot_time": spot_time,
+        "spot_fetched": len(fetch_codes),
         "n_stocks": len(universe),
         "history_window_days": SIG_HISTORY_WINDOW_DAYS,
         "stocks": stocks,

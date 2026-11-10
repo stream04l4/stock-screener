@@ -82,6 +82,16 @@ timing:                             # 选股时机（v7.0.13 引入；v7.0.24 �
   price_window_years: 5             # ① 价格低位窗口（年，滚动至最新 K线日）
   price_pctile_max: 40              # ① 当前价处于近 N 年收盘分位 ≤ 此值（%）【时机门唯一条件】
   first_drawdown_pct: 15            # 首仓建仓回撤（%）：hfq ≤ H×(1−15%) 触发首仓（k=0）
+  # 「即将进入信号区」显示带（%）：现价在触发价上方 (1+N%) 以内 → 展示分区
+  # 「即将进入」。纯 web 显示口径（v7.0.30 起进 yaml 可调；状态机/回测/微信
+  # 推送均不消费——微信统一「进入当前信号才推」）。v7.0.30 Joel 定案 3→5：
+  # 「有些股票一天就能跌掉超过5%」，带窄了临区股当天跌进线内就漏展示。
+  approach_pct: 5
+  # 实时取价预筛带（%）：web 信号页只对「持仓 ∪ 湖最后收盘距触发线 ≤ 本值%」
+  # 的股票取腾讯实时价；>本值的当天不可能触线（主板跌停 −10% 制度兜底）。
+  # 纯 web 取价口径（微信推送脚本 position_alert 仍取全 池∪持仓，零漏）。
+  # v7.0.30 Joel 定案 10：「只留小于等于10%的就行，大于10%的一定不会在当天达标」。
+  spot_preselect_pct: 10
 
 lake:                                 # 数据湖配置（lake.config.lake_cfg() 读取；缺省值见 lake/config.py）
   # v7.0.18：baostock_daily_budget 随 BaoStock 移除，键名泛化为 quota_budget_per_day

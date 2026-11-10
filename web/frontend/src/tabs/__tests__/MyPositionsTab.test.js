@@ -13,7 +13,7 @@ vi.mock("../../live/queryRegistry.js", async (orig) => ({ ...(await orig()) }));
 
 const MyPositionsTab = (await import("../MyPositionsTab.vue")).default;
 const { useTaskStore } = await import("../../stores/taskStore.js");
-const { invalidate } = await import("../../live/queryRegistry.js");
+const { invalidate, __reset } = await import("../../live/queryRegistry.js");
 
 const MY = {
   as_of: "2026-10-21",
@@ -73,7 +73,8 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 3 即将进入（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1【不入段】）/
 // 4 历史（含微信推送标记 + 1 条触碰事件）
 const SIG = {
-  as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 3,
+  as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
+  spot_preselect_pct: 10, spot_fetched: 9,
   price_source: "spot", spot_time: "20261107093000", n_stocks: 9,
   history_window_days: 90,
   stocks: [
@@ -154,7 +155,8 @@ const SIG = {
   totals: { n_stocks: 9, n_active: 5, n_touched: 1, n_approaching: 3, n_idle: 0,
             n_no_data: 0, n_active_held: 1, n_active_unheld: 4, n_history: 4 },
 };
-const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approach_pct: 3,
+const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approach_pct: 5,
+  spot_preselect_pct: 10, spot_fetched: 0,
   price_source: "lake", spot_time: null, n_stocks: 0, stocks: [], history: [],
   totals: { n_stocks: 0, n_active: 0, n_touched: 0, n_approaching: 0, n_idle: 0,
             n_no_data: 0, n_active_held: 0, n_active_unheld: 0, n_history: 0 } };
@@ -242,7 +244,10 @@ beforeEach(() => {
   setActivePinia(createPinia());
   apiMock.mockReset();
   // registry 是模块级单例（会话缓存语义）→ 测试间必须清缓存，否则首个测试的
-  // 数据（或空数据）会被后续测试的挂载直接命中。
+  // 数据（或空数据）会被后续测试的挂载直接命中。v7.0.30 时段门会在
+  // 「非时段 + 有缓存」时直接返回旧缓存不发请求，故必须 __reset 清数据（仅
+  // invalidate 只打过期标记不清数据，会让下一个测试拿到上一个测试的旧值）。
+  __reset();
   invalidate("my_positions");
   invalidate("strategy_signals");
   localStorage.clear(); // 策略选择持久化 → 测试间隔离
@@ -752,7 +757,8 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 卡片标题 + 覆盖说明 + 价源标注
     expect(w.text()).toContain("📡 策略信号");
     expect(w.text()).toContain("股票池 ∪ 我的持仓");
-    expect(w.text()).toContain("3% 以内"); // approach_pct
+    expect(w.text()).toContain("5% 以内"); // approach_pct（v7.0.30 3→5）
+    expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
     // 分段计数（当前 = active 显示 3 + touched 1；active 价格态 5 只中非持仓
@@ -828,5 +834,44 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     await flushPromises();
     expect(w.text()).toContain("数据湖正被灌数进程占用");
     w.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v7.0.30 实时刷新轮询门：交易时段内 30s 轮询；非时段保留缓存不发网络请求；
+// 首载恒取一次；手动「刷新」按钮经 forceKeys 强制走网络（非时段也可）。
+// 时段判定用 fake timers 固定系统时钟（2026-11-09 周一 20:00 北京 = 非时段）。
+// ---------------------------------------------------------------------------
+describe("MyPositionsTab · v7.0.30 实时刷新轮询门", () => {
+  const getCalls = () => apiMock.mock.calls.filter(
+    (c) => !c[1] || !c[1].method || c[1].method === "GET");
+
+  it("非时段：首载取一次、30s 轮询空转零网络、手动刷新强制走网络", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-09T20:00:00+08:00")); // 周一 20:00 北京
+      mockApi(MY, [], SIG);
+      const w = mk();
+      await flushPromises();
+      // 首载：两个 key 各取一次（非时段也取——首载恒取，保证有最近数据）
+      expect(getCalls().length).toBe(2);
+
+      // 30s 轮询 tick ×2：非时段 + 有缓存 → 返回缓存，零网络
+      vi.advanceTimersByTime(30000);
+      await flushPromises();
+      vi.advanceTimersByTime(30000);
+      await flushPromises();
+      expect(getCalls().length).toBe(2); // 仍只有首载 2 次
+
+      // 手动「刷新」→ forceKeys 强制走网络（非时段同样生效）
+      const btn = w.findAll("button").find((b) => b.text().includes("刷新"));
+      expect(btn).toBeTruthy();
+      await btn.trigger("click");
+      await flushPromises();
+      expect(getCalls().length).toBe(4); // 两 key 各补一次
+      w.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
