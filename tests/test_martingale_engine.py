@@ -178,6 +178,51 @@ def test_exdate_after_data_end_ignored():
 
 
 # ---------------------------------------------------------------------------
+# v7.0.35 年汇总（stat["annual"]：外部投入/分红(盈余)/盈亏；报告专用字段）
+# ---------------------------------------------------------------------------
+
+def test_annual_summary_two_years():
+    """跨两年：2020 建仓（2 笔含费 24007.2）年末市值 25200；2021 分红 300 +
+    市值 25200→27300。盈亏(Y)=年末资产−年初资产−当年投入；Σ=总盈亏。"""
+    p = _params()
+    d = _dates("2019-12-30", "2020-01-01", "2020-01-02", "2020-01-03",
+               "2021-01-01", "2021-01-02", "2021-01-03")
+    exmap = {np.datetime64("2021-01-02", "D").astype("datetime64[ns]"): (1.0, 0.0)}
+    sig = np.array([100.0, 100.0, 80.0, 84.0, 82.0, 82.0, 90.0])
+    stat, *_ = run_stock("t", d, sig, sig, exmap, p, verbose=False)
+    ann = stat["annual"]
+    assert [a["year"] for a in ann] == [2020, 2021]  # 2019 建仓前全零 → 跳过
+    a20 = ann[0]
+    assert a20["invested_ext"] == pytest.approx(100 * 80 * 1.0003 + 200 * 80 * 1.0003)
+    assert a20["invested_div"] == 0.0
+    assert a20["div_surplus"] == 0.0
+    assert a20["price_pnl"] == pytest.approx(300 * 84.0 - 0.0)
+    assert a20["end_assets"] == pytest.approx(300 * 84.0)
+    a21 = ann[1]
+    assert a21["invested_ext"] == 0.0
+    assert a21["invested_div"] == 0.0
+    assert a21["div_surplus"] == pytest.approx(300 * 1.0)
+    # 股价盈亏 = 市值变化 = (27300-300) - 25200 = 1800
+    assert a21["price_pnl"] == pytest.approx((300 * 90.0 + 300.0 - 300.0) - 300 * 84.0)
+    assert a21["end_assets"] == pytest.approx(300 * 90.0 + 300.0)
+    # 恒等式：年底总资产 = 年初总资产 + 股价盈亏 + 分红盈余（投入不另加）
+    assert a20["end_assets"] == pytest.approx(0.0 + a20["price_pnl"] + a20["div_surplus"])
+    assert a21["end_assets"] == pytest.approx(a20["end_assets"] + a21["price_pnl"] + a21["div_surplus"])
+    # telescoping：Σ(股价盈亏+分红盈余) = 期末总资产 = final_assets
+    assert sum(a["price_pnl"] + a["div_surplus"] for a in ann) == pytest.approx(stat["final_assets"])
+    assert sum(a["div_surplus"] for a in ann) == pytest.approx(stat["dividends"])
+
+
+def test_annual_summary_never_triggered_empty():
+    """从未建仓（无投入/无持仓/无分红）→ annual 空（不产全零行）。"""
+    p = _params()
+    d = _dates("2020-01-01", "2020-01-02", "2020-01-03")
+    sig = np.array([100.0, 101.0, 102.0])
+    stat, *_ = run_stock("t", d, sig, sig, {}, p, verbose=False)
+    assert stat["annual"] == []
+
+
+# ---------------------------------------------------------------------------
 # 隐含除权推导（af_ratio 算法）
 # ---------------------------------------------------------------------------
 

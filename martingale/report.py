@@ -6,7 +6,8 @@
 - buys.csv        逐笔买入（ts_code,seq,date,price,amount,lots）—— v7 新增，
                   v7.0.28 加 lots（本笔手数）列
 - equity_curve.csv 组合账本（与参考逐列对齐）
-- summary.md      人读摘要（买入时间表与参考格式一致；f6 回归比对基准之一）
+- summary.md      人读摘要（v7.0.35 起个股明细=年度汇总：外部投入/分红(盈余)/
+                  盈亏；买入时间表不再重复——结果区 buys 表/buys.csv 已有）
 - status.json     机器读运行元信息（Web 结果页 / 排障）
 """
 from __future__ import annotations
@@ -138,9 +139,25 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                   f"({float(r['dividends']) / float(r['total_pnl']):.1%})")
             A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {r['last_status']}, "
               f"最差浮亏 {float(r['min_unreal_pct']):.1%}")
-            A("- 买入时间表:")
-            for bdate, bprice, bamt, _bk, _bor, _blots in buys_by_code.get(r["ts_code"], []):
-                A(f"  - {bdate} @ {bprice:g} 买 {bamt:,.0f}")
+            # v7.0.35：年度汇总替代买入时间表（Joel 2026-11-10：回测结果区已有
+            # 买入时间表 buys 表/buys.csv，明细不重复；列 = 投入(外部/分红)/
+            # 分红盈余/股价盈亏/年底总资产）
+            annual = r.get("annual") or []
+            if annual:
+                A("- 年度汇总（cash 口径：投入=当年放进来/投入的新钱，外部投入=买入"
+                  "现金支出含费，分红投入=分红再投入（当前口径恒 0，列保留）；"
+                  "分红盈余=当年现金分红单列（不投入）；股价盈亏=持仓市值变化"
+                  "（含新购股份）；年底总资产=市值+累计分红现金。恒等式：年底"
+                  "总资产=年初总资产+股价盈亏+分红盈余——投入已转为市值含在"
+                  "股价盈亏内，不另加（否则重复计算））:")
+                A("")
+                A("| 年份 | 外部投入 | 分红投入 | 分红盈余 | 股价盈亏 | 年底总资产 |")
+                A("|---|---|---|---|---|---|")
+                for a in annual:
+                    A(f"| {a['year']} | {a['invested_ext']:,.0f} | "
+                      f"{a['invested_div']:,.0f} | {a['div_surplus']:,.0f} | "
+                      f"{a['price_pnl']:+,.0f} | {a['end_assets']:,.0f} |")
+                A("")
     else:
         A("## Top / Bottom 10（按 pnl_pct，仅触发过的股票）")
         if len(tp):

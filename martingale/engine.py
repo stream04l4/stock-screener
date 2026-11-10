@@ -122,6 +122,47 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
     return names, data, divs
 
 
+def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
+                    buys: List[Tuple]) -> List[Dict[str, float]]:
+    """v7.0.35 年度汇总（仅报告字段：进 summary.md 个股明细，不进 f6 字段集 /
+    per_stock.csv；状态机数学零改动）。列语义（Joel 2026-11-10 定案版）：
+    - 外部投入(Y) = 当年买入 Σamount（含佣金 = 实际现金支出）
+    - 分红投入(Y) = cash 口径不投入 → 恒 0（列保留：若未来切再投入口径，
+      此处 = 当年分红 − 分红盈余）
+    - 分红盈余(Y) = 当年累计分红现金增量（cash 口径 = 当年分红全额）
+    - 股价盈亏(Y) = 持仓市值变化 = (v−cd)末 − (v−cd)初（含新购股份价值；
+      投入的钱已转为市值，就含在这一项里）
+    - 年底总资产(Y) = 市值 + 累计分红现金 = v_arr 年末值（与 final_assets 同口径）
+    恒等式：资产(年末) = 资产(年初) + 股价盈亏 + 分红盈余（投入不另加——
+    会重复计算）；Σ(股价盈亏+分红盈余) = 期末总资产（telescoping）。
+    无持仓且无投入/分红的年份跳过（建仓前全零无信息量）。
+    """
+    n = len(dates)
+    if not n:
+        return []
+    inv: Dict[int, float] = {}
+    for b in buys:
+        y = int(str(b[0])[:4])
+        inv[y] = inv.get(y, 0.0) + float(b[2])
+    years = np.datetime_as_string(dates, unit="Y").astype(int)
+    yearly: Dict[int, tuple] = {}
+    for i in range(n):
+        yearly[int(years[i])] = (float(v_arr[i]), float(cd_arr[i]))
+    out: List[Dict[str, float]] = []
+    prev_v = prev_cd = 0.0
+    for y in sorted(yearly):
+        v_end, cd_end = yearly[y]
+        invested = inv.get(y, 0.0)
+        div_surplus = cd_end - prev_cd
+        price_pnl = (v_end - cd_end) - (prev_v - prev_cd)
+        if prev_v > 0.0 or invested > 0.0 or div_surplus > 0.0:
+            out.append({"year": int(y), "invested_ext": invested,
+                        "invested_div": 0.0, "div_surplus": div_surplus,
+                        "price_pnl": price_pnl, "end_assets": v_end})
+        prev_v, prev_cd = v_end, cd_end
+    return out
+
+
 def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarray,
               exmap: Optional[Dict], p: StrategyParams, verbose: bool = True):
     """单股状态机（high-ladder 唯一分支；不卖、不封顶、无熔断）。
@@ -132,6 +173,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     返回 (stat, state, v_arr, c_arr, flag, buys)：
     - stat: 与参考实现 per_stock.csv 字段**逐位对齐**的统计（pnl_pct/min_unreal_pct
       为比率而非百分数；first/last_buy_date 为 datetime64[ns] 的 str，缺买为 ""）；
+      另含报告专用键 annual（v7.0.35 年汇总，不进 f6 字段集/per_stock.csv 列）；
     - state: 当前持仓状态投影（status 子命令 / /api/positions 用）；
     - v_arr/c_arr/flag: 逐 bar 组合价值/成本/持仓标记；
     - buys: [(date_str, price, amount, k, first_of_round, lots), ...]
@@ -163,6 +205,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     v_arr = np.zeros(n)
     c_arr = np.zeros(n)
     flag = np.zeros(n, dtype=np.int8)
+    cd_arr = np.zeros(n)   # v7.0.35：逐 bar 累计分红现金（仅年汇总报告用，非状态量）
 
     # —— 隐含除权还原（参考 L154-202 逐行移植）——
     # 湖内 stk_div 多数为空 → 从 hfq 因子跳变推导除权事件：
@@ -279,6 +322,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
             if u < min_unreal_pct:
                 min_unreal_pct = u
         v_arr[i] = val
+        cd_arr[i] = cash_div
         c_arr[i] = open_cost if in_pos else 0.0
         flag[i] = 1 if in_pos else 0
 
@@ -302,6 +346,8 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         "last_buy_date": str(dates[last_buy_i]) if last_buy_i >= 0 else "",
         "last_status": "open" if in_pos else ("closed" if n_rounds else "never"),
         "end_date": str(dates[-1]),
+        # v7.0.35 年汇总（报告专用；f6 字段集/per_stock.csv 列不受影响）
+        "annual": _annual_summary(dates, v_arr, cd_arr, buys),
     }
     last_price = float(exec_c[-1]) if n else 0.0
     state = {
