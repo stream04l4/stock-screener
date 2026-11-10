@@ -286,13 +286,16 @@ def run(force: bool = False, dry_run: bool = False,
         return 0
 
     # 3) 实时行情（池+持仓批量一次；失败回退湖最后价——只漏报不误报）
+    # v1.1（Gate 3，设计 §5）：一主一备统一入口——腾讯主 → 东财 push2delay 备
+    #（整批切换，不逐只混用）；两源皆败 → spot={} 走下方湖价回退
     spot: Dict[str, Dict[str, Any]] = {}
+    spot_source = ""   # tencent / eastmoney_push2delay / ""（皆败）
     try:
-        from screener.data.tencent import TencentClient
+        from screener.data.realtime import fetch_spot
 
-        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(sorted(universe)) or {}
+        spot, spot_source = fetch_spot(sorted(universe), timeout=5.0, max_attempts=1)
     except Exception as exc:  # noqa: BLE001 - 行情失败不阻断（回退湖价）
-        log.warning("腾讯实时行情失败（回退湖最后价）: %s", exc)
+        log.warning("实时行情主备皆败（回退湖最后价）: %s", exc)
     # 3b) 实时分位（v7.0.31 A 案，Joel 定案）：现价（spot，无行情回退湖最后
     #     收盘）替换 5 年前复权窗口末值重算——修「破线 + 分位破线同日达成」
     #     被前夜快照漏推的结构性盲区。算完即关连接。

@@ -66,4 +66,15 @@ TRC=$?
 if [ "$TRC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] 选股时机失败 rc=$TRC（Web 回退旧快照，日志见 $LOG 尾部）"
 fi
+
+# v1.1（Gate 1 观察期，设计 §6/§8，2026-11-10）：只读交叉验证（零写入——
+# 湖 read_only 连接；唯一落盘 data/observation/）。东财 T1 列表/T2 池逐股/
+# T3 报表/T7 指数/T4 端点探活 + Fuyao PIT，≈140 调用/日（东财无硬限）。
+# 失败不阻断增量（§8）：观察输出是 Gate 2 晋主判据输入，缺失由 TL 次日补跑
+# （.venv/bin/python scripts/lake_observation.py --daily）。
+run_step "Gate1观察" 600 .venv/bin/python scripts/lake_observation.py --daily
+OBC=$?
+if [ "$OBC" -ne 0 ]; then
+  echo "[$(date -u +%FT%TZ)] Gate1 观察失败 rc=$OBC（不阻断增量；TL 次日补跑）"
+fi
 exit "$RC"

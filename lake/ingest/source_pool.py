@@ -167,6 +167,14 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     "tushare": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
          "field_group": "master", "role": "备源(现主源)"},
+        # v1.1 修订（2026-11-10 review）：T2 每日增量主引擎漏登记。生产
+        # kline_daily 已有 4.7 万行 source=tushare（lake_backfill.py incremental
+        # 3 次批量=全市场 daily+adj_factor+daily_basic，≈2.5min/5500 股）；
+        # §9-② 要求「tushare 角色如实标注」——补 T2 主源+adj 推导。
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "ohlcv_amount", "role": "主源(每日全市场批量增量)"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "adj_factor", "role": "主源·批量(观察期)"},
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
          "field_group": "valuation", "role": "备源(全市场1调用/日)"},
     ],

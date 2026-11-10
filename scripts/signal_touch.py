@@ -84,12 +84,14 @@ def run(dry_run: bool = False) -> int:
         return 0
 
     # 2) 实时行情（批量一次；high/low = 最新行情日当日高/低）
+    # v1.1（Gate 3，设计 §5）：一主一备统一入口（腾讯主 → push2delay 备，整批切换）
+    spot = {}
     try:
-        from screener.data.tencent import TencentClient
+        from screener.data.realtime import fetch_spot
 
-        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(universe) or {}
+        spot, _ = fetch_spot(universe, timeout=5.0, max_attempts=1)
     except Exception as exc:  # noqa: BLE001
-        log.warning("腾讯实时行情异常: %s", exc)
+        log.warning("实时行情主备皆败: %s", exc)
         spot = {}
     if not any(v.get("low") is not None for v in spot.values()):
         log.warning("行情整体失败（无当日 low，下轮重试，不清状态）")

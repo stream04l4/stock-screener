@@ -512,8 +512,9 @@ def test_stocks_search_lake_missing_503(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _mock_spot(monkeypatch, prices, exc=None):
-    """替换 TencentClient.fetch 为假行情（测试零网络）。"""
+    """替换 TencentClient.fetch 为假行情（测试零网络；东财备源同步屏蔽）。"""
     import screener.data.tencent as tt
+    from screener.data import realtime as rt
 
     def fake_fetch(self, codes, batch_size=50):
         if exc is not None:
@@ -521,6 +522,8 @@ def _mock_spot(monkeypatch, prices, exc=None):
         return {c: {"name": None, "price": prices[c], "timestamp": "20261022150500",
                     "pct_chg": None} for c in codes if c in prices}
     monkeypatch.setattr(tt.TencentClient, "fetch", fake_fetch)
+    # Gate 3（11-10）：主源失败会整批切东财备源 → 测试须同时屏蔽 _em_fetch（零网络）
+    monkeypatch.setattr(rt, "_em_fetch", lambda codes, timeout=rt._EM_TIMEOUT: {})
 
 
 def test_my_positions_empty_ledger_current_strategy(tmp_positions_file):

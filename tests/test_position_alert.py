@@ -99,6 +99,9 @@ def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
 
     monkeypatch.setattr(tq, "TencentClient",
                         lambda **k: SimpleNamespace(fetch=lambda cs: dict(spot)))
+    # Gate 3（11-10）：主源失败会整批切东财备源 → 屏蔽 _em_fetch（测试零网络）
+    from screener.data import realtime as rt
+    monkeypatch.setattr(rt, "_em_fetch", lambda codes, timeout=rt._EM_TIMEOUT: {})
 
     posts = posts if posts is not None else []
 

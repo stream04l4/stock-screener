@@ -232,9 +232,12 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     assert ("kline_daily", "ohlcv_amount", "主源(观察期→晋主)") in em
     assert ("index_daily", "ohlcv_amount", "主源(观察期→晋主)") in em
     assert ("dividend_events", "dividend", "主源(端点待验证)") in em
-    ts = {(p["table"], p["role"]) for p in by_name["tushare"]["provides"]}
-    assert ("stock_master", "备源(现主源)") in ts
-    assert ("valuation_daily", "备源(全市场1调用/日)") in ts
+    ts = {(p["table"], p["field_group"], p["role"]) for p in by_name["tushare"]["provides"]}
+    assert ("stock_master", "master", "备源(现主源)") in ts
+    # v1.1 修订（11-10 review 断档修复）：T2 每日增量主引擎必须如实登记
+    # （生产 kline_daily 4.7 万行 source=tushare；§9-②「角色如实标注」）
+    assert ("kline_daily", "ohlcv_amount", "主源(每日全市场批量增量)") in ts
+    assert ("valuation_daily", "valuation", "备源(全市场1调用/日)") in ts
     fy = {(p["table"], p["role"]) for p in by_name["fuyao"]["provides"]}
     assert ("fundamentals_quarterly", "备源(PIT待验证)") in fy
     # T4 分红：v1.1 起仅东财在线源列 T4（旧 em_local_static CSV 是 source 值不是源能力）

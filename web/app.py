@@ -1158,11 +1158,12 @@ def get_my_positions() -> Dict[str, Any]:
     # 状态机在湖最后 bar「触线即买」→ 湖最后 bar 处 最新价 > 下一档触发价 恒成立，
     # 用湖价判"已触线"永远为假。故信号用**实时价**（腾讯行情）对比触发价；
     # 实时行情失败 → 回退湖最后价（price_source="lake"，此时信号只会漏报不会误报）。
+    # v1.1（Gate 3，设计 §5）：一主一备统一入口（腾讯主 → push2delay 备，整批切换）
     spot: Dict[str, Dict[str, Any]] = {}
     try:
-        from screener.data.tencent import TencentClient
-        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(
-            [p["ts_code"] for p in positions]) or {}
+        from screener.data.realtime import fetch_spot
+        spot, _ = fetch_spot(
+            [p["ts_code"] for p in positions], timeout=5.0, max_attempts=1)
     except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
         spot = {}
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
@@ -1345,12 +1346,12 @@ def get_strategy_signals() -> Dict[str, Any]:
             if (last - trig) / trig * 100.0 <= tp_obj.spot_preselect_pct:
                 fetch_codes.append(c)
     # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
-    # 只漏报不误报）
+    # 只漏报不误报）。v1.1（Gate 3，设计 §5）：一主一备统一入口
     spot: Dict[str, Dict[str, Any]] = {}
     try:
-        from screener.data.tencent import TencentClient
-        spot = TencentClient(timeout=5.0, max_attempts=1).fetch(
-            fetch_codes) or {}
+        from screener.data.realtime import fetch_spot
+        spot, _ = fetch_spot(
+            fetch_codes, timeout=5.0, max_attempts=1)
     except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
         spot = {}
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"

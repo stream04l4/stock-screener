@@ -306,6 +306,9 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
     monkeypatch.setattr(tencent_mod, "TencentClient",
                         lambda **kw: SimpleNamespace(
                             fetch=lambda codes: {c: spot[c] for c in codes if c in spot}))
+    # Gate 3（11-10）：主源失败/空会整批切东财备源 → 屏蔽 _em_fetch（测试零网络）
+    from screener.data import realtime as rt
+    monkeypatch.setattr(rt, "_em_fetch", lambda codes, timeout=rt._EM_TIMEOUT: {})
 
 
 def test_strategy_signals_main_contract(monkeypatch, tmp_path):
