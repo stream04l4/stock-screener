@@ -1,4 +1,4 @@
-# stock-screener · v7.0.29（drawdown_martingale 单策略版）
+# stock-screener · v7.0.32（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -371,6 +371,23 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.32**：除权日盘中口径修正（2026-11-10 Joel 定案「要修」）：
+  - **根因**：除权日盘中湖末 bar 还是事件前 K 线（因子 19:30 CST 灌数后才
+    更新），实时原始价已除权而触发价因子未更新 → 触发价比真实除权后口径高
+    一个分红幅度；线距现价 < 分红幅度时除权一跌即假触线（假买入/加仓推送，
+    当晚湖同步自愈）。日频状态机不受影响（后复权空间，除权缺口被当日 af
+    跳变精确吸收）。
+  - **修正**：`engine.pending_exrights_factor(con, codes, now)` 单一因子
+    r_cum=af_new/af_old（单事件精确 P_prev×(1+stk_div/10)/(P_prev−cash_dps)，
+    多事件顺序模拟兜底，无数据→1.0）；`state_rows(now=北京今日)` 触发价÷
+    r_cum（附 exrights_rebase 字段）、`live_pctile_map(now=北京今日)` 现价×
+    r_cum（除权缺口不再系统性压低分位假「时机成熟」）。接线：web/app.py
+    3 处（实时=北京 date、回放=as_of）+ position_alert/signal_touch 脚本。
+  - **红线**：f6 回测走 run_stock 直连不经 state_rows；now=None → 零修正
+    （回测/回放），f6 回归逐位不变；lake/ 零改动。
+  - 验证：tests/test_exrights_live_rebase.py 15 新（tmp-duckdb 全离线）、
+    test_position_alert 口径守卫扩展 now 接线断言、后端全量 653 绿、真实湖
+    冒烟 200 股今日 0 pending 零影响。
 - **v7.0.29**：**策略库退役**（2026-11-09 Joel 定案：「策略里面的策略另存为的功能
   以及加载策略的功能删除掉，后续策略不太会大变了」「回测里的具体策略使用当前策略」）：
   - **另存为/加载/删除/列表全删**：后端 `GET/POST/DELETE /api/strategies`、

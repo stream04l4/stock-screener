@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1027,14 +1027,22 @@ def get_timing() -> Dict[str, Any]:
     }
 
 
-def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False) -> Dict[str, Dict[str, Any]]:
-    """对 codes 逐股跑状态机 → {code: 持仓行}（/api/positions 与 /api/my_positions 共用）。
+def _beijing_today():
+    """北京时区今日（A 股交易日参照；ex_date 是北京时间日期，勿用 UTC date——
+    16:00-24:00 UTC 期间 UTC 日期落后北京一天）。v7.0.32 除权日修正参照日。"""
+    return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False,
+                         now=None) -> Dict[str, Dict[str, Any]]:
+    """状态机投影（单一口径，防漂移）。
 
     v7.0.20：实现下沉至 martingale.engine.state_rows（scripts/signal_touch.py 共用
-    同一口径）——此处保留别名，调用方/测试 monkeypatch 不变。
+    同一函数）。now=参照日（实时路径传当天）→ 除权日盘中触发价按 pending 除权
+    事件修正到除权后口径（v7.0.32）；回测/回放不传 → 零修正。
     """
     from martingale.engine import state_rows
-    return state_rows(sp, con, codes, end=end, include_buys=include_buys)
+    return state_rows(sp, con, codes, end=end, include_buys=include_buys, now=now)
 
 
 @app.get("/api/positions")
@@ -1049,7 +1057,10 @@ def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
     _sp, _up, con, pool = _load_pool_ctx()
     t0 = time.time()
     try:
-        rows = _strategy_state_rows(_sp, con, pool.codes, end=as_of)
+        # now=参照日：回放（as_of 指定）→ as_of 当日口径（不套其后的除权修正）；
+        # 实时（as_of 缺省）→ 北京今日（除权日盘中触发价修正，v7.0.32）
+        _now = (date.fromisoformat(as_of) if as_of else _beijing_today())
+        rows = _strategy_state_rows(_sp, con, pool.codes, end=as_of, now=_now)
     finally:
         con.close()
     positions = [rows[c] for c in sorted(rows)]
@@ -1113,7 +1124,8 @@ def get_my_positions() -> Dict[str, Any]:
     try:
         _sp, _up, con, pool = _load_pool_ctx()
         try:
-            rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())))
+            rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())),
+                                    now=_beijing_today())
         finally:
             con.close()
     except (LakeLocked, LakeMissing, LakeInvalidFile):
@@ -1295,7 +1307,8 @@ def get_strategy_signals() -> Dict[str, Any]:
         sp_obj = _sp
         try:
             universe = sorted(set(pool.codes) | set(user.keys()))
-            rows = _strategy_state_rows(_sp, con, universe, include_buys=True)
+            rows = _strategy_state_rows(_sp, con, universe, include_buys=True,
+                                        now=_beijing_today())
             from martingale.selection import load_backtest_map
             from martingale.timing import load_timing_map
             tmap = load_timing_map(con)

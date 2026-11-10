@@ -165,7 +165,7 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
 
 
 def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
-                    tp) -> Dict[str, Optional[float]]:
+                    tp, now=None) -> Dict[str, Optional[float]]:
     """实时分位（v7.0.31）：以当前价替换 5 年前复权窗口末值重算分位①。
 
     微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
@@ -174,7 +174,11 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
     实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）。窗口与
     refresh_timing 同一口径（kline_daily_qfq、近 N 年、截至湖最新 bar）；
     现价（原始价）按该股**自身末 bar** 因子折前复权（qfq_now = price ×
-    last_qfq/last_raw；当日除权事件不影响昨日因子，误差 ~bp 级/1200 bar）。
+    last_qfq/last_raw；非事件日该因子=末 bar 当日 raw→qfq 换算，误差 ~bp 级）。
+    v7.0.32 除权日修正（now=参照日）：除权日盘中末 bar 是事件前 K 线，
+    前复权窗口停在事件前口径，现价（事件后）须乘 pending 除权累计复权比
+    （engine.pending_exrights_factor，与触发价修正同一因子）对齐窗口口径，
+    否则分位被除权缺口系统性压低（假"时机成熟"）。now=None → 零修正。
 
     :param prices: {code: 当前原始价（spot；无行情时传湖最后收盘）}；
       缺/None/≤0 → 该股 None。
@@ -210,6 +214,9 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
     for c, raw, qfq in con.fetchall():
         if raw and qfq:
             fac[str(c)] = float(qfq) / float(raw)
+    # v7.0.32 除权日修正：现价 × pending 事件累计复权比（对齐事件前窗口口径）
+    from .engine import pending_exrights_factor
+    rebase = pending_exrights_factor(con, codes, now) if now is not None else {}
     out: Dict[str, Optional[float]] = {}
     for c in codes:
         ks = series.get(str(c))
@@ -218,7 +225,7 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
         if not ks or len(ks) < 2 or p is None or p <= 0 or not f:
             out[c] = None
             continue
-        cur = float(p) * f
+        cur = float(p) * f * rebase.get(str(c), 1.0)
         out[c] = sum(1 for x in ks if x <= cur) / len(ks) * 100.0
     return out
 

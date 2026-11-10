@@ -346,8 +346,70 @@ def aggregate_into(gdates: np.ndarray, g_value: np.ndarray, g_cost: np.ndarray,
         g_open[gi[-1]:] += flag[-1]
 
 
+def pending_exrights_factor(con, codes, now) -> Dict[str, float]:
+    """除权日实时口径修正因子（v7.0.32，Joel 2026-11-10 定案修复）。
+
+    背景：实时价（原始口径）对比触发价（= 后复权档位价 ÷ 湖末 bar 因子）时，
+    **除权日盘中湖末 bar 还是昨日（事件前因子）**——除权缺口未被吸收，触发价
+    比真实除权后口径正好高一个分红幅度，与当日除权跌幅同幅 → 线近时分红一跌
+    即假触线（假买入/加仓信号；当晚 19:30 湖同步后自愈）。
+
+    对每股返回 r_cum = af_new/af_old：已生效（ex_date ≤ now）但 K 线尚未入湖
+    （ex_date > 该股末 bar）的除权事件累计复权比。单事件（现实场景）精确：
+    r = P_prev × (1 + stk_div/10) / (P_prev − cash_dps)，P_prev = 事件前末 bar
+    原始收盘；多事件（湖多日未同步，罕见）顺序模拟、忽略事件间真实价漂移
+    （近似，优于无修正）。无 pending 事件 / now=None / 无数据 → 1.0。
+
+    纯只读两查询（kline_daily 末 bar + dividend_events）；lake 与 martingale
+    零 import 约束不受影响（仅 duckdb API）。
+    """
+    out: Dict[str, float] = {str(c): 1.0 for c in codes}
+    if not codes or now is None:
+        return out
+    now_s = str(now)[:10]
+    fmt = ", ".join(["?"] * len(codes))
+    # 每股末 bar（date + 原始收盘）
+    last_bar: Dict[str, tuple] = {}
+    con.execute(f"""
+        SELECT k.ts_code, CAST(k.date AS VARCHAR) AS d, k.close FROM kline_daily k
+        JOIN (SELECT ts_code, MAX(date) AS md FROM kline_daily
+              WHERE ts_code IN ({fmt}) GROUP BY ts_code) m
+          ON m.ts_code = k.ts_code AND m.md = k.date
+        WHERE k.ts_code IN ({fmt}) AND k.close > 0""", list(codes) + list(codes))
+    for c, d, cl in con.fetchall():
+        last_bar[str(c)] = (str(d)[:10], float(cl))
+    con.execute(f"""
+        SELECT ts_code, ex_date, COALESCE(cash_dps, 0), COALESCE(stk_div, 0)
+        FROM dividend_events
+        WHERE ts_code IN ({fmt}) AND ex_date IS NOT NULL AND ex_date <= ?
+        ORDER BY ts_code, ex_date""", list(codes) + [now_s])
+    ev: Dict[str, list] = {}
+    for c, d, cash, stk in con.fetchall():
+        ev.setdefault(str(c), []).append((str(d)[:10], float(cash or 0), float(stk or 0)))
+    for c in codes:
+        cs = str(c)
+        lb = last_bar.get(cs)
+        if not lb or lb[1] <= 0:
+            continue
+        last_d, cur_price = lb
+        r_cum = 1.0
+        for d, cash, stk in ev.get(cs, ()):
+            if d <= last_d:
+                continue  # 已入湖（af 已更新）或非 pending
+            if cur_price <= 0:
+                break
+            denom = cur_price - cash
+            if denom <= 0:
+                continue  # cash_dps ≥ 价：数据异常，跳过该事件
+            p_ex = denom / (1.0 + stk / 10.0)
+            r_cum *= cur_price / p_ex
+            cur_price = p_ex
+        out[cs] = r_cum
+    return out
+
+
 def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
-               include_buys: bool = False) -> Dict[str, Dict[str, Any]]:
+               include_buys: bool = False, now=None) -> Dict[str, Dict[str, Any]]:
     """对 codes 逐股跑状态机 → {code: 持仓行}（Web /api/positions、
     /api/my_positions、/api/strategy_signals 与 scripts/signal_touch.py 共用——
     单一口径，防漂移；v7.0.20 由 web/app.py._strategy_state_rows 下沉至此）。
@@ -355,9 +417,15 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
     end=YYYY-MM-DD 截窗口（含）；缺省跑到各股最新 bar。湖中无数据的代码不产出行。
     include_buys=True 时行内附 buys（历史触发逐笔；5 元组 (date,price,amount,
     k,first_of_round) → dict 列表）+ first_level_raw（非持仓股触发价口径）。
+    now=参照日（date/datetime/str）：实时路径传当天——除权日盘中湖末 bar 还是
+    事件前 K 线，原始口径触发价需按 pending 除权事件除以累计复权比（见
+    pending_exrights_factor），否则除权缺口造成假触线；回测/回放路径不传
+    （now=None → 零修正，f6 基线不受影响）。
     """
     names, data, divs = load(con, codes=list(codes), start=None, end=end)
     rows: Dict[str, Dict[str, Any]] = {}
+    # 除权日实时口径修正（now=参照日；None → 回测/回放路径，零修正）
+    rebase = pending_exrights_factor(con, codes, now) if now is not None else None
     for c in codes:
         series = data.get(c)
         if not series or len(series[0]) < 2:
@@ -388,6 +456,13 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
             "end_date": str(dates[-1])[:10],
         }
         f = float(sig[-1]) / float(exec_c[-1]) if float(exec_c[-1]) > 0 else 1.0
+        # 除权日实时口径修正：末 bar 因子 × pending 事件累计复权比 → 触发价
+        # 换算到除权后口径（realtime 原始价同口径；非除权日 r_cum=1 零影响）
+        if rebase is not None:
+            r_cum = rebase.get(str(c), 1.0)
+            if r_cum > 1.0 + 1e-9:
+                f = f * r_cum
+                rows[c]["exrights_rebase"] = round(r_cum, 6)
         if rows[c]["next_add_price"] is not None:
             rows[c]["next_add_price_raw"] = round(rows[c]["next_add_price"] / f, 4)
         else:

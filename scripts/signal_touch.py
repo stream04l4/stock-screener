@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -73,7 +74,11 @@ def run(dry_run: bool = False) -> int:
         _sp2, _up2, con, pool = _load_pool_ctx()
         try:
             universe = sorted(set(pool.codes) | set(user.keys()))
-            rows = state_rows(_sp2, con, universe, include_buys=True)
+            # v7.0.32 除权日修正参照日（北京日期）：正常 20:05 跑时湖已同步
+            # 当日 bar（无 pending 事件、零影响）；湖同步失败日兜底生效
+            _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
+            rows = state_rows(_sp2, con, universe, include_buys=True,
+                              now=_bj_today)
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）

@@ -78,9 +78,10 @@ def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
                             lambda sp, con2, codes, **kw: dict(rows))
         import martingale.timing as tmod
 
-        # v7.0.31：run() 消费 live_pctile_map（实时分位），不再读前夜快照
+        # v7.0.31：run() 消费 live_pctile_map（实时分位），不再读前夜快照；
+        # v7.0.32：带 now（除权日口径修正）→ **kw 吸收
         monkeypatch.setattr(tmod, "live_pctile_map",
-                            lambda con2, codes, prices, tp2: dict(tmap))
+                            lambda con2, codes, prices, tp2, **kw: dict(tmap))
         import martingale.touches as ttouch
 
         monkeypatch.setattr(ttouch, "load_state",
@@ -310,17 +311,28 @@ def test_missing_key_rc2(monkeypatch, tmp_path):
 def test_run_rows_include_buys_caliber(monkeypatch, tmp_path):
     """v7.0.31 口径守卫（山煤国际实案）：run() 必须 include_buys=True 取行——
     first_level_raw 只在该口径附行；缺了它非持仓股首仓线恒 None，首仓推送
-    通道结构性全关（Web 显示 11.2478、推送侧 None 的口径漂移）。"""
+    通道结构性全关（Web 显示 11.2478、推送侧 None 的口径漂移）。
+    v7.0.32：实时路径 state_rows/live_pctile_map 必须带 now（北京 date）——
+    除权日触发价/分位口径修正依赖它；缺了静默退回旧口径（假触发回归）。"""
     calls = []
     posts, state_path = _wire(monkeypatch, tmp_path)
     import web.app as wapp
+    from datetime import date
 
     monkeypatch.setattr(wapp, "_strategy_state_rows",
                         lambda sp, con2, codes, **kw: (calls.append(kw),
                                                        dict(ROWS))[1])
+    import martingale.timing as tmod
+    tcalls = []
+    monkeypatch.setattr(tmod, "live_pctile_map",
+                        lambda con2, codes, prices, tp2, **kw:
+                        (tcalls.append(kw), {})[1])
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
     assert calls and calls[-1].get("include_buys") is True
+    assert isinstance(calls[-1].get("now"), date), "v7.0.32: state_rows 必须带 now"
+    assert tcalls and isinstance(tcalls[-1].get("now"), date), \
+        "v7.0.32: live_pctile_map 必须带 now"
 
 
 def test_trading_window_gate(monkeypatch):

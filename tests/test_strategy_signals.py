@@ -300,7 +300,7 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
         monkeypatch.setattr(wapp, "_load_pool_ctx", _pool_ctx)
     monkeypatch.setattr(
         wapp, "_strategy_state_rows",
-        lambda sp, con, codes, end=None, include_buys=False:
+        lambda sp, con, codes, end=None, include_buys=False, now=None:
         (lambda r: {k: dict(v, **({"buys": list(v["buys"])} if include_buys else {}))
                     for k, v in r.items()})(dict(rows)))
     monkeypatch.setattr(tencent_mod, "TencentClient",

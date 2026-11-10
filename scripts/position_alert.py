@@ -57,7 +57,7 @@ import logging
 import os
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -267,6 +267,8 @@ def run(force: bool = False, dry_run: bool = False,
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）
         log.warning("数据湖不可用（下轮重试）: %s", exc)
         return 3
+    # v7.0.32 除权日修正参照日（北京日期——A 股 ex_date 是北京时间日期）
+    _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
     try:
         universe = set(pool.codes) | set(held_codes)
         # include_buys=True 必须与 Web 同口径（v7.0.31 山煤国际实案）：
@@ -274,7 +276,7 @@ def run(force: bool = False, dry_run: bool = False,
         # 首仓触发线恒 None，首仓推送通道结构性全关（Web 显示首仓线、
         # 推送侧却拿不到线 = 口径漂移）
         rows = (_strategy_state_rows(_sp, con, sorted(universe),
-                                     include_buys=True)
+                                     include_buys=True, now=_bj_today)
                 if universe else {})
     except Exception as exc:  # noqa: BLE001
         con.close()
@@ -307,7 +309,7 @@ def run(force: bool = False, dry_run: bool = False,
         price_map[c] = p
     try:
         live_pct: Dict[str, Optional[float]] = timing.live_pctile_map(
-            con, sorted(universe), price_map, tp)
+            con, sorted(universe), price_map, tp, now=_bj_today)
     except Exception as exc:  # noqa: BLE001 - 分位失败 → 首仓通道 fail-closed
         log.warning("实时分位计算失败（首仓通道 fail-closed）: %s", exc)
         live_pct = {}
