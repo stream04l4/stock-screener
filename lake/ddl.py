@@ -12,7 +12,8 @@ hfq/qfq view 解析失败；已修复为 ``"close"``）。``tests/test_lake_ddl.
 v6.1（多源资源池，Q5 拍板）：T1-T7 各表追加 ``conflict_src VARCHAR``——跨源数值
 分歧时写落选源+摘要（格式 ``sina:8.12|tdx:8.11`` ≤256B），无分歧=NULL。T8/T9 不加
 （T8 本地派生无多源、T9 单源）。**view 不变**（不引用 conflict_src）。已存在的旧库
-由 :mod:`lake.migrate_conflict_col` 幂等 ALTER 补列。
+补列由 v6.1 一次性迁移模块完成（lake.migrate_conflict_col，v7.0.31 退役删除——
+生产库早已补列，幂等迁移无再跑场景；新库 init_schema 直接建出）。
 """
 from __future__ import annotations
 
@@ -106,7 +107,8 @@ TABLES = [
 ]
 
 # v6.1（Q5）：带 conflict_src 列的表 = T1-T7。T8 factor_snapshot / T9 macro_rf 不加
-# （T8 本地派生无多源、T9 单源）。migrate_conflict_col 按本清单幂等 ALTER。
+# （T8 本地派生无多源、T9 单源）。新库 init_schema 按本清单建列；旧库补列的
+# v6.1 一次性迁移模块已于 v7.0.31 退役删除。
 CONFLICT_SRC_TABLES = [
     "stock_master", "kline_daily", "valuation_daily", "dividend_events",
     "fundamentals_quarterly", "holders_snapshot", "index_daily",
