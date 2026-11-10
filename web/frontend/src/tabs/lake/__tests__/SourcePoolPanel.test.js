@@ -85,14 +85,15 @@ describe("SourcePoolPanel：adapters 三态", () => {
     expect(byName.sina.find(".lake-spp-sg").classes()).not.toContain("bad");
   });
 
-  it("probed_at + latency_ms 展示（≥1000ms → s 单位）", () => {
+  it("probed_at + latency_ms 展示（≥1000ms → s 单位；本机延迟在本机行）", () => {
     const w = mountPanel({ pool: makePool() });
     const cards = w.findAll(".lake-spp-adapter");
     const byName = {};
     for (const c of cards) byName[c.find("b").text()] = c;
     expect(byName.sina.text()).toContain("2026-09-17T08:00:00");
-    expect(byName.sina.text()).toContain("latency 120ms");
-    expect(byName.tdx.text()).toContain("latency 3.4s");
+    // v1.2 修订：本机延迟跟在本机行（原「· latency X」单行尾格式已废）
+    expect(byName.sina.findAll(".lake-spp-conn-line")[0].text()).toContain("120ms");
+    expect(byName.tdx.findAll(".lake-spp-conn-line")[0].text()).toContain("3.4s");
     expect(byName.tdx.text()).toContain("未探测");
   });
 });
@@ -219,16 +220,35 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(w.findAll(".lake-spp-adapter").length).toBe(4);
   });
 
-  it("卡内四行：连通性（本机✓可达/✗不可达/—未探测 + latency）+ 探测时间", () => {
+  it("卡内四行：连通性（本机✓可达/✗不可达/—未探测 + 各自 latency 分行）+ 探测时间", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const byName = cardsBy(w);
     expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓ 可达");
-    expect(byName.sina.text()).toContain("latency 320ms");
+    // v1.2 修订（11-10 Joel review）：本机/SG 分两行，延迟各归各——
+    // 本机行=latency_ms(320ms)，SG 行=sg_latency_ms(900ms)
+    const sinaLines = byName.sina.findAll(".lake-spp-conn-line");
+    expect(sinaLines.length).toBe(2);
+    expect(sinaLines[0].text()).toContain("本机 ✓ 可达");
+    expect(sinaLines[0].text()).toContain("320ms");
+    expect(sinaLines[1].text()).toContain("SG备用 ✓");
+    expect(sinaLines[1].text()).toContain("900ms");
     expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗ 不可达");
     expect(byName.adata_f10.find(".lake-spp-avail").text().trim()).toBe("本机 — 未探测");
     // 行4 探测时间（probed_at / 未探测）
     expect(byName.sina.text()).toContain("探测：2026-09-17T08:00:00");
     expect(byName.adata_f10.text()).toContain("探测：未探测");
+  });
+
+  it("v1.2 修订：enabled 勾选框移除（监控页只读化；后端 /sources/toggle 保留）", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    // 4 卡均无 checkbox（原 4 灌数池源各有勾选框 → 已移除）
+    expect(w.findAll("input[type=checkbox]").length).toBe(0);
+    expect(w.find(".lake-spp-toggle").exists()).toBe(false);
+    // 「已禁用」badge 渲染逻辑保留：fixture tdx enabled=false → 仍可见（只读指示）
+    const tdxCard = w.findAll(".lake-spp-adapter").find((c) => c.find("b").text() === "tdx");
+    expect(tdxCard.text()).toContain("已禁用");
+    // tdx 禁用 → 连通性行隐藏（badge 替代 ✓/✗）
+    expect(tdxCard.find(".lake-spp-conn").exists()).toBe(false);
   });
 
   it("v1.2：SG 中转备用通道档三态（✓可达 ok / ✗不可达 bad / —未探测；title 带 detail）", () => {

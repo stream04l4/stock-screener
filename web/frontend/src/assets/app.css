@@ -489,7 +489,8 @@ tr.lake-row-muted .badge { opacity: .85; }
 .lake-spp-avail { font-weight: 700; font-family: var(--mono); }
 .lake-spp-avail.ok { color: #16a34a; }
 .lake-spp-avail.bad { color: #dc2626; }
-.lake-spp-conn { display: flex; align-items: baseline; gap: 4px; font-size: 12.5px; }
+.lake-spp-conn { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.lake-spp-conn-line { display: flex; align-items: baseline; gap: 4px; }
 /* 数据类型 chips（provides；role 后缀小字 muted） */
 .lake-spp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .lake-spp-chip { display: inline-block; font-size: 11.5px; line-height: 1.5; padding: 1px 8px; border-radius: 999px; background: #eef2f7; color: #334155; border: 1px solid var(--line); }

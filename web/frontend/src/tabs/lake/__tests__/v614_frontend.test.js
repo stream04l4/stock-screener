@@ -162,42 +162,22 @@ describe("O5：SourcePoolPanel 固定色板图例行 + 中文悬停提示", () =
   });
 });
 
-describe("O4：SourcePoolPanel 源勾选 + 手动探测按钮", () => {
-  it("每源卡有 enabled checkbox（:id=src-enable-<name>）+【探测】按钮；区块标题有【全部探测】", () => {
+describe("O4：SourcePoolPanel 源卡（v1.2 修订：勾选框移除 + 手动探测按钮）", () => {
+  it("每源卡【探测】按钮 + 无 enabled checkbox（11-10 Joel review 监控页只读化）；区块标题有【全部探测】", () => {
     const w = mountSPP();
+    // v1.2 修订：原 4 灌数池源勾选框（#src-enable-*）已移除——
+    // 后端 /sources/toggle 端点保留应急（改 yaml），UI 不再提供
     for (const n of ["sina", "tencent", "tdx", "adata_f10"]) {
-      expect(w.find(`#src-enable-${n}`).exists()).toBe(true);
+      expect(w.find(`#src-enable-${n}`).exists()).toBe(false);
     }
+    expect(w.findAll("input[type=checkbox]").length).toBe(0);
     expect(w.findAll(".lake-spp-probe").length).toBe(4);
     const allBtn = w.find("#btn-lake-probe-all");
     expect(allBtn.exists()).toBe(true);
     expect(allBtn.text()).toBe("全部探测");
-    // tdx enabled=false → checkbox 未勾选
-    expect(w.find("#src-enable-tdx").element.checked).toBe(false);
-    expect(w.find("#src-enable-sina").element.checked).toBe(true);
-    w.unmount();
-  });
-
-  it("取消勾选 sina → POST /sources/toggle {name:'sina',enabled:false}；成功→toast+重拉（fetchStatus 被调）", async () => {
-    const w = mountSPP();
-    const cb = w.find("#src-enable-sina");
-    await cb.setChecked(false);
-    await flushPromises();
-    expect(postCalls.length).toBe(1);
-    expect(postCalls[0].url).toBe("/api/lake/sources/toggle");
-    expect(postCalls[0].body).toEqual({ name: "sina", enabled: false });
-    w.unmount();
-  });
-
-  it("toggle 失败（5xx）→ checkbox 回滚 + 错误 toast（不静默吞错）", async () => {
-    apiFailWith = "Internal Server Error";   // mock api() 抛错（模拟 5xx → api client throw）
-    const w = mountSPP();
-    const cb = w.find("#src-enable-sina");
-    await cb.setChecked(false);
-    await flushPromises();
-    // 回滚：DOM checked 复位为 true（api 抛错 → onToggle catch 分支 ev.target.checked=!enabled）
-    expect(cb.element.checked).toBe(true);
-    apiFailWith = null;
+    // tdx enabled=false（yaml 侧）→ 仍显示「已禁用」灰 badge（只读指示保留）
+    const tdxCard = w.findAll(".lake-spp-adapter").find((c) => c.find("b").text() === "tdx");
+    expect(tdxCard.text()).toContain("已禁用");
     w.unmount();
   });
 

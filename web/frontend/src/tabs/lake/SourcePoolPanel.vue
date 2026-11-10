@@ -30,23 +30,9 @@ const probingAll = ref(false);
 // 顶层不触碰 pinia，使纯渲染单测（无 pinia 的 mount）不受影响；真实 App 恒有 pinia。
 function _stores() { return { toast: useToastStore(), lake: useLakeStore() }; }
 
-// O4：enabled 勾选 → POST /api/lake/sources/toggle {name, enabled}。
-// 成功 → toast + 重拉 /status（pool.sources.enabled 刷新，"已禁用"badge/连通性行联动）；
-// 失败 → 回滚 checkbox（直接 DOM 复位，:checked 是单向绑定不自动回退）+ 错误 toast。
-async function onToggle(s, ev) {
-  const enabled = !!ev.target.checked;
-  const { toast, lake } = _stores();
-  try {
-    await api("/api/lake/sources/toggle", {
-      method: "POST", body: JSON.stringify({ name: s.name, enabled }),
-    });
-    toast.toast(`已${enabled ? "启用" : "禁用"} ${s.name}（写入配置，下次灌数启动生效）`);
-    lake.fetchStatus();   // 重拉 /status → source_pool.sources 刷新
-  } catch (e) {
-    ev.target.checked = !enabled;   // 回滚勾选
-    toast.toast("开关保存失败：" + e.message, false);
-  }
-}
+// O4 源开关：UI 勾选框已移除（11-10 Joel review：7 源监控页上只覆盖 4/7 卡、
+// 主引擎 tushare 不可切，误点会破坏观察期 fallback 链）。后端 /sources/toggle
+// 端点 + strategy.yaml 键保留（应急仍可改 yaml；lake.config 消费点不变）。
 
 // O4：单源探测 → POST /api/lake/sources/probe {names:[name]}（后端懒缓存先清、
 // 每源 ≤15s 超时、写 source_health.json）→ 重拉 /status 刷新卡片连通性/探测时间。
@@ -248,14 +234,8 @@ function fmtLatency(ms) {
                :style="{ borderLeft: '3px solid ' + (SOURCE_COLORS[s.name] || UNKNOWN_COLOR) }">
             <div class="lake-spp-adapter-head">
               <b :style="{ color: SOURCE_COLORS[s.name] || '#475569' }">{{ s.name }}</b>
-              <!-- v6.1.4 O4：enabled 勾选（写 strategy.yaml lake 段开关；运行中灌数不受影响）。
-                   v1.1：仅灌数池 4 源可开关（s.switchable!==false 门控——tushare/eastmoney/
-                   fuyao 无 strategy.yaml 开关键，隐藏 checkbox 防 400）；旧响应无该键→视为可开关。 -->
-              <label v-if="s.switchable !== false" class="lake-spp-toggle"
-                     :title="'启用/禁用 ' + s.name + '（立即写入配置，下次灌数启动生效）'">
-                <input type="checkbox" :id="'src-enable-' + s.name"
-                       :checked="s.enabled !== false" @change="onToggle(s, $event)">
-              </label>
+              <!-- v1.1 修订（11-10 Joel review）：enabled 勾选框移除——7 源监控页
+                   只读化（后端 /sources/toggle 保留应急）；yaml 侧禁用仍显示灰 badge -->
               <span v-if="s.enabled === false" class="badge lake-st-empty lake-spp-disabled">已禁用</span>
               <!-- v6.1.4 O4：单源手动探测（每源 ≤15s 超时纪律在后端） -->
               <button class="mini-btn lake-spp-probe" :disabled="probing[s.name]"
@@ -263,19 +243,25 @@ function fmtLatency(ms) {
                 {{ probing[s.name] ? "…" : "探测" }}
               </button>
             </div>
-            <!-- 行1 连通性（enabled=false → 上方 badge 替代 ✓/✗）
-                 v1.2：双通道——本机（EU 直连）+ SG 中转备用（source_health_sg.json）；
+            <!-- 连通性（enabled=false → 上方 badge 替代 ✓/✗）
+                 v1.2 修订（11-10 Joel review）：本机/SG备用 分两行，各带自己的延迟
+                 （原单行「SG备用 ✓ · latency X」的 latency 是本机值却贴在 SG 后面，歧义）
                  SG 三态同口径（✓可达/✗不可达/—未探测；detail 含"通道可达未鉴权"语义） -->
             <div v-if="s.enabled !== false" class="lake-spp-conn">
-              <span class="lake-spp-avail" :class="{ ok: s.available === true, bad: s.available === false }">
-                本机 {{ availMark(s.available) }} {{ connWord(s.available) }}
-              </span>
-              <span class="lake-spp-avail lake-spp-sg"
-                    :class="{ ok: s.sg_available === true, bad: s.sg_available === false }"
-                    :title="'SG 中转备用通道：' + (s.sg_detail || '未探测') + (s.sg_probed_at ? '（' + s.sg_probed_at + '）' : '')">
-                SG备用 {{ s.sg_available === true ? "✓" : s.sg_available === false ? "✗" : "—" }}
-              </span>
-              <span class="muted small mono"> · latency {{ fmtLatency(s.latency_ms) }}</span>
+              <div class="lake-spp-conn-line">
+                <span class="lake-spp-avail" :class="{ ok: s.available === true, bad: s.available === false }">
+                  本机 {{ availMark(s.available) }} {{ connWord(s.available) }}
+                </span>
+                <span class="muted small mono" v-if="s.latency_ms != null"> · {{ fmtLatency(s.latency_ms) }}</span>
+              </div>
+              <div class="lake-spp-conn-line">
+                <span class="lake-spp-avail lake-spp-sg"
+                      :class="{ ok: s.sg_available === true, bad: s.sg_available === false }"
+                      :title="'SG 中转备用通道：' + (s.sg_detail || '未探测') + (s.sg_probed_at ? '（' + s.sg_probed_at + '）' : '')">
+                  SG备用 {{ s.sg_available === true ? "✓" : s.sg_available === false ? "✗" : "—" }}
+                </span>
+                <span class="muted small mono" v-if="s.sg_latency_ms != null"> · {{ fmtLatency(s.sg_latency_ms) }}</span>
+              </div>
             </div>
             <!-- 行2 数据类型（provides chips；role 后缀小字 muted） -->
             <div class="lake-spp-chips">
