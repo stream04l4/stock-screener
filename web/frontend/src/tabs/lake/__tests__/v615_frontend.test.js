@@ -158,7 +158,7 @@ describe("F2：SourcePoolPanel 图例 local 色点 = #64748b", () => {
   it("#lake-spp-legend local 项色点背景 #64748b（非旧值）", () => {
     const w = mountSPP();
     const items = w.findAll("#lake-spp-legend .lake-spp-legend-item");
-    expect(items.length).toBe(5);  // v7.0.18：4 活跃源 + local（baostock 随渠道移除）
+    expect(items.length).toBe(8);  // v1.1（2026-11-10）：7 源 + local
     // LEGEND_ORDER 末位 = local
     const localItem = items[items.length - 1];
     expect(localItem.text()).toBe("本地缓存");

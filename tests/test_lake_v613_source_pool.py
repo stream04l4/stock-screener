@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 """test_lake_v613_source_pool —— v6.1.3 数据源池状态面板：/status.source_pool.sources。
 
-规格（v6.1.3 brief A/C；v7.0.18 更新）：
-- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 sina/tencent/
-  tdx/adata_f10，与前端 SOURCE_COLORS 对齐），每源一项：
-  ``{name, enabled, available, probed_at, latency_ms, authority, provides, quota,
-  rate_limit}``。
+规格（v6.1.3 brief A/C；v7.0.18 更新；v1.1 2026-11-10 重设计更新）：
+- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 7 源：4 灌数池源
+  + tushare/eastmoney/fuyao 展示源，与前端 SOURCE_COLORS 对齐），每源一项：
+  ``{name, enabled, switchable, available, probed_at, latency_ms, authority,
+  provides, quota, rate_limit}``。
+- ``switchable``：仅灌数池 4 源 true（strategy.yaml 有开关键；v1.1 新源无→false）；
 - ``available/probed_at/latency_ms`` **复用现有 adapters[name]**（null=未探测）；
-- ``authority`` = Q1 权威性数值（source_pool.AUTHORITY，越小越权威）；
-- ``provides`` = 静态能力表 SOURCE_CAPABILITIES（该源可提供的数据类型+role；T4 不列）；
+- ``authority`` = Q1 权威性数值（source_pool.AUTHORITY；v1.1 新源不参与 conflict
+  裁决→None）；
+- ``provides`` = 静态能力表 SOURCE_CAPABILITIES（v1.1 三角色：主源/备源/交叉校验 +
+  观察期标注；东财含 T4 分红在线主源）；
 - ``quota`` **恒 null**（v7.0.18：baostock 日配额随渠道移除，无计数方）；
-- ``rate_limit`` = min_interval_s 派生文案（sina/tdx/adata_f10 有，tencent→null）；
+- ``rate_limit`` = min_interval_s 派生文案（sina/tdx/adata_f10 有，tencent→null；
+  v1.1：tushare/eastmoney/fuyao 静态实测配额文案）；
 - **三态契约红线**：sources 仅 ready 态出现——locked/uninitialized 响应体逐字节不动
   （无 source_pool 键 → 无 sources）；ready 态 ``sync.quota_used_today/quota_budget``
   **保留不删**（v605 断言依赖 + API 契约，本次只是前端不再展示）。
@@ -35,10 +39,14 @@ import lake.web_api as wapi  # noqa: E402
 from lake import conn as lconn  # noqa: E402
 from lake.ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES  # noqa: E402
 
-# 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐；v7.0.18 baostock 移除）
-FOUR_SOURCES = ["sina", "tencent", "tdx", "adata_f10"]
-# 每源条目键集恒定（形状稳定，前端按此渲染四行卡）
-ENTRY_KEYS = {"name", "enabled", "available", "probed_at", "latency_ms",
+# 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐；v7.0.18 baostock 移除；
+# v1.1 2026-11-10：+tushare/eastmoney/fuyao 展示源）
+ALL_SOURCES = ["sina", "tencent", "tdx", "adata_f10", "tushare", "eastmoney", "fuyao"]
+SWITCHABLE_SOURCES = ["sina", "tencent", "tdx", "adata_f10"]   # 灌数池源（有开关键）
+# 每源条目键集恒定（形状稳定，前端按此渲染四行卡；v1.1 +switchable；
+# v1.2 +sg_* 四字段=SG 中转备用通道档）
+ENTRY_KEYS = {"name", "enabled", "switchable", "available", "probed_at", "latency_ms",
+              "sg_available", "sg_probed_at", "sg_latency_ms", "sg_detail",
               "authority", "provides", "quota", "rate_limit"}
 
 
@@ -116,13 +124,19 @@ def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     # conflict_codes 形状 = conflict_rows 同键集（T1-T7 + total）
     assert set(sp["conflict_codes"].keys()) == set(sp["conflict_rows"].keys())
     srcs = sp["sources"]
-    assert isinstance(srcs, list) and len(srcs) == 4, f"sources 应 4 源: {len(srcs)}"
+    assert isinstance(srcs, list) and len(srcs) == 7, f"sources 应 7 源: {len(srcs)}"
     # 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐）
-    assert [s["name"] for s in srcs] == FOUR_SOURCES, \
-        f"sources 顺序必须 sina/tencent/tdx/adata_f10: {[s['name'] for s in srcs]}"
+    assert [s["name"] for s in srcs] == ALL_SOURCES, \
+        f"sources 顺序必须=ALL_SOURCES: {[s['name'] for s in srcs]}"
     # 每源条目键集恒定（形状稳定）
     for s in srcs:
         assert set(s.keys()) == ENTRY_KEYS, f"{s['name']} 键集: {sorted(s)}"
+    # v1.1：switchable 仅灌数池 4 源（新展示源无 strategy.yaml 开关键）
+    by_sw = {s["name"]: s["switchable"] for s in srcs}
+    for n in SWITCHABLE_SOURCES:
+        assert by_sw[n] is True, f"{n} 应可开关"
+    for n in ("tushare", "eastmoney", "fuyao"):
+        assert by_sw[n] is False, f"{n} 不应有开关（无 yaml 键）"
 
 
 def test_ready_sources_available_reuses_adapters(tmp_path, monkeypatch):
@@ -168,9 +182,13 @@ def _write_source_health(tmp_path, adapters: dict):
 def test_ready_sources_authority_from_constant(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    for name in FOUR_SOURCES:
+    # v1.1：仅灌数池 4 源参与 conflict 裁决（AUTHORITY 有键）
+    for name in SWITCHABLE_SOURCES:
         assert by_name[name]["authority"] == AUTHORITY[name], \
             f"{name} authority 应={AUTHORITY[name]}: {by_name[name]['authority']}"
+    # v1.1：新展示源不参与裁决 → None（晋主前不写入，无裁决需求）
+    for name in ("tushare", "eastmoney", "fuyao"):
+        assert by_name[name]["authority"] is None
     # Q1 序：sina(0) < tencent(1) < tdx(3) == adata_f10(3)（baostock:2 空位随渠道移除）
     assert by_name["sina"]["authority"] < by_name["tencent"]["authority"] \
         < by_name["tdx"]["authority"]
@@ -183,34 +201,48 @@ def test_ready_sources_authority_from_constant(tmp_path, monkeypatch):
 def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    for name in FOUR_SOURCES:
+    for name in ALL_SOURCES:
         # 原样透出（deep copy，值相等）
         assert by_name[name]["provides"] == SOURCE_CAPABILITIES.get(name, []), \
             f"{name} provides 应=SOURCE_CAPABILITIES: {by_name[name]['provides']}"
-    # 关键内容断言（防能力表被静默改动）
+    # 关键内容断言（防能力表被静默改动）——v1.1 角色语义（观察期标注）
     sina = by_name["sina"]["provides"]
-    assert {"table": "kline_daily", "field_group": "ohlcv_amount", "role": "主源"} \
-        in [ {k: p[k] for k in ("table", "field_group", "role")} for p in sina ]
+    assert {"table": "kline_daily", "field_group": "ohlcv_amount",
+            "role": "主源(观察期→降备)"} \
+        in [{k: p[k] for k in ("table", "field_group", "role")} for p in sina]
     # v6.3.3：sina 能力表含 T6 前十大股东（v6.1.7 加 T6 时漏回填，Joel 10-02 反馈补登）
     assert {"table": "holders_snapshot", "field_group": "holders", "role": "主源"} \
-        in [ {k: p[k] for k in ("table", "field_group", "role")} for p in sina ]
-    # tencent 含 T1 主档（brief provides 表）+ T3 估值主源 + T7 指数主源
+        in [{k: p[k] for k in ("table", "field_group", "role")} for p in sina]
+    # tencent 含 T1 主档（v1.1：ST 抽查降校验）+ T3 估值主源 + T7 指数（v1.1 降校验）
     tx = by_name["tencent"]["provides"]
     tables_tx = {(p["table"], p["field_group"]) for p in tx}
     assert ("stock_master", "master") in tables_tx
     assert ("valuation_daily", "valuation") in tables_tx
     assert ("index_daily", "ohlcv") in tables_tx
-    # tdx 含 T7 amount 主源
+    # v1.1：tdx T7 由「amount 主源」收敛为单源全字段（观察期主源，东财晋主后降备）
     tdx = {(p["table"], p["field_group"], p["role"]) for p in by_name["tdx"]["provides"]}
-    assert ("index_daily", "amount", "主源") in tdx
+    assert ("index_daily", "ohlcv_amount", "主源(观察期→降备)") in tdx
     # adata_f10 仅 T5 f10 主源
     assert by_name["adata_f10"]["provides"] == [
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "主源"}]
-    # T4 分红=本地静态缓存，不属任何在线源 → 任一 provides 不得含 dividend_events
-    for name in FOUR_SOURCES:
+    # v1.1：tushare=T1 备源(现主源)+T3 备源；eastmoney=观察期目标主源矩阵；
+    # fuyao=T5 备源+T6 校验
+    em = {(p["table"], p["field_group"], p["role"]) for p in by_name["eastmoney"]["provides"]}
+    assert ("kline_daily", "ohlcv_amount", "主源(观察期→晋主)") in em
+    assert ("index_daily", "ohlcv_amount", "主源(观察期→晋主)") in em
+    assert ("dividend_events", "dividend", "主源(端点待验证)") in em
+    ts = {(p["table"], p["role"]) for p in by_name["tushare"]["provides"]}
+    assert ("stock_master", "备源(现主源)") in ts
+    assert ("valuation_daily", "备源(全市场1调用/日)") in ts
+    fy = {(p["table"], p["role"]) for p in by_name["fuyao"]["provides"]}
+    assert ("fundamentals_quarterly", "备源(PIT待验证)") in fy
+    # T4 分红：v1.1 起仅东财在线源列 T4（旧 em_local_static CSV 是 source 值不是源能力）
+    for name in ALL_SOURCES:
+        if name == "eastmoney":
+            continue
         assert all(p["table"] != "dividend_events" for p in by_name[name]["provides"]), \
-            f"{name} provides 不应含 T4（本地静态缓存）"
+            f"{name} provides 不应含 T4（仅东财在线主源）"
 
 
 # ===========================================================================
@@ -246,6 +278,10 @@ def test_ready_sources_rate_limit_text(tmp_path, monkeypatch):
     assert by_name["adata_f10"]["rate_limit"] == "≥1s/股", by_name["adata_f10"]["rate_limit"]
     # tencent 无 min_interval 配置 → null（前端显示"无官方配额"）
     assert by_name["tencent"]["rate_limit"] is None
+    # v1.1：新展示源静态实测文案（config 无关；2026-11-10 限额探测结论）
+    assert by_name["tushare"]["rate_limit"] == "免费档 5次/天·stock_basic 1次/时（超封~24h）"
+    assert by_name["eastmoney"]["rate_limit"] == "无硬限（2026-11-10 实测 20并发≈12 req/s）"
+    assert by_name["fuyao"]["rate_limit"] == "15次/秒（X-RateLimit-Limit）·日配额未观测"
 
 
 def test_ready_sources_rate_limit_from_config_override(tmp_path, monkeypatch):
@@ -267,8 +303,9 @@ def test_ready_sources_rate_limit_from_config_override(tmp_path, monkeypatch):
 def test_ready_sources_enabled_default_true(tmp_path, monkeypatch):
     d = _ready_status(tmp_path, monkeypatch)
     by_name = {s["name"]: s for s in d["source_pool"]["sources"]}
-    # 默认全开（config 缺省 *_enabled=True；tencent 无独立开关 → True）
-    for name in FOUR_SOURCES:
+    # 默认全开（config 缺省 *_enabled=True；tencent 无独立开关 → True；
+    # v1.1 新源无 yaml 开关键 → 同样默认 True）
+    for name in ALL_SOURCES:
         assert by_name[name]["enabled"] is True, f"{name} enabled 默认应 True"
 
 
@@ -337,9 +374,9 @@ def test_build_sources_no_db_no_adapter_import(tmp_path, monkeypatch):
     monkeypatch.setattr(sp, "_REGISTRY", {"sina": object()})
     prog = {"tasks": [{"quota_used_today": 42}]}
     adapters = {n: {"available": None, "probed_at": None, "latency_ms": None}
-                for n in FOUR_SOURCES}
+                for n in ALL_SOURCES}
     out = wapi._build_sources(prog, adapters)
-    assert [s["name"] for s in out] == FOUR_SOURCES
+    assert [s["name"] for s in out] == ALL_SOURCES
     # v7.0.18：quota 恒 null（progress 配额键不影响——无计数方）
     assert all(s["quota"] is None for s in out)
     # provides 来自常量（不依赖 adapter 实例）

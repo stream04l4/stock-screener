@@ -116,15 +116,23 @@ AUTHORITY: Dict[str, int] = {
 # 是数据源池的固有属性，与 AUTHORITY 同源同生命周期——web_api 只读透出。
 # table_cn 口径 = web_api._TABLE_META name_cn 的简写（T2 日K线 / T3 估值日线…），
 # 与前端 SourcePoolPanel.TABLE_LABELS 对齐；role 含"主源/fallback/交叉校验"及
-# 推导方式备注（hfq÷raw）。**T4 分红=本地静态缓存（零网络）不属任何在线源，
-# 本表不列 T4**（brief 红线）。
+# 推导方式备注（hfq÷raw）。
+#
+# v1.1 重设计（2026-11-10，Gate 0 已批；stages/01_research/
+# table_source_redesign_20261110.md §3）：每表一主一备一校验、整表切换。
+# 观察期（1 周/5 交易日）语义标注：
+#   - 「(观察期→晋主)」= 目标主源，观察期达标后切换（当前未写入）；
+#   - 「(观察期→降备)」= 当前实际主源，晋主后降备；
+#   - 「(端点/PIT 待验证)」= 接入时探活验证项。
+# T4 分红原=本地静态缓存不属在线源；重设计后东财分红报表为 T4 在线主源
+# （旧 em_local_static CSV 保留作历史基线+对账，source 值不变）。
 # ---------------------------------------------------------------------------
 SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     "sina": [
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "主源"},
+         "field_group": "ohlcv_amount", "role": "主源(观察期→降备)"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "主源(推导)"},   # hfq÷raw 推导
+         "field_group": "adj_factor", "role": "主源·推导(观察期)"},   # hfq÷raw 推导
         # v6.3.3（2026-10-02）：T6 前十大股东补登记。根因：本表建于 v6.1.3，
         # 当时 sina 只管 K线；T6 是 v6.1.7 加的（SinaClient.fetch_holders 抓新浪 F10
         # 股东研究页 vip.stock.finance.sina.com.cn vCI_CirculateStockHolder），加表
@@ -136,27 +144,57 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     ],
     "tencent": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "主源"},
-        {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "fallback"},
+         "field_group": "master", "role": "交叉校验(ST抽查)"},
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
          "field_group": "valuation", "role": "主源"},
         {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "ohlcv", "role": "主源"},
+         "field_group": "ohlcv", "role": "交叉校验"},
     ],
     "tdx": [
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "fallback"},
-        {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "fallback(推导)"},   # hfq÷raw 推导
+         "field_group": "ohlcv_amount", "role": "交叉校验"},
+        # v1.1：T7 由「腾讯 ohlcv + tdx amount 字段组拼接」收敛为 tdx 单源全字段
+        # （观察期主源；东财晋主后 tdx 降备）。
         {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "ohlcv", "role": "fallback"},
-        {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "amount", "role": "主源"},
+         "field_group": "ohlcv_amount", "role": "主源(观察期→降备)"},
     ],
     "adata_f10": [
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "主源"},
+    ],
+    # ---- v1.1（2026-11-10）新增三源（均非灌数池内 adapter：无 enabled 开关、
+    # 不参与 conflict 裁决——AUTHORITY 不加键，晋主前不写入）----
+    "tushare": [
+        {"table": "stock_master", "table_cn": "T1 股票主档",
+         "field_group": "master", "role": "备源(现主源)"},
+        {"table": "valuation_daily", "table_cn": "T3 估值日线",
+         "field_group": "valuation", "role": "备源(全市场1调用/日)"},
+    ],
+    "eastmoney": [
+        {"table": "stock_master", "table_cn": "T1 股票主档",
+         "field_group": "master", "role": "主源(观察期→晋主)"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "ohlcv_amount", "role": "主源(观察期→晋主)"},
+        {"table": "kline_daily", "table_cn": "T2 日K线",
+         "field_group": "adj_factor", "role": "主源·推导(观察期)"},   # raw÷后复权(fqt=2)
+        {"table": "valuation_daily", "table_cn": "T3 估值日线",
+         "field_group": "valuation", "role": "交叉校验(观察期)"},     # 换手率=NULL 显式降级
+        {"table": "dividend_events", "table_cn": "T4 分红事件",
+         "field_group": "dividend", "role": "主源(端点待验证)"},
+        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
+         "field_group": "f10", "role": "交叉校验(待验证)"},
+        {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
+         "field_group": "holders", "role": "备源(待验证)"},
+        {"table": "index_daily", "table_cn": "T7 指数日线",
+         "field_group": "ohlcv_amount", "role": "主源(观察期→晋主)"},  # 指数K线含amount已验
+        {"table": "macro_rf", "table_cn": "T9 无风险利率",
+         "field_group": "rf", "role": "备源(待验证)"},
+    ],
+    "fuyao": [
+        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
+         "field_group": "f10", "role": "备源(PIT待验证)"},
+        {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
+         "field_group": "holders", "role": "交叉校验(待验证)"},
     ],
 }
 

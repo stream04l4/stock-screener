@@ -146,10 +146,12 @@ def test_ready_source_pool_conflict_rows_total_sum(tmp_path, monkeypatch):
 # B. adapters / stale（source_health.json 缺失 / 新鲜 / 过期 三分支）
 # ===========================================================================
 def test_ready_adapters_missing_file_all_null_stale(tmp_path, monkeypatch):
-    """文件缺失 → adapters 4 键全 null + stale=true（'从未探测'语义）。"""
+    """文件缺失 → adapters 全 null + stale=true（'从未探测'语义；v1.1 起 7 源）。"""
     d = _ready_status(tmp_path, monkeypatch)   # 未写 source_health.json
     sp = d["source_pool"]
-    assert set(sp["adapters"].keys()) == {"sina", "tencent", "tdx", "adata_f10"}
+    # v1.1（2026-11-10 重设计）：adapters 7 源（4 灌数池 + tushare/eastmoney/fuyao 展示源）
+    assert set(sp["adapters"].keys()) == \
+        {"sina", "tencent", "tdx", "adata_f10", "tushare", "eastmoney", "fuyao"}
     for name, a in sp["adapters"].items():
         assert a == {"available": None, "probed_at": None, "latency_ms": None}, \
             f"{name} 缺失文件应全 null: {a}"

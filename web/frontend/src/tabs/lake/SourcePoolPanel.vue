@@ -136,12 +136,14 @@ const sources = computed(() => {
   const pool = props.pool || {};
   if (Array.isArray(pool.sources) && pool.sources.length) return pool.sources;
   // 回退：adapters → 最小形态（available/probed_at/latency_ms 复用，enabled=true）
+  // v1.2：sg_* 占位 null（旧响应无 SG 档 → 前端显「未探测」）
   const ad = pool.adapters || {};
   return Object.entries(ad).map(([name, a]) => ({
     name, enabled: true,
     available: (a && a.available) ?? null,
     probed_at: (a && a.probed_at) ?? null,
     latency_ms: (a && a.latency_ms) ?? null,
+    sg_available: null, sg_probed_at: null, sg_latency_ms: null, sg_detail: null,
     authority: null, provides: [], quota: null, rate_limit: null,
   }));
 });
@@ -157,10 +159,11 @@ function connWord(a) {
 }
 // 字段组 → chip 短名（brief："T2 日K线·OHLCV+amount(主源)" 形式；模板内联使用）
 // v6.3.3：补 holders（后端 SOURCE_CAPABILITIES.sina 回填 T6 后前端 chips 不再裸显英文）
+// v1.1（2026-11-10）：补 dividend/rf（东财 T4 分红报表 + T9 无风险利率备源 chips）。
 const FIELD_GROUP_CN = {
   ohlcv_amount: "OHLCV+amount", adj_factor: "复权因子", master: "主档",
   valuation: "估值", f10: "F10基本面", ohlcv: "OHLCV", amount: "amount",
-  holders: "前十大股东",
+  holders: "前十大股东", dividend: "分红", rf: "无风险利率",
 };
 // 配额行：v7.0.18 起后端 quota 恒 null（唯一硬配额源 baostock 已移除）→ 恒走
 // rate_limit 文案或"无官方配额"。函数保留（quota 对象分支防旧响应兼容）。
@@ -245,8 +248,11 @@ function fmtLatency(ms) {
                :style="{ borderLeft: '3px solid ' + (SOURCE_COLORS[s.name] || UNKNOWN_COLOR) }">
             <div class="lake-spp-adapter-head">
               <b :style="{ color: SOURCE_COLORS[s.name] || '#475569' }">{{ s.name }}</b>
-              <!-- v6.1.4 O4：enabled 勾选（写 strategy.yaml lake 段开关；运行中灌数不受影响） -->
-              <label class="lake-spp-toggle" :title="'启用/禁用 ' + s.name + '（立即写入配置，下次灌数启动生效）'">
+              <!-- v6.1.4 O4：enabled 勾选（写 strategy.yaml lake 段开关；运行中灌数不受影响）。
+                   v1.1：仅灌数池 4 源可开关（s.switchable!==false 门控——tushare/eastmoney/
+                   fuyao 无 strategy.yaml 开关键，隐藏 checkbox 防 400）；旧响应无该键→视为可开关。 -->
+              <label v-if="s.switchable !== false" class="lake-spp-toggle"
+                     :title="'启用/禁用 ' + s.name + '（立即写入配置，下次灌数启动生效）'">
                 <input type="checkbox" :id="'src-enable-' + s.name"
                        :checked="s.enabled !== false" @change="onToggle(s, $event)">
               </label>
@@ -257,10 +263,17 @@ function fmtLatency(ms) {
                 {{ probing[s.name] ? "…" : "探测" }}
               </button>
             </div>
-            <!-- 行1 连通性（enabled=false → 上方 badge 替代 ✓/✗） -->
+            <!-- 行1 连通性（enabled=false → 上方 badge 替代 ✓/✗）
+                 v1.2：双通道——本机（EU 直连）+ SG 中转备用（source_health_sg.json）；
+                 SG 三态同口径（✓可达/✗不可达/—未探测；detail 含"通道可达未鉴权"语义） -->
             <div v-if="s.enabled !== false" class="lake-spp-conn">
               <span class="lake-spp-avail" :class="{ ok: s.available === true, bad: s.available === false }">
-                {{ availMark(s.available) }} {{ connWord(s.available) }}
+                本机 {{ availMark(s.available) }} {{ connWord(s.available) }}
+              </span>
+              <span class="lake-spp-avail lake-spp-sg"
+                    :class="{ ok: s.sg_available === true, bad: s.sg_available === false }"
+                    :title="'SG 中转备用通道：' + (s.sg_detail || '未探测') + (s.sg_probed_at ? '（' + s.sg_probed_at + '）' : '')">
+                SG备用 {{ s.sg_available === true ? "✓" : s.sg_available === false ? "✗" : "—" }}
               </span>
               <span class="muted small mono"> · latency {{ fmtLatency(s.latency_ms) }}</span>
             </div>

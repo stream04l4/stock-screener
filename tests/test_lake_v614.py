@@ -41,6 +41,9 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import lake.web_api as wapi  # noqa: E402
+# v1.2：模块加载期保存真 _run_sg_batch 引用（autouse fixture 会把 wapi._run_sg_batch
+# patch 成离线替身；TSV 解析/失败模式用例要跑真函数本体）
+REAL_RUN_SG_BATCH = wapi._run_sg_batch
 from lake import backfill as lb  # noqa: E402
 from lake import conn as lconn  # noqa: E402
 from lake.ingest.tencent_ingest import INDEX_CODES  # noqa: E402
@@ -88,6 +91,11 @@ def _v614_isolate(tmp_path, monkeypatch):
                                      "source": "tradingeconomics"}))
     monkeypatch.setattr(_lci, "load_macro_rf",
                         lambda con, cache_dir, source="te_local": 0)
+    # v1.2：SG 中转探测零网络——默认离线替身（需要真解析逻辑的用例自行再 patch
+    # subprocess.run；_run_sg_batch 本体只在显式 patch 的测试里跑）
+    monkeypatch.setattr(wapi, "_run_sg_batch", lambda names: {
+        n: {"available": False, "probed_at": "2026-09-17 08:05:00",
+            "latency_ms": None, "detail": "offline-test"} for n in names})
     yield
 
 
@@ -637,11 +645,101 @@ def test_o4_probe_results_and_health_file(tmp_path, monkeypatch):
     d = wapi.sources_probe({"names": ["sina"]})
     assert d["results"]["sina"]["available"] is True
     assert d["path"] == health
+    # v1.2：SG 中转档并入结果 + 独立文件落盘（autouse 离线替身：不可达/offline-test）
+    assert d["results"]["sina"]["sg"]["available"] is False
+    assert d["results"]["sina"]["sg"]["detail"] == "offline-test"
+    sg_health = str(tmp_path / "prog" / "source_health_sg.json")
+    assert d["sg_path"] == sg_health
+    with open(sg_health, encoding="utf-8") as f:
+        saved_sg = json.load(f)
+    assert saved_sg["sina"]["available"] is False
+    assert saved_sg["sina"]["detail"] == "offline-test"
     with open(health, encoding="utf-8") as f:
         saved = json.load(f)
     assert saved["sina"]["available"] is True
     assert saved["tencent"]["probed_at"] == "2026-09-17 08:00:00", \
         "合并写必须保留未探测源的既有记录"
+
+
+# ===========================================================================
+# v1.2（2026-11-10）：SG 中转备用通道（scripts/lake_probe_sg.py + 一次 ssh 批量）
+# ===========================================================================
+class _FakeProc:
+    def __init__(self, rc=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+
+
+def test_v12_run_sg_batch_parses_tsv(tmp_path, monkeypatch):
+    """_run_sg_batch 真解析逻辑（patch subprocess.run，零 ssh）：TSV 四列→记录。"""
+    import subprocess as _sp
+
+    monkeypatch.setattr(wapi, "_sg_script_path",
+                        lambda: str(tmp_path / "probe.py"))
+    (tmp_path / "probe.py").write_text("# fake script", encoding="utf-8")
+
+    tsv = ("sina\t1\t120\tquote OK\n"
+           "eastmoney\t0\t8000\tpush2his 超时\n"
+           "garbage-line-no-tabs\n")   # 坏行须被跳过
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **kw: _FakeProc(0, tsv))
+    out = REAL_RUN_SG_BATCH(["sina", "eastmoney", "fuyao"])
+    assert out["sina"] == {"available": True, "probed_at": out["sina"]["probed_at"],
+                           "latency_ms": 120, "detail": "quote OK"}
+    assert out["eastmoney"]["available"] is False
+    assert out["eastmoney"]["detail"] == "push2his 超时"
+    # 未返回的源（fuyao 不在 TSV）→ 显式"未返回该源结果"（不 KeyError）
+    assert out["fuyao"]["available"] is False
+    assert "未返回" in out["fuyao"]["detail"]
+
+
+def test_v12_run_sg_batch_failure_modes(tmp_path, monkeypatch):
+    """ssh 层失败三态：rc!=0 / 超时 / 脚本缺失 → 全源不可达 + 原因（不抛）。"""
+    import subprocess as _sp
+
+    (tmp_path / "probe.py").write_text("# fake", encoding="utf-8")
+
+    # 1) ssh rc=255（SG 停摆/断网）
+    monkeypatch.setattr(wapi, "_sg_script_path", lambda: str(tmp_path / "probe.py"))
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **kw: _FakeProc(255, "", "ssh: Connection refused"))
+    out = REAL_RUN_SG_BATCH(["sina", "tencent"])
+    assert all(v["available"] is False for v in out.values())
+    assert "不可达" in out["sina"]["detail"] and "rc=255" in out["sina"]["detail"]
+
+    # 2) 整体超时
+    def _timeout(*a, **kw):
+        raise _sp.TimeoutExpired(cmd="ssh", timeout=45)
+    monkeypatch.setattr(_sp, "run", _timeout)
+    out = REAL_RUN_SG_BATCH(["sina"])
+    assert out["sina"]["available"] is False
+    assert "超时" in out["sina"]["detail"]
+
+    # 3) 脚本缺失
+    monkeypatch.setattr(wapi, "_sg_script_path", lambda: str(tmp_path / "missing.py"))
+    monkeypatch.setattr(_sp, "run", lambda *a, **kw: _FakeProc(0, ""))
+    out = REAL_RUN_SG_BATCH(["sina"])
+    assert out["sina"]["available"] is False
+    assert "脚本缺失" in out["sina"]["detail"]
+
+
+def test_v12_build_sources_sg_fields(tmp_path, monkeypatch):
+    """/status sources[] 带 sg 四字段（读 SG 独立文件；缺失=从未探测→None）。"""
+    monkeypatch.setattr(wapi, "_read_source_health_sg", lambda: {
+        **{n: {"available": None, "probed_at": None, "latency_ms": None, "detail": None}
+           for n in wapi._ADAPTER_NAMES},
+        "eastmoney": {"available": False, "probed_at": "2026-11-10 16:00:00",
+                      "latency_ms": 8000, "detail": "push2his 超时"}})
+    out = wapi._build_sources({"tasks": []}, {
+        n: {"available": None, "probed_at": None, "latency_ms": None}
+        for n in wapi._ADAPTER_NAMES})
+    by = {s["name"]: s for s in out}
+    assert by["eastmoney"]["sg_available"] is False
+    assert by["eastmoney"]["sg_detail"] == "push2his 超时"
+    assert by["eastmoney"]["sg_probed_at"] == "2026-11-10 16:00:00"
+    assert by["eastmoney"]["sg_latency_ms"] == 8000
+    # 从未探测 SG 的源 → 全 None（前端显「未探测」）
+    assert by["sina"]["sg_available"] is None
+    assert by["sina"]["sg_detail"] is None
 
 
 def test_o4_probe_default_all_and_bad_name_400(tmp_path, monkeypatch):
@@ -654,11 +752,92 @@ def test_o4_probe_default_all_and_bad_name_400(tmp_path, monkeypatch):
         wapi, "_probe_one_source",
         lambda name: (calls.append(name), {"available": False, "probed_at": None,
                                            "latency_ms": None, "detail": ""})[1])
-    d = wapi.sources_probe({})   # 缺省 = 全部 4 源（v7.0.18：baostock 随渠道移除）
-    assert calls == ["sina", "tencent", "tdx", "adata_f10"]
+    d = wapi.sources_probe({})   # 缺省 = 全部 7 源（v1.1：4 灌数池 + 3 展示源）
+    assert calls == ["sina", "tencent", "tdx", "adata_f10",
+                     "tushare", "eastmoney", "fuyao"]
     with pytest.raises(wapi.HTTPException) as ei:
         wapi.sources_probe({"names": ["sina", "nope"]})
     assert ei.value.status_code == 400
+    # v1.1：展示源白名单内（eastmoney 可被点名探测）
+    d2 = wapi.sources_probe({"names": ["eastmoney"]})
+    assert "eastmoney" in d2["results"]
+
+
+# ===========================================================================
+# v1.1（2026-11-10）：新源轻量探测分支（离线——网络层 monkeypatch，不发真请求）
+# ===========================================================================
+class _FakeResp:
+    def __init__(self, payload: str):
+        self._payload = payload.encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_v11_probe_tushare_offline(monkeypatch):
+    """tushare：import 成功 + token 在场 → 可用（不调 API，省配额）；缺 token → false。"""
+    # 路径守卫：web_api.py 在 lake/ 下 → repo 根 .env（dirname 2 次，非 3 次）
+    assert wapi._env_path().endswith(os.path.join("stock-screener", ".env")), \
+        f"env_path 应指向 repo 根: {wapi._env_path()}"
+    monkeypatch.setattr(wapi, "_env_token", lambda k: "tok" if k == "TUSHARE_TOKEN" else None)
+    ok, detail = wapi._probe_tushare()
+    assert ok is True and "未调 API" in detail, (ok, detail)
+    monkeypatch.setattr(wapi, "_env_token", lambda k: None)
+    ok, detail = wapi._probe_tushare()
+    assert ok is False and "TUSHARE_TOKEN" in detail
+
+
+def test_v11_probe_eastmoney_offline(monkeypatch):
+    """eastmoney：push2his rc=0 → 可用；网络异常 → false（不抛）。"""
+    import json as _json
+    import urllib.request as _ur
+
+    good = _json.dumps({"rc": 0, "data": {"klines": ["2026-11-10,11.01"]}})
+    monkeypatch.setattr(_ur, "urlopen", lambda *a, **kw: _FakeResp(good))
+    ok, detail = wapi._probe_eastmoney()
+    assert ok is True and "push2his" in detail, (ok, detail)
+
+    def _raise(req):
+        raise OSError("network down")
+    monkeypatch.setattr(_ur, "urlopen", _raise)
+    ok, detail = wapi._probe_eastmoney()
+    assert ok is False and "请求失败" in detail
+
+    # rc 非 0（geo 墙形态）→ false
+    monkeypatch.setattr(_ur, "urlopen",
+                        lambda *a, **kw: _FakeResp(_json.dumps({"rc": 1})))
+    ok, detail = wapi._probe_eastmoney()
+    assert ok is False and "rc=" in detail
+
+
+def test_v11_probe_fuyao_offline(monkeypatch):
+    """fuyao：code=0 → 可用；缺 key → false（不触网）；code 非 0 → false。"""
+    import json as _json
+    import urllib.request as _ur
+
+    monkeypatch.setattr(wapi, "_env_token",
+                        lambda k: "k" if k == "HITHINK_FINANCE_API_KEY" else None)
+    good = _json.dumps({"code": 0, "data": {"stock_items": [1, 2]}})
+    monkeypatch.setattr(_ur, "urlopen", lambda *a, **kw: _FakeResp(good))
+    ok, detail = wapi._probe_fuyao()
+    assert ok is True and "2 股" in detail, (ok, detail)
+
+    monkeypatch.setattr(wapi, "_env_token", lambda k: None)
+    ok, detail = wapi._probe_fuyao()
+    assert ok is False and "HITHINK_FINANCE_API_KEY" in detail
+
+    monkeypatch.setattr(wapi, "_env_token",
+                        lambda k: "k" if k == "HITHINK_FINANCE_API_KEY" else None)
+    monkeypatch.setattr(_ur, "urlopen",
+                        lambda *a, **kw: _FakeResp(_json.dumps({"code": 1, "message": "no"})))
+    ok, detail = wapi._probe_fuyao()
+    assert ok is False and "code=1" in detail
 
 
 def test_o4_probe_timeout_15s_isolation(tmp_path, monkeypatch):

@@ -60,6 +60,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -819,7 +820,8 @@ _CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 confli
 # v6.3.5：conflict 股票数口径的 code 列（index_daily=index_code，其余=ts_code）——
 # 与 _TABLE_META code_col 同口径，防 COUNT(DISTINCT ts_code) 在 index_daily 报列不存在。
 _CONFLICT_CODE_COL = {t[0]: t[5] for t in _TABLE_META}
-_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10"]   # v7.0.18：baostock 随渠道移除
+_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10", "tushare", "eastmoney",
+                  "fuyao"]   # v1.1（2026-11-10）：4 灌数池源 + 3 观察期/备源展示源
 _STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
 
 
@@ -873,15 +875,150 @@ def _read_source_health():
     return adapters, stale
 
 
+# ---------------------------------------------------------------------------
+# v1.2（2026-11-10，Joel 拍板）：SG 中转备用通道探测
+#
+# 背景：东财/Fuyao 有 2026-10-22 被 geo 墙前科（11-10 厂商侧解除，但随时可能再墙）；
+# SG（ssh oci，1C1G）实测可直连东财/Fuyao → 作为**备用出口通道**。数据源状态需
+# 同时标明「本机（EU）可达」与「备用通道（SG）可达」两档。
+#
+# 设计纪律：
+# - **独立文件 source_health_sg.json**：灌数 driver 每次启动全量覆盖
+#   source_health.json（只含 4 池源），若把 sg 记进取会被每日冲掉 → 分文件、
+#   仅 Web 探测写入，天然不受灌数影响。
+# - **一次 ssh 批量**：ssh oci 'python3 -s -' 跑 scripts/lake_probe_sg.py（SG 侧
+#   并行探活、纯 stdlib、无凭据、整体墙钟 25s）→ TSV 回传。不逐源开 7 条 ssh。
+# - **通道语义**：fuyao/tushare 在 SG 侧只做可达性（不附 key、不调配额 API）——
+#   key 留在 EU .env；"SG 通道可达"≠"SG 已鉴权"，detail 如实写明。
+# - **零影响红线**：sg 探测失败/超时/ssh 断 → 只记 sg 档不可达，本机档与
+#   /status 其余部分不受影响；探测是手动动作，无 cron 自动触发。
+# ---------------------------------------------------------------------------
+_SG_SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+               "-o", "StrictHostKeyChecking=accept-new", "oci"]
+_SG_PROBE_TIMEOUT_S = 45.0   # ssh 握手 + SG 侧整体墙钟 25s + 余量
+
+
+def _source_health_sg_path() -> str:
+    """source_health_sg.json 路径（与 source_health.json 同目录；测试可 monkeypatch）。"""
+    return os.path.join(os.path.dirname(_source_health_path()), "source_health_sg.json")
+
+
+def _read_source_health_sg() -> Dict[str, Dict[str, Any]]:
+    """读 SG 通道探测记录 → {name: {available, probed_at, latency_ms, detail}}。
+
+    缺失/损坏 → 全部 None（"从未探测 SG"语义，前端显「未探测」）。
+    """
+    empty = {n: {"available": None, "probed_at": None, "latency_ms": None, "detail": None}
+             for n in _ADAPTER_NAMES}
+    try:
+        with open(_source_health_sg_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return dict(empty)
+    if not isinstance(data, dict):
+        return dict(empty)
+    out: Dict[str, Any] = {}
+    for n in _ADAPTER_NAMES:
+        a = data.get(n)
+        out[n] = ({"available": a.get("available"), "probed_at": a.get("probed_at"),
+                   "latency_ms": a.get("latency_ms"), "detail": a.get("detail")}
+                  if isinstance(a, dict) else dict(empty[n]))
+    return out
+
+
+def _write_source_health_sg(merged: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """合并写 source_health_sg.json（原子；只写探测过的源，保留其余既有记录）。"""
+    import tempfile
+
+    path = _source_health_sg_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".lake_shsg_", suffix=".tmp",
+                                   dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - 写失败不阻断（结果仍在响应里）
+        log.warning("source_health_sg.json 写入失败（不阻断）: %s", exc)
+        return None
+    return path
+
+
+def _sg_script_path() -> str:
+    """SG 侧探活脚本（repo scripts/ 下；测试可 monkeypatch）。"""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "scripts", "lake_probe_sg.py")
+
+
+def _sg_unavailable(now_s: str, detail: str) -> Dict[str, Any]:
+    return {"available": False, "probed_at": now_s, "latency_ms": None, "detail": detail}
+
+
+def _run_sg_batch(names: List[str]) -> Dict[str, Dict[str, Any]]:
+    """SG 中转通道批量探活（**一次 ssh**，SG 侧并行；返回 {name: sg 记录}）。
+
+    任何失败（ssh 断/超时/脚本缺/解析空）→ 所有 name 记 available=False +
+    具体原因；**不抛**（sg 档失败不得影响本机档与请求）。
+    """
+    now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(_sg_script_path(), "r", encoding="utf-8") as f:
+            script = f.read()
+    except OSError as exc:
+        log.warning("SG 探活脚本缺失: %s", exc)
+        return {n: _sg_unavailable(now_s, f"SG 脚本缺失: {exc}") for n in names}
+    try:
+        p = subprocess.run(
+            _SG_SSH_CMD + ["python3", "-s", "-", ",".join(names)],
+            input=script, capture_output=True, text=True,
+            timeout=_SG_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {n: _sg_unavailable(now_s, f"SG 探测超时 >{_SG_PROBE_TIMEOUT_S:.0f}s")
+                for n in names}
+    except Exception as exc:  # noqa: BLE001 - ssh 层异常（断网/key 失效等）
+        return {n: _sg_unavailable(now_s, f"ssh 失败: {exc}"[:120]) for n in names}
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip().replace("\n", " ")[:120]
+        log.warning("SG 探测 ssh rc=%s: %s", p.returncode, err)
+        return {n: _sg_unavailable(now_s, f"SG 服务器不可达（rc={p.returncode}）: {err}")
+                for n in names}
+    out: Dict[str, Any] = {}
+    for line in p.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        n = parts[0]
+        if n not in _PROBE_NAMES:
+            continue
+        out[n] = {"available": parts[1] == "1",
+                  "probed_at": now_s,
+                  "latency_ms": int(parts[2]) if parts[2].isdigit() else None,
+                  "detail": "\t".join(parts[3:])[:160]}
+    return {n: out.get(n) or _sg_unavailable(now_s, "SG 侧未返回该源结果") for n in names}
+
+
 # v7.0.18：原 _quota_from_progress（BaoStock 日配额 used_today 派生）随渠道移除。
 
 
 def _rate_limit_text(name: str, cfg: Dict[str, Any]) -> Optional[str]:
-    """限速纪律文案（config ``{name}_min_interval_s`` 派生；未配置 → None）。
+    """限速/配额文案。
 
-    1.0 → "≥1s/股"（整数去小数点）；0.5 → "≥0.5s/股"。tencent 无
-    min_interval 配置 → None（前端显示"无官方配额"）。
+    灌数池 4 源：config ``{name}_min_interval_s`` 派生（1.0 → "≥1s/股"；
+    未配置 → None，前端显示"无官方配额"）。
+    v1.1 新增 3 展示源（2026-11-10 实测口径，静态文案）：
+    - tushare：免费档硬配额（5 次/天 + stock_basic 1 次/时，超 ~24h 硬封）；
+    - eastmoney：无硬限（连发 60+20 并发零 429/繁忙，20 并发 ≈12 req/s）；
+    - fuyao：X-RateLimit-Limit=15（秒级窗口），日配额未观测（63 次/日未触底）。
     """
+    if name == "tushare":
+        return "免费档 5次/天·stock_basic 1次/时（超封~24h）"
+    if name == "eastmoney":
+        return "无硬限（2026-11-10 实测 20并发≈12 req/s）"
+    if name == "fuyao":
+        return "15次/秒（X-RateLimit-Limit）·日配额未观测"
     v = cfg.get(f"{name}_min_interval_s")
     if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
         s = str(int(v)) if float(v).is_integer() else str(v)
@@ -904,23 +1041,33 @@ def _build_sources(prog: Dict[str, Any], adapters: Dict[str, Any]) -> List[Dict[
     - ``quota``：恒 null（v7.0.18：唯一有硬配额的 baostock 已移除；字段保留
       前端形状稳定）；
     - ``rate_limit``：min_interval_s 派生文案（sina/tdx/adata_f10 有；
-      tencent → None）。
+      tencent → None）；
+    - ``sg_available/sg_probed_at/sg_latency_ms/sg_detail``（v1.2）：SG 中转备用
+      通道状态（读 source_health_sg.json，仅 Web 探测写入；null=从未探测 SG）。
 
-    全部只读（config 文件 + progress dict + 静态常量），零网络、零库查询。
+    全部只读（config 文件 + progress dict + 静态常量 + health 文件），零网络、零库查询。
     """
     from .config import lake_cfg
     from .ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES
 
     cfg = lake_cfg()
+    sg_health = _read_source_health_sg()
     out: List[Dict[str, Any]] = []
     for name in _ADAPTER_NAMES:
         a = adapters.get(name) or {}
+        sg = sg_health.get(name) or {}
         out.append({
             "name": name,
             "enabled": bool(cfg.get(f"{name}_enabled", True)),
+            "switchable": name in _SOURCE_SWITCH_NAMES,
             "available": a.get("available"),
             "probed_at": a.get("probed_at"),
             "latency_ms": a.get("latency_ms"),
+            # v1.2：SG 中转备用通道（独立于本机档；null=从未探测）
+            "sg_available": sg.get("available"),
+            "sg_probed_at": sg.get("probed_at"),
+            "sg_latency_ms": sg.get("latency_ms"),
+            "sg_detail": sg.get("detail"),
             "authority": AUTHORITY.get(name),
             "provides": [dict(p) for p in SOURCE_CAPABILITIES.get(name, [])],
             "quota": None,
@@ -1494,7 +1641,87 @@ def status() -> Dict[str, Any]:
 # v7.0.18：原 baostock Q6 真探测特例随渠道移除（4 源统一走 adapter.available()）。
 # ---------------------------------------------------------------------------
 _SOURCE_SWITCH_NAMES = ["sina", "tencent", "tdx", "adata_f10"]
+# v1.1：探测白名单=全部展示源（东财/Fuyao/tushare 有轻量探测分支，见
+# _probe_one_source）；开关白名单仍=4 灌数池源（strategy.yaml 无新源开关键）。
+_PROBE_NAMES = list(_ADAPTER_NAMES)
 _PROBE_TIMEOUT_S = 15.0   # O4 超时纪律：每源最多 15s（hang 不能拖死请求）
+
+
+def _env_path() -> str:
+    """项目根 .env 路径（测试可 monkeypatch）。
+
+    注意：web_api.py 在 lake/ 下（比 ingest/ 少一层），dirname 只取 2 次。
+    """
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".env")
+
+
+def _env_token(key: str) -> Optional[str]:
+    """从 .env 读 token（手动解析，不依赖 python-dotenv；缺失→None）。"""
+    try:
+        with open(_env_path(), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'") or None
+    except OSError:
+        return None
+    return None
+
+
+def _probe_tushare() -> tuple:
+    """tushare 探测：**不调 API**（省免费档配额）——import 成功 + token 在场即可用。"""
+    try:
+        import tushare  # noqa: F401
+    except ImportError:
+        return False, "tushare 未安装"
+    if not _env_token("TUSHARE_TOKEN"):
+        return False, ".env 缺 TUSHARE_TOKEN"
+    return True, "已安装+token 在场（未调 API，省配额）"
+
+
+def _probe_eastmoney() -> tuple:
+    """东财探测：push2his 日K 1 根（rc==0=可达；2026-11-10 起 EU 直连已通）。"""
+    import json as _json
+    import urllib.request
+
+    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+           "secid=1.600546&fields1=f1&fields2=f51,f53&klt=101&fqt=1&lmt=1&end=20500101")
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                timeout=10) as r:
+            d = _json.loads(r.read())
+    except Exception as exc:  # noqa: BLE001 - 网络层异常→不可达（不抛）
+        return False, f"请求失败: {exc}"
+    if d.get("rc") == 0 and (d.get("data") or {}).get("klines"):
+        return True, "push2his 日K OK"
+    return False, f"rc={d.get('rc')}（疑 geo 墙/端点漂移）"
+
+
+def _probe_fuyao() -> tuple:
+    """Fuyao 探测：龙虎榜 1 次（code==0=可达；2026-11-10 起 EU 直连已通）。"""
+    import json as _json
+    import urllib.request
+
+    key = _env_token("HITHINK_FINANCE_API_KEY")
+    if not key:
+        return False, ".env 缺 HITHINK_FINANCE_API_KEY"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                "https://fuyao.aicubes.cn/api/a-share/special-data/dragon-tiger-list?date=2026-11-09",
+                headers={"User-Agent": "Mozilla/5.0", "X-api-key": key}),
+                timeout=10) as r:
+            d = _json.loads(r.read())
+    except Exception as exc:  # noqa: BLE001
+        return False, f"请求失败: {exc}"
+    if d.get("code") == 0:
+        return True, f"龙虎榜 OK（{len((d.get('data') or {}).get('stock_items', []))} 股）"
+    return False, f"code={d.get('code')} {d.get('message')}"
 
 
 def _probe_one_source(name: str) -> Dict[str, Any]:
@@ -1502,23 +1729,32 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
 
     sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
     （首次触发 EU 自检；失败→False，不抛）。
+    v1.1：tushare（import+token，不调 API）/eastmoney（push2his 1 根）/
+    fuyao（龙虎榜 1 次）走轻量探测分支。
     """
     from .ingest import source_pool as sp
 
     now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.monotonic()
     detail = ""
-    try:
-        ad = sp.get_adapter(name)
-        if ad is None:
-            return {"available": False, "probed_at": now_s, "latency_ms": None,
-                    "detail": "adapter 未注册（依赖库未装）"}
-        reset = getattr(ad, "reset_available_for_test", None)   # 懒缓存先清（brief 逐字）
-        if callable(reset):
-            reset()
-        ok = bool(ad.available())
-    except Exception as exc:  # noqa: BLE001 - 单源异常→false（不 crash、不拖死请求）
-        ok, detail = False, f"probe error: {exc}"
+    if name == "tushare":
+        ok, detail = _probe_tushare()
+    elif name == "eastmoney":
+        ok, detail = _probe_eastmoney()
+    elif name == "fuyao":
+        ok, detail = _probe_fuyao()
+    else:
+        try:
+            ad = sp.get_adapter(name)
+            if ad is None:
+                return {"available": False, "probed_at": now_s, "latency_ms": None,
+                        "detail": "adapter 未注册（依赖库未装）"}
+            reset = getattr(ad, "reset_available_for_test", None)   # 懒缓存先清（brief 逐字）
+            if callable(reset):
+                reset()
+            ok = bool(ad.available())
+        except Exception as exc:  # noqa: BLE001 - 单源异常→false（不 crash、不拖死请求）
+            ok, detail = False, f"probe error: {exc}"
     return {"available": ok, "probed_at": now_s,
             "latency_ms": int((time.monotonic() - t0) * 1000),
             "detail": detail}
@@ -1586,27 +1822,42 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
     """O4：手动探测各源连通性（每源 ≤15s 超时隔离；写 source_health.json）。
 
     :param payload: ``{"names": ["sina", ...]}``（缺省/空 = 全部 4 源）。
-    - 200 ``{results: {name: {available, probed_at, latency_ms, detail?}}, path}``。
+    - 200 ``{results: {name: {available, probed_at, latency_ms, detail?,
+      sg: {available, probed_at, latency_ms, detail}}}, path, sg_path}``。
     - **400**：names 含非白名单源名。
 
     **超时纪律**（brief 逐字）：每源最多 15s——hang 场景不能拖死请求。
     实现=每源一个 daemon 线程 + join(15)；超时 → available=false detail="probe timeout"
     （线程无法强杀，hang 的后台线程泄漏但请求已返回；socket 层 10s 超时是主防线）。
     **灌数运行中允许探测**：只读网络自检、不碰库（health 是 JSON 文件）。
+
+    **v1.2 SG 中转档**：本机探测循环之外，一次 ssh 批量探 SG 通道（独立线程 +
+    ≤45s 墙钟）；SG 结果并入 results[name].sg + 写 source_health_sg.json（独立
+    文件，灌数 driver 全量覆盖 source_health.json 冲不掉）。SG 失败只记 sg 档。
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body 必须是 JSON 对象 {names:[...]}")
-    names = payload.get("names") or list(_SOURCE_SWITCH_NAMES)
+    names = payload.get("names") or list(_PROBE_NAMES)
     if not isinstance(names, list) or not names:
         raise HTTPException(status_code=400, detail="names 必须是非空数组")
-    bad = [n for n in names if n not in _SOURCE_SWITCH_NAMES]
+    bad = [n for n in names if n not in _PROBE_NAMES]
     if bad:
         raise HTTPException(
             status_code=400,
-            detail=f"非法源名: {bad}（白名单: {', '.join(_SOURCE_SWITCH_NAMES)}）")
+            detail=f"非法源名: {bad}（白名单: {', '.join(_PROBE_NAMES)}）")
+
+    # v1.2：SG 中转档与本机探测**并行**（独立线程；SG 失败不拖累本机档/请求）
+    probe_names = list(dict.fromkeys(names))
+    sg_holder: Dict[str, Any] = {}
+
+    def _sg_worker():
+        sg_holder["results"] = _run_sg_batch(probe_names)
+
+    sg_thread = threading.Thread(target=_sg_worker, daemon=True, name="sg-probe")
+    sg_thread.start()
 
     results: Dict[str, Any] = {}
-    for name in dict.fromkeys(names):   # 去重保序（重复探测无意义）
+    for name in probe_names:   # 去重保序（重复探测无意义）
         # F3/v6.1.5：O4 手动探测复用 source_pool._with_timeout（通用墙钟超时工具，
         # 不各写一套）。每源 ≤_PROBE_TIMEOUT_S(15s) 墙钟隔离——hang 场景
         # 请求不拖死；超时 → available=false detail="probe timeout"（brief 逐字语义）。
@@ -1626,6 +1877,18 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
             results[name] = {"available": False, "probed_at": None, "latency_ms": None,
                              "detail": f"probe error: {exc}"}
 
+    # v1.2：收 SG 中转档（墙钟兜底——_run_sg_batch 内部已有 45s 硬超时，这里 50s
+    # 是双保险；超时/异常 → 全源 sg 档记不可达，不影响本机档）
+    sg_thread.join(timeout=_SG_PROBE_TIMEOUT_S + 5)
+    sg_results = sg_holder.get("results")
+    if sg_results is None:
+        log.warning("SG 中转探测线程未按时返回（按不可达处理）")
+        now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        sg_results = {n: _sg_unavailable(now_s, "SG 探测线程超时") for n in probe_names}
+    for name, r in results.items():
+        r["sg"] = sg_results.get(name) or _sg_unavailable(
+            str(r.get("probed_at") or ""), "SG 侧未返回该源结果")
+
     # 合并写 source_health.json（保留未探测源的既有记录；格式同 _read_source_health）
     existing, _stale = _read_source_health()
     merged: Dict[str, Any] = {n: dict(existing.get(n) or {}) for n in _ADAPTER_NAMES}
@@ -1633,7 +1896,15 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
         merged[name] = {"available": r.get("available"), "probed_at": r.get("probed_at"),
                         "latency_ms": r.get("latency_ms")}
     path = _write_source_health(merged)
-    return {"results": results, "path": path}
+    # v1.2：SG 档独立文件（合并保留未探测源的既有记录）
+    existing_sg = _read_source_health_sg()
+    merged_sg = {n: dict(existing_sg.get(n) or {}) for n in _ADAPTER_NAMES}
+    for name, r in results.items():
+        sg = r.get("sg") or {}
+        merged_sg[name] = {"available": sg.get("available"), "probed_at": sg.get("probed_at"),
+                           "latency_ms": sg.get("latency_ms"), "detail": sg.get("detail")}
+    sg_path = _write_source_health_sg(merged_sg)
+    return {"results": results, "path": path, "sg_path": sg_path}
 
 
 # ---------------------------------------------------------------------------

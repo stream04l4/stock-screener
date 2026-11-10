@@ -75,10 +75,14 @@ describe("SourcePoolPanel：adapters 三态", () => {
     const byName = {};
     for (const c of cards) byName[c.find("b").text()] = c;
     expect(byName.sina.find(".lake-spp-avail").classes()).toContain("ok");
-    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓ 可达");
     expect(byName.tencent.find(".lake-spp-avail").classes()).toContain("bad");
-    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
-    expect(byName.tdx.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗ 不可达");
+    expect(byName.tdx.find(".lake-spp-avail").text().trim()).toBe("本机 — 未探测");
+    // v1.2：旧形态（无 sg 字段）→ SG 备用档三态占位「—」
+    expect(byName.sina.find(".lake-spp-sg").text().trim()).toBe("SG备用 —");
+    expect(byName.sina.find(".lake-spp-sg").classes()).not.toContain("ok");
+    expect(byName.sina.find(".lake-spp-sg").classes()).not.toContain("bad");
   });
 
   it("probed_at + latency_ms 展示（≥1000ms → s 单位）", () => {
@@ -165,13 +169,20 @@ function makeSourcesPool(over = {}) {
     ...base,
     sources: [
       { name: "sina", enabled: true, available: true, probed_at: "2026-09-17T08:00:00",
-        latency_ms: 320, authority: 0,
+        latency_ms: 320,
+        // v1.2：SG 中转备用通道档
+        sg_available: true, sg_probed_at: "2026-09-17T08:05:00", sg_latency_ms: 900,
+        sg_detail: "quote OK",
+        authority: 0,
         provides: [
           { table: "kline_daily", table_cn: "T2 日K线", field_group: "ohlcv_amount", role: "主源" },
           { table: "kline_daily", table_cn: "T2 日K线", field_group: "adj_factor", role: "主源(推导)" },
         ], quota: null, rate_limit: "≥1s/股" },
       { name: "tencent", enabled: true, available: false, probed_at: "2026-09-17T08:00:01",
-        latency_ms: null, authority: 1,
+        latency_ms: null,
+        sg_available: false, sg_probed_at: "2026-09-17T08:05:01", sg_latency_ms: 8000,
+        sg_detail: "超时",
+        authority: 1,
         provides: [
           { table: "stock_master", table_cn: "T1 股票主档", field_group: "master", role: "主源" },
           { table: "valuation_daily", table_cn: "T3 估值日线", field_group: "valuation", role: "主源" },
@@ -182,7 +193,9 @@ function makeSourcesPool(over = {}) {
           { table: "index_daily", table_cn: "T7 指数日线", field_group: "amount", role: "主源" },
         ], quota: null, rate_limit: "≥0.5s/股" },
       { name: "adata_f10", enabled: true, available: null, probed_at: null,
-        latency_ms: 88, authority: 3,
+        latency_ms: 88,
+        sg_available: null, sg_probed_at: null, sg_latency_ms: null, sg_detail: null,
+        authority: 3,
         provides: [
           { table: "fundamentals_quarterly", table_cn: "T5 季度基本面", field_group: "f10", role: "主源" },
         ], quota: null, rate_limit: "≥1s/股" },
@@ -206,16 +219,32 @@ describe("SourcePoolPanel v6.1.3：数据源状态卡（pool.sources）", () => 
     expect(w.findAll(".lake-spp-adapter").length).toBe(4);
   });
 
-  it("卡内四行：连通性（✓可达/✗不可达/—未探测 + latency）+ 探测时间", () => {
+  it("卡内四行：连通性（本机✓可达/✗不可达/—未探测 + latency）+ 探测时间", () => {
     const w = mountPanel({ pool: makeSourcesPool() });
     const byName = cardsBy(w);
-    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("✓ 可达");
+    expect(byName.sina.find(".lake-spp-avail").text().trim()).toBe("本机 ✓ 可达");
     expect(byName.sina.text()).toContain("latency 320ms");
-    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("✗ 不可达");
-    expect(byName.adata_f10.find(".lake-spp-avail").text().trim()).toBe("— 未探测");
+    expect(byName.tencent.find(".lake-spp-avail").text().trim()).toBe("本机 ✗ 不可达");
+    expect(byName.adata_f10.find(".lake-spp-avail").text().trim()).toBe("本机 — 未探测");
     // 行4 探测时间（probed_at / 未探测）
     expect(byName.sina.text()).toContain("探测：2026-09-17T08:00:00");
     expect(byName.adata_f10.text()).toContain("探测：未探测");
+  });
+
+  it("v1.2：SG 中转备用通道档三态（✓可达 ok / ✗不可达 bad / —未探测；title 带 detail）", () => {
+    const w = mountPanel({ pool: makeSourcesPool() });
+    const byName = cardsBy(w);
+    const sinaSg = byName.sina.find(".lake-spp-sg");
+    expect(sinaSg.text().trim()).toBe("SG备用 ✓");
+    expect(sinaSg.classes()).toContain("ok");
+    expect(sinaSg.attributes("title")).toContain("quote OK");
+    const txSg = byName.tencent.find(".lake-spp-sg");
+    expect(txSg.text().trim()).toBe("SG备用 ✗");
+    expect(txSg.classes()).toContain("bad");
+    const adSg = byName.adata_f10.find(".lake-spp-sg");
+    expect(adSg.text().trim()).toBe("SG备用 —");
+    expect(adSg.classes()).not.toContain("ok");
+    expect(adSg.classes()).not.toContain("bad");
   });
 
   it("数据类型 chips（table_cn·字段组 + role 后缀小字 muted）", () => {

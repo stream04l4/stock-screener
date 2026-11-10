@@ -16,19 +16,24 @@
 // 三处同源自动跟随（防漂移）。
 
 // 固定色板（brief 逐字）；未知源（legacy 't'/'em_local_static' 等）→ UNKNOWN_COLOR。
-// v7.0.18：baostock 随渠道移除（历史库行 source='baostock' 走 LEGACY_SOURCE_ALIASES 灰显）。
+// v7.0.18：baostock 随渠道移除（历史行走 legacy 灰显）。
+// v1.1（2026-11-10）：+tushare 靛/eastmoney 红/fuyao 紫（观察期/备源展示源；
+// by_source 实际出现值新增 tushare——T1 主档 + T2/T3 批量增量行）。
 export const SOURCE_COLORS = {
   sina: "#2563eb", tencent: "#f97316",
   tdx: "#06b6d4", adata_f10: "#ec4899", local: "#64748b",   // v6.1.5 F2：slate-500（白底可读）
+  tushare: "#6366f1", eastmoney: "#ef4444", fuyao: "#8b5cf6",
 };
 export const UNKNOWN_COLOR = "#cbd5e1";
 
 // 中文源名（O5：图例 + 悬停提示用；brief 逐字 "● sina 新浪 / …"）。
 // 仅列**当前活跃**的 source 值（与 LEGEND_ORDER 对齐）——legacy 别名走下方
 // LEGACY_SOURCE_ALIASES，不混进图例固定顺序。v7.0.18：baostock 随渠道移除。
+// v1.1：+tushare/eastmoney/fuyao（东财/Fuyao 晋主前 by_source 尚无行，图例先占位）。
 export const SOURCE_LABELS = {
   sina: "新浪", tencent: "腾讯",
   tdx: "通达信", adata_f10: "adata", local: "本地缓存",
+  tushare: "Tushare", eastmoney: "东财", fuyao: "Fuyao",
 };
 
 // v6.3.3（2026-10-02）：已知 source **变体**着色（活跃源的子标记值，不占图例位）。
@@ -47,6 +52,9 @@ export const SOURCE_VARIANTS = {
   // v6.3.6：T3 估值历史回填 = 百度股市通月度序列一次性落库（source=bd_static，
   // 见 lake/ingest/baidu_valuation_adapter）——本地缓存语义 → 灰 + 中文 label。
   bd_static: { color: UNKNOWN_COLOR, label: "百度回填" },
+  // v1.1：T4 分红 2026-10-21 Web 端点人工核验落库行（source=web_verified_20261021，
+  // 本地核验语义 → 灰 + 中文 label，不再裸显"其他·…"）。
+  web_verified_20261021: { color: UNKNOWN_COLOR, label: "Web核验(T4)" },
 };
 
 // v6.1.5 F1：已知 legacy source 别名映射（生产库 DISTINCT source 核对结果 + brief 点名）。
@@ -73,7 +81,9 @@ export const LEGACY_SOURCE_ALIASES = {
 };
 
 // 图例行固定顺序（v7.0.18：baostock 随渠道移除，5 源 + local）。
-export const LEGEND_ORDER = ["sina", "tencent", "tdx", "adata_f10", "local"];
+// v1.1（2026-11-10）：+tushare/eastmoney/fuyao（灌数池 4 源在前，展示源居中，local 殿后）。
+export const LEGEND_ORDER = ["sina", "tencent", "tdx", "adata_f10",
+  "tushare", "eastmoney", "fuyao", "local"];
 
 // source → {color, label}（v6.1.5 F1 三级 + v6.3.3 变体级，不再裸显英文）
 //   1) 当前活跃源 SOURCE_COLORS/SOURCE_LABELS → 固定色 + 中文名；
