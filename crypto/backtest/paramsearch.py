@@ -77,6 +77,7 @@ def _metrics(r: dict, years: float) -> dict:
         "ext": ext,
         "eq": eq,
         "roi": (eq / ext - 1.0) * 100.0 if ext > 0 else None,
+        "net": (eq - ext) if ext > 0 else None,
         "cagr": ((eq / ext) ** (1.0 / years) - 1.0) * 100.0
                 if (ext > 0 and eq > 0) else (-100.0 if ext > 0 else None),
         "avg_days": (sum(x["bars"] for x in rounds) / len(rounds) / 24.0)
@@ -100,8 +101,9 @@ def _fmt_row(base, d: float, tp: float, gr: float, m: dict,
     avg_s = f"{m['avg_days']:.0f}" if m["avg_days"] is not None else "—"
     cap_s = "✂" if m["capped"] else ""
     cov_s = (f"L{m['cover']}" if m.get("cover") is not None else "∞")
+    net_s = f"{m['net']:+.0f}" if m.get("net") is not None else "—"
     return (f"| {base:g} | {d:g}% | {tp:g}x | {gr:g} | {m['rounds']} | {op_s} | "
-            f"{m['ext']:.0f}/{budget:g}{cap_s} | {cov_s} | {m['eq']:.0f} | {roi_s} | "
+            f"{m['ext']:.0f}/{budget:g}{cap_s} | {cov_s} | {m['eq']:.0f} | {net_s} | {roi_s} | "
             f"{cagr_s} | {avg_s} | {m['mdd']:.1f} |")
 
 
@@ -142,8 +144,8 @@ def render_report(rows_by_coin: dict, drops: list, tps: list, grs: list,
                   bases: list, start: str, end: str,
                   years: float, budget: float) -> str:
     hdr = ("| 起始资金(U) | 建仓幅度 | 止盈 | 加仓 | 轮次 | 持仓中 | "
-           "外部投入/预算 | 预算可至 | 期末净值(U) | 回报率 | 周转CAGR | 均持仓(d) | MDD |")
-    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+           "外部投入/预算 | 预算可至 | 期末净值(U) | 净收益(U) | 回报率 | 周转CAGR | 均持仓(d) | MDD |")
+    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     out = [
         "# 加密货币参数寻优",
         "",
