@@ -43,3 +43,17 @@ coins:
 # coin_master.is_active=FALSE；恢复 = 加回 coins 重跑 sync）：
 # BNBUSDT XRPUSDT ADAUSDT DOGEUSDT AVAXUSDT LINKUSDT DOTUSDT LTCUSDT
 # BCHUSDT TRXUSDT NEARUSDT POLUSDT ATOMUSDT UNIUSDT XLMUSDT ETCUSDT VETUSDT
+
+# 马丁格尔策略（v7.0.47，Joel 2026-11-11 规格 + 两个决策门拍板）：
+# 1 建仓=价≤一年高点×30%（跌70%）首仓 10 USDT；2 加仓=建仓价×(1−1%×k) 网格、
+# 第 k 级 10×1.05^k USDT 不设上限；3 上涨不加仓/新高不刷新建仓价；
+# 4 止盈=价≥建仓价×10 全卖、entry 重置进入下一轮。
+# 引擎：crypto/strategy/engine.py；回测：python -m crypto.backtest
+strategy:
+  first_drop_pct: 70        # 建仓触发 = 一年高点 × (1 − 70%) = 30%（决策门1）
+  add_grid_pct: 1           # 加仓级距 = 建仓价的 1%/级（固定网格，不设上限）
+  base_amount_usdt: 10      # 初始建仓金额（USDT）
+  growth: 1.05              # 每次加仓 × 1.05
+  take_profit_mult: 10      # 止盈 = 建仓价 × 10（决策门2：确认 10 倍）
+  fee_bps: 10               # taker 手续费 10bps（Binance 现货 0.1%；0=关闭）
+  lookback_h: 8760          # 一年高点 = 滚动 365 天收盘价最大（含当日 bar）

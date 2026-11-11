@@ -1,5 +1,11 @@
 # 加密货币板块设计 v0.3（框架已落地 v7.0.43，内容待完善）
 
+> **v7.0.47 更新（2026-11-11）**：P3 策略 + 回测实体化——`crypto.yaml`
+> strategy 段（Joel 马丁格尔规格：跌 70% 建仓 / 1% 网格 10×1.05^k 加仓不设
+> 上限 / 10x 止盈重置，两决策门拍板）；`crypto/strategy/engine.py` 状态机 +
+> `python -m crypto.backtest` 全史回测（报告 `data/crypto/backtest_report.md`）。
+> Web 回测 tab（/api/backtest 实体化 + BacktestTab）等回测数字过目后做。
+>
 > **v7.0.45 更新（2026-11-11）**：数据湖正式开工——coins 聚焦
 > BTC/ETH/SOL 三标的；全量历史 = Binance 月度快照（`crypto.sources.
 > binance_vision`）；实时 K 线网关 `crypto.gateway/`（WS 组合流 + 看门狗 +

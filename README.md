@@ -1,4 +1,4 @@
-# stock-screener · v7.0.45（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v7.0.47（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -387,6 +387,22 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.47**：加密货币马丁格尔策略 + 全史回测（Joel 2026-11-11 规格，两决策门拍板）：
+  - `crypto.yaml` 新增 **strategy 段**：建仓 = 价 ≤ 一年高点×30%（跌 70% 触发，
+    首仓 10 USDT）；加仓 = 建仓价×(1−1%×k) 固定网格、第 k 级 10×1.05^k USDT
+    不设上限；上涨不加仓、新高不刷新建仓价；止盈 = 价 ≥ 建仓价×10 全卖、
+    entry 重置进入下一轮；fee 10bps；一年高点 = 滚动 8760h 收盘价最大。
+  - `crypto/strategy/engine.py` 状态机（纯函数）+ `python -m crypto.backtest`
+    全史回测 → `data/crypto/backtest_report.md`。全史结果：BTC/ETH 各了结 1 轮
+    （2018 建仓 → 2021 10x 止盈，+1427% / +3022%）；2022 熊市轮 3 币均持仓中
+    待 10x（止盈线 BTC 20.3万 / ETH 1.45万 / SOL 775）。
+  - tests/test_crypto_strategy.py 13 用例（合成路径零网络）；全量 694 过。
+  - 边界纪律：回测 = 策略验证工具，不接自动交易。
+- **v7.0.46b**：数据湖 tab 聚焦 3 币展示——per_symbol 加 active 标记，主表只列
+  active 3 币、退役 17 币折叠展示（数据保留，仅显示层）。
+- **v7.0.46**：回测湖依赖自包含化——test_martingale_web 13 例原依赖
+  /tmp/lake_bt_20261022.duckdb 外部快照（被 ops 清理 → skip），改为自包含
+  合成湖（生产 DDL + 4 股受控 K 线路径），零外部依赖、不随行情漂移。
 - **v7.0.45**：加密货币数据湖三标的全量 + 实时 K 线网关（Joel 2026-11-11 正式开工）：
   - coins 聚焦 **BTCUSDT/ETHUSDT/SOLUSDT**（top20 其余 17 币 is_active=FALSE，
     数据保留可恢复）；全量历史走 **Binance 官方月度快照**（`crypto.sources.

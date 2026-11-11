@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""crypto.strategy —— P3：策略定义（预留代码落点）。
+"""crypto.strategy —— 加密货币马丁格尔策略（v7.0.47 实体化）。
 
-规划：策略参数/状态机/信号定义（config 或代码，参照股票侧
-martingale/ 的分层：timing.py 单一定义点 + config/strategy.yaml 锁定）。
-边界纪律（设计文档 §7）：只做数据驱动的展示型策略定义，不做 ML 预测、
-不做自动交易。
+策略参数单一定义点：StrategyParams（engine.py，从 crypto.yaml strategy 段
+加载）；状态机 run_coin（1h 收盘价序列 → 轮次/净值，纯函数零 IO）。
+规格与决策门见 engine.py docstring（Joel 2026-11-11 定案）。
+
+边界纪律（设计文档 §7）：策略验证用途，不接自动交易、不做预测。
 """
+from crypto.strategy.engine import StrategyParams, rolling_high_1y, run_coin
+
+__all__ = ["StrategyParams", "rolling_high_1y", "run_coin"]

@@ -67,11 +67,12 @@ stock-screener/
 │   └── crypto/          # 【加密货币】独占：crypto.duckdb + sync_state.json
 │                        #    + gateway_state.json（实时网关状态）
 │                        #    + vision_cache/（月度快照沙盒缓存，不入库）
+│                        #    + backtest_report.md（策略回测报告，v7.0.47）
 ├── output/              # 回测产物（gitignore）；v7 现行 = backtest_martingale/
 ├── cache/               # 拉取缓存（gitignore）
 ├── logs/                # 运行日志（gitignore）
 ├── docs/                # 架构与专项设计（本文件 + crypto_design.md）
-├── tests/               # 全量测试（665；v7 防护契约 test_v7_guards.py）
+├── tests/              # 全量测试（694；v7 防护契约 test_v7_guards.py）
 └── stages/              # 已删（v6 团队流水线副产物）
 ```
 
@@ -93,8 +94,11 @@ crypto/
 │   │                    #   gateway 实体端点 + positions/strategy/backtest 骨架端点）
 │   └── frontend/        # 独立 Vue SPA（双入口登录 + 四页签；dist 不入库）
 ├── positions/           # P2 我的持仓（预留；__init__ 内写明规划）
-├── strategy/            # P3 策略定义（预留）
-└── backtest/            # P3 回测引擎（预留；产物落 data/crypto/backtest/）
+├── strategy/            # P3 策略（v7.0.47 实体化）：engine.py 马丁格尔
+│                        #   状态机（StrategyParams 单一参数点 + run_coin 纯函数）
+└── backtest/            # P3 回测（v7.0.47 实体化）：runner.py 湖读取 +
+                         #   python -m crypto.backtest CLI，报告落
+                         #   data/crypto/backtest_report.md
 ```
 
 ## 4. 扩展约定（新东西放哪里）
@@ -131,6 +135,21 @@ crypto/
 
 ## 6. 变更记录
 
+- **v7.0.47（2026-11-11）**：加密马丁格尔策略 + 全史回测。`crypto.yaml`
+  新增 strategy 段（Joel 2026-11-11 规格 + 两决策门：建仓=一年高点×30%
+  即跌 70%；止盈=建仓价×10 确认）；`crypto/strategy/engine.py` 状态机
+  （滚动 8760h 一年高点、1% 固定网格加仓 10×1.05^k 不设上限、新高不刷新
+  entry、10x 全卖重置）；`python -m crypto.backtest` 全史回测 →
+  data/crypto/backtest_report.md（BTC/ETH 各了结 1 轮 2018/2020 建仓 →
+  2021 10x 止盈 +1427%/+3022%；2022 轮均持仓中待 10x）；
+  tests/test_crypto_strategy.py 13 用例（合成路径零网络）。全量 694 过。
+- **v7.0.46b（2026-11-11）**：数据湖 tab 聚焦 3 币展示——stats() per_symbol
+  加 active 标记（LEFT JOIN coin_master），LakeTab 主表只列 active 3 币、
+  退役 17 币折叠展示（数据保留，仅显示层）。
+- **v7.0.46（2026-11-11）**：回测湖依赖自包含化——test_martingale_web 13 例
+  原依赖 /tmp/lake_bt_20261022.duckdb 外部快照（被 ops 清理丢失 → skip），
+  改为自包含合成湖（生产 DDL + 4 股受控 K 线路径，bounce 再武装语义
+  确定性推值），零外部依赖不随行情漂移。
 - **v7.0.45（2026-11-11）**：数据湖三标的全量 + 实时网关。coins 聚焦
   BTCUSDT/ETHUSDT/SOLUSDT（top20 其余 17 币 is_active=FALSE 数据保留）；
   `crypto.sources.binance_vision`（官方月度快照全量历史，纯 stdlib，
