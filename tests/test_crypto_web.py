@@ -123,11 +123,19 @@ class TestBacktestEndpoint:
         # 第 5 根 bar（收 10 ≤ 滚动高点 300×0.3）再建仓 → 持仓中
         assert res["open_round"] is not None
         assert res["open_round"]["entry"] == pytest.approx(10.0)
-        # 净值 ≈ 了结所得 + 新仓价值（10x 后远大于初始）
-        assert res["final_equity"] > 90
+        # 账户模型（v7.0.53）：首轮 10 全外部；了结所得 ≈99.8 全额滚入余额，
+        # 再建仓 10 从余额扣 → 外部投入仍 = 10，期末余额 ≈ 89.8
+        assert res["external_invested"] == pytest.approx(10.0, abs=0.01)
+        assert res["wallet"] == pytest.approx(89.8, abs=0.01)
+        # 净值 = 持仓市值 + 余额 ≈ 9.99 + 89.8
+        assert res["final_equity"] == pytest.approx(
+            res["open_round"]["value"] + res["wallet"], abs=0.05)
         # 净值曲线已降采样且非空
         assert 2 <= len(res["equity_curve"]) <= 401
         assert "equity" not in res and "dates" not in res  # 原始数组不外发
+        # 价格曲线：同采样步长，末点 = 最后一根 bar 收盘价 10
+        assert 2 <= len(res["price_curve"]) <= 401
+        assert res["price_curve"][-1][1] == pytest.approx(10.0)
         # 事件序列：建仓@30 → 平仓@300 → 再建仓@10
         # （合成湖 5 根 1h bar 同属 2020-01-01 → 日期相同，事件按 bar 序区分）
         ev = res["events"]

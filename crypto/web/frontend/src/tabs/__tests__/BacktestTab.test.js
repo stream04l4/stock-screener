@@ -1,4 +1,5 @@
-// BacktestTab（v7.0.48）：运行回测 → 渲染逐币结果/净值曲线/持仓中（mock fetch）。
+// BacktestTab（v7.0.53）：运行回测 → 渲染逐币结果/净值曲线/价格曲线
+// （对数坐标）/总外部投入/持仓中（mock fetch）。
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import BacktestTab from "../BacktestTab.vue";
@@ -19,8 +20,11 @@ const BT_RESULT = {
       { date: "2020-01-05", type: "entry", level: 0, price: 10 },
     ],
     realized_cash: 89.8, realized_pnl_pct: 898,
-    final_equity: 99.79, mdd_pct: 0,
-    equity_curve: [["2020-01-01", 0], ["2020-01-03", 0], ["2020-01-05", 99.79]],
+    final_equity: 89.89, mdd_pct: 0,
+    external_invested: 10, wallet: 79.9,
+    equity_curve: [["2020-01-01", 0], ["2020-01-03", 0], ["2020-01-05", 89.89]],
+    price_curve: [["2020-01-01", 100], ["2020-01-03", 30],
+                  ["2020-01-04", 300], ["2020-01-05", 10]],
   }],
 };
 
@@ -47,16 +51,31 @@ describe("BacktestTab", () => {
     expect(w.text()).toContain("已了结轮次");
     expect(w.text()).toContain("持仓中");
     expect(w.text()).toContain("100"); // 止盈线
-    expect(w.find("svg.chart").exists()).toBe(true);
-    expect(w.find("svg.chart polyline").exists()).toBe(true);
+    // 总结模块：总外部投入（账户模型 v7.0.53）
+    expect(w.text()).toContain("总外部投入");
+    expect(w.text()).toContain("10 USDT");
+    // 双图：净值 + 价格
+    const svgs = w.findAll("svg.chart");
+    expect(svgs.length).toBe(2);
+    expect(svgs[0].find("polyline").exists()).toBe(true);
+    expect(svgs[1].find("polyline").exists()).toBe(true);
+    expect(w.text()).toContain("价格曲线（对数坐标 · 标记 = 成交价）");
     // 时间轴刻度（跨度 4 天 < 366 → 完整日期 YYYY-MM-DD）
     expect(w.text()).toContain("2020-01-01");
     expect(w.text()).toContain("2020-01-05");
-    // 事件标记（限定 svg 内，图例不算）：建仓 2 + 平仓 1（无加仓）
-    const svg = w.find("svg.chart");
+    // 净值图事件标记：建仓 2 + 平仓 1（无加仓）
+    const svg = svgs[0];
     expect(svg.findAll(".mk-entry").length).toBe(2);
     expect(svg.findAll(".mk-exit").length).toBe(1);
     expect(svg.findAll(".mk-add").length).toBe(0);
+    // 价格图事件标记：同样 3 个（落在精确成交价上）
+    const psvg = svgs[1];
+    expect(psvg.findAll(".mk-entry").length).toBe(2);
+    expect(psvg.findAll(".mk-exit").length).toBe(1);
+    // 价格图对数 y 轴刻度（10~300 区间内的 1/2/5 网格）
+    const ptickTexts = psvg.findAll("text").map((t) => t.text());
+    expect(ptickTexts).toContain("200");
+    expect(ptickTexts).toContain("50");
     // 图例
     expect(w.text()).toContain("加仓（每级）");
     expect(w.text()).toContain("悬停标记看明细");

@@ -123,7 +123,9 @@ def render_report(results: List[Dict[str, Any]], p: StrategyParams) -> str:
             lines += ["### 未了结轮次", "", "无（当前空仓）。", ""]
         lines += [
             f"- 已了结净盈亏：{r['realized_cash']} USDT",
-            f"- 当前净值（持仓市值 + 已了结净盈亏）：{r['final_equity']} USDT",
+            f"- 总外部投入：{r['external_invested']} USDT（首次建仓全为外部；"
+            f"了结后余额滚入下一轮，余额耗尽才追加）",
+            f"- 当前净值（持仓市值 + 期末余额 {r['wallet']} USDT）：{r['final_equity']} USDT",
             f"- 净值曲线最大回撤：{r['mdd_pct']}%",
             "",
         ]

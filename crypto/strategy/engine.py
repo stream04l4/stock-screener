@@ -17,6 +17,12 @@ taker 手续费 fee_bps（默认 10bps = Binance 现货 0.1%），买卖双向�
 一年高点：滚动 365 天（8760 根 1h bar）收盘价最大值，含当日 bar；
 数据头不足一年时用已有全部历史（部分窗口），报告中注明。
 
+账户模型（Joel 2026-11-11 定案，v7.0.53）：单账户资金闭环——
+  首次建仓全部资金为**外部投入**；止盈了结后所得成为**账户余额**，
+  滚入下一轮：下一轮建仓/加仓优先从余额扣除，**余额耗尽才追加外部
+  投入**。净值曲线 = 持仓市值 + 余额（现金）。external_invested =
+  累计外部投入（全期口径），wallet = 期末余额。
+
 边界纪律（设计文档 §7）：回测 = 策略验证工具，不接自动交易、不做预测。
 """
 from __future__ import annotations
@@ -85,7 +91,9 @@ def run_coin(
     """单币状态机回测（1h 收盘价序列）。
 
     :returns: 结果 dict：已了结轮次 rounds + 未了结 open_round +
-        净值曲线 equity + 最大回撤 mdd_pct。纯函数，零 IO。
+        净值曲线 equity（= 持仓市值 + 余额）+ 最大回撤 mdd_pct +
+        事件序列 events + external_invested（累计外部投入）+
+        wallet（期末余额）。纯函数，零 IO。
     """
     dates = np.asarray(dates)
     c_arr = np.asarray(closes, dtype=float)
@@ -96,7 +104,9 @@ def run_coin(
                 "rounds": [], "open_round": None,
                 "realized_cash": 0.0, "final_equity": 0.0,
                 "mdd_pct": 0.0, "equity": np.array([]), "dates": np.array([]),
-                "events": [], "note": "无数据"}
+                "closes": np.array([]), "events": [],
+                "external_invested": 0.0, "wallet": 0.0,
+                "note": "无数据"}
 
     h1y = rolling_high_1y(c_arr, p.lookback_h)
     trig = p.trigger_frac()
@@ -110,9 +120,18 @@ def run_coin(
     shares = 0.0         # 当前持有数量
     round_spent = 0.0    # 本轮累计支出（USDT 本金口径；手续费折所得/数量）
     realized_cash = 0.0  # 已了结轮次净盈亏累计（proceeds − spent）
+    wallet = 0.0         # 账户余额现金（了结所得滚存；恒 ≥ 0）
+    external = 0.0       # 累计外部投入（余额不足时才追加）
     rounds: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []  # 图表事件：entry/add/exit（日期+级数+价）
     equity = np.empty(n, dtype=float)
+
+    def _fund(amount: float) -> None:
+        """买入出资：先扣余额，余额不足部分计外部投入（账户模型）。"""
+        nonlocal wallet, external
+        take = min(wallet, amount)
+        wallet -= take
+        external += amount - take
 
     for i in range(n):
         c = float(c_arr[i])
@@ -124,6 +143,7 @@ def run_coin(
                 round_start = i
                 k = 0
                 usdt = p.base_amount_usdt
+                _fund(usdt)
                 shares = usdt * (1.0 - fee) / c
                 round_spent = usdt
                 events.append({"date": str(dates[i])[:10], "type": "entry",
@@ -133,15 +153,17 @@ def run_coin(
             while k < _MAX_LEVELS and c <= entry * (1.0 - grid * (k + 1)) + _EPS:
                 k += 1
                 usdt = p.base_amount_usdt * (p.growth ** k)
+                _fund(usdt)
                 shares += usdt * (1.0 - fee) / c
                 round_spent += usdt
                 events.append({"date": str(dates[i])[:10], "type": "add",
                                "level": k, "price": round(c, 4)})
-            # 3) 止盈：价 ≥ 建仓价 × 10 → 全卖，本轮了结
+            # 3) 止盈：价 ≥ 建仓价 × 10 → 全卖，本轮了结；所得滚入余额
             if c >= entry * p.take_profit_mult - _EPS:
                 proceeds = shares * c * (1.0 - fee)
                 pnl = proceeds - round_spent
                 realized_cash += pnl
+                wallet += proceeds
                 events.append({"date": str(dates[i])[:10], "type": "exit",
                                "level": 0, "price": round(c, 4)})
                 rounds.append({
@@ -162,7 +184,8 @@ def run_coin(
                 round_start = -1
                 k = 0
                 round_spent = 0.0
-        equity[i] = shares * c + realized_cash
+        # 净值 = 持仓市值 + 余额（账户口径；首轮余额恒 0，与原口径一致）
+        equity[i] = shares * c + wallet
 
     # 未了结轮次（持仓中）
     open_round = None
@@ -201,5 +224,8 @@ def run_coin(
         "mdd_pct": round(mdd_pct, 2),
         "equity": equity,
         "dates": dates,
+        "closes": c_arr,
         "events": events,
+        "external_invested": round(external, 2),
+        "wallet": round(wallet, 2),
     }

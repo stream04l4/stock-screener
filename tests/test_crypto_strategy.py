@@ -170,8 +170,50 @@ def test_net_equity_and_mdd_shape():
     closes = [100.0] * H + [30.0, 29.7, 300.0]
     r = _run(closes)
     eq = r["equity"]
-    # 建仓前净值 0；了结后 = 净盈亏（恒定）——结果字段 round(2)，用 abs 容差
+    # 建仓前净值 0；了结后空仓 = 余额（所得全额 = 净盈亏 + 外部投入，
+    # 本金已回笼在账户里）——结果字段 round(2)，用 abs 容差
     assert eq[0] == 0.0
     assert eq[-1] == pytest.approx(r["final_equity"], abs=0.01)
-    assert eq[-1] == pytest.approx(r["realized_cash"], abs=0.01)
+    assert eq[-1] == pytest.approx(
+        r["realized_cash"] + r["external_invested"], abs=0.01)
     assert r["mdd_pct"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# 账户模型（v7.0.53）：余额滚存下一轮，余额耗尽才追加外部投入
+# ---------------------------------------------------------------------------
+def test_wallet_rolls_over_next_round():
+    # 轮 1：30 建仓 → 300 了结（fee=10bps：proceeds ≈ 99.9）
+    # 轮 2：89 再建仓（10 U）→ 全部从余额（89.9）扣，不再计外部
+    closes = [100.0] * H + [30.0, 300.0, 100.0, 89.0]
+    r = _run(closes)
+    assert len(r["rounds"]) == 1
+    assert r["external_invested"] == pytest.approx(10.0, abs=0.01)  # 仅首轮
+    proceeds = r["rounds"][0]["proceeds_usdt"]
+    assert r["wallet"] == pytest.approx(proceeds - 10.0, abs=0.01)
+    o = r["open_round"]
+    # 净值 = 持仓市值 + 余额（恒等式）
+    assert r["final_equity"] == pytest.approx(
+        o["value_usdt"] + r["wallet"], abs=0.02)
+
+
+def test_external_topup_when_balance_exhausted():
+    # fee=0 便于精确对账：轮 1 了结所得恰 100（10/30×300），余额 = 90
+    p0 = StrategyParams(fee_bps=0)
+    # 轮 2：89 建仓后逐根贴网格下跌 34 级（每根触发恰好 1 级加仓）
+    drops = [89.0 * (1.0 - 0.01 * j) - 0.001 for j in range(1, 35)]
+    closes = [100.0] * H + [30.0, 300.0, 100.0, 89.0] + drops
+    r = _run(closes, p0)
+    o = r["open_round"]
+    assert o["k_level"] == 34
+    spent2 = o["spent_usdt"]                      # 轮 2 累计支出（fee=0 精确）
+    spent_total = r["rounds"][0]["spent_usdt"] + spent2
+    proceeds1 = r["rounds"][0]["proceeds_usdt"]   # = 100.0（fee=0）
+    # 余额 90 在 ~第 34 级耗尽 → 期末余额 ≈ 0，外部 = 总投入 − 了结所得
+    assert r["wallet"] == pytest.approx(0.0, abs=0.02)
+    assert r["external_invested"] == pytest.approx(
+        spent_total - proceeds1, abs=0.02)
+    assert r["external_invested"] > 10.0          # 确实追加过外部
+    # 恒等式：外部 + 余额滚存 = 总投入
+    assert r["external_invested"] + (proceeds1 - r["wallet"]) == pytest.approx(
+        spent_total, abs=0.02)

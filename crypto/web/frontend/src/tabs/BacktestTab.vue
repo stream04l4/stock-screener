@@ -1,6 +1,7 @@
-// 回测（v7.0.48 实体化，v7.0.51 图表增强）：POST /api/backtest 全史回测 →
-// 逐币：净值曲线（时间轴刻度 + 建仓▼/加仓●/平仓▲ 事件标记，悬停看明细）
-// + 了结轮次表 / 持仓中轮次 / 净值统计。内联 SVG，零图表库依赖。
+// 回测（v7.0.48 实体化，v7.0.51 图表增强，v7.0.53 价格图 + 外部投入）：
+// POST /api/backtest 全史回测 → 逐币：净值曲线 + 价格曲线（对数坐标）
+// （时间轴刻度 + 建仓▼/加仓●/平仓▲ 事件标记，悬停看明细）
+// + 了结轮次表 / 持仓中轮次 / 净值与投入统计。内联 SVG，零图表库依赖。
 <script setup>
 import { computed, ref } from "vue";
 import { api } from "../api/client.js";
@@ -92,7 +93,40 @@ const charts = computed(() =>
       ev,
       label: evLabel(ev, r),
     }));
-    return { r, ready: true, max, pts, ticks, marks };
+    // ---- 价格图（对数坐标；事件标记落在精确价格上）----
+    const pc = r.price_curve || [];
+    let pchart = null;
+    if (pc.length >= 2) {
+      const prices = pc.map((p) => p[1]);
+      const lmin = Math.log10(Math.min(...prices));
+      const lmax = Math.log10(Math.max(...prices));
+      const lspan = lmax - lmin || 1;
+      const pyOf = (v) =>
+        CHART.bottom - ((Math.log10(v) - lmin) / lspan) * (CHART.bottom - CHART.top);
+      const ppts = pc
+        .map((p) => `${timeX(pc, p[0]).toFixed(1)},${pyOf(p[1]).toFixed(1)}`)
+        .join(" ");
+      // y 轴刻度：1/2/5 × 10^e，范围内最多 7 个
+      const yt = [];
+      for (let e = Math.floor(lmin) - 1; e <= Math.ceil(lmax) + 1 && yt.length < 7; e++)
+        for (const m of [1, 2, 5]) {
+          const v = m * 10 ** e;
+          const lv = Math.log10(v);
+          if (lv >= lmin - 1e-9 && lv <= lmax + 1e-9) yt.push(v);
+        }
+      const pmarks = (r.events || []).map((ev) => ({
+        x: timeX(pc, ev.date),
+        y: pyOf(ev.price),
+        ev,
+        label: evLabel(ev, r),
+      }));
+      pchart = {
+        ppts, pmax: Math.max(...prices), pmin: Math.min(...prices),
+        yt: yt.map((v) => ({ y: pyOf(v), label: fmtPrice(v) })),
+        pmarks,
+      };
+    }
+    return { r, ready: true, max, pts, ticks, marks, pchart };
   }));
 
 function evLabel(ev, r) {
@@ -116,6 +150,12 @@ function tickAnchor(i, n) {
 function fmt(v) {
   if (v == null) return "—";
   return Number(v).toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+// 价格轴刻度：10^4 以上紧凑化（59448 → 59.4k），小数价保留 4 位
+function fmtPrice(v) {
+  if (v >= 10000) return (v / 1000).toFixed(1) + "k";
+  if (v >= 100) return String(Math.round(v));
+  return String(Number(v.toPrecision(3)));
 }
 function pct(v) {
   return v == null ? "—" : `${v > 0 ? "+" : ""}${fmt(v)}%`;
@@ -153,10 +193,16 @@ function pct(v) {
               {{ pct(ch.r.realized_pnl_pct) }}（{{ fmt(ch.r.realized_cash) }} USDT）
             </b>
           </div>
-          <div class="stat"><em>当前净值</em><b>{{ fmt(ch.r.final_equity) }} USDT</b></div>
+          <div class="stat" title="首次建仓全为外部投入；止盈了结后余额滚入下一轮，余额耗尽才追加">
+            <em>总外部投入</em><b>{{ fmt(ch.r.external_invested) }} USDT</b>
+          </div>
+          <div class="stat" title="持仓市值 + 期末余额（现金）">
+            <em>当前净值</em><b>{{ fmt(ch.r.final_equity) }} USDT</b>
+          </div>
           <div class="stat"><em>净值最大回撤</em><b>{{ fmt(ch.r.mdd_pct) }}%</b></div>
         </div>
 
+        <h4>净值曲线（持仓市值 + 余额）</h4>
         <svg v-if="ch.ready" :viewBox="`0 0 ${CHART.W} 210`"
              class="chart" role="img" :aria-label="`${ch.r.symbol} 净值曲线`">
           <!-- 时间刻度（竖网格线 + 日期标签） -->
@@ -179,6 +225,39 @@ function pct(v) {
           <text :x="CHART.W - CHART.padX" :y="CHART.top - 1" class="axlbl"
                 text-anchor="end">峰值 {{ fmt(ch.max) }} USDT</text>
         </svg>
+
+        <template v-if="ch.ready && ch.pchart">
+          <h4>价格曲线（对数坐标 · 标记 = 成交价）</h4>
+          <svg :viewBox="`0 0 ${CHART.W} 210`"
+               class="chart" role="img" :aria-label="`${ch.r.symbol} 价格曲线`">
+            <!-- 时间刻度（与净值图共用刻度值，保证上下对齐） -->
+            <g v-for="(t, i) in ch.ticks" :key="'pt' + i">
+              <line :x1="t.x" :x2="t.x" :y1="CHART.top" :y2="CHART.bottom" class="gridline" />
+              <text :x="t.x" :y="CHART.axisY" class="axlbl"
+                    :text-anchor="tickAnchor(i, ch.ticks.length)">{{ t.label }}</text>
+            </g>
+            <!-- 价格 y 轴刻度（1/2/5 对数网格） -->
+            <g v-for="(yt, i) in ch.pchart.yt" :key="'py' + i">
+              <line :x1="CHART.padX" :x2="CHART.W - CHART.padX"
+                    :y1="yt.y" :y2="yt.y" class="gridline" />
+              <text :x="CHART.padX + 2" :y="yt.y - 2" class="axlbl">{{ yt.label }}</text>
+            </g>
+            <line :x1="CHART.padX" :x2="CHART.W - CHART.padX"
+                  :y1="CHART.bottom" :y2="CHART.bottom" class="baseline" />
+            <!-- 价格曲线 -->
+            <polyline :points="ch.pchart.ppts" fill="none" class="price-line" />
+            <!-- 事件标记：建仓 ▼ / 加仓 ● / 平仓 ▲（落在精确成交价上） -->
+            <g v-for="(m, i) in ch.pchart.pmarks" :key="'pm' + i"
+               :class="['mk', 'mk-' + m.ev.type]">
+              <polygon v-if="m.ev.type !== 'add'" :points="triPoints(m)" />
+              <circle v-else :cx="m.x" :cy="m.y" r="1.7" />
+              <title>{{ m.label }}</title>
+            </g>
+            <text :x="CHART.W - CHART.padX" :y="CHART.top - 1" class="axlbl"
+                  text-anchor="end">峰值 {{ fmtPrice(ch.pchart.pmax) }} · 最低 {{ fmtPrice(ch.pchart.pmin) }}</text>
+          </svg>
+        </template>
+
         <div v-if="ch.ready" class="legend">
           <span><i class="mk mk-entry"><svg viewBox="0 0 10 10" width="10" height="10"><polygon points="5,9 0.5,2.5 9.5,2.5" /></svg></i> 建仓</span>
           <span><i class="mk mk-add"><svg viewBox="0 0 10 10" width="10" height="10"><circle cx="5" cy="5" r="3" /></svg></i> 加仓（每级）</span>
@@ -251,6 +330,7 @@ h4 { margin: 14px 0 6px; font-size: 12px; color: #555; }
 .baseline { stroke: #ddd; stroke-width: 1; }
 .axlbl { font-size: 10px; fill: #888; }
 .eq-line { stroke: #188038; stroke-width: 1.6; }
+.price-line { stroke: #1a73e8; stroke-width: 1.6; }
 /* 事件标记：建仓=蓝 ▼，加仓=灰 ●，平仓=红 ▲ */
 .mk-entry polygon { fill: #1a73e8; }
 .mk-add circle { fill: #777; }

@@ -372,17 +372,27 @@ class _BacktestBody(BaseModel):
 
 
 def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
-    """引擎结果 → 页面契约（键名归一；净值曲线降采样 ≤400 点）。"""
+    """引擎结果 → 页面契约（键名归一；净值/价格曲线降采样 ≤400 点）。"""
     eq = r.pop("equity")
     dates = r.pop("dates")
-    if len(eq):
-        step = max(1, len(eq) // 400)
+    closes = r.pop("closes", None)
+    n = len(eq)
+    step = max(1, n // 400) if n else 1
+    if n:
         curve = [[str(dates[i])[:10], round(float(eq[i]), 2)]
-                 for i in range(0, len(eq), step)]
-        if curve and curve[-1][0] != str(dates[-1])[:10]:
+                 for i in range(0, n, step)]
+        if curve[-1][0] != str(dates[-1])[:10]:
             curve.append([str(dates[-1])[:10], round(float(eq[-1]), 2)])
     else:
         curve = []
+    # 价格曲线（同采样步长；图表用对数坐标，前端处理）
+    if closes is not None and len(closes):
+        pcurve = [[str(dates[i])[:10], round(float(closes[i]), 6)]
+                  for i in range(0, len(closes), step)]
+        if pcurve[-1][0] != str(dates[-1])[:10]:
+            pcurve.append([str(dates[-1])[:10], round(float(closes[-1]), 6)])
+    else:
+        pcurve = []
     rounds = [{
         "entry_date": x["entry_date"], "entry": x["entry"],
         "exit_date": x["exit_date"], "exit": x["exit_price"],
@@ -409,7 +419,10 @@ def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
         "events": r.get("events", []),
         "realized_cash": r["realized_cash"], "realized_pnl_pct": rpct,
         "final_equity": r["final_equity"], "mdd_pct": r["mdd_pct"],
+        "external_invested": r.get("external_invested", 0.0),
+        "wallet": r.get("wallet", 0.0),
         "equity_curve": curve,
+        "price_curve": pcurve,
     }
 
 
