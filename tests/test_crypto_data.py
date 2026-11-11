@@ -67,16 +67,23 @@ def test_coin_master_active_flip(lake):
 
 def test_stats_shape(lake):
     con, p = lake
-    models.upsert_coins(con, ["BTCUSDT"])
+    models.upsert_coins(con, ["BTCUSDT", "OLDUSDT"])
     models.upsert_klines(con, "binance", "BTCUSDT", [
         {"ts": 1700000000, "open": 1, "high": 2, "low": 0.5, "close": 1.5,
          "volume": 10, "quote_volume": 15}])
+    models.upsert_klines(con, "binance", "OLDUSDT", [
+        {"ts": 1700000000, "open": 1, "high": 2, "low": 0.5, "close": 0.8,
+         "volume": 5, "quote_volume": 6}])
+    # OLDUSDT 退役（数据保留，is_active=FALSE）→ stats 带 active 标记
+    con.execute("UPDATE coin_master SET is_active=FALSE WHERE symbol='OLDUSDT'")
     con.close()  # stats 用 read_only 连接，须先释放写锁（与生产锁语义一致）
     st = models.stats(p)
     assert st["installed"] is True
     names = {t["name"]: t["rows"] for t in st["tables"]}
-    assert names["kline_1h"] == 1
-    assert st["per_symbol"][0]["symbol"] == "BTCUSDT"
+    assert names["kline_1h"] == 2
+    per = {s["symbol"]: s for s in st["per_symbol"]}
+    assert per["BTCUSDT"]["active"] is True
+    assert per["OLDUSDT"]["active"] is False  # 退役币仍列出，供折叠展示
 
 
 # ---------------------------------------------------------------------------

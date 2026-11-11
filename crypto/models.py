@@ -121,17 +121,19 @@ def stats(lake_path: str) -> dict:
             n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             out["tables"].append({"name": t, "rows": n})
         per_sym = con.execute("""
-            SELECT m.symbol, m.n_rows, m.mn, m.mx, k.close
+            SELECT k.symbol, k.n_rows, k.mn, k.mx, x.close,
+                   COALESCE(m.is_active, FALSE) AS is_active
             FROM (SELECT symbol, COUNT(*) n_rows, MIN(ts) mn, MAX(ts) mx
-                  FROM kline_1h WHERE exchange='binance' GROUP BY symbol) m
-            JOIN kline_1h k ON k.symbol = m.symbol AND k.ts = m.mx
-                 AND k.exchange = 'binance'
-            ORDER BY m.symbol
+                  FROM kline_1h WHERE exchange='binance' GROUP BY symbol) k
+            JOIN kline_1h x ON x.symbol = k.symbol AND x.ts = k.mx
+                 AND x.exchange = 'binance'
+            LEFT JOIN coin_master m ON m.symbol = k.symbol
+            ORDER BY k.symbol
         """).fetchall()
         import datetime as _dt
-        for sym, n, mn, mx, last in per_sym:
+        for sym, n, mn, mx, last, act in per_sym:
             out["per_symbol"].append({
-                "symbol": sym, "rows": n,
+                "symbol": sym, "active": bool(act), "rows": n,
                 "from": _dt.datetime.fromtimestamp(mn).strftime("%Y-%m-%d %H:%M"),
                 "to": _dt.datetime.fromtimestamp(mx).strftime("%Y-%m-%d %H:%M"),
                 "last_close": last,  # 最新一根 K 线收盘价（非历史最高）

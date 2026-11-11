@@ -8,6 +8,10 @@ const st = ref(null);
 const err = ref("");
 const gw = ref(null);
 
+// 聚焦 3 币（v7.0.45 收敛）：主表只列 active；退役币数据保留、折叠展示
+const activeSyms = () => (st.value?.per_symbol || []).filter(s => s.active);
+const retiredSyms = () => (st.value?.per_symbol || []).filter(s => !s.active);
+
 async function load() {
   try {
     st.value = await api("/api/lake/status");
@@ -70,19 +74,33 @@ onUnmounted(() => {
       </div>
       <p v-else class="hint">尚未同步——跑 <code>python -m crypto.sync</code></p>
 
-      <h3>每币 K 线（1h，Binance）</h3>
-      <table v-if="st.per_symbol?.length">
+      <h3>每币 K 线（1h，Binance，聚焦 3 币）</h3>
+      <table v-if="activeSyms().length">
         <thead>
           <tr><th>币种</th><th>行数</th><th>起</th><th>止</th><th>最新收盘</th></tr>
         </thead>
         <tbody>
-          <tr v-for="s in st.per_symbol" :key="s.symbol">
+          <tr v-for="s in activeSyms()" :key="s.symbol">
             <td>{{ s.symbol }}</td><td>{{ s.rows }}</td>
             <td>{{ s.from }}</td><td>{{ s.to }}</td><td>{{ s.last_close }}</td>
           </tr>
         </tbody>
       </table>
       <p v-else class="hint">湖内暂无 K 线。</p>
+      <details v-if="retiredSyms().length" class="retired">
+        <summary>退役币（{{ retiredSyms().length }}，数据保留 · 不再同步/网关不推送）</summary>
+        <table>
+          <thead>
+            <tr><th>币种</th><th>行数</th><th>起</th><th>止</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in retiredSyms()" :key="s.symbol">
+              <td>{{ s.symbol }}</td><td>{{ s.rows }}</td>
+              <td>{{ s.from }}</td><td>{{ s.to }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
     </template>
   </div>
 </template>
@@ -105,4 +123,6 @@ h3 { margin: 18px 0 8px; font-size: 13px; color: #555; }
 table { width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ececf2; }
 th { color: #888; font-weight: 500; font-size: 12px; }
+.retired { margin-top: 10px; font-size: 12px; color: #777; }
+.retired summary { cursor: pointer; color: #888; }
 </style>
