@@ -1,5 +1,14 @@
 # 加密货币板块设计 v0.3（框架已落地 v7.0.43，内容待完善）
 
+> **v8.0.7 更新（2026-11-11）**：我的持仓 tab 实体化——`/api/positions`
+> 返回策略当前轮（纸面持仓，引擎全史回测 open_round）+ Gate 模拟盘状态；
+> 新增 `crypto/live/gate.py`（testnet API v4 最小客户端，base 锁模拟盘、
+> 拒绝实盘 URL，Key 读 .env 不回显）；PositionsTab = 纸面持仓表 + 模拟盘
+> 状态卡（纸面 = 模拟盘镜像基准）。
+>
+> **v8.0.6 更新（2026-11-11）**：ETH 退役（只保留 BTC）——coins 清单
+> 单币；is_active=FALSE、数据保留；网关 1 标的。
+>
 > **v8.0.5 更新（2026-11-11）**：追踪止损出场——引擎
 > `trail_activation_mult`/`trail_drawdown_pct`（1.5× 激活、自激活后
 > 最高收盘回撤 20% 平仓），`take_profit_mult=None` 关闭固定止盈，

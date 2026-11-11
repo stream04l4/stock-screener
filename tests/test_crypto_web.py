@@ -216,3 +216,42 @@ class TestBacktestEndpoint:
         assert lake_client.post(
             "/api/backtest", json={"coins": ["TESTUSDT"],
                                    "start": "2020-01-01"}).status_code == 200
+
+
+class TestPositionsEndpoint:
+    """v8.0.7：/api/positions = 策略当前轮（open_round）+ Gate 模拟盘状态。
+
+    gate 状态一律 monkeypatch（测试不打 testnet 网络）。
+    """
+
+    def test_positions_open_round_and_gate(self, lake_client, monkeypatch):
+        monkeypatch.setattr(webapp, "_gate_status", lambda: {
+            "connected": True, "detail": "ok",
+            "btc_avail": 0.001, "usdt_avail": 5.0})
+        monkeypatch.setitem(webapp.CFG, "coins", ["TESTUSDT"])
+        # 合成湖 [100,100,30,300,10]：@30 建仓 → 300=10x 了结 → @10 再建仓
+        r = lake_client.get("/api/positions")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["ready"] is True
+        assert len(d["positions"]) == 1
+        p = d["positions"][0]
+        assert p["symbol"] == "TESTUSDT"
+        assert p["entry"] == pytest.approx(10.0)
+        assert p["k_level"] == 0
+        assert p["tp_price"] == pytest.approx(100.0)
+        assert d["gate"]["connected"] is True
+
+    def test_positions_no_open_round(self, client, tmp_path, monkeypatch):
+        # 全 100 湖 → 永远不触发 70% 跌 → 无开仓轮
+        p = _build_lake(tmp_path / "flat.duckdb", [100.0] * 10)
+        monkeypatch.setattr(webapp, "DB_PATH", p)
+        monkeypatch.setitem(webapp.CFG, "coins", ["TESTUSDT"])
+        monkeypatch.setattr(webapp, "_gate_status", lambda: {
+            "connected": False, "detail": "NO_KEY: test",
+            "btc_avail": None, "usdt_avail": None})
+        r = client.get("/api/positions")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["positions"] == []
+        assert d["gate"]["connected"] is False

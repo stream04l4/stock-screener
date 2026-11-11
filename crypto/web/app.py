@@ -462,10 +462,44 @@ def backtest(body: _BacktestBody) -> Dict[str, Any]:
             "results": [_ui_result(r) for r in results]}
 
 
-# 我的持仓（P2）骨架占位——启动前与 Joel 确认账本归属（crypto_design §9）
+# ---------------------------------------------------------------------------
+# 我的持仓（v8.0.7 实体化）：策略当前轮（纸面持仓）+ Gate 模拟盘状态
+# ---------------------------------------------------------------------------
+_gate_status_cache: Dict[str, Any] = {"t": 0.0, "v": None}
+_GATE_STATUS_TTL_S = 60.0
+
+
+def _gate_status() -> Dict[str, Any]:
+    """Gate 模拟盘探测（60s 缓存，避免每请求打 testnet）。"""
+    import time as _t
+    now = _t.time()
+    if _gate_status_cache["v"] is not None and now - _gate_status_cache["t"] < _GATE_STATUS_TTL_S:
+        return _gate_status_cache["v"]
+    from crypto.live import gate
+    v = gate.status()
+    _gate_status_cache.update(t=now, v=v)
+    return v
+
+
 @core_app.get("/api/positions")
 def positions() -> Dict[str, Any]:
-    return {"ready": False, "detail": "我的持仓：框架已搭，功能待完善（P2 手动登记）"}
+    """我的持仓（v8.0.7）：
+
+    - ``positions``：策略当前轮（纸面持仓）——每个活跃币按生效参数
+      （页面覆盖 > yaml）全史回测取 open_round；无开仓轮 = 空列表；
+    - ``gate``：Gate 模拟盘（testnet）连通性 + BTC/USDT 可用余额
+      （60s 缓存；Key 失效/未配置 → connected=false + detail）。
+    """
+    from crypto.backtest.runner import run_backtest
+    p, eff = _effective_params(None)
+    out = []
+    for coin in CFG["coins"]:
+        r = run_backtest([coin], p, lake_path=str(DB_PATH))[0]
+        o = r["open_round"]
+        if o:
+            out.append({"symbol": coin, **o})
+    return {"ready": True, "params": eff, "positions": out,
+            "gate": _gate_status()}
 
 
 # ---------------------------------------------------------------------------

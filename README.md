@@ -1,4 +1,4 @@
-# stock-screener · v8.0.6（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.7（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -342,8 +342,21 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.6）
+## 10. 版本历史（v7.0.11 → v8.0.7）
 
+- **v8.0.7**：我的持仓 tab 实体化 + Gate 模拟盘接入（Joel 2026-11-11：
+  "把我的持仓也建起来" / "先页面上落地"）：
+  - **`/api/positions`**：策略当前轮（纸面持仓）——每个活跃币按生效参数
+    （页面覆盖 > yaml）全史回测取 open_round（建仓价/级数/数量/均价/
+    现价/市值/浮盈/止盈线）；+ Gate 模拟盘状态（60s 缓存探测）。
+  - **`crypto/live/gate.py`**：Gate testnet API v4 最小客户端（纯 stdlib，
+    HMAC-SHA512 签名；base 代码层锁定 `api-testnet.gateapi.io` 模拟盘，
+    拒绝实盘 URL；Key 读仓库根 .env `GATE_API_KEY/SECRET`，只读不回显）。
+  - **PositionsTab.vue**：策略当前轮表格 + Gate 模拟盘状态卡
+    （连通/余额 或 未连通原因）；当前纸面持仓 = 模拟盘镜像基准
+    （BTC 0.002217，2026-02-05 建 L7，均价 60,155，止盈线 188,730）。
+  - 测试：后端 +2（open_round / 无开仓轮，gate 状态 monkeypatch 不打网络）、
+    前端 +2（表格渲染 / 空态+余额）；crypto 38/38 + 前端 15/15 绿。
 - **v8.0.6**：ETH 退役（Joel 2026-11-11："把 eth 也退役吧，只保留 btc"）：
   yaml `coins` 只留 BTCUSDT；sync 自动置 ETHUSDT `coin_master.is_active=FALSE`
   （湖内 80,841 根 1h 数据保留，恢复 = 加回清单重跑 sync）；crypto-gateway
