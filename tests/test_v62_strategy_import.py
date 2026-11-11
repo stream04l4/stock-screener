@@ -47,13 +47,21 @@ def _setup_tmp_config(tmp_path, monkeypatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def _rescan_safety(monkeypatch):
-    """v7.0.27：写路径测试一律桩掉「保存后重算选股时机表」（不写生产湖）。"""
+    """v7.0.27：写路径测试一律桩掉「保存后重算选股时机表」（不写生产湖）。
+    v7.0.41：十年回测表重算（refresh_selection）同桩。"""
+    from martingale import selection as msel
     from martingale import timing as mtiming
 
     monkeypatch.setattr(
         mtiming, "refresh_timing",
         lambda con, up, tp, **kw: {"as_of": "2000-01-01", "n_codes": 3,
                                    "n_watchlist": 1, "n_push": 1, "elapsed_s": 0.0},
+    )
+    monkeypatch.setattr(
+        msel, "refresh_selection",
+        lambda con, sp, up, **kw: {"as_of": "2000-01-01", "start": "2000-01-01",
+                                   "n_codes": 3, "n_written": 3, "n_positive": 2,
+                                   "elapsed_s": 0.0},
     )
 
 
@@ -160,7 +168,8 @@ def test_put_response_shape(tmp_path, monkeypatch):
     new_val = int(yaml.safe_load(target.read_bytes())["strategy"]["first_lots"]) + 1
     payload = _valid_payload()
     res = appmod.put_strategy(copy.deepcopy(payload))
-    assert set(res.keys()) == {"ok", "backup", "timing_rescan"}  # v7.0.27：+ 重算结果
+    assert set(res.keys()) == {"ok", "backup", "selection_rescan", "timing_rescan"}
+    # v7.0.27 时机重算结果 / v7.0.41 十年回测表重算结果
     assert res["ok"] is True
     assert isinstance(res["backup"], str) and res["backup"].endswith("strategy.yaml.bak")
     reloaded = yaml.safe_load(target.read_text(encoding="utf-8"))
