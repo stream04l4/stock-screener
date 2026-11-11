@@ -285,7 +285,7 @@ describe("MyPositionsTab · 渲染", () => {
     w.unmount();
   });
 
-  it("有账本：表格行 + 汇总条（万为单位）+ 数据截至", async () => {
+  it("有账本：表格行 + 汇总条（万为单位）+ 数据截至 + 价源标注", async () => {
     mockApi(MY);
     const w = mk();
     await flushPromises();
@@ -293,6 +293,7 @@ describe("MyPositionsTab · 渲染", () => {
     expect(w.text()).toContain("sh.601088");
     expect(w.text()).toContain("¥4.1万"); // 40680 市值
     expect(w.text()).toContain("数据截至 2026-10-21");
+    expect(w.text()).toContain("最新收盘（T+1）"); // 无 price_source → 湖价口径（v7.0.40）
     w.unmount();
   });
 
@@ -354,6 +355,8 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     expect(w.text()).toContain("现价 40"); // 现价（实时价，数字渲染为 40）
     expect(w.text()).toContain("42.07"); // 触发价（原始口径）
     expect(w.text()).toContain("实时行情"); // 价源标注
+    // v7.0.40：持仓卡价源标注（实时行情 + 时间戳）
+    expect(w.text()).toContain("价源：实时行情 20261022150500");
     expect(w.text()).toContain("第 0 档 → 第 1 档");
     expect(w.text()).toContain("1 手"); // v7.0.28 建议手数（k=0 加仓 = 1 手）
     expect(w.text()).toContain("¥0.4万"); // 1 手×100 股×现价 40 → 0.4 万

@@ -386,10 +386,15 @@ def test_my_positions_corrupt_ledger_treated_as_empty(tmp_positions_file):
 
 
 def test_my_positions_lake_unavailable_degrades(tmp_positions_file, monkeypatch):
-    """湖锁定/缺失 → 不 500：账本仍列出，无价格字段，lake_locked=True。"""
+    """湖锁定/缺失 → 不 500：账本仍列出，lake_locked=True。
+
+    v7.0.40：展示价 = 实时行情优先——湖不可用但行情可用时价格照出（价源 spot）；
+    行情也缺失 → 无价格字段（纯降级）。
+    """
     import martingale.data as mdata
     monkeypatch.setattr(mdata, "default_db_path", lambda: Path("/tmp/nonexistent_lake_xyz.duckdb"))
     wapp.put_my_positions({"ts_code": "sh.600036", "shares": 100, "cost_price": 10.0})
+    _mock_spot(monkeypatch, {})  # 湖 + 行情双缺 → 纯降级
     out = wapp.get_my_positions()
     assert out["lake_locked"] is True
     assert out["n"] == 1
@@ -399,6 +404,14 @@ def test_my_positions_lake_unavailable_degrades(tmp_positions_file, monkeypatch)
     assert p0["next_add_price"] is None  # 策略参考整体缺省
     assert out["totals"]["market_value"] is None
     assert out["totals"]["cost"] == 1000.0
+    # 湖不可用但行情可用 → 展示价 = 实时价（v7.0.40）
+    _mock_spot(monkeypatch, {"sh.600036": 11.5})
+    out2 = wapp.get_my_positions()
+    assert out2["price_source"] == "spot"
+    p1 = out2["positions"][0]
+    assert p1["last_price"] == 11.5
+    assert p1["market_value"] == 1150.0 and p1["pnl"] == 150.0
+    assert out2["totals"]["market_value"] == 1150.0
     import json
     json.dumps(out)
 
@@ -634,6 +647,40 @@ def test_my_positions_signal_spot_failure_fallback(tmp_positions_file, bt_copy, 
     assert out["price_source"] == "lake"
     assert out["signals"] == []
     assert out["positions"][0]["spot_price"] is None
+
+
+def test_my_positions_spot_display_overlay(tmp_positions_file, bt_copy, monkeypatch):
+    """v7.0.40：展示价 = 实时行情优先（最新价/市值/盈亏/汇总均按展示价）；
+    行情缺失按股回退湖价（混合口径按股各自结算）。
+
+    sh.601088 中国神华（湖最后 49.27）：实时 40.0 → 展示 40.0；
+    sh.600000（湖最后 9.66）：无行情 → 回退湖价 9.66。
+    """
+    wapp._up_write({
+        "sh.601088": {"shares": 100, "cost_price": 45.0},
+        "sh.600000": {"shares": 200, "cost_price": 9.0},
+    })
+    _mock_spot(monkeypatch, {"sh.601088": 40.0})
+    out = wapp.get_my_positions()
+    assert out["price_source"] == "spot"
+    pos = {p["ts_code"]: p for p in out["positions"]}
+    # 实时价覆盖：最新价/市值/盈亏全部按实时价
+    p1 = pos["sh.601088"]
+    assert p1["spot_price"] == 40.0 and p1["last_price"] == 40.0
+    assert p1["market_value"] == 4000.0
+    assert p1["pnl"] == -500.0
+    assert p1["pnl_pct"] == round(-500.0 / 4500.0 * 100.0, 2)  # -11.11
+    # 缺失行情 → 按股回退湖价
+    p0 = pos["sh.600000"]
+    assert p0["spot_price"] is None and p0["last_price"] == 9.66
+    assert p0["market_value"] == 1932.0
+    assert p0["pnl"] == 132.0
+    # 汇总 = 两只展示价合计（4000+1932；成本 4500+1800）
+    t = out["totals"]
+    assert t["market_value"] == 5932.0
+    assert t["cost"] == 6300.0
+    assert t["pnl"] == -368.0
+    assert t["pnl_pct"] == round(-368.0 / 6300.0 * 100.0, 2)  # -5.84
 
 
 def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path, monkeypatch):

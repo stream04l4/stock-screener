@@ -1147,7 +1147,11 @@ def _up_write(positions: Dict[str, Any]) -> None:
 
 @app.get("/api/my_positions")
 def get_my_positions() -> Dict[str, Any]:
-    """我的持仓 = 用户账本（股数/成本）× 湖最新价 + 策略状态机参考（档/触发价）+ 加仓信号。
+    """我的持仓 = 用户账本（股数/成本）× 展示价 + 策略状态机参考（档/触发价）+ 加仓信号。
+
+    展示价（v7.0.40）：实时行情优先（Gate 3 一主一备：腾讯主 → push2delay 备）；
+    行情缺失/失败按股回退湖最新价。最新价/市值/浮动盈亏/汇总均按展示价口径
+    （状态机参考仍按湖历史，数据截至日 = 湖日期，不受实时价影响）。
 
     - 只列用户账本里的代码；策略参考对池外股同样有效（状态机不挑池）。
     - 空账本 → 不连湖直接返回（灌数持锁期间页面仍可用）。
@@ -1180,28 +1184,21 @@ def get_my_positions() -> Dict[str, Any]:
         lake_locked = True
         rows = {}
     positions: List[Dict[str, Any]] = []
-    tot_mv = tot_cost = 0.0
+    tot_cost = 0.0
     for c in sorted(user):
         u = user[c] if isinstance(user[c], dict) else {}
         s = rows.get(c, {})
         shares = float(u.get("shares") or 0)
         cost = float(u.get("cost_price") or 0)
-        last = s.get("last_price")
-        mv = shares * last if last is not None else None
-        cost_total = shares * cost
-        pnl = (mv - cost_total) if mv is not None else None
-        if mv is not None:
-            tot_mv += mv
-        tot_cost += cost_total
         positions.append({
             "ts_code": c,
             "name": s.get("name") or c,
             "shares": shares,
             "cost_price": cost,
-            "last_price": last,
-            "market_value": round(mv, 2) if mv is not None else None,
-            "pnl": round(pnl, 2) if pnl is not None else None,
-            "pnl_pct": round(pnl / cost_total * 100.0, 2) if (pnl is not None and cost_total > 0) else None,
+            "last_price": s.get("last_price"),  # 湖最新价（下方实时行情覆盖，v7.0.40）
+            "market_value": None,  # 行情覆盖后按展示价统一计算
+            "pnl": None,
+            "pnl_pct": None,
             "updated_at": u.get("updated_at"),
             # 策略状态机参考（池外股/湖中无数据时字段为 None）
             "in_pos": s.get("in_pos"),
@@ -1213,7 +1210,7 @@ def get_my_positions() -> Dict[str, Any]:
             "next_rearm_price_raw": s.get("next_rearm_price_raw"),
             "end_date": s.get("end_date"),
         })
-    has_price = any(r["market_value"] is not None for r in positions)
+        tot_cost += shares * cost
     # 加仓信号（实时价口径）：
     # 状态机在湖最后 bar「触线即买」→ 湖最后 bar 处 最新价 > 下一档触发价 恒成立，
     # 用湖价判"已触线"永远为假。故信号用**实时价**（腾讯行情）对比触发价；
@@ -1231,6 +1228,25 @@ def get_my_positions() -> Dict[str, Any]:
     for pos in positions:
         p_now = (spot.get(pos["ts_code"]) or {}).get("price")
         pos["spot_price"] = p_now
+        # v7.0.40：展示价 = 实时行情优先（缺失按股回退湖价）；市值/盈亏/
+        # 汇总统一按展示价口径（下方重算）。状态机参考（档/触发价）不受影响。
+        if p_now is not None:
+            pos["last_price"] = p_now
+    # 市值 / 浮动盈亏 / 汇总（v7.0.40：行情覆盖后按展示价计算）
+    tot_mv = 0.0
+    has_price = False
+    for pos in positions:
+        shares = pos["shares"]
+        cost_total = shares * pos["cost_price"]
+        last = pos["last_price"]
+        mv = shares * last if last is not None else None
+        pnl = (mv - cost_total) if mv is not None else None
+        pos["market_value"] = round(mv, 2) if mv is not None else None
+        pos["pnl"] = round(pnl, 2) if pnl is not None else None
+        pos["pnl_pct"] = round(pnl / cost_total * 100.0, 2) if (pnl is not None and cost_total > 0) else None
+        if mv is not None:
+            tot_mv += mv
+            has_price = True
     # 信号：现价（实时优先）≤ 下一档触发价（原始口径，v7.0.28 手数）
     # - in_pos（持仓中，第 k 档）→ "add"：加仓到第 k+1 档，
     #   手数 = first_lots + k×add_lots_step

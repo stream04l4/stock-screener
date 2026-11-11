@@ -1,7 +1,7 @@
 // 我的持仓 tab（v7.0.1，原「查询」改名重定位）：维护用户自己的实际持仓状态。
 // - 账本 = data/user_positions.json（后端 /api/my_positions 读写，原子落盘）；
-// - 展示 = 账本 × 湖最新价（市值/浮盈）+ 策略状态机参考（当前档/下次加仓价/再武装价，
-//   池外股同样有参考——状态机不挑池）；
+// - 展示 = 账本 × 展示价（v7.0.40：实时行情优先，行情失败按股回退湖最新价）
+//   + 策略状态机参考（当前档/下次加仓价/再武装价，池外股同样有参考——状态机不挑池）；
 // - 添加/更新/删除：顶部录入条 + 行点击弹层编辑，PUT 单条 upsert（shares=0 删除）。
 // 数据按需加载（useLiveQuery，非日跑）→ 手动刷新按钮 invalidate。
 <script setup>
@@ -545,7 +545,9 @@ function pnlColor(v) {
           ⏳ 数据湖正被灌数进程占用——最新价/市值/策略参考暂不可用，当前只显示你的账本；灌数结束后刷新。
         </div>
         <p class="muted small" v-if="myData.n">
-          数据截至 {{ myData.as_of || "—" }} · 行点击可编辑股数/成本或删除
+          数据截至 {{ myData.as_of || "—" }}（状态机） · 价源：{{ myData.price_source === "spot"
+            ? `实时行情${myData.spot_time ? " " + myData.spot_time : ""}` : "最新收盘（T+1）" }}
+          · 行点击可编辑股数/成本或删除
         </p>
         <div v-if="t && myData.n" class="totals-bar">
           <span>总市值 <b>{{ fmtW(t.market_value) }}</b></span>
