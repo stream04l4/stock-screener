@@ -36,12 +36,12 @@ async function doLogout() {
 
 <template>
   <header class="topbar">
-    <div class="brand">📉 深回撤金字塔加仓 <span class="sub">A股深回撤加仓单策略 · 高点回撤首仓 · 阶梯加仓不封顶（v7.0）</span></div>
+    <div class="brand">📉 马丁格尔 · A股 <span class="sub">深回撤金字塔加仓 · 高点回撤首仓 · 阶梯加仓不封顶</span></div>
     <nav class="tabs">
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
     <ToastBar />
-    <a class="topbar-jump" :href="cryptoUrl" title="跳转加密货币系统（/crypto/，已登录免登）">🪙 加密货币</a>
+    <a class="topbar-jump" :href="cryptoUrl" title="跳转加密货币系统（/crypto/，已登录免登）">🪙 加密马丁格尔</a>
     <div class="topbar-auth">
       <span class="topbar-user">👤 {{ auth.user }}</span>
       <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
@@ -59,7 +59,7 @@ async function doLogout() {
 
   <footer class="footnote">
     数据源：本机 DuckDB 数据湖（data/lake/，lake-sync 定时灌数，T+1）；页面数据读自湖 + output/backtest_martingale/ 回测产物 + config/strategy.yaml。
-    v7.0：单一策略（深回撤金字塔加仓）——逐股独立状态机，高点回撤首仓、每再跌一档加仓一档（手数阶梯：第 k 档 = first_lots+k×add_lots_step 手，上不封顶）、不卖出、无熔断；
+    v7.0：单一策略（马丁格尔 · 深回撤金字塔加仓）——逐股独立状态机，高点回撤首仓、每再跌一档加仓一档（手数阶梯：第 k 档 = first_lots+k×add_lots_step 手，上不封顶）、不卖出、无熔断；
     信号用后复权收盘、成交按原始收盘、现金分红单列（cash 口径）。湖内无退市股（幸存者偏差），回测产物已带声明。
   </footer>
 </template>

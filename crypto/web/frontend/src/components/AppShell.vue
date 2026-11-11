@@ -30,11 +30,11 @@ async function doLogout() {
 
 <template>
   <header class="topbar">
-    <div class="brand">🪙 加密货币 <span class="sub">独立系统 · 与股票系统同仓库 · 框架 v7.0.43</span></div>
+    <div class="brand">🪙 马丁格尔 · 加密货币 <span class="sub">深回撤网格 + 10x 止盈 · 1h 数据湖 + 实时网关</span></div>
     <nav class="tabs">
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
-    <a class="topbar-jump" :href="stockUrl" title="跳转股票系统（:9090，已登录免登）">📉 股票</a>
+    <a class="topbar-jump" :href="stockUrl" title="跳转股票系统（/，已登录免登）">📉 A股马丁格尔</a>
     <div class="topbar-auth">
       <span class="topbar-user">👤 {{ auth.user }}</span>
       <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
@@ -51,8 +51,8 @@ async function doLogout() {
   </main>
 
   <footer class="footnote">
-    数据源：本机 DuckDB 独立湖（data/lake/crypto.duckdb，crypto-sync 每小时灌数，Binance 主源 + OKX 交叉校验）。
-    框架阶段（v7.0.43）：四页签骨架 + 数据底座；持仓/策略/回测内容后续慢慢完善。
+    策略：马丁格尔 · 深回撤网格 + 倍率止盈（参数在策略 tab 调整，回测 tab 一键全史回测）。
+    数据源：本机 DuckDB 独立湖（data/crypto/crypto.duckdb，crypto-sync 每小时灌数，Binance 主源 + OKX 交叉校验）+ 实时 K 线网关（纯内存，不入湖）。
   </footer>
 </template>
 

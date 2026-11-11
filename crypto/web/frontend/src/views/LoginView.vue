@@ -1,5 +1,5 @@
-// 登录页（加密货币系统，v7.0.43）：双系统统一登录入口（与股票登录页对称）。
-// - 📉 登录 A股4维选股：POST /api/login（ssc_session cookie 按 host 跨端口）
+// 登录页（v7.0.49 统一品牌）：双系统统一登录入口（与股票登录页对称）。
+// - 📉 登录 A股（马丁格尔）：POST /api/login（ssc_session cookie 按 host 跨端口）
 //   → 成功后整页跳转 :9090，股票系统凭同一 cookie 免登（表单默认/回车触发）；
 // - 🪙 登录 加密货币：同一 POST /api/login → 本站 AppShell；
 // - 同一账号密码（与股票系统相同 WEB_ADMIN_USER/WEB_ADMIN_PASS）；
@@ -36,8 +36,8 @@ async function doLogin(target) {
 <template>
   <div class="login-wrap">
     <form class="login-card" @submit.prevent="doLogin('stock')">
-      <h1 class="login-title">📉🪙 双系统统一登录</h1>
-      <p class="login-sub">A股4维选股 · 加密货币 · 同一账号密码，选择要进入的系统</p>
+      <h1 class="login-title">📉🪙 马丁格尔 · 双市场统一登录</h1>
+      <p class="login-sub">A股深回撤金字塔加仓 · 加密深回撤网格 + 10x 止盈 · 同一账号密码，选择要进入的系统</p>
       <label class="login-field">
         <span>用户名</span>
         <input v-model="form.username" autocomplete="username" placeholder="admin" />
@@ -49,10 +49,10 @@ async function doLogin(target) {
       </label>
       <p v-if="auth.loginErr" class="login-err">{{ auth.loginErr }}</p>
       <button type="submit" class="login-btn login-btn-stock" :disabled="busy">
-        📉 {{ busy ? "登录中…" : "登录 A股4维选股" }}
+        📉 {{ busy ? "登录中…" : "登录 A股（马丁格尔）" }}
       </button>
       <button type="button" class="login-btn login-btn-crypto" :disabled="busy" @click="doLogin('crypto')">
-        🪙 {{ busy ? "登录中…" : "登录 加密货币" }}
+        🪙 {{ busy ? "登录中…" : "登录 加密货币（马丁格尔）" }}
       </button>
     </form>
   </div>

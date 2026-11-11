@@ -17,7 +17,7 @@
 // FieldEditor 用 FIELD_TYPE[field] 取类型，未注册 → 回退 "str"。
 
 export const SECTION_META = {
-  strategy: { title: "持仓策略（深回撤金字塔加仓）", icon: "📉" },
+  strategy: { title: "持仓策略（马丁格尔 · 深回撤金字塔加仓）", icon: "📉" },
   universe: { title: "股票池（候选池：基础 5 条件 + 选股 3 门槛）", icon: "🗂️" },
   timing: { title: "选股策略（买入时机筛选）", icon: "🎯" },
 };

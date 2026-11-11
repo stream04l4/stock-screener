@@ -35,10 +35,10 @@ describe("LoginView（加密货币系统，双入口）", () => {
     mockFetch({ "/crypto/api/auth/me": { ok: false, status: 401, body: {} } });
     const w = mountView();
     await flushPromises();
-    expect(w.text()).toContain("双系统统一登录");
+    expect(w.text()).toContain("马丁格尔");
     const btns = w.findAll("button.login-btn");
     expect(btns.length).toBe(2);
-    expect(btns[0].text()).toContain("A股4维选股");
+    expect(btns[0].text()).toContain("A股（马丁格尔）");
     expect(btns[1].text()).toContain("加密货币");
   });
 

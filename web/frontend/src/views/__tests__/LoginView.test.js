@@ -57,7 +57,7 @@ describe("App 登录门禁", () => {
     expect(isLogin(w)).toBe(false); // checked=false 加载中
     await flushPromises();
     expect(isLogin(w)).toBe(true);
-    expect(w.find(".login-title").text()).toContain("双系统统一登录");
+    expect(w.find(".login-title").text()).toContain("马丁格尔");
     expect(w.find(".login-btn-stock").exists()).toBe(true);
     expect(w.find(".login-btn-crypto").exists()).toBe(true);
     w.unmount();
