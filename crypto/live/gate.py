@@ -46,21 +46,30 @@ def _load_keys() -> tuple[str, str]:
     return env.get("GATE_API_KEY", ""), env.get("GATE_API_SECRET", "")
 
 
-def _request(method: str, path: str, body: dict | None = None) -> Any:
-    """带签名的 REST 调用（base 锁定 testnet；path 形如 /spot/accounts）。"""
+def _request(method: str, path: str, body: dict | None = None,
+             params: dict | None = None) -> Any:
+    """带签名的 REST 调用（base 锁定 testnet；path 形如 /spot/accounts）。
+
+    params → URL query（按 key 排序 urlencode）；签名字符串 =
+    METHOD\\n/api/v4+path\\nquery_string\\nsha512(body)\\n秒级时间戳。
+    """
+    from urllib.parse import urlencode
     key, secret = _load_keys()
     if not key or not secret:
         raise GateError("NO_KEY", ".env 未配置 GATE_API_KEY/GATE_API_SECRET")
     if not path.startswith("/"):
         path = "/" + path
+    qs = urlencode(sorted(params.items())) if params else ""
+    full_path = path + (f"?{qs}" if qs else "")
     payload = json.dumps(body).encode("utf-8") if body is not None else b""
     ts = str(int(time.time()))
     hashed_payload = hashlib.sha512(payload).hexdigest()
-    sign_str = f"{method}\n{path}\n\n{hashed_payload}\n{ts}"
+    # 验签用完整 URL path（含 /api/v4 前缀）+ 排序后的 query_string
+    sign_str = f"{method}\n/api/v4{path}\n{qs}\n{hashed_payload}\n{ts}"
     sign = hmac.new(secret.encode(), sign_str.encode(),
                     hashlib.sha512).hexdigest()
     req = urllib.request.Request(
-        TESTNET_BASE + path,
+        TESTNET_BASE + full_path,
         data=payload if payload else None,
         method=method,
         headers={
