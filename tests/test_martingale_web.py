@@ -360,15 +360,98 @@ def tmp_positions_file(tmp_path, monkeypatch):
     return dst
 
 
-@pytest.fixture()
-def bt_copy(monkeypatch):
-    """湖被灌数持锁时，非空账本 GET 走 /tmp 回测副本（数据至 2026-10-21）。"""
-    p = Path("/tmp/lake_bt_20261022.duckdb")
-    if not p.exists():
-        pytest.skip("回测湖副本不存在")
-    import martingale.data as mdata
-    monkeypatch.setattr(mdata, "default_db_path", lambda: p)
+def _last_n_weekdays(n: int, end: str = "2026-11-11") -> list:
+    """生成截至 end 的最近 n 个工作日（周一~周五）。"""
+    from datetime import date, timedelta
+    d = date.fromisoformat(end)
+    out = []
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return [x.isoformat() for x in reversed(out)]
+
+
+# 合成湖价格路径（收盘价；open=high=low=close，adj_factor=1.0 无复权）。
+# 设计口径（strategy.yaml: first_dd=15%, add_step=5%, rearm=15% bounce）：
+# ⚠️ bounce 再武装模式下 entry_high 不跟随新高——恒为首 bar / 再武装 bar 价，
+# 首仓线 = entry_high×0.85。
+# - sh.601088 中国神华：首 bar 50（entry_high=50）→ 冲高 55（bounce 不更新
+#   高点）→ 跌至 42（≤50×0.85=42.5 首仓 k=0，k→1；k=1 线 40 未到）→ 低点 42
+#   反弹至 48.5（≥42×1.15=48.3 → rearm：entry_high=48.5, k 复位 0, in_pos 保持
+#   True）→ 收尾 49.27（>下一加仓线 48.5×0.85=41.225 不触线）。
+#   终态 in_pos=True/k=0/last=49.27/next_add_raw=41.225；spot 40.0≤41.225 → add 信号。
+# - sh.600941 中国移动：首 bar 100 → 最低 95（bounce 首仓线 85 / 严格档 75 均未
+#   到）→ 收尾 96.59。严格档（dd=25%）：in_pos=False/k=0/next_add_raw=75.0；
+#   spot 70.0≤75.0 → buy 信号。
+# - sh.600000 浦发银行：首 bar 10.0 → 末收 **9.66**（spot 展示断言锚点），
+#   首仓线 8.5 未到 → 不持仓。
+# - sh.600036 招商银行：40.5 附近窄幅，末收 40.8，仅保证有行（last_price 非空）。
+_BT_PATHS = {
+    "sh.601088": [50, 51, 52, 53, 54, 55, 53, 50, 47, 43, 42, 44, 48.5, 50,
+                  51, 52, 51, 50, 49.5, 49.27],
+    "sh.600941": [100, 100.5, 101, 100, 99, 98, 97, 96, 95, 96, 96.5, 96.59],
+    "sh.600000": [10.0, 10.1, 10.2, 10.0, 9.9, 9.8, 9.7, 9.66],
+    "sh.600036": [40.5, 40.6, 40.4, 40.7, 40.8],
+}
+# 搜索接口断言需要的名录（industry_name 仅展示用；delist_date=NULL 在市）
+_BT_MASTER = [
+    ("sh.600000", "浦发银行", "银行"),
+    ("sh.600025", "国电电力", "电力"),
+    ("sh.600036", "招商银行", "银行"),
+    ("sh.600900", "长江电力", "电力"),
+    ("sh.600941", "中国移动", "通信"),
+    ("sh.601088", "中国神华", "煤炭"),
+]
+
+
+def _build_synthetic_bt_lake(path: str) -> None:
+    """建自包含合成回测湖：生产 DDL（lake.ddl 全表全视图）+ 上述受控 K 线路径。
+
+    零外部依赖：不复制生产湖/不依赖 /tmp 快照，断言值由路径确定性推得
+    （见 _BT_PATHS 注释）。dividend_events 留空 → 无除权修正（f=1, r_cum=1）。
+    """
+    import duckdb
+    from lake.ddl import init_schema
+    con = duckdb.connect(path)
+    try:
+        init_schema(con)
+        con.executemany(
+            "INSERT INTO stock_master (ts_code, name, industry_name) VALUES (?,?,?)",
+            _BT_MASTER)
+        rows = []
+        for code, closes in _BT_PATHS.items():
+            dates = _last_n_weekdays(len(closes))
+            for d, c in zip(dates, closes):
+                rows.append((code, d, c, c, c, c, 1_000_000, 0.0, 1.0))
+        con.executemany(
+            "INSERT INTO kline_daily (ts_code, date, open, high, low, close,"
+            " volume, pct_chg, adj_factor) VALUES (?,?,?,?,?,?,?,?,?)", rows)
+        con.close()
+    except Exception:
+        con.close()
+        raise
+
+
+@pytest.fixture(scope="module")
+def bt_lake_file(tmp_path_factory):
+    """模块级合成回测湖（建一次，全 bt 用例共享，只读使用）。"""
+    p = tmp_path_factory.mktemp("bt_lake") / "lake_bt.duckdb"
+    _build_synthetic_bt_lake(str(p))
     return p
+
+
+@pytest.fixture()
+def bt_copy(bt_lake_file, monkeypatch):
+    """自包含合成回测湖 + monkeypatch（v7.0.46 起）。
+
+    取代旧方案（外部快照 /tmp/lake_bt_20261022.duckdb：2026-11-11 被 ops
+    清理丢失 → 13 例 skip）。合成路径确定性复现原快照断言值（49.27/41.225 神华、
+    96.59/75.0 移动严格档、9.66 浦发末收），不随行情漂移。
+    """
+    import martingale.data as mdata
+    monkeypatch.setattr(mdata, "default_db_path", lambda: str(bt_lake_file))
+    return bt_lake_file
 
 
 def test_my_positions_empty_ledger(tmp_positions_file):
@@ -667,9 +750,9 @@ def test_my_positions_empty_ledger_current_strategy(tmp_positions_file):
 def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypatch):
     """实时价跌破下一档触发线 → 加仓信号（湖价单独判定永远为假：触线即买）。
 
-    中国神华 sh.601088（活动策略：k=0，raw 触发 42.07，湖最后价 49.27）：
-    - 无实时行情 → 回退湖价 49.27 > 42.07 → 无信号，price_source=lake；
-    - 实时价 40.0 ≤ 42.07 → 信号，建议加仓 = base×growth^0 = 10000。
+    中国神华 sh.601088（合成湖：in_pos k=0，raw 触发 41.225，湖最后价 49.27）：
+    - 无实时行情 → 回退湖价 49.27 > 41.225 → 无信号，price_source=lake；
+    - 实时价 40.0 ≤ 41.225 → 信号，建议加仓 = base×growth^0 = 10000。
     """
     wapp._up_write({"sh.601088": {"shares": 100, "cost_price": 45.0}})
     _mock_spot(monkeypatch, {})
@@ -741,9 +824,9 @@ def test_my_positions_spot_display_overlay(tmp_positions_file, bt_copy, monkeypa
 def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path, monkeypatch):
     """买入（首仓）信号：当前策略下未持仓（never）→ 实时价跌破首仓触发线 → buy。
 
-    活动策略（dd=15%）下池内 101 只全部 in_pos（十年内都经历过 ≥15% 回撤）；
+    活动策略（dd=15%）下生产池 101 只几乎全部 in_pos（十年内都经历过 ≥15% 回撤）；
     v7.0.29 策略库退役后改用 CONFIG_PATH 临时副本模拟更严格策略（dd=25%）：
-    sh.600941 从未触线（k=0，raw 触发 72.36，湖价 96.59）。
+    sh.600941 合成湖从未触线（k=0，raw 触发 75.0，湖价 96.59）。
     """
     import yaml as _y
     wapp._up_write({"sh.600941": {"shares": 100, "cost_price": 100.0}})
@@ -752,13 +835,13 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     cfg["timing"]["first_drawdown_pct"] = 25   # v7.0.26：dd 居 timing 段
     strict.write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(wapp, "CONFIG_PATH", strict)
-    _mock_spot(monkeypatch, {})  # 湖价回退：96.59 > 72.36 → 不误报
+    _mock_spot(monkeypatch, {})  # 湖价回退：96.59 > 75.0 → 不误报
     out0 = wapp.get_my_positions()
     p0 = out0["positions"][0]
     assert p0["in_pos"] is False and p0["k_level"] == 0
     assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
     assert out0["signals"] == []
-    # 实时价 70.0 ≤ 72.36 → buy 信号，建议手数 = first_lots = 1
+    # 实时价 70.0 ≤ 75.0 → buy 信号，建议手数 = first_lots = 1
     _mock_spot(monkeypatch, {"sh.600941": 70.0})
     out = wapp.get_my_positions()
     assert len(out["signals"]) == 1
