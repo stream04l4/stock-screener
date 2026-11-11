@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import os
 import re
 import time
@@ -42,6 +43,28 @@ from crypto.backtest.runner import run_backtest        # noqa: E402
 
 def _parse_list(s: str, cast) -> list:
     return [cast(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _cover_levels(base: float, gr: float, budget: float):
+    """budget U 外部投入在 base/gr 下能完整买到的最大档位（0 起，L0=首仓）。
+
+    解析式 + 浮点边界前向/回退校验：base·Σ_{j=0..k} gr^j ≤ budget。
+    budget<=0（不限）→ None；base>budget（首仓都买不起）→ -1。
+    """
+    if not budget or budget <= 0 or base <= 0:
+        return None
+    if base > budget:
+        return -1
+    if abs(gr - 1.0) < 1e-12:
+        return int(budget // base) - 1
+    # base*(gr^(k+1)-1)/(gr-1) ≤ budget → gr^(k+1) ≤ 1 + budget*(gr-1)/base
+    rhs = 1.0 + budget * (gr - 1.0) / base
+    k = int(math.floor(math.log(rhs) / math.log(gr))) - 1
+    while base * (gr ** (k + 2) - 1.0) / (gr - 1.0) <= budget + 1e-9:
+        k += 1
+    while k > -1 and base * (gr ** (k + 1) - 1.0) / (gr - 1.0) > budget + 1e-9:
+        k -= 1
+    return k
 
 
 def _metrics(r: dict, years: float) -> dict:
@@ -76,8 +99,9 @@ def _fmt_row(base, d: float, tp: float, gr: float, m: dict,
     cagr_s = f"{m['cagr']:+.1f}%" if m["cagr"] is not None else "—"
     avg_s = f"{m['avg_days']:.0f}" if m["avg_days"] is not None else "—"
     cap_s = "✂" if m["capped"] else ""
+    cov_s = (f"L{m['cover']}" if m.get("cover") is not None else "∞")
     return (f"| {base:g} | {d:g}% | {tp:g}x | {gr:g} | {m['rounds']} | {op_s} | "
-            f"{m['ext']:.0f}/{budget:g}{cap_s} | {m['eq']:.0f} | {roi_s} | "
+            f"{m['ext']:.0f}/{budget:g}{cap_s} | {cov_s} | {m['eq']:.0f} | {roi_s} | "
             f"{cagr_s} | {avg_s} | {m['mdd']:.1f} |")
 
 
@@ -102,7 +126,9 @@ def run_search(drops: list, tps: list, grs: list, bases: list, coins: list,
                                lookback_h=base_p.lookback_h)
             r = run_backtest([coin], p, start=start, end=end,
                              external_cap=budget or None)[0]
-            rows.append((base, d, tp, gr, _metrics(r, years)))
+            m = _metrics(r, years)
+            m["cover"] = _cover_levels(float(base), gr, budget)
+            rows.append((base, d, tp, gr, m))
         rows.sort(key=lambda x: (x[4]["ext"] > 0, x[4]["cagr"] or -999),
                   reverse=True)
         out[coin] = rows
@@ -116,8 +142,8 @@ def render_report(rows_by_coin: dict, drops: list, tps: list, grs: list,
                   bases: list, start: str, end: str,
                   years: float, budget: float) -> str:
     hdr = ("| 起始资金(U) | 建仓幅度 | 止盈 | 加仓 | 轮次 | 持仓中 | "
-           "外部投入/预算 | 期末净值(U) | 回报率 | 周转CAGR | 均持仓(d) | MDD |")
-    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|"
+           "外部投入/预算 | 预算可至 | 期末净值(U) | 回报率 | 周转CAGR | 均持仓(d) | MDD |")
+    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     out = [
         "# 加密货币参数寻优",
         "",
@@ -130,6 +156,17 @@ def render_report(rows_by_coin: dict, drops: list, tps: list, grs: list,
     if budget:
         out.append(f"预算：外部投入硬上限 {budget:g} USDT（买不起的档位整档"
                    "放弃，不做部分买入；了结所得滚存不受限）。✂ = 被预算截断。")
+        out += [
+            "",
+            f"### 预算覆盖深度：{budget:g} U 外部投入能完整买到的最大档位"
+            "（L0 = 首仓，L80 = 价格较建仓价再跌 80%）",
+            "",
+            "| 起始 \\ 加仓 | " + " | ".join(f"{g:g}" for g in grs) + " |",
+            "|" + "---|" * (len(grs) + 1),
+        ]
+        for b in bases:
+            out.append("| " + f"{b:g} | " + " | ".join(
+                f"L{_cover_levels(b, g, budget)}" for g in grs) + " |")
     out += [
         "",
         "指标口径：回报率 = 期末净值/总外部投入 − 1（含未了结浮盈）；"
