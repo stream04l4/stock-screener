@@ -1,4 +1,4 @@
-# stock-screener · v7.0.41（drawdown_martingale 单策略版）
+# stock-screener · v7.0.42（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -374,6 +374,14 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.42**：双系统登录解耦（2026-11-11 Joel「把当前本机的加密货币部分完全
+  删除掉」，Quant iTransformer 下线）：
+  - 登录页移除 ⚡Quant 按钮（回到 A股4维选股单系统入口），顶栏移除 ⚡Quant
+    跳转（9091）；LoginView/AppShell/LoginView.test.js 同步，前端 253 绿，
+    重建 bundle 后全 JS 零 9091/quant 引用。
+  - 本机 quant-gateway(8000)/quant-tower(9091)/quant-live 服务与 unit 文件
+    已删除；加密货币研究资产（仓库/joint_project 4 目录）已全删。
+  - 纯展示层改动：策略/数学/推送零改动，f6 红线不受影响。
 - **v7.0.41**：改策略触发十年回测表重算（2026-11-11 Joel「改策略是应该触发
   重算」）：
   - 背景：G7 十年回测表按「当前生产策略参数」回放，此前仅 19:30 lake-sync 刷新

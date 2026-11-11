@@ -2,9 +2,8 @@
 //
 // mock 点：api client（零网络）。流程契约：
 // - 启动 → GET /api/auth/me：401 → 渲染登录页；200 → 直进 AppShell；
-// - 登录提交（表单默认/回车 = A股按钮）→ POST /api/login：成功 → AppShell 挂载
+// - 登录提交（表单默认/回车）→ POST /api/login：成功 → AppShell 挂载
 //   + taskStore.restore（/api/health）；失败 → 行内错误文案，停留登录页；
-//   （Quant 按钮走同一 POST，成功后整页跳转 :9091，浏览器 E2E 覆盖）
 // - 运行中任意受保护 API 401 → client 发 auth:401 → 回登录页；
 // - 顶栏「退出」→ POST /api/logout → 回登录页。
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,14 +52,13 @@ beforeEach(() => {
 });
 
 describe("App 登录门禁", () => {
-  it("未登录（me 401）→ 登录页；双系统登录按钮在位；加载态不渲染页签", async () => {
+  it("未登录（me 401）→ 登录页；A股登录按钮在位；加载态不渲染页签", async () => {
     const w = mk();
     expect(isLogin(w)).toBe(false); // checked=false 加载中
     await flushPromises();
     expect(isLogin(w)).toBe(true);
-    expect(w.find(".login-title").text()).toContain("双系统统一登录");
+    expect(w.find(".login-title").text()).toContain("A股4维选股");
     expect(w.find(".login-btn-stock").exists()).toBe(true);
-    expect(w.find(".login-btn-quant").exists()).toBe(true);
     w.unmount();
   });
 
