@@ -47,6 +47,13 @@ describe("BacktestTab", () => {
     await flushPromises();
 
     expect(fn.mock.calls.length).toBe(1);
+    // 时间范围输入：两个日期框；缺省全史（body start/end 为空）
+    const dateInputs = w.findAll('input[type="date"]');
+    expect(dateInputs.length).toBe(2);
+    const body0 = JSON.parse(fn.mock.calls[0][1].body);
+    expect(body0.start).toBe("");
+    expect(body0.end).toBe("");
+    expect(w.text()).toContain("全史");
     expect(w.text()).toContain("TESTUSDT");
     expect(w.text()).toContain("已了结轮次");
     expect(w.text()).toContain("持仓中");
@@ -80,6 +87,28 @@ describe("BacktestTab", () => {
     expect(w.text()).toContain("加仓（每级）");
     expect(w.text()).toContain("悬停标记看明细");
     expect(w.text()).toContain("耗时 0.1s");
+  });
+
+  it("设置回测时间范围 → body 携带 start/end 且标题显示范围", async () => {
+    const fn = vi.fn(async (path, opts) => {
+      if (path === "/crypto/api/backtest" && opts && opts.method === "POST") {
+        return { ok: true, status: 200, json: async () => BT_RESULT };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    vi.stubGlobal("fetch", fn);
+    const w = mount(BacktestTab);
+    await flushPromises();
+
+    const dateInputs = w.findAll('input[type="date"]');
+    await dateInputs[0].setValue("2020-01-03");
+    await w.find("button.primary").trigger("click");
+    await flushPromises();
+
+    const body = JSON.parse(fn.mock.calls[0][1].body);
+    expect(body.start).toBe("2020-01-03");
+    expect(body.end).toBe("");
+    expect(w.text()).toContain("2020-01-03 → 最新");
   });
 
   it("回测失败 → 显示错误信息", async () => {

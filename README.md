@@ -1,4 +1,4 @@
-# stock-screener · v7.0.53（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v7.0.54（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -387,6 +387,29 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.54**：回测时间范围（Joel 2026-11-11："这个回测得加个回测时间范围"）：
+  - **口径**（定案）：窗口 = `[start, end]`（UTC 日界，start 含、end 含当日）；
+    窗口内**账户从空开始**（不继承窗口前的持仓/余额）；但**一年高点**自动
+    用窗口前 `lookback_h`(8760h) 根历史做基线（只算高点、不产生交易），
+    避免窗口起点附近因"无前置高点"而误触发/漏触发。start/end 缺省 = 全史。
+  - **引擎**（`engine.run_coin`）：新增 `h1y` 入参——外部传入的一年高点数组
+    （与 `closes` 等长）；`None` 时回退自算 `rolling_high_1y`（向后兼容）。
+  - **runner**（`backtest/runner.py`）：`load_bars(lake, symbol, lo_ts, hi_ts)`
+    加窗口过滤；`_date_to_ts(date_str, end_of_day)`（YYYY-MM-DD → UTC epoch 秒）；
+    `run_backtest(..., start, end)`——先把**全量**序列算好 `h1y_full`，再按
+    `ts >= start_ts` 切片 `ts/closes/h1y`（空窗口返回 `n_bars=0` 空结果，不崩）；
+    `render_report(..., start, end)` 报告头加"回测范围"行（仅带范围时）。
+  - **CLI**（`backtest/__main__.py`）：`--start YYYY-MM-DD` / `--end YYYY-MM-DD`
+    （格式/顺序校验 → 退出码 2）；`save_report(..., start, end)` 透传。
+  - **Web**（`/api/backtest`）：body 加可选 `start`/`end`（`YYYY-MM-DD`，UTC）；
+    校验失败 400（格式错 / start>end）；响应加 `range: {start, end}` 回显。
+  - **前端**（BacktestTab）：工具条加两个 `<input type="date">`（start/end，
+    留空 = 全史），标题动态显示当前范围（"全史" / "2020-01-03 → 最新"），
+    提示文案说明"一年高点用窗口前 8760h 历史做基线"。
+  - 真实湖验证（2019-2021 窗口，growth=1.05）：BTC 2019-01-01 建仓 3700.31
+    → 2021-01-07 止盈 37150.66（10.04x）、投入 125.78 U、外部 125.78 U；
+    ETH 同步 1 轮；CLI/端点/前端全链路一致；全量回归 **708 passed / 0 failed**
+    （crypto 后端 43 + 前端 13，新增引擎 h1y / 端点范围/校验 5 例）。
 - **v7.0.53**：回测双图（净值+价格）+ 总外部投入（Joel 2026-11-11："加个
   价格图也标明建仓/加仓/平仓；总结里要看总外部投入——首次建仓全外部，
   了结后余额滚入下一轮，余额耗尽再算外部"）：

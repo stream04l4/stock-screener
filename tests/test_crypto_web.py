@@ -56,6 +56,19 @@ def lake_client(client, tmp_path, monkeypatch):
     return client
 
 
+@pytest.fixture()
+def lake_client2d(client, tmp_path, monkeypatch):
+    """跨 2 天湖：2020-01-01 全天 24 根 100 + 2020-01-02 两根 [30, 300]。
+
+    用于时间范围回测：窗口起点 2020-01-02 时，一年高点需含窗口前历史
+    （24 根 100）才能触发 30 ≤ 100×30% 建仓。
+    """
+    closes = [100.0] * 24 + [30.0, 300.0]
+    p = _build_lake(tmp_path / "test_crypto_2d.duckdb", closes)
+    monkeypatch.setattr(webapp, "DB_PATH", p)
+    return client
+
+
 class TestStrategyEndpoint:
     def test_get_defaults(self, client):
         r = client.get("/api/strategy")
@@ -149,3 +162,57 @@ class TestBacktestEndpoint:
         assert r.status_code == 200
         assert r.json()["results"][0]["n_bars"] == 0
         assert r.json()["results"][0]["equity_curve"] == []
+
+    # ---- 时间范围（v7.0.54）----
+    def test_range_start_uses_padded_high(self, lake_client2d):
+        # 窗口 = 2020-01-02 两根 [30, 300]；一年高点含窗口前 24 根 100
+        # → 30 ≤ 100×30% 立即建仓、300 了结（若无前置历史则完全不触发）
+        r = lake_client2d.post("/api/backtest",
+                               json={"coins": ["TESTUSDT"],
+                                     "start": "2020-01-02"})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["range"] == {"start": "2020-01-02", "end": None}
+        res = d["results"][0]
+        assert res["n_bars"] == 2
+        assert res["start"] == "2020-01-02"
+        assert len(res["rounds"]) == 1
+        assert res["rounds"][0]["entry"] == pytest.approx(30.0)
+        assert res["open_round"] is None
+        # 事件全部落在窗口内
+        assert [e["date"] for e in res["events"]] == ["2020-01-02", "2020-01-02"]
+        # 窗口内账户从空开始：外部投入 = 首仓 10
+        assert res["external_invested"] == pytest.approx(10.0, abs=0.01)
+
+    def test_range_end_excludes_later_bars(self, lake_client2d):
+        # end 含当日：只取 2020-01-01 的 24 根 100 → 无触发
+        r = lake_client2d.post("/api/backtest",
+                               json={"coins": ["TESTUSDT"],
+                                     "end": "2020-01-01"})
+        assert r.status_code == 200
+        res = r.json()["results"][0]
+        assert res["n_bars"] == 24
+        assert res["rounds"] == [] and res["open_round"] is None
+
+    def test_range_start_after_all_data_is_empty(self, lake_client2d):
+        r = lake_client2d.post("/api/backtest",
+                               json={"coins": ["TESTUSDT"],
+                                     "start": "2021-01-01"})
+        assert r.status_code == 200
+        res = r.json()["results"][0]
+        assert res["n_bars"] == 0
+        assert res["equity_curve"] == [] and res["price_curve"] == []
+
+    def test_range_validation(self, lake_client):
+        # 格式错
+        assert lake_client.post(
+            "/api/backtest", json={"start": "2020/01/01"}).status_code == 400
+        # 顺序错
+        assert lake_client.post(
+            "/api/backtest",
+            json={"start": "2020-02-01", "end": "2020-01-01"}
+        ).status_code == 400
+        # 合法（含只给一头）
+        assert lake_client.post(
+            "/api/backtest", json={"coins": ["TESTUSDT"],
+                                   "start": "2020-01-01"}).status_code == 200

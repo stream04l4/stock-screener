@@ -34,35 +34,81 @@ def connect_readonly(lake_path: str = LAKE_PATH):
     raise RuntimeError("数据湖写入占用中，稍后重试（cron 同步？）")
 
 
-def load_bars(lake_path: str, symbol: str) -> Tuple[np.ndarray, np.ndarray]:
-    """单币 1h K 线：(dates[datetime64[D]], closes[float])，按 ts 升序。"""
+def load_bars(
+    lake_path: str,
+    symbol: str,
+    lo_ts: int | None = None,
+    hi_ts: int | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """单币 1h K 线：(ts[int64 秒], closes[float])，按 ts 升序。
+
+    :param lo_ts: 可选下界（含）；:param hi_ts: 可选上界（不含）。
+    """
     con = connect_readonly(lake_path)
     try:
-        rows = con.execute(
-            "SELECT ts, close FROM kline_1h "
-            "WHERE exchange='binance' AND symbol=? AND close > 0 ORDER BY ts",
-            [symbol],
-        ).fetchall()
+        sql = ("SELECT ts, close FROM kline_1h "
+               "WHERE exchange='binance' AND symbol=? AND close > 0")
+        args: list = [symbol]
+        if lo_ts is not None:
+            sql += " AND ts >= ?"
+            args.append(lo_ts)
+        if hi_ts is not None:
+            sql += " AND ts < ?"
+            args.append(hi_ts)
+        sql += " ORDER BY ts"
+        rows = con.execute(sql, args).fetchall()
     finally:
         con.close()
     if not rows:
-        return np.array([], dtype="datetime64[D]"), np.array([], dtype=float)
+        return np.array([], dtype="int64"), np.array([], dtype=float)
     ts = np.array([r[0] for r in rows], dtype="int64")      # SQL 已按 ts 升序
     closes = np.array([r[1] for r in rows], dtype=float)
-    dates = (ts // 86400).astype("datetime64[D]")
-    return dates, closes
+    return ts, closes
+
+
+def _date_to_ts(date_str: str, end_of_day: bool = False) -> int:
+    """'YYYY-MM-DD' → UTC epoch 秒（end_of_day = 该日 24:00，即次日 00:00）。"""
+    import datetime as dt
+    d = dt.datetime.strptime(date_str, "%Y-%m-%d").replace(
+        tzinfo=dt.timezone.utc)
+    if end_of_day:
+        d += dt.timedelta(days=1)
+    return int(d.timestamp())
 
 
 def run_backtest(
     symbols: List[str],
     p: StrategyParams,
     lake_path: str = LAKE_PATH,
+    start: str | None = None,
+    end: str | None = None,
 ) -> List[Dict[str, Any]]:
-    """逐币跑引擎 → 结果列表（含 equity 曲线，供报告/绘图）。"""
+    """逐币跑引擎 → 结果列表（含 equity 曲线，供报告/绘图）。
+
+    时间范围（v7.0.54）：start/end = 'YYYY-MM-DD'（UTC 日界，end 含当日）。
+    窗口内账户从空开始（了结余额/外部投入均为窗口内口径）；但一年高点
+    用**窗口前 lookback_h 根 bar 的前置历史**参与计算（只用于高点，不产生
+    交易）——保证窗口起点第一根 bar 的触发阈值与全史一致。
+    """
+    from crypto.strategy.engine import rolling_high_1y
+    start_ts = _date_to_ts(start) if start else None
+    end_ts = _date_to_ts(end, end_of_day=True) if end else None
     out = []
     for sym in symbols:
-        dates, closes = load_bars(lake_path, sym)
-        out.append(run_coin(sym, dates, closes, p))
+        lo = (start_ts - p.lookback_h * 3600) if start_ts else None
+        ts, closes = load_bars(lake_path, sym, lo_ts=lo, hi_ts=end_ts)
+        if start_ts is not None:
+            # 切出窗口内部分（前置历史只用于算高点）
+            keep = np.where(ts >= start_ts)[0]
+            if not len(keep):
+                ts, closes, h1y = ts[:0], closes[:0], None  # 空窗口：引擎直接返回空结果
+            else:
+                h1y_full = rolling_high_1y(closes, p.lookback_h)
+                ts, closes, h1y = ts[keep], closes[keep], h1y_full[keep]
+        else:
+            h1y = None
+        dates = (ts // 86400).astype("datetime64[D]")
+        out.append(run_coin(sym, dates, closes, p, h1y=h1y))
     return out
 
 
@@ -73,13 +119,24 @@ def _fmt_open(r: Dict[str, Any]) -> str:
             f"止盈线 {r['tp_price']}（持有 {r['bars_holding']}h）")
 
 
-def render_report(results: List[Dict[str, Any]], p: StrategyParams) -> str:
-    """markdown 报告：参数 + 逐币轮次/未了结/净值回撤。"""
+def render_report(
+    results: List[Dict[str, Any]],
+    p: StrategyParams,
+    start: str | None = None,
+    end: str | None = None,
+) -> str:
+    """markdown 报告：参数 + 范围 + 逐币轮次/未了结/净值回撤。"""
     import datetime as dt
     lines = [
         "# 加密货币马丁格尔回测报告",
         "",
         f"生成时间：{dt.datetime.now().strftime('%Y-%m-%d %H:%M')} UTC",
+    ]
+    if start or end:
+        lines.append(
+            f"回测范围：{start or '数据起点'} → {end or '最新'}（UTC 日界，end 含当日；"
+            f"窗口内账户从空开始，一年高点用窗口前 {p.lookback_h}h 历史做基线）")
+    lines += [
         "",
         "## 策略参数",
         "",
@@ -137,9 +194,10 @@ def render_report(results: List[Dict[str, Any]], p: StrategyParams) -> str:
 
 
 def save_report(results: List[Dict[str, Any]], p: StrategyParams,
-                out_path: str = "") -> str:
+                out_path: str = "", start: str | None = None,
+                end: str | None = None) -> str:
     out_path = out_path or REPORT_PATH
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(render_report(results, p))
+        f.write(render_report(results, p, start=start, end=end))
     return out_path

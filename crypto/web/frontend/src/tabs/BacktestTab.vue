@@ -9,14 +9,19 @@ import { api } from "../api/client.js";
 const busy = ref(false);
 const err = ref("");
 const done = ref(false);
-const res = ref(null); // { params, elapsed_s, results: [...] }
+const res = ref(null); // { params, range, elapsed_s, results: [...] }
+const start = ref("");  // 'YYYY-MM-DD'（UTC 日界）；空 = 数据起点
+const end = ref("");    // 空 = 最新（end 含当日）
+const today = new Date().toISOString().slice(0, 10);
+const rangeText = computed(() => (start.value || end.value)
+  ? `${start.value || "数据起点"} → ${end.value || "最新"}` : "全史");
 
 async function run() {
   busy.value = true; err.value = "";
   try {
     res.value = await api("/api/backtest", {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify({ start: start.value, end: end.value }),
     });
     done.value = true;
   } catch (e) {
@@ -164,18 +169,27 @@ function pct(v) {
 
 <template>
   <div class="card">
-    <h2>回测（全史 1h K 线 · 当前生效参数）</h2>
+    <h2>回测（1h K 线 · {{ rangeText }} · 当前生效参数）</h2>
     <p v-if="err" class="err">{{ err }}</p>
     <div class="toolbar">
       <button class="btn primary" :disabled="busy" @click="run">
         {{ busy ? "回测运行中…" : done ? "重新回测" : "运行回测" }}
       </button>
+      <span class="range">
+        <input type="date" v-model="start" :max="today" class="date"
+               title="回测起点（UTC 日界；留空 = 数据起点）">
+        →
+        <input type="date" v-model="end" :max="today" class="date"
+               title="回测终点（UTC，含当日；留空 = 最新）">
+      </span>
       <span v-if="res" class="hint">
-        耗时 {{ res.elapsed_s }}s · 参数：
+        耗时 {{ res.elapsed_s }}s · 范围 {{ rangeText }} · 参数：
         <span v-for="c in paramChips" :key="c" class="chip">{{ c }}</span>
       </span>
       <span v-else-if="!busy" class="hint">
-        用湖内全部 1h 数据回测当前策略（策略 tab 改参数后点"重新回测"即可）
+        起止留空 = 全史；窗口内账户从空开始，一年高点自动用窗口前
+        {{ (res && res.params && res.params.lookback_h) || 8760 }}h
+        历史做基线（策略 tab 改参数后点"重新回测"即可）
       </span>
     </div>
 
@@ -312,6 +326,11 @@ h4 { margin: 14px 0 6px; font-size: 12px; color: #555; }
 }
 .btn.primary { background: #188038; border-color: #188038; color: #fff; }
 .btn:disabled { opacity: 0.5; cursor: default; }
+.range { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #555; }
+.date {
+  padding: 5px 8px; border: 1px solid #d0d0d8; border-radius: 8px;
+  font-size: 12px; background: #fff; color: #333;
+}
 .hint { color: #999; font-size: 11px; }
 .chip {
   display: inline-block; background: #f0f1f5; border-radius: 999px;

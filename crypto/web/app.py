@@ -16,6 +16,7 @@ WEB_SESSION_SECRET，ssc_session cookie 按 hostname 跨端口生效）。
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -369,6 +370,20 @@ def strategy_reset() -> Dict[str, Any]:
 class _BacktestBody(BaseModel):
     params: Dict[str, Any] = {}     # 可选：本次回测临时覆盖（不落盘）
     coins: list = []                # 可选：缺省 = crypto.yaml coins 段
+    start: str = ""                 # 可选：'YYYY-MM-DD'（UTC 日界，缺省 = 数据起点）
+    end: str = ""                   # 可选：'YYYY-MM-DD'（UTC，含当日，缺省 = 最新）
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _check_range(start: str, end: str) -> None:
+    """格式/顺序校验 → HTTPException 400。"""
+    for label, v in (("start", start), ("end", end)):
+        if v and not _DATE_RE.match(v):
+            raise HTTPException(400, f"{label} 需 YYYY-MM-DD（UTC）：{v!r}")
+    if start and end and start > end:
+        raise HTTPException(400, "start 不能晚于 end")
 
 
 def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -428,16 +443,22 @@ def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
 
 @core_app.post("/api/backtest")
 def backtest(body: _BacktestBody) -> Dict[str, Any]:
-    """全史回测（湖 1h K 线 → 引擎 → 逐币结果 + 降采样净值曲线）。
+    """回测（湖 1h K 线 → 引擎 → 逐币结果 + 降采样净值/价格曲线）。
 
-    同步执行（3 币全史 ~1s）。params 优先级：请求 > 覆盖文件 > yaml。
+    同步执行（全史 2 币 ~0.7s）。params 优先级：请求 > 覆盖文件 > yaml。
+    start/end 可选时间范围（UTC 日界，end 含当日）：窗口内账户从空开始，
+    一年高点用窗口前 lookback_h 根历史做基线（只算高点，不产生交易）。
     """
     from crypto.backtest.runner import run_backtest
+    _check_range(body.start, body.end)
     p, eff = _effective_params(body.params or None)
     coins = [c for c in (body.coins or []) if c] or CFG["coins"]
     t0 = time.time()
-    results = run_backtest(coins, p, lake_path=str(DB_PATH))
-    return {"ok": True, "params": eff, "elapsed_s": round(time.time() - t0, 2),
+    results = run_backtest(coins, p, lake_path=str(DB_PATH),
+                           start=body.start or None, end=body.end or None)
+    return {"ok": True, "params": eff,
+            "range": {"start": body.start or None, "end": body.end or None},
+            "elapsed_s": round(time.time() - t0, 2),
             "results": [_ui_result(r) for r in results]}
 
 

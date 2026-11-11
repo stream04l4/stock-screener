@@ -217,3 +217,19 @@ def test_external_topup_when_balance_exhausted():
     # 恒等式：外部 + 余额滚存 = 总投入
     assert r["external_invested"] + (proceeds1 - r["wallet"]) == pytest.approx(
         spent_total, abs=0.02)
+
+
+# ---------------------------------------------------------------------------
+# 时间范围（v7.0.54）：外部 h1y 覆盖（窗口前历史做一年高点基线）
+# ---------------------------------------------------------------------------
+def test_h1y_override_used_for_trigger():
+    # 5 根前置高位 bar（100）+ 窗口 [30, 300]：用含前置历史的 h1y，
+    # 首根窗口 bar 即 30 ≤ 100×30% → 立即建仓了结；
+    # 只用窗口序列 [30, 300] 自算 h1y 则不会触发（部分窗口起点 = 自身价）
+    closes = np.array([100.0] * 5 + [30.0, 300.0])
+    h1y = rolling_high_1y(closes, 8760)
+    r = run_coin("T", _dates(7), closes, P, h1y=h1y)
+    assert len(r["rounds"]) == 1
+    assert r["rounds"][0]["entry"] == 30.0
+    r2 = run_coin("T", _dates(2), np.array([30.0, 300.0]), P)
+    assert r2["rounds"] == [] and r2["open_round"] is None

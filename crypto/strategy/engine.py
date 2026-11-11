@@ -87,9 +87,14 @@ def run_coin(
     dates: np.ndarray,
     closes: np.ndarray,
     p: StrategyParams,
+    h1y: np.ndarray | None = None,
 ) -> Dict[str, Any]:
     """单币状态机回测（1h 收盘价序列）。
 
+    :param h1y: 可选的一年高点序列（与 closes 等长）。时间范围回测时由
+        runner 用**含窗口前历史**的完整序列计算后切片传入——保证窗口
+        起点的第一根 bar 就有准确的一年高点；缺省 = 用 closes 自算
+        （全史回测，头部部分窗口）。
     :returns: 结果 dict：已了结轮次 rounds + 未了结 open_round +
         净值曲线 equity（= 持仓市值 + 余额）+ 最大回撤 mdd_pct +
         事件序列 events + external_invested（累计外部投入）+
@@ -108,7 +113,8 @@ def run_coin(
                 "external_invested": 0.0, "wallet": 0.0,
                 "note": "无数据"}
 
-    h1y = rolling_high_1y(c_arr, p.lookback_h)
+    if h1y is None:
+        h1y = rolling_high_1y(c_arr, p.lookback_h)
     trig = p.trigger_frac()
     fee = p.fee_bps / 10000.0
     grid = p.add_grid_pct / 100.0
