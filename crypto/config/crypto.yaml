@@ -21,28 +21,25 @@ source:
 sync:
   interval: "1h"          # 基础 K 线粒度（4h/1d 由 1h 本地聚合，不单独取数）
   backfill_window_h: 3    # 日常增量回补窗口（自愈漏同步/交易所补发）
-  backfill_start: "2019-01-01"   # 全量回填起点（Binance 实测 1h 历史至此）
+  backfill_start: "2019-01-01"   # REST 增量起点（--full 历史段走 vision 快照，不受此限）
   request_pause_s: 0.15   # 批量请求间隔（限速余量 >99%）
 
-# 币种清单（Binance USDT 现货）。框架阶段 top 20；增删 = 改这里重跑 sync 即可。
+# 全量历史回填源：Binance 官方月度快照 data.binance.vision（月末才发布当月；
+# 当月+尾巴走 REST 补齐）。参考 quant_iTransformer historical_pipeline
+# build_main_features.py 的月度 ZIP + 沙盒缓存 + 403/429 退避模式。
+vision:
+  enabled: true
+  probe_start_ym: "2017-08"   # 自动探测每币首个可用月份（404 → 下月，实测 BTC/ETH 2017-08 起、SOL 2020-08 起）
+  workers: 4                  # 并发下载线程数
+  cache_dir: "data/crypto/vision_cache"   # 月度 CSV 沙盒缓存（不入库）
+
+# 币种清单（Binance USDT 现货）。v7.0.45 起聚焦三标的（Joel 2026-11-11 定案）；
+# 增删 = 改这里重跑 sync 即可。
 coins:
   - BTCUSDT
   - ETHUSDT
-  - BNBUSDT
   - SOLUSDT
-  - XRPUSDT
-  - ADAUSDT
-  - DOGEUSDT
-  - AVAXUSDT
-  - LINKUSDT
-  - DOTUSDT
-  - LTCUSDT
-  - BCHUSDT
-  - TRXUSDT
-  - NEARUSDT
-  - POLUSDT
-  - ATOMUSDT
-  - UNIUSDT
-  - XLMUSDT
-  - ETCUSDT
-  - VETUSDT
+# 退役清单（v7.0.43 top20 其余 17 币，2026-11-11 停用：湖里数据保留、
+# coin_master.is_active=FALSE；恢复 = 加回 coins 重跑 sync）：
+# BNBUSDT XRPUSDT ADAUSDT DOGEUSDT AVAXUSDT LINKUSDT DOTUSDT LTCUSDT
+# BCHUSDT TRXUSDT NEARUSDT POLUSDT ATOMUSDT UNIUSDT XLMUSDT ETCUSDT VETUSDT

@@ -1,17 +1,35 @@
-// 数据湖（v7.0.43 框架，真实数据）：crypto.duckdb 表/行数/每币 K 线范围
-// + 最近一次同步状态（sync.py 写 data/crypto_sync_state.json）。
+// 数据湖：crypto.duckdb 表/行数/每币 K 线范围 + 最近同步状态
+// + 实时网关（/api/gateway，WS 状态 + 最新价，15s 自动刷新）。
 <script setup>
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { api } from "../api/client.js";
 
 const st = ref(null);
 const err = ref("");
-onMounted(async () => {
+const gw = ref(null);
+
+async function load() {
   try {
     st.value = await api("/api/lake/status");
   } catch (e) {
     err.value = String((e && e.message) || e);
   }
+}
+async function loadGw() {
+  try {
+    gw.value = await api("/api/gateway");
+  } catch {
+    gw.value = null; // 网关端点不可用不阻断数据湖展示
+  }
+}
+let timer = null;
+onMounted(async () => {
+  await load();
+  await loadGw();
+  timer = setInterval(loadGw, 15000);
+});
+onUnmounted(() => {
+  if (timer) clearInterval(timer);
 });
 </script>
 
@@ -27,6 +45,18 @@ onMounted(async () => {
         </span>
         <span class="chip">同步间隔：每小时 :05</span>
       </div>
+
+      <h3>实时 K 线网关（WebSocket）</h3>
+      <div v-if="gw" class="sync">
+        <span :class="['gwdot', gw.ok && !gw.stale ? 'on' : 'off']"></span>
+        <span>WS {{ gw.ws }}</span>
+        <span v-if="gw.last_error" class="hint">（{{ gw.last_error }}）</span>
+        <span v-if="gw.reconnects">重连 {{ gw.reconnects }} 次</span>
+        <span v-for="(c, s) in gw.coins" :key="s" class="chip">
+          {{ s.replace("USDT", "") }} {{ c.price }}
+        </span>
+      </div>
+      <p v-else class="hint">网关未启动（systemctl --user start crypto-gateway）</p>
 
       <h3>最近同步</h3>
       <div v-if="st.last_sync" class="sync">
@@ -67,8 +97,11 @@ h3 { margin: 18px 0 8px; font-size: 13px; color: #555; }
   font-size: 12px; padding: 3px 10px; border-radius: 999px;
   background: #f0f1f5; color: #444;
 }
-.sync { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: #555; }
+.sync { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: #555; align-items: center; }
 .hint { color: #999; font-size: 12px; }
+.gwdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.gwdot.on { background: #188038; }
+.gwdot.off { background: #d92d20; }
 table { width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ececf2; }
 th { color: #888; font-weight: 500; font-size: 12px; }

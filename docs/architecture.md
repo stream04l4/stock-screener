@@ -19,13 +19,13 @@
 |---|---|---|
 | 入口路径 | / | /crypto/ |
 | 端口 | :9090 | :9091 |
-| 服务 | stock-screener-web.service | crypto-web.service |
+| 服务 | stock-screener-web.service | crypto-web.service + **crypto-gateway.service**（实时 WS 网关，纯内存态） |
 | 后端 | `web/app.py`（web/auth.py 共享登录模块） | `crypto/web/app.py`（import web.auth；对外挂 /crypto 前缀 + 外层 auth 门） |
 | 前端 | `web/frontend/`（独立 SPA + build） | `crypto/web/frontend/`（独立 SPA + build） |
 | 代码包 | `lake/` `martingale/` `screener/` `af_rebase.py` | `crypto/`（sources/sync/models/web/positions/strategy/backtest） |
 | 配置 | `config/strategy.yaml` | `crypto/config/crypto.yaml` |
 | 数据 | `data/lake/` `data/raw/` `data/canonical/` `data/alerts/` `data/observation/` `data/strategies/` `data/*.json` | **`data/crypto/`（独占，湖 = data/crypto/crypto.duckdb）** |
-| 脚本 | `scripts/`（run_*.sh + 同步/告警 py） | 无独立脚本：`python -m crypto.sync`（cron 直接调） |
+| 脚本 | `scripts/`（run_*.sh + 同步/告警 py） | `python -m crypto.sync`（cron 直接调）+ `python -m crypto.gateway`（systemd 常驻） |
 | 定时 | crontab 5 条业务行（lake-sync 11:30 / gate1-latency / signal-touch 12:05 / t1-delist 周日 / t6 季度） | crontab 1 条：crypto-sync 每小时 :05 |
 | 测试 | `tests/`（665 用例，含 v7 防护契约） | 后端并入 tests/（test_crypto_* 前缀）+ 前端 crypto/web/frontend 自测 |
 
@@ -65,7 +65,8 @@ stock-screener/
 │   ├── strategies/      # 【股票】本机策略库快照
 │   ├── user_positions.json / my_trades.json   # 【股票】用户持仓/账本
 │   └── crypto/          # 【加密货币】独占：crypto.duckdb + sync_state.json
-│                        #    未来：alerts/（P2）backtest/（P3 产物）
+│                        #    + gateway_state.json（实时网关状态）
+│                        #    + vision_cache/（月度快照沙盒缓存，不入库）
 ├── output/              # 回测产物（gitignore）；v7 现行 = backtest_martingale/
 ├── cache/               # 拉取缓存（gitignore）
 ├── logs/                # 运行日志（gitignore）
@@ -78,13 +79,18 @@ stock-screener/
 
 ```
 crypto/
-├── config/crypto.yaml   # 唯一配置入口（币种/数据源/端口/湖路径）
-├── sources/             # 数据源适配（binance 主源 / okx 备源，同构可切主）
+├── config/crypto.yaml   # 唯一配置入口（币种/数据源/端口/湖路径/vision 段）
+├── sources/             # 数据源适配（binance REST 主源 / okx 备源 /
+│                        #   binance_vision 月度快照全量历史源，纯 stdlib）
 ├── sync.py              # python -m crypto.sync [--days N|--full]（幂等）
+│                        #   --full = vision 历史段 + REST 当月尾巴（v7.0.45）
 ├── models.py            # 湖表 DDL + upsert + stats（路径由配置传入，不读配置）
+├── gateway/             # 实时 K 线网关（WS 组合流，**纯内存态不入湖**，
+│   │                    #   systemd crypto-gateway.service；120s 看门狗 +
+│   │                    #   指数退避重连 + 状态文件 gateway_state.json）
 ├── web/
-│   ├── app.py           # 独立 FastAPI（:9091；login 三件套 + lake/coins/kline
-│   │                    #   实体端点 + positions/strategy/backtest 骨架端点）
+│   ├── app.py           # 独立 FastAPI（:9091；login 三件套 + lake/coins/kline/
+│   │                    #   gateway 实体端点 + positions/strategy/backtest 骨架端点）
 │   └── frontend/        # 独立 Vue SPA（双入口登录 + 四页签；dist 不入库）
 ├── positions/           # P2 我的持仓（预留；__init__ 内写明规划）
 ├── strategy/            # P3 策略定义（预留）
@@ -100,6 +106,10 @@ crypto/
 **加密货币系统新功能** → 一律落 `crypto/` 内：
 - 新数据源 → `crypto/sources/<exchange>.py`（同构接口：klines/ticker）
 - 新湖表 → `crypto/models.py`（DDL 集中一处）
+- **实时/离线边界（v7.0.45 Joel 定案）**：数据湖 = 离线数据（cron 同步刷新，
+  最多落后约一天）；`crypto/gateway/` = 实时底座（WS 内存态，**不入湖**），
+  服务后续实时买点判断。新实时功能读 gateway 状态（内存/状态文件），
+  新历史功能读湖——两者不互写。
 - 新端点 → `crypto/web/app.py` 的 core_app（路由保持 /api/*，对外自动带 /crypto
   前缀；**新 API 必须走外层 auth 门覆盖范围**，公开端点加进 _AUTH_PUBLIC_PATHS）；
   新页面 → `crypto/web/frontend/src/tabs/`（vite base '/crypto/'，API 走 api() 单一入口）
@@ -121,6 +131,13 @@ crypto/
 
 ## 6. 变更记录
 
+- **v7.0.45（2026-11-11）**：数据湖三标的全量 + 实时网关。coins 聚焦
+  BTCUSDT/ETHUSDT/SOLUSDT（top20 其余 17 币 is_active=FALSE 数据保留）；
+  `crypto.sources.binance_vision`（官方月度快照全量历史，纯 stdlib，
+  4 线程 + 沙盒缓存 + 403/429 退避）；`crypto.sync --full` = vision 历史段
+  + REST 当月尾巴；`crypto.gateway/` 实时 K 线网关（WS 组合流 + 120s 看门狗
+  + 指数退避重连，**纯内存态不入湖**——湖由 cron 离线刷新）；web 加
+  /api/gateway 端点 + LakeTab 实时卡片；tests/test_crypto_data.py（15 用例）。
 - **v7.0.44（2026-11-11）**：443 单域名 HTTPS 入口。nginx 按路径分流
   （/ → 股票 :9090，/crypto/ → 加密 :9091，前缀不剥）；Let's Encrypt
   证书（acme.sh ALPN-01 签发 + 自动续期钩子）；crypto 后端/前端统一 /crypto

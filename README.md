@@ -1,4 +1,4 @@
-# stock-screener · v7.0.44（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v7.0.45（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -387,6 +387,23 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.45**：加密货币数据湖三标的全量 + 实时 K 线网关（Joel 2026-11-11 正式开工）：
+  - coins 聚焦 **BTCUSDT/ETHUSDT/SOLUSDT**（top20 其余 17 币 is_active=FALSE，
+    数据保留可恢复）；全量历史走 **Binance 官方月度快照**（`crypto.sources.
+    binance_vision`，参考 quant_iTransformer 离线获取：4 线程 + (币,年,月)
+    沙盒缓存 + 403/429 退避，纯 stdlib 无新依赖）；BTC/ETH 自 2017-08、
+    SOL 自 2020-08 起。
+  - `crypto.sync --full` = vision 历史段（每币自动探测首月 → 最后已发布月）
+    + REST 当月尾巴（幂等，重复无害）；日常增量仍走整点 cron（:05）。
+  - `crypto.gateway/` 实时 K 线网关（systemd crypto-gateway.service）：
+    WS 组合流（1 连接 3 标的 kline_1h）+ 120s 看门狗 + 指数退避重连 +
+    同 ts K 线去重（替换未完成 K 线）；**纯内存态不入湖**（Joel 定案：
+    湖 = 离线数据，网关服务后续实时买点判断）；状态文件
+    data/crypto/gateway_state.json 供 web 展示。
+  - web：/api/gateway 端点（外层 auth 门覆盖）+ LakeTab 实时网关卡片
+    （WS 状态 + 最新价，15s 自刷）；前端 4/4。
+  - 测试：tests/test_crypto_data.py 15 用例（湖幂等/vision 解析/网关去重/
+    看门狗假死/端点分支，零真实网络）。
 - **v7.0.44**：443 单域名 HTTPS 入口（Joel 2026-11-11 放通 443）：
   - nginx 443（Let's Encrypt 证书，acme.sh ALPN-01 签发 + 续期钩子自动腾挪 443
     + 看门狗兜底）按路径分流：`https://stream04l4.duckdns.org/` → 股票 :9090，

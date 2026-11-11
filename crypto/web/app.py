@@ -36,6 +36,7 @@ with open(CFG_PATH, "r", encoding="utf-8") as _f:
 
 STATE_PATH = PROJECT_ROOT / CFG["lake"]["state_file"]
 DB_PATH = PROJECT_ROOT / CFG["lake"]["path"]
+GATEWAY_STATE_PATH = PROJECT_ROOT / "data" / "crypto" / "gateway_state.json"
 
 # 核心应用：全部路由保持 /api/* + 静态根（子应用内视角）。
 # 对外统一挂 /crypto 前缀（见文件底部 app）——浏览器走
@@ -47,7 +48,14 @@ core_app = FastAPI(title="crypto-screener web", version="0.1.0")
 def _db() -> duckdb.DuckDBPyConnection:
     if not DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据湖未初始化（先跑 python -m crypto.sync）")
-    return duckdb.connect(str(DB_PATH), read_only=True)
+    # 锁语义：read_only 与写锁互斥，cron 离线同步运行中可能短暂持锁 → 短重试
+    import time
+    for _ in range(3):
+        try:
+            return duckdb.connect(str(DB_PATH), read_only=True)
+        except Exception:  # noqa: BLE001 - 写锁竞争
+            time.sleep(0.5)
+    raise HTTPException(status_code=503, detail="数据湖写入占用中，稍后重试")
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +138,25 @@ def lake_status() -> Dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError):
         st["last_sync"] = None
     return st
+
+
+@core_app.get("/api/gateway")
+def gateway_status() -> Dict[str, Any]:
+    """实时 K 线网关状态（crypto.gateway 进程写的状态文件；进程停 → down）。"""
+    import json
+    import time
+
+    if not GATEWAY_STATE_PATH.exists():
+        return {"ok": False, "ws": "down",
+                "detail": "网关状态文件不存在（crypto-gateway.service 未启动？）"}
+    try:
+        with open(GATEWAY_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        d["stale_s"] = int(time.time()) - int(d.get("updated", 0))
+        d["stale"] = d["stale_s"] > 180  # 状态文件 3 分钟未更新视为网关掉线
+        return d
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "ws": "down", "detail": f"状态文件读取失败: {e}"}
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import List
 
@@ -61,6 +62,22 @@ def upsert_coins(con, coins: List[str]) -> None:
         )
 
 
+def deactivate_others(con, active_coins: List[str]) -> int:
+    """清单外币种置 is_active=FALSE（数据保留，可恢复）。返回停用数。"""
+    if not active_coins:
+        return 0
+    ph = ",".join("?" * len(active_coins))
+    con.execute(
+        f"UPDATE coin_master SET is_active = FALSE WHERE symbol NOT IN ({ph})",
+        active_coins,
+    )
+    # DuckDB UPDATE 无直接行数 → 查差异计数
+    row = con.execute(
+        "SELECT COUNT(*) FROM coin_master WHERE is_active = FALSE"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def upsert_klines(con, exchange: str, symbol: str, bars: list) -> int:
     """幂等写入 1h K 线（PK 冲突替换）。返回写入行数。"""
     if not bars:
@@ -77,10 +94,23 @@ def upsert_klines(con, exchange: str, symbol: str, bars: list) -> int:
 
 
 def stats(lake_path: str) -> dict:
-    """数据湖 tab 用：表清单 + 行数 + 每币 K 线范围 + 库大小。湖不存在 → 空结构。"""
+    """数据湖 tab 用：表清单 + 行数 + 每币 K 线范围 + 库大小。湖不存在 → 空结构。
+
+    锁语义：read_only 连接与写锁互斥——离线同步（cron）持锁期间（秒级）
+    打开会失败 → 短重试（3×0.5s），绝大多数情况第一轮即中。
+    """
     if not os.path.exists(lake_path):
         return {"installed": False, "tables": [], "size_mb": 0.0}
-    con = duckdb.connect(lake_path, read_only=True)
+    con = None
+    for _ in range(3):
+        try:
+            con = duckdb.connect(lake_path, read_only=True)
+            break
+        except Exception:  # noqa: BLE001 - 写锁竞争
+            time.sleep(0.5)
+    if con is None:
+        return {"installed": False, "tables": [], "size_mb": 0.0,
+                "error": "湖被写入占用（稍后重试）"}
     try:
         out = {"installed": True, "size_mb": round(os.path.getsize(lake_path) / 1048576, 2),
                "tables": [], "per_symbol": []}
@@ -91,8 +121,12 @@ def stats(lake_path: str) -> dict:
             n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             out["tables"].append({"name": t, "rows": n})
         per_sym = con.execute("""
-            SELECT symbol, COUNT(*), MIN(ts), MAX(ts), MAX(close)
-            FROM kline_1h WHERE exchange='binance' GROUP BY symbol ORDER BY symbol
+            SELECT m.symbol, m.n_rows, m.mn, m.mx, k.close
+            FROM (SELECT symbol, COUNT(*) n_rows, MIN(ts) mn, MAX(ts) mx
+                  FROM kline_1h WHERE exchange='binance' GROUP BY symbol) m
+            JOIN kline_1h k ON k.symbol = m.symbol AND k.ts = m.mx
+                 AND k.exchange = 'binance'
+            ORDER BY m.symbol
         """).fetchall()
         import datetime as _dt
         for sym, n, mn, mx, last in per_sym:
@@ -100,7 +134,7 @@ def stats(lake_path: str) -> dict:
                 "symbol": sym, "rows": n,
                 "from": _dt.datetime.fromtimestamp(mn).strftime("%Y-%m-%d %H:%M"),
                 "to": _dt.datetime.fromtimestamp(mx).strftime("%Y-%m-%d %H:%M"),
-                "last_close": last,
+                "last_close": last,  # 最新一根 K 线收盘价（非历史最高）
             })
         return out
     finally:

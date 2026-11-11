@@ -1,5 +1,11 @@
 # 加密货币板块设计 v0.3（框架已落地 v7.0.43，内容待完善）
 
+> **v7.0.45 更新（2026-11-11）**：数据湖正式开工——coins 聚焦
+> BTC/ETH/SOL 三标的；全量历史 = Binance 月度快照（`crypto.sources.
+> binance_vision`）；实时 K 线网关 `crypto.gateway/`（WS 组合流 + 看门狗 +
+> 退避重连，**纯内存态不入湖**：湖 = 离线数据由 cron 刷新，网关服务后续
+> 实时买点判断）。详见 docs/architecture.md §4"实时/离线边界"。
+>
 > **v7.0.44 更新（2026-11-11）**：访问入口改为 443 单域名 HTTPS——
 > `https://stream04l4.duckdns.org/`（股票）与 `/crypto/`（加密）由 nginx 按
 > 路径分流（前缀不剥），本文"跨端口 cookie / 直连 :9091"等描述以
