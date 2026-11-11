@@ -1,16 +1,34 @@
-# stock-screener · v7.0.55（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.0（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
-A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
-多因子选股/日跑体系，仓库只保留一条链路：
+**v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
+DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
+
+- **A股**（稳定区）：深回撤金字塔加仓（`drawdown_martingale`，日线状态机）
+- **加密货币**（v8 主特性，`crypto/` 独立单元）：深回撤网格 + 10x 止盈
+  （1h 状态机，BTC/ETH）
+
+A股链路：
 
 ```
-DuckDB 数据湖（lake/ 包维护，cron 每日同步）
+DuckDB 数据湖 data/lake/（lake/ 包维护，cron 每日同步）
    │  read_only
    ▼
 martingale/ 包（5 条件股票池 → 逐股状态机回测 → 产物 CSV/MD）
    │
    ▼
-Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
+Web（FastAPI :9090，四页签：我的持仓 / 策略 / 回测 / 数据湖）
+```
+
+加密货币链路：
+
+```
+Binance 主源 + OKX 交叉校验 → data/crypto/crypto.duckdb（1h K线，全史 2017-）
+   │  read_only（+ crypto-gateway 实时 K 线，纯内存态）
+   ▼
+crypto/strategy（70% 回撤建仓 → 1% 网格加仓 → 10x 止盈 → 下一轮）
+   │
+   ▼
+Web（FastAPI :9091，/crypto/ 前缀，四页签：我的持仓 / 策略 / 回测 / 数据湖）
 ```
 
 ## 0. 项目结构（双系统，v7.0.44）
@@ -182,11 +200,83 @@ cookie）· `/api/logout`（POST）· `/api/auth/me`（GET 当前用户，未登
 `{id}/events` SSE / `{id}/cancel`）· `/api/bt/results/{id}` · `/api/lake/*`。
 回测 = 异步子进程（单任务 409 + pidfile 锁），进度 SSE（15s 心跳，断线 3 次降级 3s 轮询）。
 
+## 5.5 加密货币系统（crypto/，:9091 /crypto/，v8 主特性）
+
+独立进程 / 独立端口 / 独立 SPA / 独立湖（与 A 股湖物理隔离）；登录/鉴权与 A 股
+同源（同一账号，ssc_session cookie 同域互免登）。设计细节 → `docs/crypto_design.md`；
+目录职责 / 扩展约定 → `docs/architecture.md`。
+
+**策略**（`crypto/strategy/engine.py` 纯函数状态机，1h bar；参数 = `crypto/config/
+crypto.yaml` strategy 段 + 页面覆盖 `data/crypto/strategy_params.json`，页面覆盖
+不改仓库配置）：
+
+- **建仓** = 价 ≤ 一年高点×(1−first_drop_pct)（默认跌 70% → 30% 建仓位），首仓
+  10 USDT（base_amount_usdt）；
+- **加仓** = 建仓价×(1−1%×k) 固定网格，第 k 级 = 10×1.05^k USDT（growth 1.05，
+  不设上限）；**上涨不加仓、新高不刷新建仓价**；
+- **止盈** = 价 ≥ 建仓价×10（take_profit_mult 10）全卖 → entry 重置进入下一轮；
+- 手续费 fee 10bps（taker）；一年高点 = 滚动 8760h（lookback_h）收盘价最大（含当日 bar）；
+- **账户模型**（v7.0.53）：单账户闭环——买入先扣余额（了结所得滚存），不足计
+  外部投入；净值曲线 = 持仓市值 + 余额；
+- **边界纪律**：回测 = 策略验证工具，不接自动交易。
+
+**数据**（独立湖 `data/crypto/crypto.duckdb`）：
+
+- 表：`kline_1h`（PK exchange,symbol,ts，幂等 upsert）+ `coin_master`（is_active
+  开关）；1d/4h 由 1h 本地聚合，不建表。
+- 全量历史：Binance 官方月度快照 data.binance.vision（`--full`，4 线程 + 月度
+  CSV 沙盒缓存 + 403/429 退避，纯 stdlib 无新依赖）——BTC/ETH 自 2017-08 起；
+  日常增量：cron 每小时 `python -m crypto.sync`（3h 回补窗口自愈 + OKX 最近
+  24h 收盘交叉校验，告警阈值 0.1%）。
+- 币种清单：聚焦 **BTC/ETH**（SOL v7.0.52 退役，退役共 18 币；数据保留、
+  is_active=FALSE，恢复 = 加回 coins 重跑 sync）。
+- **实时 K 线网关**（`crypto-gateway.service`）：WS 组合流（1 连接多标的 1h
+  K 线）+ 120s 看门狗 + 指数退避重连 + 同 ts 去重；**纯内存态不入湖**（服务
+  后续实时买点判断），状态文件 `data/crypto/gateway_state.json`。
+
+**Web**（`crypto/web/app.py`，:9091，systemd `crypto-web.service`；443 入口
+`/crypto/` 前缀透传 + 外层 auth 门）：四页签 **我的持仓**（P2 占位，ready=
+false）/ **策略**（7 参数编辑-锁死模式，v7.0.50 与 A 股 tab 同语义）/
+**回测**（全史 + 时间范围（v7.0.54，窗口账户从空 + 前置高点基线）+ 双图
+（净值 + 价格对数坐标，建仓▼/加仓●/平仓▲ 事件标记）+ 总外部投入）/
+**数据湖**（聚焦 2 币主表 + 退役币折叠 + 实时网关卡片）。主要 API：
+`/api/coins` · `/api/kline` · `/api/positions`（P2 占位）· `/api/strategy`
+（GET / POST 保存 / POST reset）· `/api/backtest`（POST，可选 start/end
+UTC 日界）· `/api/gateway` · `/api/lake/status`。
+
+**CLI**：
+
+```bash
+.venv/bin/python -m crypto.sync                # 1h K线增量（cron 每小时）
+.venv/bin/python -m crypto.sync --full         # 全量历史（vision 月度快照 + REST 尾巴）
+.venv/bin/python -m crypto.backtest            # 全史回测 → data/crypto/backtest_report.md
+.venv/bin/python -m crypto.backtest --start 2021-11-11 --end 2026-11-11
+.venv/bin/python -m crypto.backtest.paramsearch --start --end --coins --out   # 参数网格寻优（v7.0.55）
+```
+
+**参数寻优**（v7.0.55，`crypto/backtest/paramsearch.py`）：建仓回撤 × 止盈倍数 ×
+加仓倍数网格（默认 4×4×4 = 64 组合/币，2 币 ~17s），指标 = 交易频率 / 总外部
+投入 / 回报率 / 资金周转 CAGR / 均持仓天数 / MDD，按 CAGR 降序。近 5 年
+（2021-11-11→2026-11-11）结论 → `data/crypto/param_search_5y.md`：两币最多
+1~2 轮（触发集中在 2022 熊市）；**止盈 5x 显著优于 8/10x**（5x 已了结落袋、
+8/10x 至今持仓）；加仓倍数只放大投入规模；80% 回撤 BTC 五年内从未触发
+（机会风险）。
+
 ## 6. 定时任务
 
-crontab 仅剩一条业务行：**lake-sync**（`30 11 * * 1-5 scripts/run_lake_sync_daily.sh`，
-数据湖每日同步，martingale 的一切查询都依赖它）。v6 的 `35 9 * * 1-5 run_cron.sh`
-（多因子日跑）已删除。
+crontab 业务行（2026-11-11 现状，6 条：A 股 5 + 加密货币 1）：
+
+| 行 | 时间（UTC） | 职责 |
+|---|---|---|
+| lake-sync-daily | 1-5 11:30 | A 股数据湖每日同步 + 候选池预计算（selection ~2s → timing ~1s），martingale 一切查询依赖它 |
+| gate1-latency-3pts | 1-5 01:35/04:35/06:35 | Gate 1 实时价源（腾讯主/push2delay 备）延时观察 |
+| signal-touch-daily | 1-5 12:05 | 盘中触碰事件落盘（lake-sync 灌完当日 bar 后，与页面同口径） |
+| t1-delist-weekly | 周日 11:30 | T1 退市股处理 |
+| t6-quarterly | 9/11/5 月 5 日 11:30 | T6 季度维护 |
+| crypto-sync-hourly | 每小时 :05 | 加密货币 1h K 线增量 + OKX 交叉校验 |
+
+另有 systemd user timer `stock-screener-alerts.timer`（持仓点位微信提醒，不在
+crontab）。v6 的 `35 9 * * 1-5 run_cron.sh`（多因子日跑）已删除。
 
 **v7.0.12/7.0.13**：lake-sync 脚本在湖增量结束后自动追加
 `python -m martingale selection`（候选池选股预计算，~2s）→
@@ -212,8 +302,9 @@ gitignore，禁入 git/日志）。
 ## 7. 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 后端（591 用例，含 test_timing 边沿语义 + test_web_auth 登录门禁）
-cd web/frontend && npm test                   # 前端 vitest（239 用例，含登录页/门禁/买入登记）
+.venv/bin/python -m pytest tests/ -q          # 后端（708 用例，A股+加密货币；全离线：tmp-duckdb/monkeypatch，零真实网络）
+cd web/frontend && npm test                   # A股前端 vitest（253 用例，22 文件）
+cd crypto/web/frontend && npm test            # 加密货币前端 vitest（13 用例，3 文件）
 cd web/frontend && npm run build               # dist/ 供 StaticFiles 挂载
 ```
 
@@ -229,14 +320,16 @@ fixture 逐位比对（n_buys / total_invested / final_assets / pnl_pct / divide
 ## 8. 目录结构
 
 ```
-martingale/        # v7 策略包：config/data/universe/engine/report/__main__(CLI)
+martingale/        # v7 策略包（A股）：config/data/universe/engine/report/__main__(CLI)
+crypto/            # 加密货币系统（v8 主特性）：sources/strategy/backtest/gateway/positions/web + config/crypto.yaml
 lake/              # 数据湖（v6 保留，零改动红线）
 screener/          # 退化为数据客户端库：config + data/{baostock_client,tencent,sina,rf}
-web/               # FastAPI app.py + frontend/（Vue3 + vitest；dist/ 构建产物）
-config/strategy.yaml   # strategy(9键)/universe(10键)/timing(5键,可缺省)/lake/datasource
+web/               # A股 FastAPI app.py + frontend/（Vue3 + vitest；dist/ 构建产物）
+config/strategy.yaml   # A股策略：strategy(8键)/universe(11键)/timing(5键,可缺省)/lake/datasource
 scripts/           # lake 运维：lake_backfill / run_lake_sync_daily.sh / lake_smoke / …
-data/lake/         # lake.duckdb（gitignore）
-tests/             # pytest（含 fixtures/f6_baseline/）
+data/lake/         # A股数据湖 lake.duckdb（gitignore）
+data/crypto/       # 加密货币数据湖 crypto.duckdb + 运行时文件（gitignore）
+tests/             # pytest（含 fixtures/f6_baseline/；test_crypto_* 覆盖加密系统）
 output/            # 回测产物（gitignore；旧多因子产物保留未清）
 ```
 
@@ -249,7 +342,19 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 近期版本（v7.0.11 → v7.0.27）
+## 10. 版本历史（v7.0.11 → v8.0.0）
+
+- **v8.0.0**：major 版本——加密货币系统升格为双系统主特性（2026-11-11 Joel
+  「推成 v8」）；A 股侧零改动（策略/数学/数据不变）：
+  - 加密货币模块系列（v7.0.42~v7.0.55，详见下）：旧 Quant 清理 + 双系统登录
+    解耦 → 加密框架（同仓库双系统定案）→ 数据湖全史 + 实时 K 线网关 →
+    聚焦 2 币（SOL 退役）→ 443 单域名 HTTPS → 策略 + 回测落实到页面 →
+    编辑模式 / 马丁格尔品牌统一 → 图表时间轴 + 交易事件标记 → 双图（净值
+    + 价格）+ 总外部投入 → 回测时间范围 → 近 5 年参数寻优
+  - README 统一更新：标题 / 引言双链路 / §5.5 加密货币章节（新增）/
+    §6 定时任务 6 条现状 / §7 测试数 / §8 目录结构全部对齐 v8 现状；
+    A 股页面页脚版本标注 v7.0 → v8.0
+  - 入口：`https://stream04l4.duckdns.org/`（A 股）/ `/crypto/`（加密货币）
 
 - **v7.0.11**：持仓股到策略点位 → PushPlus 微信提醒（timer 盘中 10 分钟节奏，
   去重 + 实时价回退湖价）。
