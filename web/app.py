@@ -1936,8 +1936,10 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
     3) .bak 备份（保留最近一份，shutil.copy2 保留 mtime）；
     4) ruamel round-trip 保留注释与排版写回（失败退回 safe_dump）。
     返回 (backup_path_str, sections)。
-    写盘成功后的「选股时机表重算」由各入口（put/import/load）调
-    _rescan_timing_after_save（v7.0.27）。
+    写盘成功后的预计算重算由各入口（put/import）依次调
+    _rescan_selection_after_save → _rescan_timing_after_save
+    （v7.0.27 时机 / v7.0.41 十年回测；顺序不可换：时机表按候选池算，
+    候选池 G7 读十年回测表）。
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
@@ -1966,6 +1968,38 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
 
     _write_strategy_preserving_comments(payload)
     return str(bak_path), list(payload.keys())
+
+
+def _rescan_selection_after_save() -> Dict[str, Any]:
+    """v7.0.41：策略配置写盘成功后立即重算候选池十年回测表（selection_backtest_10y）。
+
+    G7 十年回测门槛按「当前生产策略参数」回放预计算（v7.0.40 前仅 11:30 UTC
+    lake-sync 刷新）——改策略参数（回撤%/手数等）不重算，G7 停在旧参数快照
+    直到次日（Joel 2026-11-11「改策略是应该触发重算」）。
+    重算 ~2s（102 股×十年回放实测 2.2s）；失败（如 11:30 同步窗口湖被锁）
+    不影响保存结果 → 降级 refreshed=false，新参数于下次 11:30 刷新自动生效。
+    须在时机表重算**之前**执行：时机表按候选池算，而候选池 G7 读本表。
+    """
+    try:
+        import duckdb
+
+        from martingale.config import load_config
+        from martingale.data import default_db_path
+        from martingale.selection import refresh_selection
+
+        _sp, up, _tp = load_config(str(CONFIG_PATH))
+        p = default_db_path()
+        if not os.path.exists(p):
+            return {"refreshed": False, "reason": "数据湖不存在（新值下次同步生效）"}
+        con = duckdb.connect(p)  # 写连接：湖被锁时立即失败（已实测不挂起）
+        try:
+            out = refresh_selection(con, _sp, up)
+        finally:
+            con.close()
+        return {"refreshed": True, "as_of": out.get("as_of"),
+                "n_codes": out.get("n_codes"), "n_written": out.get("n_written")}
+    except Exception as exc:  # noqa: BLE001 - 保存本身已成功，重算降级不阻断
+        return {"refreshed": False, "reason": str(exc)[:200]}
 
 
 def _rescan_timing_after_save() -> Dict[str, Any]:
@@ -2002,7 +2036,9 @@ def _rescan_timing_after_save() -> Dict[str, Any]:
 @app.put("/api/strategy")
 def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
     backup, _ = _apply_strategy_write(payload)
-    return {"ok": True, "backup": backup, "timing_rescan": _rescan_timing_after_save()}
+    return {"ok": True, "backup": backup,
+            "selection_rescan": _rescan_selection_after_save(),
+            "timing_rescan": _rescan_timing_after_save()}
 
 
 @app.post("/api/strategy/import")
@@ -2014,6 +2050,7 @@ def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail={"errors": [f"YAML 解析失败: {exc}"]})
     backup, sections = _apply_strategy_write(data)
     return {"ok": True, "backup": backup, "sections": sections,
+            "selection_rescan": _rescan_selection_after_save(),
             "timing_rescan": _rescan_timing_after_save()}
 
 

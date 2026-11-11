@@ -71,17 +71,25 @@ def tmp_config(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _rescan_safety(monkeypatch):
     """v7.0.27：web 测试一律桩掉「保存后重算选股时机表」的湖写。
+    v7.0.41：十年回测表重算（refresh_selection）同桩。
 
-    只 stub refresh_timing（不写表）；duckdb 写连接只开在真实湖上瞬间
-    即关（refresh 已 no-op，无任何写入）——不碰 default_db_path，
+    只 stub refresh_timing / refresh_selection（不写表）；duckdb 写连接只开在
+    真实湖上瞬间即关（refresh 已 no-op，无任何写入）——不碰 default_db_path，
     免得污染本模块其他用真实湖只读连接的测试。
     """
+    from martingale import selection as msel
     from martingale import timing as mtiming
 
     monkeypatch.setattr(
         mtiming, "refresh_timing",
         lambda con, up, tp, **kw: {"as_of": "2000-01-01", "n_codes": 3,
                                    "n_watchlist": 1, "n_push": 1, "elapsed_s": 0.0},
+    )
+    monkeypatch.setattr(
+        msel, "refresh_selection",
+        lambda con, sp, up, **kw: {"as_of": "2000-01-01", "start": "2000-01-01",
+                                   "n_codes": 3, "n_written": 3, "n_positive": 2,
+                                   "elapsed_s": 0.0},
     )
 
 
@@ -162,8 +170,53 @@ def test_put_strategy_triggers_timing_rescan_with_new_params(tmp_config, monkeyp
     assert seen["tp"].price_pctile_max == 35.0  # 重算用了新值而非旧缓存
 
 
+def test_put_strategy_triggers_selection_rescan_with_new_params(tmp_config, monkeypatch):
+    """v7.0.41：保存后同步重算十年回测表，且重算吃**刚保存的新值**（读盘）；
+    顺序 = selection（十年回测）先于 timing（候选池 G7 读十年回测表）。
+
+    first_drawdown_pct 居 timing 段（v7.0.26）但驱动引擎回放参数
+    （StrategyParams.first_drawdown）——改它 G7 回放结果即变。
+    """
+    import duckdb
+
+    from martingale import selection as msel
+    from martingale import timing as mtiming
+
+    order = []
+    seen_sp = {}
+
+    def fake_sel(con, sp, up, **kw):
+        order.append("selection")
+        seen_sp["sp"] = sp
+        return {"as_of": "2026-11-11", "start": "2016-11-11", "n_codes": 4,
+                "n_written": 4, "n_positive": 3, "elapsed_s": 0.1}
+
+    def fake_timing(con, up, tp, **kw):
+        order.append("timing")
+        return {"as_of": "2026-11-11", "n_codes": 4, "n_watchlist": 1,
+                "n_push": 1, "elapsed_s": 0.1}
+
+    class _FakeCon:
+        def close(self):  # noqa: D401
+            pass
+
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _FakeCon())  # 不碰生产湖
+    monkeypatch.setattr(msel, "refresh_selection", fake_sel)
+    monkeypatch.setattr(mtiming, "refresh_timing", fake_timing)
+    payload = copy.deepcopy(wapp.get_strategy()["json"])
+    payload["timing"]["first_drawdown_pct"] = 20.0  # 15 → 20（回放参数）
+    out = wapp.put_strategy(payload)
+    assert out["ok"] is True
+    assert out["selection_rescan"] == {"refreshed": True, "as_of": "2026-11-11",
+                                       "n_codes": 4, "n_written": 4}
+    assert out["timing_rescan"]["refreshed"] is True
+    assert order == ["selection", "timing"]  # 回测表先、时机表后
+    assert seen_sp["sp"].first_drawdown == 0.20  # 重算用了新值而非旧缓存
+
+
 def test_put_strategy_rescan_degrades_on_lake_lock(tmp_config, monkeypatch):
-    """v7.0.27：湖被锁（11:30 同步窗口）→ 重算降级，保存本身成功。"""
+    """v7.0.27：湖被锁（11:30 同步窗口）→ 重算降级，保存本身成功。
+    v7.0.41：十年回测表 + 时机表双双降级。"""
     import duckdb
 
     def boom(*a, **k):
@@ -173,6 +226,8 @@ def test_put_strategy_rescan_degrades_on_lake_lock(tmp_config, monkeypatch):
     payload = copy.deepcopy(wapp.get_strategy()["json"])
     out = wapp.put_strategy(payload)
     assert out["ok"] is True  # 保存不受影响
+    assert out["selection_rescan"]["refreshed"] is False
+    assert "Conflicting lock" in out["selection_rescan"]["reason"]
     assert out["timing_rescan"]["refreshed"] is False
     assert "Conflicting lock" in out["timing_rescan"]["reason"]
 

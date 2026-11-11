@@ -1,4 +1,4 @@
-# stock-screener · v7.0.40（drawdown_martingale 单策略版）
+# stock-screener · v7.0.41（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -374,6 +374,21 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.41**：改策略触发十年回测表重算（2026-11-11 Joel「改策略是应该触发
+  重算」）：
+  - 背景：G7 十年回测表按「当前生产策略参数」回放，此前仅 19:30 lake-sync 刷新
+    ——改策略参数（回撤%/手数等）后 G7 停在旧参数快照直到次日；而门槛值本身
+    （20%/3%/价格带）改完本就即时生效，只有回放参数有这一档延迟
+  - PUT /api/strategy 与 POST /api/strategy/import 写盘成功后依次调
+    `_rescan_selection_after_save`（~2s，102 股×十年回放）→
+    `_rescan_timing_after_save`（~1s）；**顺序不可换**：时机表按候选池算，
+    候选池 G7 读十年回测表；湖被锁各自降级 refreshed=false（下次 19:30 生效），
+    保存本身不受影响
+  - 前端保存提示追加「十年回测表已重算（N 只）」/降级说明
+  - 验证：新增专测（新值生效 first_drawdown 15→20 读盘 + selection 先于
+    timing 顺序断言）+ 湖锁双表降级断言 + web 测试 rescan 安全桩扩展；
+    端到端实测：dd 15→16 表即时重算（正收益 91→90）→ 还原 15（91 复原，
+    yaml 逐字节一致）
 - **v7.0.40**：我的持仓展示价改实时（2026-11-11 Joel「持仓里股票的现价还不是
   实时更新的」）：
   - 根源：`/api/my_positions` 早已取实时行情（Gate 3 腾讯主→push2delay 备），但
