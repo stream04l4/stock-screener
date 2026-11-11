@@ -99,13 +99,18 @@ def spot_accounts():
     return _request("GET", "/spot/accounts")
 
 
-def market_buy(pair: str, amount: str) -> dict:
-    """市价买入（amount = 基币数量，字符串保精度）。返回订单对象。"""
+def market_buy(pair: str, quote_amount: str) -> dict:
+    """市价买入（taker）：amount = **计价币（USDT）金额**（Gate 规则：
+    市价买单 amount 按计价币计）；time_in_force 必须显式 ioc/fok
+    （市价单不支持默认 gtc；ioc = 立即成交、未成部分撤销）。
+    返回订单对象（成交后 filled_amount = 实得基币量、avg_deal_price 均价、
+    fee 按买入币扣）。"""
     return _request("POST", "/spot/orders", {
         "currency_pair": pair,
         "side": "buy",
         "type": "market",
-        "amount": str(amount),
+        "time_in_force": "ioc",
+        "amount": str(quote_amount),
     })
 
 
