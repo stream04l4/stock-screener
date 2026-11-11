@@ -1,5 +1,6 @@
-// 回测（v7.0.48 实体化）：POST /api/backtest 全史回测（按当前生效参数）→
-// 逐币：了结轮次表 / 持仓中轮次 / 净值统计 / 净值曲线（内联 SVG，零图表依赖）。
+// 回测（v7.0.48 实体化，v7.0.51 图表增强）：POST /api/backtest 全史回测 →
+// 逐币：净值曲线（时间轴刻度 + 建仓▼/加仓●/平仓▲ 事件标记，悬停看明细）
+// + 了结轮次表 / 持仓中轮次 / 净值统计。内联 SVG，零图表库依赖。
 <script setup>
 import { computed, ref } from "vue";
 import { api } from "../api/client.js";
@@ -37,18 +38,79 @@ const paramChips = computed(() => {
   ];
 });
 
-// 净值曲线 → SVG polyline points（viewBox 760×200，y 基线 0）
-function curvePoints(curve) {
-  if (!curve || curve.length < 2) return "";
-  const W = 760, H = 200, pad = 6;
-  const max = Math.max(...curve.map((c) => c[1]), 1);
-  return curve
-    .map((c, i) => {
-      const x = pad + (i / (curve.length - 1)) * (W - 2 * pad);
-      const y = H - pad - (c[1] / max) * (H - 2 * pad);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+// ---- 图表几何（viewBox 760×210：绘图区 y∈[12,178]，时间轴标签 y=196）----
+const CHART = { W: 760, top: 12, bottom: 178, padX: 10, axisY: 196 };
+
+const parseD = (s) => Date.parse(s + "T00:00:00Z");
+
+// 时间 → x（线性时间轴；曲线与事件共用，保证对齐）
+function timeX(curve, dateStr) {
+  const s = parseD(curve[0][0]);
+  const e = parseD(curve[curve.length - 1][0]);
+  const t = (parseD(dateStr) - s) / (e - s || 1);
+  return CHART.padX + Math.min(1, Math.max(0, t)) * (CHART.W - 2 * CHART.padX);
+}
+function yOf(v, max) {
+  return CHART.bottom - (v / (max || 1)) * (CHART.bottom - CHART.top);
+}
+// 事件日期 → 曲线上 y（curve 按日期升序，二分找最近点）
+function yAt(curve, max, dateStr) {
+  let lo = 0, hi = curve.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (curve[mid][0] <= dateStr) lo = mid; else hi = mid;
+  }
+  const v = (dateStr - curve[lo][0]) <= (curve[hi][0] - dateStr)
+    ? curve[lo][1] : curve[hi][1];
+  return yOf(v, max);
+}
+
+// 每币图表模型：折线点 / 时间刻度 / 事件标记（x,y 已算好）
+const charts = computed(() =>
+  ((res.value && res.value.results) || []).map((r) => {
+    const curve = r.equity_curve || [];
+    if (curve.length < 2) return { r, ready: false };
+    const max = Math.max(...curve.map((c) => c[1]), 1);
+    const pts = curve
+      .map((c) => `${timeX(curve, c[0]).toFixed(1)},${yOf(c[1], max).toFixed(1)}`)
+      .join(" ");
+    // 6 个等距时间刻度（去重首尾）
+    const idxs = [];
+    for (let i = 0; i < 6; i++) {
+      const j = Math.round((i / 5) * (curve.length - 1));
+      if (!idxs.includes(j)) idxs.push(j);
+    }
+    const spanDays =
+      (parseD(curve[curve.length - 1][0]) - parseD(curve[0][0])) / 86400000;
+    const fmtTick = (d) => (spanDays > 366 ? d.slice(0, 7) : d);
+    const ticks = idxs.map((j) => ({
+      x: timeX(curve, curve[j][0]), label: fmtTick(curve[j][0]),
+    }));
+    const marks = (r.events || []).map((ev) => ({
+      x: timeX(curve, ev.date),
+      y: yAt(curve, max, ev.date),
+      ev,
+      label: evLabel(ev, r),
+    }));
+    return { r, ready: true, max, pts, ticks, marks };
+  }));
+
+function evLabel(ev, r) {
+  if (ev.type === "entry") return `建仓 ${ev.date} @${ev.price}`;
+  if (ev.type === "add") return `加仓 第${ev.level}级 ${ev.date} @${ev.price}`;
+  return `平仓 ${ev.date} @${ev.price}（${r.take_profit_mult}x 止盈）`;
+}
+// 三角标记顶点（建仓=下三角 ▼，平仓=上三角 ▲）
+function triPoints(m) {
+  const { x, y } = m;
+  return m.ev.type === "entry"
+    ? `${x},${y + 4.5} ${x - 4.5},${y - 3} ${x + 4.5},${y - 3}`
+    : `${x},${y - 4.5} ${x - 4.5},${y + 3} ${x + 4.5},${y + 3}`;
+}
+function tickAnchor(i, n) {
+  if (i === 0) return "start";
+  if (i === n - 1) return "end";
+  return "middle";
 }
 
 function fmt(v) {
@@ -78,39 +140,57 @@ function pct(v) {
     </div>
 
     <template v-if="done && res">
-      <section v-for="r in res.results" :key="r.symbol" class="coin">
+      <section v-for="ch in charts" :key="ch.r.symbol" class="coin">
         <div class="coin-head">
-          <h3>{{ r.symbol }}</h3>
-          <span class="hint">{{ r.start }} → {{ r.end }} · {{ r.n_bars }} 根 1h</span>
+          <h3>{{ ch.r.symbol }}</h3>
+          <span class="hint">{{ ch.r.start }} → {{ ch.r.end }} · {{ ch.r.n_bars }} 根 1h</span>
         </div>
 
         <div class="stats">
-          <div class="stat"><em>已了结轮次</em><b>{{ r.rounds.length }}</b></div>
+          <div class="stat"><em>已了结轮次</em><b>{{ ch.r.rounds.length }}</b></div>
           <div class="stat"><em>已了结净盈亏</em>
-            <b :class="{ pos: r.realized_cash >= 0, neg: r.realized_cash < 0 }">
-              {{ pct(r.realized_pnl_pct) }}（{{ fmt(r.realized_cash) }} USDT）
+            <b :class="{ pos: ch.r.realized_cash >= 0, neg: ch.r.realized_cash < 0 }">
+              {{ pct(ch.r.realized_pnl_pct) }}（{{ fmt(ch.r.realized_cash) }} USDT）
             </b>
           </div>
-          <div class="stat"><em>当前净值</em><b>{{ fmt(r.final_equity) }} USDT</b></div>
-          <div class="stat"><em>净值最大回撤</em><b>{{ fmt(r.mdd_pct) }}%</b></div>
+          <div class="stat"><em>当前净值</em><b>{{ fmt(ch.r.final_equity) }} USDT</b></div>
+          <div class="stat"><em>净值最大回撤</em><b>{{ fmt(ch.r.mdd_pct) }}%</b></div>
         </div>
 
-        <svg v-if="r.equity_curve && r.equity_curve.length > 1"
-             viewBox="0 0 760 200" class="chart" role="img" aria-label="净值曲线">
-          <line x1="6" x2="754" y1="194" y2="194" stroke="#ddd" stroke-width="1" />
-          <polyline :points="curvePoints(r.equity_curve)" fill="none"
-                    stroke="#188038" stroke-width="1.6" />
+        <svg v-if="ch.ready" :viewBox="`0 0 ${CHART.W} 210`"
+             class="chart" role="img" :aria-label="`${ch.r.symbol} 净值曲线`">
+          <!-- 时间刻度（竖网格线 + 日期标签） -->
+          <g v-for="(t, i) in ch.ticks" :key="'t' + i">
+            <line :x1="t.x" :x2="t.x" :y1="CHART.top" :y2="CHART.bottom" class="gridline" />
+            <text :x="t.x" :y="CHART.axisY" class="axlbl"
+                  :text-anchor="tickAnchor(i, ch.ticks.length)">{{ t.label }}</text>
+          </g>
+          <line :x1="CHART.padX" :x2="CHART.W - CHART.padX"
+                :y1="CHART.bottom" :y2="CHART.bottom" class="baseline" />
+          <!-- 净值曲线 -->
+          <polyline :points="ch.pts" fill="none" class="eq-line" />
+          <!-- 事件标记：建仓 ▼ / 加仓 ● / 平仓 ▲（悬停看明细） -->
+          <g v-for="(m, i) in ch.marks" :key="'m' + i"
+             :class="['mk', 'mk-' + m.ev.type]">
+            <polygon v-if="m.ev.type !== 'add'" :points="triPoints(m)" />
+            <circle v-else :cx="m.x" :cy="m.y" r="1.7" />
+            <title>{{ m.label }}</title>
+          </g>
+          <text :x="CHART.W - CHART.padX" :y="CHART.top - 1" class="axlbl"
+                text-anchor="end">峰值 {{ fmt(ch.max) }} USDT</text>
         </svg>
-        <p v-if="r.equity_curve && r.equity_curve.length > 1" class="hint chart-x">
-          {{ r.equity_curve[0][0] }} ———— {{ r.equity_curve[r.equity_curve.length - 1][0] }}
-          （峰值 {{ fmt(Math.max(...r.equity_curve.map(c => c[1]))) }} USDT）
-        </p>
+        <div v-if="ch.ready" class="legend">
+          <span><i class="mk mk-entry"><svg viewBox="0 0 10 10" width="10" height="10"><polygon points="5,9 0.5,2.5 9.5,2.5" /></svg></i> 建仓</span>
+          <span><i class="mk mk-add"><svg viewBox="0 0 10 10" width="10" height="10"><circle cx="5" cy="5" r="3" /></svg></i> 加仓（每级）</span>
+          <span><i class="mk mk-exit"><svg viewBox="0 0 10 10" width="10" height="10"><polygon points="5,1 0.5,7.5 9.5,7.5" /></svg></i> 平仓（止盈）</span>
+          <span class="hint">悬停标记看明细</span>
+        </div>
 
-        <h4>了结轮次（{{ r.take_profit_mult }}x 止盈触发）</h4>
-        <table v-if="r.rounds.length" class="tbl">
+        <h4>了结轮次（{{ ch.r.take_profit_mult }}x 止盈触发）</h4>
+        <table v-if="ch.r.rounds.length" class="tbl">
           <tr><th>建仓日</th><th>建仓价</th><th>了结日</th><th>了结价</th>
               <th>级数</th><th>投入</th><th>所得</th><th>收益率</th></tr>
-          <tr v-for="(rd, i) in r.rounds" :key="i">
+          <tr v-for="(rd, i) in ch.r.rounds" :key="i">
             <td>{{ rd.entry_date }}</td>
             <td>{{ fmt(rd.entry) }}</td>
             <td>{{ rd.exit_date }}</td>
@@ -123,16 +203,16 @@ function pct(v) {
             </td>
           </tr>
         </table>
-        <p v-else class="hint">无（历史未触发 {{ r.take_profit_mult }}x 止盈）</p>
+        <p v-else class="hint">无（历史未触发 {{ ch.r.take_profit_mult }}x 止盈）</p>
 
-        <div v-if="r.open_round" class="open">
-          <b>持仓中（等待 {{ r.take_profit_mult }}x 止盈）</b>
+        <div v-if="ch.r.open_round" class="open">
+          <b>持仓中（等待 {{ ch.r.take_profit_mult }}x 止盈）</b>
           <span>
-            {{ r.open_round.entry_date }} @ {{ fmt(r.open_round.entry) }} 建仓 ·
-            已加仓 {{ r.open_round.k }} 级 ·
-            投入 {{ fmt(r.open_round.spent) }} USDT ·
-            现值 {{ fmt(r.open_round.value) }}（{{ pct(r.open_round.unrealized_pct) }}）·
-            止盈线 <b>{{ fmt(r.open_round.tp_line) }}</b>
+            {{ ch.r.open_round.entry_date }} @ {{ fmt(ch.r.open_round.entry) }} 建仓 ·
+            已加仓 {{ ch.r.open_round.k }} 级 ·
+            投入 {{ fmt(ch.r.open_round.spent) }} USDT ·
+            现值 {{ fmt(ch.r.open_round.value) }}（{{ pct(ch.r.open_round.unrealized_pct) }}）·
+            止盈线 <b>{{ fmt(ch.r.open_round.tp_line) }}</b>
           </span>
         </div>
       </section>
@@ -167,7 +247,20 @@ h4 { margin: 14px 0 6px; font-size: 12px; color: #555; }
 .pos { color: #188038; }
 .neg { color: #c9302c; }
 .chart { width: 100%; height: auto; background: #fcfcfe; border: 1px solid #eee; border-radius: 8px; }
-.chart-x { margin-top: 2px; }
+.gridline { stroke: #ececf2; stroke-width: 1; }
+.baseline { stroke: #ddd; stroke-width: 1; }
+.axlbl { font-size: 10px; fill: #888; }
+.eq-line { stroke: #188038; stroke-width: 1.6; }
+/* 事件标记：建仓=蓝 ▼，加仓=灰 ●，平仓=红 ▲ */
+.mk-entry polygon { fill: #1a73e8; }
+.mk-add circle { fill: #777; }
+.mk-exit polygon { fill: #d93025; }
+.mk { cursor: help; }
+.legend { display: flex; gap: 14px; align-items: center; font-size: 11px; color: #555; margin-top: 4px; flex-wrap: wrap; }
+.legend i { display: inline-flex; margin-right: 3px; }
+.legend .mk-entry polygon { fill: #1a73e8; }
+.legend .mk-add circle { fill: #777; }
+.legend .mk-exit polygon { fill: #d93025; }
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
 .tbl th, .tbl td { text-align: right; padding: 4px 8px; border-bottom: 1px solid #eee; }
 .tbl th { color: #888; font-weight: normal; }

@@ -96,6 +96,10 @@ def test_grid_adds_step_by_step():
     # 10 + 10×1.05 + 10×1.05² + 10×1.05³
     want = 10.0 * sum(1.05 ** k for k in range(4))
     assert o["spent_usdt"] == pytest.approx(round(want, 2))
+    # 事件序列：建仓 1 + 逐级加仓 3（级数 1/2/3）
+    ev = r["events"]
+    assert [e["type"] for e in ev] == ["entry", "add", "add", "add"]
+    assert [e["level"] for e in ev[1:]] == [1, 2, 3]
 
 
 def test_gap_crosses_multiple_levels_in_one_bar():
@@ -104,6 +108,10 @@ def test_gap_crosses_multiple_levels_in_one_bar():
     assert r["open_round"]["k_level"] == 5
     want = 10.0 * sum(1.05 ** k for k in range(6))
     assert r["open_round"]["spent_usdt"] == pytest.approx(round(want, 2))
+    # 跳空同 bar 多级：5 个 add 事件同日期
+    adds = [e for e in r["events"] if e["type"] == "add"]
+    assert len(adds) == 5
+    assert len({e["date"] for e in adds}) == 1
 
 
 def test_no_add_on_rise_and_entry_not_refreshed():
@@ -131,6 +139,10 @@ def test_exit_10x_closes_round_and_reenters():
     o = r["open_round"]
     assert o is not None and o["entry"] == 89.0
     assert o["k_level"] == 0
+    # 事件序列：建仓(30) → 平仓(300) → 再建仓(89)
+    ev = r["events"]
+    assert [e["type"] for e in ev] == ["entry", "exit", "entry"]
+    assert [e["price"] for e in ev] == [30.0, 300.0, 89.0]
 
 
 def test_no_exit_below_10x():

@@ -96,7 +96,7 @@ def run_coin(
                 "rounds": [], "open_round": None,
                 "realized_cash": 0.0, "final_equity": 0.0,
                 "mdd_pct": 0.0, "equity": np.array([]), "dates": np.array([]),
-                "note": "无数据"}
+                "events": [], "note": "无数据"}
 
     h1y = rolling_high_1y(c_arr, p.lookback_h)
     trig = p.trigger_frac()
@@ -111,6 +111,7 @@ def run_coin(
     round_spent = 0.0    # 本轮累计支出（USDT 本金口径；手续费折所得/数量）
     realized_cash = 0.0  # 已了结轮次净盈亏累计（proceeds − spent）
     rounds: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []  # 图表事件：entry/add/exit（日期+级数+价）
     equity = np.empty(n, dtype=float)
 
     for i in range(n):
@@ -125,6 +126,8 @@ def run_coin(
                 usdt = p.base_amount_usdt
                 shares = usdt * (1.0 - fee) / c
                 round_spent = usdt
+                events.append({"date": str(dates[i])[:10], "type": "entry",
+                               "level": 0, "price": round(c, 4)})
         else:
             # 2) 加仓：固定网格 entry×(1−grid×k)，跳空穿多级 → 同 bar 逐级
             while k < _MAX_LEVELS and c <= entry * (1.0 - grid * (k + 1)) + _EPS:
@@ -132,11 +135,15 @@ def run_coin(
                 usdt = p.base_amount_usdt * (p.growth ** k)
                 shares += usdt * (1.0 - fee) / c
                 round_spent += usdt
+                events.append({"date": str(dates[i])[:10], "type": "add",
+                               "level": k, "price": round(c, 4)})
             # 3) 止盈：价 ≥ 建仓价 × 10 → 全卖，本轮了结
             if c >= entry * p.take_profit_mult - _EPS:
                 proceeds = shares * c * (1.0 - fee)
                 pnl = proceeds - round_spent
                 realized_cash += pnl
+                events.append({"date": str(dates[i])[:10], "type": "exit",
+                               "level": 0, "price": round(c, 4)})
                 rounds.append({
                     "entry_date": str(dates[round_start])[:10],
                     "entry": round(entry, 4),
@@ -194,4 +201,5 @@ def run_coin(
         "mdd_pct": round(mdd_pct, 2),
         "equity": equity,
         "dates": dates,
+        "events": events,
     }

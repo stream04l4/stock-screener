@@ -406,6 +406,7 @@ def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": r["symbol"], "n_bars": r["n_bars"],
         "start": r["start"], "end": r["end"],
         "rounds": rounds, "open_round": open_round,
+        "events": r.get("events", []),
         "realized_cash": r["realized_cash"], "realized_pnl_pct": rpct,
         "final_equity": r["final_equity"], "mdd_pct": r["mdd_pct"],
         "equity_curve": curve,

@@ -128,6 +128,13 @@ class TestBacktestEndpoint:
         # 净值曲线已降采样且非空
         assert 2 <= len(res["equity_curve"]) <= 401
         assert "equity" not in res and "dates" not in res  # 原始数组不外发
+        # 事件序列：建仓@30 → 平仓@300 → 再建仓@10
+        # （合成湖 5 根 1h bar 同属 2020-01-01 → 日期相同，事件按 bar 序区分）
+        ev = res["events"]
+        assert [e["type"] for e in ev] == ["entry", "exit", "entry"]
+        assert ev[0]["date"] == "2020-01-01" and ev[0]["price"] == 30.0
+        assert ev[1]["date"] == "2020-01-01" and ev[1]["price"] == 300.0
+        assert ev[2]["date"] == "2020-01-01" and ev[2]["price"] == 10.0
 
     def test_unknown_coin(self, lake_client):
         r = lake_client.post("/api/backtest", json={"coins": ["NOPEUSDT"]})
