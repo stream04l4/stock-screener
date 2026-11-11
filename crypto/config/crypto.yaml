@@ -34,13 +34,13 @@ vision:
   cache_dir: "data/crypto/vision_cache"   # 月度 CSV 沙盒缓存（不入库）
 
 # 币种清单（Binance USDT 现货）。v7.0.45 聚焦三标的（Joel 2026-11-11 定案）；
-# v7.0.52 SOL 退役（Joel 2026-11-11）→ 聚焦 BTC/ETH。增删 = 改这里重跑 sync 即可。
+# v7.0.52 SOL 退役；v8.0.6 ETH 退役（Joel 2026-11-11）→ 只保留 BTC。
+# 增删 = 改这里重跑 sync 即可。
 coins:
   - BTCUSDT
-  - ETHUSDT
-# 退役清单（v7.0.43 top20 其余 17 币 + v7.0.52 SOL，停用：湖里数据保留、
+# 退役清单（v7.0.43 top20 其余 17 币 + v7.0.52 SOL + v8.0.6 ETH，停用：湖里数据保留、
 # coin_master.is_active=FALSE；恢复 = 加回 coins 重跑 sync）：
-# SOLUSDT BNBUSDT XRPUSDT ADAUSDT DOGEUSDT AVAXUSDT LINKUSDT DOTUSDT
+# ETHUSDT SOLUSDT BNBUSDT XRPUSDT ADAUSDT DOGEUSDT AVAXUSDT LINKUSDT DOTUSDT
 # LTCUSDT BCHUSDT TRXUSDT NEARUSDT POLUSDT ATOMUSDT UNIUSDT XLMUSDT ETCUSDT VETUSDT
 
 # 马丁格尔策略（v7.0.47，Joel 2026-11-11 规格 + 两个决策门拍板）：

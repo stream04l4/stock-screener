@@ -1,4 +1,4 @@
-# stock-screener · v8.0.5（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.6（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -342,8 +342,13 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.5）
+## 10. 版本历史（v7.0.11 → v8.0.6）
 
+- **v8.0.6**：ETH 退役（Joel 2026-11-11："把 eth 也退役吧，只保留 btc"）：
+  yaml `coins` 只留 BTCUSDT；sync 自动置 ETHUSDT `coin_master.is_active=FALSE`
+  （湖内 80,841 根 1h 数据保留，恢复 = 加回清单重跑 sync）；crypto-gateway
+  重启后 1 标的流（BTC live）；回测/寻优/Web 币列表全部跟随（默认币源 =
+  yaml coins 或湖 is_active）。退役币累计 19（17 + SOL + ETH）。
 - **v8.0.5**：追踪止损失败出场升级（Joel 2026-11-11："超过建仓价的
   1.5 倍就开始追踪止损，回撤 20% 就平仓"）：
   - **引擎**：`StrategyParams` 增 `trail_activation_mult`（激活：价 ≥
