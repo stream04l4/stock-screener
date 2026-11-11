@@ -304,6 +304,61 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
   });
 });
 
+describe("BacktestTab · 买入时间表折叠（v7.0.38）", () => {
+  it("长 buys（>30 行）默认折叠：表体隐藏 + 已折叠提示；点标题展开", async () => {
+    const longBuys = Array.from({ length: 40 }, (_, i) => ({
+      ts_code: "sh.600737", seq: i + 1, date: `200${i % 10}-0${(i % 9) + 1}-01`,
+      price: 10 + i * 0.1, amount: 1000 + i,
+    }));
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 1, status: "running", out_dir: "/tmp/bt_t1",
+                 meta: { start: null, end: null, codes: null, pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t1$/.test(path)) {
+        return JSON.parse(JSON.stringify({ ...RESULTS, buys: longBuys }));
+      }
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+
+    // 标题含行数；默认折叠（v-show → inline display:none + 提示行）
+    expect(w.text()).toContain("40 行");
+    const tbl = w.find(".bt-buys .simple-table");
+    expect(tbl.exists()).toBe(true);
+    expect(tbl.element.style.display).toBe("none");
+    expect(w.text()).toContain("已折叠");
+    // 点标题 → 展开（v-show 移除 inline 样式）
+    await w.find("#btn-bt-buys-toggle").trigger("click");
+    expect(w.find(".bt-buys .simple-table").element.style.display).toBe("");
+    expect(w.text()).not.toContain("已折叠");
+    w.unmount();
+  });
+
+  it("短 buys（≤30 行）默认展开；点标题可折叠再展开", async () => {
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    // 默认 RESULTS buys=3 行 → 展开
+    expect(w.find(".bt-buys .simple-table").element.style.display).toBe("");
+    expect(w.text()).toContain("3 行");
+    await w.find("#btn-bt-buys-toggle").trigger("click");
+    expect(w.find(".bt-buys .simple-table").element.style.display).toBe("none");
+    expect(w.text()).toContain("已折叠");
+    await w.find("#btn-bt-buys-toggle").trigger("click");
+    expect(w.find(".bt-buys .simple-table").element.style.display).toBe("");
+    w.unmount();
+  });
+});
+
 describe("BacktestTab · 历史回测结果（v7.0.34）", () => {
   it("onMounted 拉 /api/bt/runs 列表 → 下拉 2 项（完整 + 运行中/不完整）", async () => {
     const w = mk();

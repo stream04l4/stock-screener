@@ -206,6 +206,22 @@ async function onHistoryLoad() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 买入时间表折叠（v7.0.38，Joel 2026-11-10「回测报告里这个买入时间表太长了，
+// 折叠一下」）：SimpleTable 无分页，池回测 200+ 行整屏铺开 → 卡片可折叠。
+// 默认态按行数：≤30 行展开（小回测直接可见），>30 行折叠（大回测省版面）；
+// 每次新结果加载重置默认态，标题按钮手动切换（v-show 保表内搜索/排序状态）。
+// ---------------------------------------------------------------------------
+const BUYS_COLLAPSE_THRESHOLD = 30;
+const buysOpen = ref(true);
+const buysN = computed(() => (results.value && results.value.buys) ? results.value.buys.length : 0);
+watch(
+  () => results.value && results.value.buys,
+  (rows) => { buysOpen.value = !rows || rows.length <= BUYS_COLLAPSE_THRESHOLD; },
+  { immediate: true }
+);
+function toggleBuys() { buysOpen.value = !buysOpen.value; }
+
 onMounted(loadHistory);
 </script>
 
@@ -280,9 +296,16 @@ onMounted(loadHistory);
         <SimpleTable :rows="results.per_stock || []" :cols="PER_STOCK_COLS" empty="（无个股结果）" />
       </div>
 
-      <div class="card">
-        <h3>买入时间表（buys）</h3>
-        <SimpleTable :rows="results.buys || []" :cols="BUYS_COLS" empty="（无买入记录）" />
+      <div class="card bt-buys">
+        <h3>
+          <button id="btn-bt-buys-toggle" class="card-toggle" @click="toggleBuys">
+            <span aria-hidden="true">{{ buysOpen ? "▾" : "▸" }}</span>
+            买入时间表（buys）
+            <span v-if="buysN" class="cnt">{{ buysN }} 行</span>
+          </button>
+        </h3>
+        <SimpleTable v-show="buysOpen" :rows="results.buys || []" :cols="BUYS_COLS" empty="（无买入记录）" />
+        <p v-if="!buysOpen" class="muted small">已折叠 · 点击标题展开（{{ buysN }} 行）</p>
       </div>
 
       <div class="card" v-if="results.summary">

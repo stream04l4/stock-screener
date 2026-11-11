@@ -613,6 +613,14 @@ tr.lake-row-muted .badge { opacity: .85; }
 .bt-form .f-row .muted { margin-left: 2px; }
 @media (max-width: 700px) { .bt-form-grid { grid-template-columns: minmax(0, 1fr); } }
 
+/* ---------- v7.0.38 买入时间表折叠（Joel 2026-11-10「买入时间表太长了，折叠一下」） ---------- */
+.bt-buys .card-toggle {
+  border: 0; background: none; padding: 0; margin: 0;
+  font: inherit; color: inherit; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.bt-buys .card-toggle .cnt { color: var(--muted); font-weight: 400; font-size: 12.5px; }
+
 @media (max-width: 900px) {
   .results-layout { grid-template-columns: 1fr; }
   .run-list-box { position: static; }
