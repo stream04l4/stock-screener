@@ -233,3 +233,51 @@ def test_h1y_override_used_for_trigger():
     assert r["rounds"][0]["entry"] == 30.0
     r2 = run_coin("T", _dates(2), np.array([30.0, 300.0]), P)
     assert r2["rounds"] == [] and r2["open_round"] is None
+
+
+# ---------------------------------------------------------------------------
+# 资金预算（v7.0.56）：external_cap 硬预算，买不起整档放弃、不做部分买入
+# ---------------------------------------------------------------------------
+def test_external_cap_truncates_deep_levels():
+    # fee=0 便于精确对账：30 建仓后逐根贴网格下跌 3 级（29.7/29.4/29.1），
+    # 累计支出 = 10 + 10.5 + 11.025 + 11.57625 = 43.10125
+    p0 = StrategyParams(fee_bps=0)
+    closes = [100.0] * H + [30.0, 29.7, 29.4, 29.1, 100.0]
+    # 无限预算：3 级全买（返回口径 round(…, 2)）
+    full = run_coin("T", _dates(len(closes)), np.array(closes), p0)
+    assert full["open_round"]["k_level"] == 3
+    assert full["external_invested"] == pytest.approx(43.10125, abs=0.01)
+    # 预算 35：L0+L1+L2 = 31.525 ≤ 35，L3（11.576）买不起 → 截断
+    capped = run_coin("T", _dates(len(closes)), np.array(closes), p0,
+                      external_cap=35.0)
+    o = capped["open_round"]
+    assert o["k_level"] == 2
+    assert o["capped"] is True
+    assert o["spent_usdt"] == pytest.approx(31.525, abs=0.01)
+    assert capped["external_invested"] == pytest.approx(31.525, abs=0.01)
+    assert capped["external_invested"] <= 35.0
+    # 截断后份额/净值 = 前 3 档（L0+L1+L2）
+    assert o["shares"] == pytest.approx(
+        10.0 / 30.0 + 10.5 / 29.7 + 11.025 / 29.4, rel=1e-6)
+
+
+def test_external_cap_too_small_skips_entry():
+    # 首仓 10 > 预算 5 → 买不起 → 不建仓（每 bar 重试，恒不入场）
+    p0 = StrategyParams(fee_bps=0)
+    closes = [100.0] * H + [30.0, 29.0, 300.0]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p0,
+                 external_cap=5.0)
+    assert r["rounds"] == [] and r["open_round"] is None
+    assert r["external_invested"] == 0.0
+    assert r["final_equity"] == 0.0
+
+
+def test_external_cap_none_matches_legacy():
+    # 缺省（无限预算）与显式 None 完全一致
+    closes = [100.0] * H + [30.0, 29.7, 29.4, 29.1, 100.0]
+    a = run_coin("T", _dates(len(closes)), np.array(closes), P)
+    b = run_coin("T", _dates(len(closes)), np.array(closes), P,
+                 external_cap=None)
+    assert a["external_invested"] == b["external_invested"]
+    assert a["open_round"]["k_level"] == b["open_round"]["k_level"]
+    assert a["final_equity"] == b["final_equity"]

@@ -1,4 +1,4 @@
-# stock-screener · v8.0.0（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.1（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -251,7 +251,7 @@ UTC 日界）· `/api/gateway` · `/api/lake/status`。
 .venv/bin/python -m crypto.sync --full         # 全量历史（vision 月度快照 + REST 尾巴）
 .venv/bin/python -m crypto.backtest            # 全史回测 → data/crypto/backtest_report.md
 .venv/bin/python -m crypto.backtest --start 2021-11-11 --end 2026-11-11
-.venv/bin/python -m crypto.backtest.paramsearch --start --end --coins --out   # 参数网格寻优（v7.0.55）
+.venv/bin/python -m crypto.backtest.paramsearch --start --end --coins --base --budget --out   # 参数网格寻优（v7.0.55 / v8.0.1 预算）
 ```
 
 **参数寻优**（v7.0.55，`crypto/backtest/paramsearch.py`）：建仓回撤 × 止盈倍数 ×
@@ -342,8 +342,31 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.0）
+## 10. 版本历史（v7.0.11 → v8.0.1）
 
+- **v8.0.1**：回测资金预算 + 起始资金寻优（Joel 2026-11-11："目前投入
+  3000usd，基于这个资金量看看起始资金和加仓比例设置多少"）：
+  - **引擎**（`engine.run_coin`）：新增 `external_cap` 外部投入硬预算
+    （USDT，累计口径）——买不起的档位**整档放弃、不做部分买入**：首仓
+    买不起 → 不建仓；加仓买不起 → 该轮截断（`capped=True` 标记，报告
+    ✂）。余额（了结所得滚存）不受预算限。缺省 None = 无限（原行为）。
+  - **runner/CLI**：`run_backtest(..., external_cap=…)` 透传；报告轮次
+    表加 ✂截断 标记。
+  - **paramsearch**：新增 `--base`（起始资金网格，默认
+    10,30,100,300,1000）+ `--budget`（外部投入硬预算 USDT）；报告表加
+    起始资金列 + 外部投入/预算（✂=被截断）。
+  - 近 5 年 3000 U 预算寻优报告 `data/crypto/param_search_3k.md`
+    （5 起始资金 × 3 回撤 × 4 止盈 × 4 加仓 = 240 组合/币）：**起始
+    10~30 U 单位效率最高**（70% 回撤整轮只需 288~2386 U，预算宽松）；
+    起始 ≥100 U 深跌段被截断（1000 U 首仓只买得起首仓+1 级），单位
+    效率递减（BTC 70%/5x：base30 每 U 外部 6.05 U 期末 → base1000 5.18 U）；
+    加仓倍数 1.02~1.10 在 3000 U 内都装得下（base≤30），ROI 随 growth
+    略升（深档均价更低）——预算不是压制 growth 的理由，budget 约束只在
+    base≥100 或 50/60% 浅回撤时生效。推荐：BTC 30 U / 70% / 5x / 1.05
+    （外部 2,386 U → +492%，2024-12 落袋）；ETH 10 U / 70% / 3x / 1.05
+    （外部 1,077 U → +313%，2025-08 落袋）。
+  - 测试：+3 例（预算截断精确对账 / 首仓买不起跳过 / None=原行为）；
+    crypto 46/46 绿。
 - **v8.0.0**：major 版本——加密货币系统升格为双系统主特性（2026-11-11 Joel
   「推成 v8」）；A 股侧零改动（策略/数学/数据不变）：
   - 加密货币模块系列（v7.0.42~v7.0.55，详见下）：旧 Quant 清理 + 双系统登录

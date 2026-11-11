@@ -88,6 +88,7 @@ def run_coin(
     closes: np.ndarray,
     p: StrategyParams,
     h1y: np.ndarray | None = None,
+    external_cap: float | None = None,
 ) -> Dict[str, Any]:
     """单币状态机回测（1h 收盘价序列）。
 
@@ -95,6 +96,10 @@ def run_coin(
         runner 用**含窗口前历史**的完整序列计算后切片传入——保证窗口
         起点的第一根 bar 就有准确的一年高点；缺省 = 用 closes 自算
         （全史回测，头部部分窗口）。
+    :param external_cap: 可选的外部投入硬预算（USDT，累计口径）。预算
+        耗尽后：首仓买不起 → 不建仓（每 bar 重试）；加仓买不起 → 该轮
+        截断（后续档位同样买不起，直接停）。**不做部分买入**（整档全买
+        或放弃）。余额（了结所得）不受此限。缺省 = 预算无限（原行为）。
     :returns: 结果 dict：已了结轮次 rounds + 未了结 open_round +
         净值曲线 equity（= 持仓市值 + 余额）+ 最大回撤 mdd_pct +
         事件序列 events + external_invested（累计外部投入）+
@@ -128,38 +133,55 @@ def run_coin(
     realized_cash = 0.0  # 已了结轮次净盈亏累计（proceeds − spent）
     wallet = 0.0         # 账户余额现金（了结所得滚存；恒 ≥ 0）
     external = 0.0       # 累计外部投入（余额不足时才追加）
+    capped = False       # 本轮是否因预算截断（external_cap 生效）
     rounds: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []  # 图表事件：entry/add/exit（日期+级数+价）
     equity = np.empty(n, dtype=float)
 
-    def _fund(amount: float) -> None:
-        """买入出资：先扣余额，余额不足部分计外部投入（账户模型）。"""
+    def _fund(amount: float) -> float:
+        """买入出资：先扣余额，不足部分计外部投入（账户模型）。
+
+        external_cap 生效时外部投入累计封顶（硬预算、**不做部分买入**）：
+        可用资金 < 整档金额 → 返回 0（调用方整档放弃）；否则全额出资
+        并返回 amount。
+        """
         nonlocal wallet, external
-        take = min(wallet, amount)
-        wallet -= take
-        external += amount - take
+        avail = wallet + (
+            (external_cap - external)
+            if external_cap is not None else float("inf"))
+        if avail < amount - _EPS:
+            return 0.0
+        take = amount
+        from_wallet = min(wallet, take)
+        wallet -= from_wallet
+        external += take - from_wallet
+        return take
 
     for i in range(n):
         c = float(c_arr[i])
         if not in_pos:
-            # 1) 建仓：价 ≤ 一年高点 × 30%
+            # 1) 建仓：价 ≤ 一年高点 × 30%（预算不足 → 不建仓，下 bar 重试）
             if c <= h1y[i] * trig + _EPS:
-                in_pos = True
-                entry = c
-                round_start = i
-                k = 0
                 usdt = p.base_amount_usdt
-                _fund(usdt)
-                shares = usdt * (1.0 - fee) / c
-                round_spent = usdt
-                events.append({"date": str(dates[i])[:10], "type": "entry",
-                               "level": 0, "price": round(c, 4)})
+                if _fund(usdt) > 0.0:
+                    in_pos = True
+                    entry = c
+                    round_start = i
+                    k = 0
+                    capped = False
+                    shares = usdt * (1.0 - fee) / c
+                    round_spent = usdt
+                    events.append({"date": str(dates[i])[:10], "type": "entry",
+                                   "level": 0, "price": round(c, 4)})
         else:
-            # 2) 加仓：固定网格 entry×(1−grid×k)，跳空穿多级 → 同 bar 逐级
+            # 2) 加仓：固定网格 entry×(1−grid×k)，跳空穿多级 → 同 bar 逐级；
+            #    预算不足 → 本轮截断（后续档位更贵，同样买不起）
             while k < _MAX_LEVELS and c <= entry * (1.0 - grid * (k + 1)) + _EPS:
+                usdt = p.base_amount_usdt * (p.growth ** (k + 1))
+                if _fund(usdt) <= 0.0:
+                    capped = True
+                    break
                 k += 1
-                usdt = p.base_amount_usdt * (p.growth ** k)
-                _fund(usdt)
                 shares += usdt * (1.0 - fee) / c
                 round_spent += usdt
                 events.append({"date": str(dates[i])[:10], "type": "add",
@@ -183,6 +205,7 @@ def run_coin(
                     "proceeds_usdt": round(proceeds, 2),
                     "pnl_usdt": round(pnl, 2),
                     "pnl_pct": round(pnl / round_spent * 100.0, 2),
+                    "capped": capped,
                 })
                 in_pos = False
                 shares = 0.0
@@ -190,6 +213,7 @@ def run_coin(
                 round_start = -1
                 k = 0
                 round_spent = 0.0
+                capped = False
         # 净值 = 持仓市值 + 余额（账户口径；首轮余额恒 0，与原口径一致）
         equity[i] = shares * c + wallet
 
@@ -210,6 +234,7 @@ def run_coin(
             "unrealized_pct": round((shares * last / round_spent - 1.0) * 100.0, 2),
             "tp_price": round(entry * p.take_profit_mult, 4),
             "bars_holding": n - round_start,
+            "capped": capped,
         }
 
     # 最大回撤（基于净值曲线；净值恒 ≥0，peak=0 段回撤视为 0）

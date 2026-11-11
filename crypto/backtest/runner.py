@@ -82,6 +82,7 @@ def run_backtest(
     lake_path: str = LAKE_PATH,
     start: str | None = None,
     end: str | None = None,
+    external_cap: float | None = None,
 ) -> List[Dict[str, Any]]:
     """逐币跑引擎 → 结果列表（含 equity 曲线，供报告/绘图）。
 
@@ -89,6 +90,9 @@ def run_backtest(
     窗口内账户从空开始（了结余额/外部投入均为窗口内口径）；但一年高点
     用**窗口前 lookback_h 根 bar 的前置历史**参与计算（只用于高点，不产生
     交易）——保证窗口起点第一根 bar 的触发阈值与全史一致。
+
+    预算（v7.0.56）：external_cap = 外部投入硬预算（USDT，累计口径）；
+    买不起的档位整档放弃（不做部分买入），余额（了结所得）不受限。
     """
     from crypto.strategy.engine import rolling_high_1y
     start_ts = _date_to_ts(start) if start else None
@@ -108,13 +112,15 @@ def run_backtest(
         else:
             h1y = None
         dates = (ts // 86400).astype("datetime64[D]")
-        out.append(run_coin(sym, dates, closes, p, h1y=h1y))
+        out.append(run_coin(sym, dates, closes, p, h1y=h1y,
+                            external_cap=external_cap))
     return out
 
 
 def _fmt_open(r: Dict[str, Any]) -> str:
+    cap_s = "，预算截断（该档买不起）" if r.get("capped") else ""
     return (f"{r['entry_date']} 建仓 {r['entry']} → 现 {r['last_price']}，"
-            f"已加仓 {r['k_level']} 级，投入 {r['spent_usdt']} USDT，"
+            f"已加仓 {r['k_level']} 级，投入 {r['spent_usdt']} USDT{cap_s}，"
             f"浮盈 {r['unrealized_usdt']} USDT（{r['unrealized_pct']}%），"
             f"止盈线 {r['tp_price']}（持有 {r['bars_holding']}h）")
 
@@ -165,9 +171,10 @@ def render_report(
                 "|---|---|---|---|---|---|---|---|---|---|",
             ]
             for rd in r["rounds"]:
+                cap_mark = "✂截断" if rd.get("capped") else ""
                 lines.append(
                     f"| {rd['entry_date']} | {rd['entry']} | {rd['exit_date']} "
-                    f"| {rd['exit_price']} | {rd['bars']} | {rd['max_level']} "
+                    f"| {rd['exit_price']} | {rd['bars']} | {rd['max_level']}{cap_mark} "
                     f"| {rd['spent_usdt']} | {rd['proceeds_usdt']} "
                     f"| {rd['pnl_usdt']} | {rd['pnl_pct']}% |")
             lines.append("")
