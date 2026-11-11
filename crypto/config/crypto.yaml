@@ -1,0 +1,48 @@
+# 加密货币系统配置（v7.0.43 框架）。
+# 数据源：Binance 主源 + OKX 交叉校验（2026-11-11 EU 直连实测全通，均无需 key）。
+# 本文件是加密货币系统的唯一配置入口（对应股票侧 config/strategy.yaml 的角色）。
+
+web:
+  host: "0.0.0.0"
+  port: 9091              # 沿用旧 Quant 塔端口（已验证空闲）
+
+lake:
+  # 相对仓库根；与 A 股 data/lake/lake.duckdb 物理隔离（DuckDB 单写锁，禁共库）
+  path: "data/lake/crypto.duckdb"
+  state_file: "data/crypto_sync_state.json"   # 最近同步状态（数据湖 tab 展示）
+
+source:
+  primary: binance        # 切备源：改 primary: okx（1 行）
+  backup: okx
+  timeout_s: 10
+  cross_check: true       # 每次同步比对两源最近 24h 收盘价
+  cross_check_warn_pct: 0.1
+
+sync:
+  interval: "1h"          # 基础 K 线粒度（4h/1d 由 1h 本地聚合，不单独取数）
+  backfill_window_h: 3    # 日常增量回补窗口（自愈漏同步/交易所补发）
+  backfill_start: "2019-01-01"   # 全量回填起点（Binance 实测 1h 历史至此）
+  request_pause_s: 0.15   # 批量请求间隔（限速余量 >99%）
+
+# 币种清单（Binance USDT 现货）。框架阶段 top 20；增删 = 改这里重跑 sync 即可。
+coins:
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - DOGEUSDT
+  - AVAXUSDT
+  - LINKUSDT
+  - DOTUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - TRXUSDT
+  - NEARUSDT
+  - POLUSDT
+  - ATOMUSDT
+  - UNIUSDT
+  - XLMUSDT
+  - ETCUSDT
+  - VETUSDT

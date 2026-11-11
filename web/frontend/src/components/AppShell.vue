@@ -4,6 +4,7 @@
 //   已挂载过的 tab 用 keep-alive 保活（切回状态仍在）。
 // v7.0.2：页签重排——回测移到第三位（主入口=我的持仓）；回测内新增策略选择（策略库快照）。
 // v7.0.12：候选池不设独立页签——池即策略页签「股票池」卡片（含选股门槛 + 手动池录入条）。
+// v7.0.43：顶栏恢复加密货币系统跳转入口（:9091，独立系统，cookie 跨端口免登）。
 <script setup>
 import { ref } from "vue";
 import ToastBar from "./ToastBar.vue";
@@ -23,6 +24,9 @@ const TABS = [
 // 默认激活第一个页签（v7.0.2：我的持仓 = 日常主入口）
 const active = ref("my_positions");
 
+// v7.0.43：加密货币系统跳转（同 hostname，cookie 按 host 不按端口 → 已登录免登）
+const cryptoUrl = "http://" + window.location.hostname + ":9091/";
+
 // v7.0.14：顶栏显示当前用户 + 退出（回登录页，cookie 清除）
 const auth = useAuthStore();
 async function doLogout() {
@@ -37,6 +41,7 @@ async function doLogout() {
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
     <ToastBar />
+    <a class="topbar-jump" :href="cryptoUrl" title="跳转加密货币系统（:9091，已登录免登）">🪙 加密货币</a>
     <div class="topbar-auth">
       <span class="topbar-user">👤 {{ auth.user }}</span>
       <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
@@ -60,6 +65,12 @@ async function doLogout() {
 </template>
 
 <style scoped>
+.topbar-jump {
+  margin-left: auto; font-size: 13px; color: #9a6b00; text-decoration: none;
+  padding: 4px 12px; border: 1px solid #e0cf9a; border-radius: 8px; background: #fff;
+  white-space: nowrap;
+}
+.topbar-jump:hover { background: #fbf6e8; }
 .topbar-auth { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .topbar-user { font-size: 12px; color: #666; }
 .topbar-logout {

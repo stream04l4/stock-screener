@@ -52,13 +52,14 @@ beforeEach(() => {
 });
 
 describe("App 登录门禁", () => {
-  it("未登录（me 401）→ 登录页；A股登录按钮在位；加载态不渲染页签", async () => {
+  it("未登录（me 401）→ 登录页；双入口按钮在位（v7.0.43 恢复）；加载态不渲染页签", async () => {
     const w = mk();
     expect(isLogin(w)).toBe(false); // checked=false 加载中
     await flushPromises();
     expect(isLogin(w)).toBe(true);
-    expect(w.find(".login-title").text()).toContain("A股4维选股");
+    expect(w.find(".login-title").text()).toContain("双系统统一登录");
     expect(w.find(".login-btn-stock").exists()).toBe(true);
+    expect(w.find(".login-btn-crypto").exists()).toBe(true);
     w.unmount();
   });
 

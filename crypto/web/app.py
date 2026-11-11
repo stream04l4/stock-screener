@@ -1,0 +1,247 @@
+# -*- coding: utf-8 -*-
+"""crypto.web.app —— 加密货币系统 Web（v7.0.43 框架）。
+
+独立进程 / 独立端口 :9091 / 独立 SPA（crypto/web/frontend/dist）。
+与股票系统（web/app.py，:9090）共享登录：直接 import web.auth（同一
+WEB_SESSION_SECRET，ssc_session cookie 按 hostname 跨端口生效）。
+
+框架阶段端点：
+- 登录三件套 + health（与股票同款）
+- /api/lake/status：数据湖状态（表/行数/每币范围/最近同步）——真实
+- /api/coins、/api/kline：行情查询（湖内 1h K 线）——真实，供后续 tab 用
+- /api/positions、/api/strategy、/api/backtest：骨架占位（ready=false）
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import duckdb
+import yaml
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware import Middleware
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# 仓库根（crypto/web/app.py → 上三级）；stock 侧 web.auth 直接复用
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# vite outDir="../dist"（相对 crypto/web/frontend）→ 产物落 crypto/web/dist
+DIST_DIR = Path(__file__).resolve().parent / "dist"
+
+CFG_PATH = PROJECT_ROOT / "crypto" / "config" / "crypto.yaml"
+with open(CFG_PATH, "r", encoding="utf-8") as _f:
+    CFG = yaml.safe_load(_f)
+
+STATE_PATH = PROJECT_ROOT / CFG["lake"]["state_file"]
+DB_PATH = PROJECT_ROOT / "data" / "lake" / "crypto.duckdb"
+
+app = FastAPI(title="crypto-screener web", version="0.1.0")
+
+
+def _db() -> duckdb.DuckDBPyConnection:
+    if not DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据湖未初始化（先跑 python -m crypto.sync）")
+    return duckdb.connect(str(DB_PATH), read_only=True)
+
+
+# ---------------------------------------------------------------------------
+# 登录（复用股票 web.auth：同 secret、同 cookie 名、同防爆破语义）
+# ---------------------------------------------------------------------------
+from web.auth import (COOKIE_NAME, TOKEN_TTL_S, check_credentials,  # noqa: E402
+                      load_auth_config, lock_status, make_token,
+                      parse_token, record_fail, record_ok)
+
+_AUTH_PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
+_AUTH_DISABLED = os.environ.get("WEB_TEST_NO_AUTH") == "1"
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not _AUTH_DISABLED and path not in _AUTH_PUBLIC_PATHS:
+        _u, _p, secret = load_auth_config()
+        if parse_token(request.cookies.get(COOKIE_NAME), secret) is None:
+            return JSONResponse({"detail": "未登录或会话已过期，请先登录"}, status_code=401)
+    return await call_next(request)
+
+
+class _LoginBody(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+@app.post("/api/login")
+def login(body: _LoginBody, request: Request, response: Response) -> Dict[str, Any]:
+    """与股票系统同一账号；cookie 按 hostname 跨端口 → 股票 :9090 同步免登。"""
+    admin_user, admin_pass, secret = load_auth_config()
+    if not admin_user or not admin_pass:
+        raise HTTPException(status_code=500,
+                            detail="登录凭据未配置（.env WEB_ADMIN_USER/WEB_ADMIN_PASS）")
+    ip = request.client.host if request.client else "unknown"
+    if lock_status(ip):
+        raise HTTPException(status_code=429, detail="失败次数过多，请 2 分钟后再试")
+    if not check_credentials(body.username, body.password, admin_user, admin_pass):
+        record_fail(ip)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    record_ok(ip)
+    response.set_cookie(COOKIE_NAME, make_token(admin_user, secret), max_age=TOKEN_TTL_S,
+                        httponly=True, samesite="lax", path="/")
+    return {"ok": True, "user": admin_user}
+
+
+@app.post("/api/logout")
+def logout(response: Response) -> Dict[str, Any]:
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> Dict[str, Any]:
+    _u, _p, secret = load_auth_config()
+    user = parse_token(request.cookies.get(COOKIE_NAME), secret)
+    if user is None:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+    return {"user": user}
+
+
+@app.get("/api/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "system": "crypto-screener", "version": "0.1.0",
+            "port": CFG["web"]["port"]}
+
+
+# ---------------------------------------------------------------------------
+# 数据湖（真实）
+# ---------------------------------------------------------------------------
+@app.get("/api/lake/status")
+def lake_status() -> Dict[str, Any]:
+    from crypto import models
+    st = models.stats(str(PROJECT_ROOT))
+    try:
+        import json
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            st["last_sync"] = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        st["last_sync"] = None
+    return st
+
+
+# ---------------------------------------------------------------------------
+# 行情查询（湖内 1h K 线；真实，供后续 tab 扩展）
+# ---------------------------------------------------------------------------
+_INTERVAL_AGG = {
+    # 1h 基础粒度；4h/1d 本地聚合（GROUP BY 小时整除）
+    "1h": None, "4h": 4, "1d": 24,
+}
+
+
+@app.get("/api/coins")
+def coins() -> Dict[str, Any]:
+    """币列表 + 湖内最新 1h 收盘（实时 24h ticker 后续版本接源缓存）。"""
+    con = _db()
+    try:
+        rows = con.execute("""
+            SELECT m.symbol, m.is_active, k.ts, k.close
+            FROM coin_master m
+            LEFT JOIN (
+                SELECT symbol, ts, close FROM kline_1h a
+                WHERE exchange='binance' AND ts = (
+                    SELECT MAX(ts) FROM kline_1h b
+                    WHERE b.exchange='binance' AND b.symbol = a.symbol)
+            ) k USING (symbol)
+            ORDER BY m.symbol
+        """).fetchall()
+        import datetime as dt
+        out = [{"symbol": s, "active": bool(act),
+                "last_close": c,
+                "last_ts": dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+                if t else None}
+               for s, act, t, c in rows]
+        return {"coins": out}
+    finally:
+        con.close()
+
+
+@app.get("/api/kline")
+def kline(symbol: str = Query(..., description="Binance 格式，如 BTCUSDT"),
+          interval: str = "1h",
+          from_ts: Optional[int] = Query(None),
+          to_ts: Optional[int] = Query(None),
+          limit: int = Query(720, le=20000)) -> Dict[str, Any]:
+    """湖内 K 线（1h 原始；4h/1d 本地聚合）。升序。"""
+    if interval not in _INTERVAL_AGG:
+        raise HTTPException(status_code=400, detail="interval 仅支持 1h/4h/1d")
+    agg = _INTERVAL_AGG[interval]
+    con = _db()
+    try:
+        where = "exchange='binance' AND symbol=?"
+        params: list = [symbol]
+        if from_ts is not None:
+            where += " AND ts>=?"; params.append(int(from_ts))
+        if to_ts is not None:
+            where += " AND ts<=?"; params.append(int(to_ts))
+        if agg:
+            bucket = agg * 3600
+            sql = f"""
+                SELECT ts/{bucket}*{bucket} AS ts,
+                       MIN(open) AS open, MAX(high) AS high, MIN(low) AS low,
+                       MAX_BY(close, ts) AS close,
+                       SUM(volume) AS volume, SUM(quote_volume) AS quote_volume
+                FROM kline_1h WHERE {where}
+                GROUP BY 1 ORDER BY 1 DESC LIMIT ?
+            """
+            params.append(int(limit))
+        else:
+            sql = f"""
+                SELECT ts, open, high, low, close, volume, quote_volume
+                FROM kline_1h WHERE {where}
+                ORDER BY ts DESC LIMIT ?
+            """
+            params.append(int(limit))
+        rows = con.execute(sql, params).fetchall()
+        rows.reverse()  # → 升序
+        return {"symbol": symbol, "interval": interval,
+                "bars": [{"ts": int(r[0]), "open": r[1], "high": r[2], "low": r[3],
+                          "close": r[4], "volume": r[5], "quote_volume": r[6]}
+                         for r in rows]}
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# 四 tab 骨架占位（内容后续慢慢完善）
+# ---------------------------------------------------------------------------
+@app.get("/api/positions")
+def positions() -> Dict[str, Any]:
+    return {"ready": False, "detail": "我的持仓：框架已搭，功能待完善（P2 手动登记）"}
+
+
+@app.get("/api/strategy")
+def strategy() -> Dict[str, Any]:
+    return {"ready": False, "detail": "策略：框架已搭，功能待完善"}
+
+
+@app.get("/api/backtest")
+def backtest() -> Dict[str, Any]:
+    return {"ready": False, "detail": "回测：框架已搭，功能待完善"}
+
+
+# ---------------------------------------------------------------------------
+# 静态前端（最后挂载，避免吞掉 /api/*）
+# ---------------------------------------------------------------------------
+if DIST_DIR.exists():
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/")
+    def index() -> FileResponse:
+        return FileResponse(str(DIST_DIR / "index.html"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=CFG["web"]["host"], port=int(CFG["web"]["port"]))

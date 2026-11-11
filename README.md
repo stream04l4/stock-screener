@@ -1,4 +1,4 @@
-# stock-screener · v7.0.42（drawdown_martingale 单策略版）
+# stock-screener · v7.0.43（双系统版：A股 + 加密货币）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -374,6 +374,20 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.43**：加密货币系统框架（Joel 2026-11-11 定案：同仓库双系统，加密货币
+  独立页面/进程/服务/数据湖，参照股票四页签，先搭框架慢慢完善）：
+  - 新增顶层包 `crypto/`：Binance 主源 + OKX 交叉校验（EU 直连实测 6/6 200）、
+    `python -m crypto.sync`（幂等，cron 每小时 :05，--full 7 年回填）、
+    独立湖 `data/lake/crypto.duckdb`（top 20 币，与 A 股湖物理隔离）。
+  - 独立 Web：`crypto/web/app.py`（:9091，crypto-web.service）+ 独立 Vue SPA
+    （crypto/web/frontend/）——登录页双入口（恢复 v7.0.42 解耦的双系统登录，
+    ssc_session cookie 按 hostname 跨端口，任一端登录另一端免登），四页签
+    我的持仓/策略/回测/数据湖（框架骨架，数据湖真实展示），顶栏 📉股票 回跳。
+  - 股票侧：登录页恢复双按钮（🪙 加密货币 → :9091）、顶栏加 🪙 加密货币
+    跳转——仅展示层 3 文件；策略/数学/推送/数据零改动。
+  - 验证：跨端口免登双向 200；停 :9091 后 :9090 全功能正常（进程级隔离）；
+    股票前端 253/253 + 加密前端 4/4 绿；sync 实测 20 币 1460 行 + 交叉校验
+    5/5（最大偏差 0.05%）。详见 docs/crypto_design.md（v0.3）。
 - **v7.0.42**：双系统登录解耦（2026-11-11 Joel「把当前本机的加密货币部分完全
   删除掉」，Quant iTransformer 下线）：
   - 登录页移除 ⚡Quant 按钮（回到 A股4维选股单系统入口），顶栏移除 ⚡Quant

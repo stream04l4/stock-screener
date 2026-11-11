@@ -1,0 +1,24 @@
+{
+  "name": "crypto-screener-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "加密货币系统 Web 控制台 —— Vue3+Vite+Pinia SPA（v7.0.43 框架：双入口登录 + 我的持仓/策略/回测/数据湖四 tab 骨架；独立 :9091，dev-only :5175）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "pinia": "^4.0.3",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "@vue/test-utils": "^2.5.1",
+    "happy-dom": "^20.14.5",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}
