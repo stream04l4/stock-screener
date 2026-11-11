@@ -119,10 +119,16 @@ def run_backtest(
 
 def _fmt_open(r: Dict[str, Any]) -> str:
     cap_s = "，预算截断（该档买不起）" if r.get("capped") else ""
+    tp_s = (f"止盈线 {r['tp_price']}" if r.get("tp_price") is not None
+            else "无止盈线")
+    trail_s = ""
+    if r.get("trail_on"):
+        trail_s = (f"，追踪止损已激活（峰值 {r['trail_peak']}，"
+                   f"平仓线 {r['trail_stop']}）")
     return (f"{r['entry_date']} 建仓 {r['entry']} → 现 {r['last_price']}，"
             f"已加仓 {r['k_level']} 级，投入 {r['spent_usdt']} USDT{cap_s}，"
             f"浮盈 {r['unrealized_usdt']} USDT（{r['unrealized_pct']}%），"
-            f"止盈线 {r['tp_price']}（持有 {r['bars_holding']}h）")
+            f"{tp_s}{trail_s}（持有 {r['bars_holding']}h）")
 
 
 def render_report(
@@ -150,7 +156,15 @@ def render_report(
         f"首仓 {p.base_amount_usdt:g} USDT",
         f"- 加仓：固定网格 建仓价 × (1 − {p.add_grid_pct:g}% × k)，第 k 级 "
         f"{p.base_amount_usdt:g} × {p.growth:g}^k USDT，不设上限",
-        f"- 止盈：价 ≥ 建仓价 × {p.take_profit_mult:g} → 全卖，entry 重置",
+        (f"- 固定止盈：价 ≥ 建仓价 × {p.take_profit_mult:g} → 全卖"
+         if p.take_profit_mult is not None else "- 固定止盈：关闭"),
+    ]
+    if p.trail_activation_mult is not None and p.trail_drawdown_pct is not None:
+        lines.append(
+            f"- 追踪止损：价 ≥ 建仓价 × {p.trail_activation_mult:g} 激活，"
+            f"自激活后最高收盘回撤 {p.trail_drawdown_pct:.0%} 平仓"
+            "（与固定止盈先到先了结）")
+    lines += [
         f"- 持有：上涨不加仓，新高不刷新建仓价",
         f"- 手续费：{p.fee_bps:g} bps（买卖双向）；执行：1h 收盘价",
         f"- 一年高点：滚动 {p.lookback_h}h 收盘价最大（数据头不足一年用部分窗口）",
@@ -167,19 +181,22 @@ def render_report(
             lines += [
                 f"### 已了结轮次（{len(r['rounds'])}）",
                 "",
-                "| 建仓日 | 建仓价 | 止盈日 | 止盈价 | 持有(h) | 最深层 | 投入 | 所得 | 盈亏 | 收益率 |",
-                "|---|---|---|---|---|---|---|---|---|---|",
+                "| 建仓日 | 建仓价 | 了结日 | 了结价 | 了结方式 | 持有(h) | 最深层 | 投入 | 所得 | 盈亏 | 收益率 |",
+                "|---|---|---|---|---|---|---|---|---|---|---|",
             ]
             for rd in r["rounds"]:
                 cap_mark = "✂截断" if rd.get("capped") else ""
+                reason = "止盈" if rd.get("reason") == "tp" else "追踪止损"
+                peak_s = f"（峰 {rd['peak_price']}）" if rd.get("peak_price") else ""
                 lines.append(
                     f"| {rd['entry_date']} | {rd['entry']} | {rd['exit_date']} "
-                    f"| {rd['exit_price']} | {rd['bars']} | {rd['max_level']}{cap_mark} "
+                    f"| {rd['exit_price']} | {reason}{peak_s} | {rd['bars']} "
+                    f"| {rd['max_level']}{cap_mark} "
                     f"| {rd['spent_usdt']} | {rd['proceeds_usdt']} "
                     f"| {rd['pnl_usdt']} | {rd['pnl_pct']}% |")
             lines.append("")
         else:
-            lines += ["### 已了结轮次", "", "无（10x 止盈从未触发）。", ""]
+            lines += ["### 已了结轮次", "", "无（出场条件从未触发）。", ""]
         o = r["open_round"]
         if o:
             lines += ["### 未了结轮次（持仓中）", "", _fmt_open(o), ""]

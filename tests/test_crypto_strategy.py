@@ -281,3 +281,82 @@ def test_external_cap_none_matches_legacy():
     assert a["external_invested"] == b["external_invested"]
     assert a["open_round"]["k_level"] == b["open_round"]["k_level"]
     assert a["final_equity"] == b["final_equity"]
+
+
+# ---------------------------------------------------------------------------
+# 追踪止损（v8.0.5）：价 ≥ 建仓价×act 激活，自激活后最高收盘回撤 dd% 平仓
+# ---------------------------------------------------------------------------
+def test_params_from_cfg_trail_and_null_tp():
+    p = StrategyParams.from_cfg({"strategy": {
+        "take_profit_mult": None,
+        "trail_activation_mult": 1.5, "trail_drawdown_pct": 0.2}})
+    assert p.take_profit_mult is None
+    assert p.trail_activation_mult == 1.5
+    assert p.trail_drawdown_pct == 0.2
+
+
+def test_trail_stop_exits_on_20pct_pullback():
+    # fee=0：30 建仓 → 45（=1.5×30 激活，初峰 45）→ 48（峰 48）
+    # → 38.4（=48×0.8 → 追踪止损平仓）
+    p = StrategyParams(fee_bps=0, take_profit_mult=None,
+                       trail_activation_mult=1.5, trail_drawdown_pct=0.2)
+    closes = [100.0] * H + [30.0, 45.0, 48.0, 38.4, 100.0]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p)
+    assert len(r["rounds"]) == 1
+    rd = r["rounds"][0]
+    assert rd["reason"] == "trail"
+    assert rd["entry"] == 30.0
+    assert rd["exit_price"] == 38.4
+    assert rd["peak_price"] == 48.0
+    assert rd["proceeds_usdt"] == pytest.approx(10.0 / 30.0 * 38.4, abs=0.01)
+    assert rd["pnl_usdt"] == pytest.approx(10.0 / 30.0 * 38.4 - 10.0,
+                                           abs=0.01)
+
+
+def test_trail_ignores_pullback_before_activation():
+    # 30 建仓 → 42（=1.4×，未激活）→ 30.5（距峰 42 回撤 17.5% 但未激活
+    # → 不平仓）；未激活轮次 tp_price=None（无固定止盈）
+    p = StrategyParams(fee_bps=0, take_profit_mult=None,
+                       trail_activation_mult=1.5, trail_drawdown_pct=0.2)
+    closes = [100.0] * H + [30.0, 42.0, 30.5]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p)
+    assert r["rounds"] == []
+    o = r["open_round"]
+    assert o is not None and o["trail_on"] is False
+    assert o["tp_price"] is None
+
+
+def test_trail_rides_monotonic_rise():
+    # 激活后单调上涨（无 20% 回撤）一路持有到收盘，平仓线跟随峰值
+    p = StrategyParams(fee_bps=0, take_profit_mult=None,
+                       trail_activation_mult=1.5, trail_drawdown_pct=0.2)
+    closes = [100.0] * H + [30.0, 45.0, 60.0, 90.0, 120.0]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p)
+    assert r["rounds"] == []
+    o = r["open_round"]
+    assert o["trail_on"] is True
+    assert o["trail_peak"] == 120.0
+    assert o["trail_stop"] == pytest.approx(96.0)
+
+
+def test_trail_survives_shallow_pullback():
+    # 45 激活 → 48 峰 → 40（回撤 16.7% < 20% 不触发）→ 50 新峰 → 仍持仓
+    p = StrategyParams(fee_bps=0, take_profit_mult=None,
+                       trail_activation_mult=1.5, trail_drawdown_pct=0.2)
+    closes = [100.0] * H + [30.0, 45.0, 48.0, 40.0, 50.0]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p)
+    assert r["rounds"] == []
+    o = r["open_round"]
+    assert o["trail_peak"] == 50.0
+    assert o["trail_stop"] == pytest.approx(40.0)
+
+
+def test_fixed_tp_wins_over_trail():
+    # 固定止盈 1.4× 低于激活线 1.5× → 止盈先了结，追踪从未激活
+    p = StrategyParams(fee_bps=0, take_profit_mult=1.4,
+                       trail_activation_mult=1.5, trail_drawdown_pct=0.2)
+    closes = [100.0] * H + [30.0, 42.0, 100.0]
+    r = run_coin("T", _dates(len(closes)), np.array(closes), p)
+    assert len(r["rounds"]) == 1
+    assert r["rounds"][0]["reason"] == "tp"
+    assert r["rounds"][0]["exit_price"] == 42.0

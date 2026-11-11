@@ -11,6 +11,10 @@
    滚动高点——加密侧一轮内 entry 恒定，直到止盈了结）。
 4. 止盈：收盘价 ≥ entry × 10 → 全部卖出，本轮结束；entry 重置，
    下一轮重新等规则 1（一年高点滚动重算）触发。
+5. 追踪止损（可选，v8.0.5）：收盘价 ≥ entry × trail_activation_mult
+   （如 1.5）时激活；激活后跟踪最高收盘价，收盘自最高价回撤
+   trail_drawdown_pct（如 20%）→ 全部卖出（reason="trail"）。与固定
+   止盈并存时先到先了结；take_profit_mult=None 关闭固定止盈（纯追踪）。
 
 执行口径：1h K 线收盘价成交；跳空一下穿多级 → 同一 bar 逐级加仓；
 taker 手续费 fee_bps（默认 10bps = Binance 现货 0.1%），买卖双向计。
@@ -43,22 +47,29 @@ class StrategyParams:
     add_grid_pct: float = 1.0        # 加仓级距：建仓价的 1%/级（固定网格）
     base_amount_usdt: float = 10.0   # 初始建仓金额
     growth: float = 1.05             # 每次加仓 × 1.05
-    take_profit_mult: float = 10.0   # 止盈：价 ≥ 建仓价 × 10
+    take_profit_mult: float | None = 10.0   # 固定止盈：价 ≥ 建仓价 × 10（None = 关闭）
     fee_bps: float = 10.0            # taker 手续费（0 = 关闭）
     lookback_h: int = 8760           # 一年高点窗口（小时）
+    trail_activation_mult: float | None = None  # 追踪止损激活：价 ≥ 建仓价 × 1.5
+    trail_drawdown_pct: float | None = None     # 追踪止损平仓：自最高收盘回撤 20%
 
     @classmethod
     def from_cfg(cls, cfg: Dict[str, Any]) -> "StrategyParams":
         """从 crypto.yaml 全文的 strategy 段构造；缺省字段用默认值。"""
         s = cfg.get("strategy", {}) or {}
+        tp = s.get("take_profit_mult", 10.0)
+        act = s.get("trail_activation_mult")
+        dd = s.get("trail_drawdown_pct")
         return cls(
             first_drop_pct=float(s.get("first_drop_pct", 70.0)),
             add_grid_pct=float(s.get("add_grid_pct", 1.0)),
             base_amount_usdt=float(s.get("base_amount_usdt", 10.0)),
             growth=float(s.get("growth", 1.05)),
-            take_profit_mult=float(s.get("take_profit_mult", 10.0)),
+            take_profit_mult=float(tp) if tp is not None else None,
             fee_bps=float(s.get("fee_bps", 10.0)),
             lookback_h=int(s.get("lookback_h", 8760)),
+            trail_activation_mult=float(act) if act is not None else None,
+            trail_drawdown_pct=float(dd) if dd is not None else None,
         )
 
     def trigger_frac(self) -> float:
@@ -134,6 +145,8 @@ def run_coin(
     wallet = 0.0         # 账户余额现金（了结所得滚存；恒 ≥ 0）
     external = 0.0       # 累计外部投入（余额不足时才追加）
     capped = False       # 本轮是否因预算截断（external_cap 生效）
+    trail_on = False     # 本轮追踪止损是否已激活（价 ≥ entry × act）
+    trail_peak = 0.0     # 激活后跟踪的最高收盘价
     rounds: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []  # 图表事件：entry/add/exit（日期+级数+价）
     equity = np.empty(n, dtype=float)
@@ -169,6 +182,8 @@ def run_coin(
                     round_start = i
                     k = 0
                     capped = False
+                    trail_on = False
+                    trail_peak = 0.0
                     shares = usdt * (1.0 - fee) / c
                     round_spent = usdt
                     events.append({"date": str(dates[i])[:10], "type": "entry",
@@ -186,8 +201,22 @@ def run_coin(
                 round_spent += usdt
                 events.append({"date": str(dates[i])[:10], "type": "add",
                                "level": k, "price": round(c, 4)})
-            # 3) 止盈：价 ≥ 建仓价 × 10 → 全卖，本轮了结；所得滚入余额
-            if c >= entry * p.take_profit_mult - _EPS:
+            # 3) 追踪止损（启用时）：价 ≥ entry×act 激活（当 bar 收盘为初峰）；
+            #    之后跟踪激活后最高收盘，收盘自峰值回撤 dd% → 了结
+            hit_trail = False
+            if (p.trail_activation_mult is not None
+                    and p.trail_drawdown_pct is not None):
+                if not trail_on and c >= entry * p.trail_activation_mult - _EPS:
+                    trail_on = True
+                    trail_peak = c
+                if trail_on:
+                    if c > trail_peak:
+                        trail_peak = c
+                    hit_trail = c <= trail_peak * (1.0 - p.trail_drawdown_pct) + _EPS
+            # 4) 固定止盈（启用时）：价 ≥ entry × mult → 全卖；先到先了结
+            hit_tp = (p.take_profit_mult is not None
+                      and c >= entry * p.take_profit_mult - _EPS)
+            if hit_tp or hit_trail:
                 proceeds = shares * c * (1.0 - fee)
                 pnl = proceeds - round_spent
                 realized_cash += pnl
@@ -206,6 +235,8 @@ def run_coin(
                     "pnl_usdt": round(pnl, 2),
                     "pnl_pct": round(pnl / round_spent * 100.0, 2),
                     "capped": capped,
+                    "reason": "tp" if hit_tp else "trail",
+                    "peak_price": round(trail_peak, 4) if trail_on else None,
                 })
                 in_pos = False
                 shares = 0.0
@@ -214,6 +245,8 @@ def run_coin(
                 k = 0
                 round_spent = 0.0
                 capped = False
+                trail_on = False
+                trail_peak = 0.0
         # 净值 = 持仓市值 + 余额（账户口径；首轮余额恒 0，与原口径一致）
         equity[i] = shares * c + wallet
 
@@ -221,6 +254,8 @@ def run_coin(
     open_round = None
     if in_pos and shares > 0:
         last = float(c_arr[-1])
+        tp_price = (entry * p.take_profit_mult
+                    if p.take_profit_mult is not None else None)
         open_round = {
             "entry_date": str(dates[round_start])[:10],
             "entry": round(entry, 4),
@@ -232,7 +267,12 @@ def run_coin(
             "value_usdt": round(shares * last, 2),
             "unrealized_usdt": round(shares * last - round_spent, 2),
             "unrealized_pct": round((shares * last / round_spent - 1.0) * 100.0, 2),
-            "tp_price": round(entry * p.take_profit_mult, 4),
+            "tp_price": round(tp_price, 4) if tp_price is not None else None,
+            "trail_on": trail_on,
+            "trail_peak": round(trail_peak, 4) if trail_on else None,
+            "trail_stop": (round(trail_peak * (1.0 - p.trail_drawdown_pct), 4)
+                           if trail_on and p.trail_drawdown_pct is not None
+                           else None),
             "bars_holding": n - round_start,
             "capped": capped,
         }
