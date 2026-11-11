@@ -341,6 +341,8 @@ _STRATEGY_SCHEMA: Dict[str, Dict[str, tuple]] = {
         # v7.0.12 候选池选股门槛
         "backtest_positive": ("bool", None, None),
         "backtest_window_years": ("int", 1, 30),
+        # v7.0.39：十年回测净收益率下限（%，百分数口径；0 = 原「必须为正」语义）
+        "backtest_min_return_pct": ("float", 0, 1e3),
         "min_ttm_yield_pct": ("float", 0, 100),
         "price_min_yuan": ("float", 0, 1e4),
         "price_max_yuan": ("float", 0, 1e5),

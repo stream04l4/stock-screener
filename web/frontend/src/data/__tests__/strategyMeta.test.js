@@ -72,7 +72,7 @@ describe("strategyMeta · v7 结构", () => {
 });
 
 describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
-  it("FIELD_TYPE = 23 键（strategy 8 + universe 10 + timing 5），类型逐一断言", () => {
+  it("FIELD_TYPE = 24 键（strategy 8 + universe 11 + timing 5），类型逐一断言", () => {
     const expected = {
       name: "str",
       lot_size: "int",
@@ -89,6 +89,7 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
       listing_min_trading_days: "int",
       backtest_positive: "bool",
       backtest_window_years: "int",
+      backtest_min_return_pct: "float",
       min_ttm_yield_pct: "float",
       price_min_yuan: "float",
       price_max_yuan: "float",

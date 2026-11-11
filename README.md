@@ -1,4 +1,4 @@
-# stock-screener · v7.0.38（drawdown_martingale 单策略版）
+# stock-screener · v7.0.39（drawdown_martingale 单策略版）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -42,8 +42,10 @@ Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
 基础 5 条件（`build_pool`）：`kline_daily 5556 只 → 行业白名单(csric2) → SOE(国资前十大股东)
 → 总市值≥200亿 → 上市≥250 bars → 连续分红N年`。
 选股门槛（v7.0.12，Joel 2026-10-24 拍板；波动率门槛经讨论不加）：
-⑦ **十年滚动回测为正**（≥1 次触发且净利>0，含分红扣佣金；预计算表 `selection_backtest_10y`，
-fail-closed：缺行不入选）→ ⑧ **TTM 股息率≥3%** → ⑨ **价格 3~100 元**。
+⑦ **十年滚动回测门槛**（≥1 次触发且净收益率 ≥ backtest_min_return_pct%，默认 20
+——v7.0.39 Joel 定案，原「必须为正」= 0% 门槛；含分红扣佣金；预计算表
+`selection_backtest_10y`，fail-closed：缺行/收益率为 NULL 不入选）→
+⑧ **TTM 股息率≥3%** → ⑨ **价格 3~100 元**。
 **手动添加**：`data/manual_pool.json`（策略页签股票池卡片内的手动录入条 /
 `GET/POST/DELETE /api/pool/manual`）绕过 ⑦⑧⑨ 恒在候选池；退市自动剔除；
 与自动入选重叠时保留自动版并标记 `is_manual`。
@@ -123,8 +125,9 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | min_total_mv_yi | 总市值门槛（亿） |
 | | min_consecutive_div_years | 连续分红年数 |
 | | listing_min_trading_days | 最少上市 bar 数 |
-| | backtest_positive | ⑦ 十年回测为正开关（v7.0.12） |
+| | backtest_positive | ⑦ 十年回测门槛开关（v7.0.12） |
 | | backtest_window_years | ⑦ 回测窗口年数（滚动） |
+| | backtest_min_return_pct | ⑦ 十年回测净收益率下限（%，默认 20；v7.0.39，可选键） |
 | | min_ttm_yield_pct | ⑧ TTM 股息率下限（%） |
 | | price_min_yuan / price_max_yuan | ⑨ 最新价区间（元） |
 | timing（**段可缺省**，缺省=默认值；旧快照无此段时 first_drawdown_pct 回退读 strategy 段） | price_window_years | ① 价格分位窗口（年，默认 5） |
@@ -371,6 +374,22 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.39**：股票池十年回测门槛加收益率百分比（2026-11-10 Joel「十年回测只能
+  选择真或否，需要可以设置收益率百分比门槛，默认 20%，过滤掉一些收益不高的
+  股票」）：
+  - universe 新增 `backtest_min_return_pct`（%，默认 20；**可选键**，老 yaml
+    缺省 20.0——v7.0.30 先例；生产 yaml 显式 20）；G7 语义 = n_buys≥1 且
+    净收益率 ≥ 门槛（原「必须为正」= 0% 门槛；设 0 恢复原语义）；收益率
+    NULL fail-closed；仅在 backtest_positive 开启时生效
+  - 消费链零新代码：池构建/策略页/信号/微信推送全部读预计算表 pnl_pct
+    （selection_backtest_10y 已有列，无湖 schema 变更、无需重算）；PUT
+    /api/strategy schema + 校验 + 策略页字段行（「十年回测收益率下限（%）」，
+    「十年回测必须为正」改名「十年回测门槛」）
+  - 线上实测（重启后）：G7 漏斗 91→73（过滤 18 只正收益但 <20% 的股票），
+    候选池 65→58，成员最低收益率 21.02%
+  - 验证：test_selection 门槛专测 3 组（20% 边界≥/门槛 0 恢复原语义/门槛 50
+    全剔 + NULL fail-closed）、既有门槛用例 fixture 同步（12%→25% 过门槛）、
+    前端 253 绿（21 字段/16 数字输入/PUT 11 键/FIELD_TYPE 24 键同步）
 - **v7.0.38**：回测页买入时间表折叠（2026-11-10 Joel「回测报告里这个买入时间表
   太长了，折叠一下」）：
   - SimpleTable 无分页，池回测 200+ 行（实测 102 股 = 1,394 行）整屏铺开 →

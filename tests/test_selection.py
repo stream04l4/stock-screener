@@ -39,6 +39,7 @@ def make_up(**kw) -> UniverseParams:
         listing_min_trading_days=250,
         backtest_positive=True,
         backtest_window_years=10,
+        backtest_min_return_pct=20.0,   # v7.0.39：生产默认 20%
         min_ttm_yield_pct=3.0,
         price_min_yuan=3.0,
         price_max_yuan=100.0,
@@ -109,26 +110,28 @@ def bt_row(code, n_buys, total_pnl, pnl_pct) -> tuple:
 def test_gates_pass_fail_boundaries():
     up = make_up()
     base = base_pool([
-        ("a.1", 4.0),   # 全过
+        ("a.1", 4.0),   # 全过（收益率 25% ≥ 20 门槛）
         ("b.2", 4.0),   # G7 失败：从未触发
         ("c.3", 4.0),   # G7 失败：净利为负
-        ("d.4", 2.99),  # G8 失败：股息率 2.99 < 3
-        ("e.5", 4.0),   # G9 失败：价格 2.5 < 3
-        ("f.6", 4.0),   # G9 失败：价格 150 > 100
+        ("h.8", 4.0),   # G7 失败（v7.0.39）：正收益 15% < 20% 门槛
+        ("d.4", 2.99),  # G7 fail-closed 先行（无预计算行）
+        ("e.5", 4.0),   # G7 fail-closed（无预计算行）
+        ("f.6", 4.0),   # G7 fail-closed（无预计算行）
         ("g.7", 4.0),   # G7 fail-closed：无预计算行
     ])
     con = make_lake(
-        bt_rows=[bt_row("a.1", 5, 12000.0, 0.12),
+        bt_rows=[bt_row("a.1", 5, 12000.0, 0.25),
                  bt_row("b.2", 0, 0.0, None),
-                 bt_row("c.3", 7, -3000.0, -0.03)],
+                 bt_row("c.3", 7, -3000.0, -0.03),
+                 bt_row("h.8", 4, 1500.0, 0.15)],
         prices={"a.1": 10.0, "b.2": 10.0, "c.3": 10.0, "d.4": 10.0,
-                "e.5": 2.5, "f.6": 150.0, "g.7": 10.0})
+                "e.5": 2.5, "f.6": 150.0, "g.7": 10.0, "h.8": 10.0})
     pool = sel.build_candidate_pool(con, up, base=base)
     assert [m.ts_code for m in pool.members] == ["a.1"]
     fu = pool.funnel
     assert (fu["backtest"], fu["yield"], fu["price"], fu["final"], fu["manual"]) == (1, 1, 1, 1, 0)
     m = pool.members[0]
-    assert m.bt_pnl_pct == 0.12 and m.bt_n_buys == 5 and m.price_latest == 10.0
+    assert m.bt_pnl_pct == 0.25 and m.bt_n_buys == 5 and m.price_latest == 10.0
     con.close()
 
 
@@ -144,10 +147,39 @@ def test_backtest_gate_disabled():
 def test_yield_exact_boundary_passes():
     up = make_up(min_ttm_yield_pct=3.0)
     base = base_pool([("a.1", 3.0)])
-    con = make_lake(bt_rows=[bt_row("a.1", 2, 1000.0, 0.01)],
+    # v7.0.39：a.1 收益率须 ≥ 20% 过 G7，才能测到 G8 股息率边界
+    con = make_lake(bt_rows=[bt_row("a.1", 2, 1000.0, 0.25)],
                     prices={"a.1": 10.0})
     pool = sel.build_candidate_pool(con, up, base=base)
     assert [m.ts_code for m in pool.members] == ["a.1"]  # 3.0 >= 3.0 过
+    con.close()
+
+
+def test_backtest_min_return_threshold():
+    """v7.0.39 十年回测收益率门槛（Joel：默认 20%，过滤收益不高的股票）。"""
+    base = base_pool([("low.1", 4.0), ("edge.2", 4.0), ("high.3", 4.0),
+                      ("null.4", 4.0)])
+    con = make_lake(
+        bt_rows=[bt_row("low.1", 5, 1500.0, 0.15),     # 15%：正收益但 < 20
+                 bt_row("edge.2", 5, 2000.0, 0.20),    # 20%：恰好达标（边界 ≥）
+                 bt_row("high.3", 5, 3500.0, 0.35),   # 35%：达标
+                 bt_row("null.4", 5, 1000.0, None)],  # 收益率 NULL：fail-closed
+        prices={"low.1": 10.0, "edge.2": 10.0, "high.3": 10.0, "null.4": 10.0})
+
+    # 默认 20%：仅 edge.2 / high.3 入选（自动成员按收益率降序）
+    pool = sel.build_candidate_pool(con, up=make_up(), base=base)
+    assert [m.ts_code for m in pool.members] == ["high.3", "edge.2"]
+    assert pool.funnel["backtest"] == 2
+
+    # 门槛 0：恢复原「必须为正」语义（15% 正收益也入选；NULL 仍 fail-closed）
+    pool = sel.build_candidate_pool(con, up=make_up(backtest_min_return_pct=0.0),
+                                    base=base)
+    assert [m.ts_code for m in pool.members] == ["high.3", "edge.2", "low.1"]
+
+    # 门槛 50：全部剔除
+    pool = sel.build_candidate_pool(con, up=make_up(backtest_min_return_pct=50.0),
+                                    base=base)
+    assert pool.members == [] and pool.funnel["backtest"] == 0
     con.close()
 
 
@@ -160,7 +192,7 @@ def test_manual_bypasses_gates_and_dedupes():
     manual = {"m.1": {"name": "手动股", "added_at": "2026-10-24T12:00:00"},
               "a.1": {"name": "A", "added_at": "2026-10-24T12:00:00"}}  # 双料
     con = make_lake(
-        bt_rows=[bt_row("a.1", 5, 12000.0, 0.12),
+        bt_rows=[bt_row("a.1", 5, 12000.0, 0.25),   # v7.0.39：25% 过默认 20% 门槛
                  bt_row("m.1", 1, -500.0, -0.005)],  # m.1 回测为负但手动→仍入选
         prices={"a.1": 10.0, "m.1": 50.0},
         manual_master=[("m.1", "手动股"), ("a.1", "A")])
@@ -169,7 +201,7 @@ def test_manual_bypasses_gates_and_dedupes():
     assert set(codes) == {"a.1", "m.1"}
     by = {m.ts_code: m for m in pool.members}
     assert by["a.1"].is_manual is True          # 双料 → 保留自动版+手动标记
-    assert by["a.1"].bt_pnl_pct == 0.12
+    assert by["a.1"].bt_pnl_pct == 0.25
     assert by["m.1"].is_manual is True
     assert by["m.1"].bt_pnl_pct == -0.005       # 手动股回测值为负也照实展示
     assert pool.funnel["manual"] == 2

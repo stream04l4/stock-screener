@@ -5,10 +5,12 @@
 （Web「我的持仓」页信号 / position_alert 微信提醒，口径不变）。
 
 漏斗（在 universe.build_pool 基础 5 条件 ①~⑤ 之上）：
-- G7 十年回测必须为正（backtest_positive）：n_buys ≥ 1 且 total_pnl > 0
-  （净利含现金分红、扣 3bps 佣金；窗口 = 最新 K线日回溯 backtest_window_years 年，
-  滚动；参数 = 当前生产策略参数）。**fail-closed**：无预计算行的代码不入选
-  （预计算缺失时宁缺毋滥，Web 侧以 funnel.backtest 计数暴露异常）。
+- G7 十年回测门槛（backtest_positive + backtest_min_return_pct）：n_buys ≥ 1
+  且 净收益率 ≥ backtest_min_return_pct%（默认 20，2026-11-10 Joel 定案——原
+  「必须为正」= 0% 门槛；过滤收益不高的股票；净利含现金分红、扣 3bps 佣金；
+  窗口 = 最新 K线日回溯 backtest_window_years 年，滚动；参数 = 当前生产策略
+  参数）。**fail-closed**：无预计算行 / 收益率 NULL 的代码不入选（预计算缺失时
+  宁缺毋滥，Web 侧以 funnel.backtest 计数暴露异常）。
 - G8 TTM 股息率 ≥ min_ttm_yield_pct（valuation_daily 每只最新一行）。
 - G9 最新收盘 ∈ [price_min_yuan, price_max_yuan]。
 - 波动率门槛：经讨论**明确不加**（2026-10-24）。
@@ -198,9 +200,14 @@ def build_candidate_pool(con, up: UniverseParams,
     auto: List[Member] = []
     for m in base.members:
         b = bt.get(m.ts_code)
+        # G7（v7.0.39）：≥1 次触发 且 净收益率 ≥ 门槛（百分数口径对比：
+        # 表内 pnl_pct 是小数 ×100）。NULL 收益率 fail-closed 不入选。
+        # 门槛 0 时语义 ≈ 原「必须为正」（pnl_pct ≥ 0 ⟺ total_pnl ≥ 0，
+        # n_buys≥1 时 total_invested>0）。
         g7 = (not up.backtest_positive) or (
             b is not None and int(b["n_buys"] or 0) >= 1
-            and float(b["total_pnl"] or 0.0) > 0.0)
+            and b.get("pnl_pct") is not None
+            and float(b["pnl_pct"]) * 100.0 >= up.backtest_min_return_pct)
         if not g7:
             continue
         n_g7 += 1

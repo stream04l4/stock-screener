@@ -45,6 +45,7 @@ const STRATEGY_JSON = {
     listing_min_trading_days: 250,
     backtest_positive: true,
     backtest_window_years: 10,
+    backtest_min_return_pct: 20,   // v7.0.39：十年回测净收益率下限（%）
     min_ttm_yield_pct: 3,
     price_min_yuan: 3,
     price_max_yuan: 100,
@@ -127,8 +128,8 @@ beforeEach(() => {
   mockApi();
 });
 
-describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 隐藏；lake/datasource 不渲染）", () => {
-  it("渲染 3 组（持仓策略/选股策略/股票池）；字段行 = 20；name 不出现为字段行", async () => {
+describe("v7 · 21 字段页渲染（strategy 7 + universe 11 + timing 3；name 隐藏；lake/datasource 不渲染）", () => {
+  it("渲染 3 组（持仓策略/选股策略/股票池）；字段行 = 21；name 不出现为字段行", async () => {
     const w = mk();
     await flushPromises();
     const groups = w.findAll(".s-group");
@@ -137,20 +138,21 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     expect(groups[1].text()).toContain("选股策略");
     expect(groups[2].text()).toContain("股票池");
     const fields = w.findAll(".s-field");
-    expect(fields.length).toBe(20);
+    expect(fields.length).toBe(21);
     // 2026-10-23：字段行主显示 = 通俗名；原始 yaml 字段名降为 .s-key 的 title（hover 提示）
     // 2026-10-26：选股策略（timing）调到股票池之前 → 字段序 = strategy 7 + timing 3 + universe 10
     // v7.0.26：② 股息率 / ③ 250 日线删除、首仓建仓回撤移入 timing
+    // v7.0.39：+ 十年回测收益率下限（%）（universe 10 → 11；「十年回测必须为正」改名「十年回测门槛」）
     const keys = fields.map((f) => f.find(".s-key").text());
     expect(keys).toEqual([
       "每手股数", "首仓手数", "加仓手数增量", "加仓步长（%）",
       "高点再武装方式", "再武装反弹幅度（%）", "成交口径（固定）",
       // v7.0.13 选股时机（v7.0.26：3 键）
       "价格分位窗口（年）【时机门条件①】", "价格低位分位上限（%）【时机门唯一条件】", "首仓建仓回撤（%）",
-      // v7.0.12 股票池 + 候选池选股门槛
+      // v7.0.12 股票池 + 候选池选股门槛（v7.0.39：+ 收益率下限）
       "行业白名单（证监会二级代码）", "央国企识别关键词", "总市值下限（亿元）",
       "连续分红年数下限", "最少上市交易日",
-      "十年回测必须为正", "回测窗口（年）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
+      "十年回测门槛", "回测窗口（年）", "十年回测收益率下限（%）", "股息率下限 TTM（%）", "股价下限（元）", "股价上限（元）",
     ]);
     // 原始字段名保留为 hover 提示（排查用）
     expect(fields.map((f) => f.find(".s-key").attributes("title"))).toEqual([
@@ -159,8 +161,8 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
       "price_window_years", "price_pctile_max", "first_drawdown_pct",
       "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
       "min_consecutive_div_years", "listing_min_trading_days",
-      "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
-      "price_min_yuan", "price_max_yuan",
+      "backtest_positive", "backtest_window_years", "backtest_min_return_pct",
+      "min_ttm_yield_pct", "price_min_yuan", "price_max_yuan",
     ]);
     // name（策略标识）不作为字段行
     expect(keys).not.toContain("策略标识");
@@ -217,9 +219,9 @@ describe("v7 · 20 字段页渲染（strategy 7 + universe 10 + timing 3；name 
     await w.find("#btn-strategy-edit").trigger("click");
     await nextTick();
     // strategy 5（int×3 + float×2；v7.0.28 手数口径）
-    // + universe 7（v7.0.12：mv float + 3×int + 3×float）
-    // + timing 3（v7.0.26：int×1 + float×2）= 15
-    expect(w.findAll('input[type="number"]').length).toBe(15);
+    // + universe 8（v7.0.12：mv float + 3×int + 4×float；v7.0.39 + 收益率下限）
+    // + timing 3（v7.0.26：int×1 + float×2）= 16
+    expect(w.findAll('input[type="number"]').length).toBe(16);
     // backtest_positive 是 bool select（不是 number input）；rearm_mode 是 enum2 select
     expect(w.findAll(".s-field select").length).toBeGreaterThanOrEqual(2);
     // accounting 编辑态仍是只读展示（无 input，有 .s-readonly）
@@ -281,7 +283,7 @@ describe("v7 · 本地保存校验（int/float/list；400 保持编辑态）", (
     // PUT full：lake/datasource/universe/timing 段完整带回（v7.0.18：lake 空段 null 原样回）
     expect(captured.lake).toBeNull();
     expect(captured.datasource).toEqual({ sina: { interval_s: 1.0 }, rf: { fallback_pct: 2.0 } });
-    expect(Object.keys(captured.universe)).toHaveLength(10); // v7.0.12：基础 5 + 门槛 5
+    expect(Object.keys(captured.universe)).toHaveLength(11); // v7.0.12：基础 5 + 门槛 5；v7.0.39 + 收益率下限
     expect(captured.timing).toEqual({ price_window_years: 5, price_pctile_max: 40,
       first_drawdown_pct: 15 }); // v7.0.26：时机段 3 键不丢
     expect(toastMsg()).toContain("策略已更新");

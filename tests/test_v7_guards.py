@@ -160,8 +160,9 @@ def test_strategy_yaml_v7_schema_shape():
     assert set(cfg["universe"].keys()) == {
         "industry_whitelist_csric2", "soe_keywords", "min_total_mv_yi",
         "min_consecutive_div_years", "listing_min_trading_days",
-        # v7.0.12 候选池选股门槛
-        "backtest_positive", "backtest_window_years", "min_ttm_yield_pct",
+        # v7.0.12 候选池选股门槛（v7.0.39：+ 十年回测收益率下限）
+        "backtest_positive", "backtest_window_years",
+        "backtest_min_return_pct", "min_ttm_yield_pct",
         "price_min_yuan", "price_max_yuan"}
     # v7.0.13 选股时机（v7.0.26：②③ 删除、首仓建仓回撤移入；v7.0.30：+
     # approach_pct 显示带 / spot_preselect_pct 实时取价预筛带，均 web 侧口径）

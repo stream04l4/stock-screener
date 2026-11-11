@@ -18,6 +18,9 @@ schema（定案，勿增删）：
 - universe: industry_whitelist_csric2 / soe_keywords / min_total_mv_yi /
   min_consecutive_div_years / listing_min_trading_days
   （SOE 恒强制，不设开关——TL 拍板；全链 5 条件保留）
+  + v7.0.12 门槛：backtest_positive / backtest_window_years /
+  backtest_min_return_pct（**可选键**，缺省 20.0，v7.0.39）/ min_ttm_yield_pct /
+  price_min_yuan / price_max_yuan
 - timing: price_window_years / price_pctile_max / first_drawdown_pct
   （v7.0.13 选股时机；v7.0.26：② 股息率 / ③ 250 日线删除、首仓建仓回撤
   first_drawdown_pct 自 strategy 段移入；**段可缺省**——策略库旧快照
@@ -103,8 +106,12 @@ class UniverseParams:
     listing_min_trading_days: int                # 上市满 N 个交易日（K线行数）
     # —— v7.0.12 候选池选股门槛（Joel 2026-10-24 拍板；波动率门槛经讨论明确不加）——
     # 默认值 = 生产 config/strategy.yaml；直接构造（测试等）缺省时行为与生产一致。
-    backtest_positive: bool = True                 # ⑦ 十年回测必须为正（硬门槛开关）
+    backtest_positive: bool = True                 # ⑦ 十年回测门槛开关
     backtest_window_years: int = 10                # ⑦ 回测窗口年数（滚动，截至最新 K线日）
+    # ⑦ 十年回测净收益率下限（%，百分数口径；2026-11-10 Joel 定案默认 20——原
+    # 「必须为正」= 0% 门槛的放宽版，过滤收益不高的股票）。仅在
+    # backtest_positive 开启时生效；老 yaml 缺键 → 默认 20.0（可选键，v7.0.30 先例）。
+    backtest_min_return_pct: float = 20.0
     min_ttm_yield_pct: float = 3.0                 # ⑧ TTM 股息率下限（%）
     price_min_yuan: float = 3.0                    # ⑨ 股价区间下限（元；远离退市风险区）
     price_max_yuan: float = 100.0                  # ⑨ 股价区间上限（元；手数粒度约束）
@@ -240,6 +247,11 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
     if not isinstance(bt_pos, bool):
         raise ConfigError(f"universe.backtest_positive 必须是布尔（当前 {bt_pos!r}）")
     bt_years = _int(u["backtest_window_years"], "universe.backtest_window_years", 1, 30)
+    # backtest_min_return_pct：v7.0.39 新增，**可选键**（老 yaml/策略库历史快照
+    # 无此键 → 默认 20.0；生产 yaml 已显式写入 20）。百分数口径（与
+    # min_ttm_yield_pct 同，不做小数转换）；0 = 恢复原「必须为正」语义。
+    bt_min = _num(u.get("backtest_min_return_pct", 20.0),
+                  "universe.backtest_min_return_pct", 0, 1e3)
     min_yield = _num(u["min_ttm_yield_pct"], "universe.min_ttm_yield_pct", 0, 100)
     pmin = _num(u["price_min_yuan"], "universe.price_min_yuan", 0, 1e4)
     pmax = _num(u["price_max_yuan"], "universe.price_max_yuan", 0, 1e5)
@@ -251,6 +263,7 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
         min_total_mv_yi=mv, min_consecutive_div_years=divy,
         listing_min_trading_days=listing,
         backtest_positive=bt_pos, backtest_window_years=bt_years,
+        backtest_min_return_pct=bt_min,
         min_ttm_yield_pct=min_yield, price_min_yuan=pmin, price_max_yuan=pmax,
     )
 

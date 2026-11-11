@@ -41,7 +41,7 @@ export const SECTION_DESC = {
     "注意：再武装后档位归零，新轮从 first_lots 手重新起算。",
   universe:
     "候选池门槛 = 基础 5 条件（行业白名单、央国企、总市值下限、上市天数、连续分红）" +
-    "叠加 3 道选股门槛（十年回测为正、股息率下限、股价区间）；入选 ≠ 买入信号，" +
+    "叠加 3 道选股门槛（十年回测收益率、股息率下限、股价区间）；入选 ≠ 买入信号，" +
     "买不买看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。",
   timing:
     "在候选池之上筛「何时首仓买入」：时机门 = 5年分位 ≤ 上限（v7.0.24 单条件）。" +
@@ -67,8 +67,9 @@ export const FIELD_LABELS = {
   "universe.min_total_mv_yi": "总市值下限（亿元）",
   "universe.min_consecutive_div_years": "连续分红年数下限",
   "universe.listing_min_trading_days": "最少上市交易日",
-  "universe.backtest_positive": "十年回测必须为正",
+  "universe.backtest_positive": "十年回测门槛",
   "universe.backtest_window_years": "回测窗口（年）",
+  "universe.backtest_min_return_pct": "十年回测收益率下限（%）",
   "universe.min_ttm_yield_pct": "股息率下限 TTM（%）",
   "universe.price_min_yuan": "股价下限（元）",
   "universe.price_max_yuan": "股价上限（元）",
@@ -111,9 +112,11 @@ export const FIELD_DESC = {
   "universe.listing_min_trading_days": "上市交易天数没满这个数 → 剔除",
   // v7.0.12 候选池选股门槛
   "universe.backtest_positive":
-    "开关：十年滚动回测（含分红、扣佣金）净利为正且至少触发过一次策略的股票才有资格进候选池；关掉则跳过这道门槛",
+    "开关：开启后须同时满足「至少触发过一次策略 且 十年回测净收益率 ≥ 收益率下限」才有资格进候选池；关掉则跳过这道门槛",
   "universe.backtest_window_years":
     "从最新 K线日往回数 N 年作为回测窗口（滚动，每日刷新）",
+  "universe.backtest_min_return_pct":
+    "十年滚动回测净收益率（含分红、扣佣金）低于这个值 → 剔除（2026-11-10 默认 20，过滤收益不高的股票；仅在「十年回测门槛」开启时生效，设 0 = 只要求为正）",
   "universe.min_ttm_yield_pct": "最新估值日 TTM 股息率低于这个数 → 剔除",
   "universe.price_min_yuan": "最新收盘价低于这个价 → 剔除（远离退市风险区）",
   "universe.price_max_yuan": "最新收盘价高于这个价 → 剔除（保证加仓档位整手可行）",
@@ -154,6 +157,7 @@ export const FIELD_TYPE = {
   listing_min_trading_days: "int",
   backtest_positive: "bool",
   backtest_window_years: "int",
+  backtest_min_return_pct: "float",
   min_ttm_yield_pct: "float",
   price_min_yuan: "float",
   price_max_yuan: "float",
