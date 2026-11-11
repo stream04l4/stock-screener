@@ -91,8 +91,12 @@ def run_coin(
     c_arr = np.asarray(closes, dtype=float)
     n = len(c_arr)
     if n == 0:
-        return {"symbol": symbol, "n_bars": 0, "rounds": [], "open_round": None,
-                "equity": np.array([]), "mdd_pct": 0.0, "note": "无数据"}
+        return {"symbol": symbol, "n_bars": 0,
+                "start": None, "end": None,
+                "rounds": [], "open_round": None,
+                "realized_cash": 0.0, "final_equity": 0.0,
+                "mdd_pct": 0.0, "equity": np.array([]), "dates": np.array([]),
+                "note": "无数据"}
 
     h1y = rolling_high_1y(c_arr, p.lookback_h)
     trig = p.trigger_frac()

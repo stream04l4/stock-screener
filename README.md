@@ -1,4 +1,4 @@
-# stock-screener · v7.0.47（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v7.0.48（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -387,6 +387,24 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.48**：策略 + 回测落实到页面（Joel 2026-11-11："先把这个策略和回测
+  落实到页面中去，策略后续我再调整"）：
+  - `GET /api/strategy`：当前生效参数（yaml 基线 + 页面覆盖）+ 规则说明 +
+    默认值对照；`POST /api/strategy` 保存参数 → 覆盖文件
+    `data/crypto/strategy_params.json`（运行时覆盖，不改仓库配置，子集可存、
+    与既有覆盖合并）；`POST /api/strategy/reset` 恢复默认。7 参数带范围护栏
+    （越界/未知字段/非数字 → 400）。
+  - `POST /api/backtest`：全史回测（湖 1h → 引擎 → 逐币结果 + 净值曲线
+    降采样 ≤400 点；3 币全史 ~0.8s 同步执行）；params 优先级：请求 > 覆盖
+    文件 > yaml；端点层做引擎键→页面键归一（`_ui_result`）。
+  - 前端 StrategyTab（参数表单 + 保存/恢复默认 + 规则卡）、BacktestTab
+    （一键回测 + 逐币：了结轮次表/持仓中卡/净值统计/内联 SVG 净值曲线，
+    零图表库依赖）。
+  - 引擎小修：`run_coin` 空数据路径补齐 start/end/realized_cash/
+    final_equity/dates 键（与正常路径契约一致，防端点 KeyError）。
+  - 测试：tests/test_crypto_web.py 7 用例（TestClient + 合成小湖，
+    覆盖文件 monkeypatch 到 tmp）；前端 StrategyTab/BacktestTab 4 用例。
+    全量 701 过（694 + 7）；前端 8/8。
 - **v7.0.47**：加密货币马丁格尔策略 + 全史回测（Joel 2026-11-11 规格，两决策门拍板）：
   - `crypto.yaml` 新增 **strategy 段**：建仓 = 价 ≤ 一年高点×30%（跌 70% 触发，
     首仓 10 USDT）；加仓 = 建仓价×(1−1%×k) 固定网格、第 k 级 10×1.05^k USDT

@@ -72,7 +72,7 @@ stock-screener/
 ├── cache/               # 拉取缓存（gitignore）
 ├── logs/                # 运行日志（gitignore）
 ├── docs/                # 架构与专项设计（本文件 + crypto_design.md）
-├── tests/              # 全量测试（694；v7 防护契约 test_v7_guards.py）
+├── tests/              # 全量测试（701；v7 防护契约 test_v7_guards.py）
 └── stages/              # 已删（v6 团队流水线副产物）
 ```
 
@@ -91,7 +91,8 @@ crypto/
 │   │                    #   指数退避重连 + 状态文件 gateway_state.json）
 ├── web/
 │   ├── app.py           # 独立 FastAPI（:9091；login 三件套 + lake/coins/kline/
-│   │                    #   gateway 实体端点 + positions/strategy/backtest 骨架端点）
+│   │                    #   gateway/strategy（参数读存重置）/backtest（全史回测）
+│   │                    #   实体端点 + positions 骨架端点；v7.0.48 策略/回测实体化）
 │   └── frontend/        # 独立 Vue SPA（双入口登录 + 四页签；dist 不入库）
 ├── positions/           # P2 我的持仓（预留；__init__ 内写明规划）
 ├── strategy/            # P3 策略（v7.0.47 实体化）：engine.py 马丁格尔
@@ -142,7 +143,9 @@ crypto/
   entry、10x 全卖重置）；`python -m crypto.backtest` 全史回测 →
   data/crypto/backtest_report.md（BTC/ETH 各了结 1 轮 2018/2020 建仓 →
   2021 10x 止盈 +1427%/+3022%；2022 轮均持仓中待 10x）；
-  tests/test_crypto_strategy.py 13 用例（合成路径零网络）。全量 694 过。
+  tests/test_crypto_strategy.py 13 用例（合成路径零网络）+
+  tests/test_crypto_web.py 7 用例（端点：strategy 读存重置 + backtest 合成小湖）。
+  全量 701 过。
 - **v7.0.46b（2026-11-11）**：数据湖 tab 聚焦 3 币展示——stats() per_symbol
   加 active 标记（LEFT JOIN coin_master），LakeTab 主表只列 active 3 币、
   退役 17 币折叠展示（数据保留，仅显示层）。

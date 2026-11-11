@@ -9,7 +9,9 @@ WEB_SESSION_SECRET，ssc_session cookie 按 hostname 跨端口生效）。
 - 登录三件套 + health（与股票同款）
 - /api/lake/status：数据湖状态（表/行数/每币范围/最近同步）——真实
 - /api/coins、/api/kline：行情查询（湖内 1h K 线）——真实，供后续 tab 用
-- /api/positions、/api/strategy、/api/backtest：骨架占位（ready=false）
+- /api/positions：骨架占位（ready=false，P2 手动登记）
+- /api/strategy：策略参数读/存/重置（v7.0.48；覆盖文件 data/crypto/strategy_params.json）
+- /api/backtest：全史回测（v7.0.48；湖 1h → 引擎 → 逐币结果 + 净值曲线）
 """
 from __future__ import annotations
 
@@ -242,21 +244,193 @@ def kline(symbol: str = Query(..., description="Binance 格式，如 BTCUSDT"),
 
 
 # ---------------------------------------------------------------------------
-# 四 tab 骨架占位（内容后续慢慢完善）
+# 策略（P3，v7.0.48 实体化）：参数单一来源 = crypto.yaml strategy 段
+# + 运行时覆盖 data/crypto/strategy_params.json（页面调整，gitignore 运行时目录）
 # ---------------------------------------------------------------------------
-@core_app.get("/api/positions")
-def positions() -> Dict[str, Any]:
-    return {"ready": False, "detail": "我的持仓：框架已搭，功能待完善（P2 手动登记）"}
+import json  # noqa: E402
+import time  # noqa: E402
+
+from crypto.strategy.engine import StrategyParams  # noqa: E402
+
+STRATEGY_OVERRIDE_PATH = PROJECT_ROOT / "data" / "crypto" / "strategy_params.json"
+
+# 字段名 → (类型, 下限, 上限)：页面/接口的合理性护栏（防手滑写崩引擎）
+_STRATEGY_FIELDS = {
+    "first_drop_pct": (float, 1.0, 95.0),        # 建仓跌幅 %（1=跌1% 即建仓）
+    "add_grid_pct": (float, 0.1, 50.0),          # 加仓级距 %
+    "base_amount_usdt": (float, 0.1, 1_000_000.0),
+    "growth": (float, 1.0, 3.0),                 # 每次加仓倍数
+    "take_profit_mult": (float, 1.01, 1000.0),   # 止盈倍数
+    "fee_bps": (float, 0.0, 1000.0),
+    "lookback_h": (int, 168, 87600),             # 一年高点窗口（小时）
+}
+
+
+def _validate_strategy_dict(d: Dict[str, Any], partial: bool = True) -> Dict[str, Any]:
+    """校验/清洗参数字典 → 合法部分；越界或类型错 → 400。partial=True 允许子集。"""
+    clean: Dict[str, Any] = {}
+    for k, v in (d or {}).items():
+        if k not in _STRATEGY_FIELDS:
+            raise HTTPException(status_code=400, detail=f"未知策略参数: {k}")
+        typ, lo, hi = _STRATEGY_FIELDS[k]
+        try:
+            x = typ(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"参数 {k} 需为数字")
+        if not lo <= x <= hi:
+            raise HTTPException(status_code=400,
+                                detail=f"参数 {k}={v} 超出范围 [{lo}, {hi}]")
+        clean[k] = x
+    if not partial and set(clean) != set(_STRATEGY_FIELDS):
+        raise HTTPException(status_code=400,
+                            detail="缺少策略参数: "
+                                   + ", ".join(set(_STRATEGY_FIELDS) - set(clean)))
+    return clean
+
+
+def _load_override() -> Dict[str, Any]:
+    if STRATEGY_OVERRIDE_PATH.exists():
+        try:
+            with open(STRATEGY_OVERRIDE_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+            return _validate_strategy_dict(d)
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 - 损坏覆盖文件 → 忽略（回退 yaml）
+            return {}
+    return {}
+
+
+def _effective_params(extra: Optional[Dict[str, Any]] = None):
+    """yaml 基线 ← 覆盖文件 ← 请求内临时参数 → (StrategyParams, 生效 dict)。"""
+    merged = dict(CFG.get("strategy") or {})
+    merged.update(_load_override())
+    if extra:
+        merged.update(_validate_strategy_dict(extra))
+    p = StrategyParams.from_cfg({"strategy": merged})
+    return p, p.__dict__.copy()  # type: ignore[attr-defined]
+
+
+def _write_override(d: Dict[str, Any]) -> None:
+    """覆盖文件原子写（tmp + rename）。d = 合并后的完整有效字段子集。"""
+    STRATEGY_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STRATEGY_OVERRIDE_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STRATEGY_OVERRIDE_PATH)
 
 
 @core_app.get("/api/strategy")
 def strategy() -> Dict[str, Any]:
-    return {"ready": False, "detail": "策略：框架已搭，功能待完善"}
+    """当前生效策略参数（yaml 基线 + 页面覆盖）+ 默认值 + 覆盖标记。"""
+    p, eff = _effective_params()
+    has_override = STRATEGY_OVERRIDE_PATH.exists()
+    defaults = StrategyParams().__dict__.copy()  # type: ignore[attr-defined]
+    return {
+        "ready": True,
+        "params": eff,
+        "defaults": defaults,
+        "has_override": has_override,
+        "rule": {
+            "first": "建仓：价 ≤ 一年高点 × (1 − first_drop_pct%)，首仓 base_amount_usdt USDT",
+            "add": "加仓：固定网格 建仓价 × (1 − add_grid_pct% × k)，第 k 级 base×growth^k USDT，不设上限",
+            "hold": "上涨不加仓，新高不刷新建仓价",
+            "exit": "止盈：价 ≥ 建仓价 × take_profit_mult → 全卖，entry 重置进入下一轮",
+        },
+    }
 
 
-@core_app.get("/api/backtest")
-def backtest() -> Dict[str, Any]:
-    return {"ready": False, "detail": "回测：框架已搭，功能待完善"}
+class _StrategyBody(BaseModel):
+    params: Dict[str, Any] = {}
+
+
+@core_app.post("/api/strategy")
+def strategy_save(body: _StrategyBody) -> Dict[str, Any]:
+    """保存页面参数 → 覆盖文件（与既有覆盖合并，子集可存）。"""
+    new = _validate_strategy_dict(body.params)
+    if not new:
+        raise HTTPException(status_code=400, detail="params 为空")
+    merged = _load_override()
+    merged.update(new)
+    _write_override(merged)
+    p, eff = _effective_params()
+    return {"ok": True, "params": eff, "has_override": True}
+
+
+@core_app.post("/api/strategy/reset")
+def strategy_reset() -> Dict[str, Any]:
+    """删除覆盖文件 → 回退 crypto.yaml 默认。"""
+    if STRATEGY_OVERRIDE_PATH.exists():
+        STRATEGY_OVERRIDE_PATH.unlink()
+    p, eff = _effective_params()
+    return {"ok": True, "params": eff, "has_override": False}
+
+
+class _BacktestBody(BaseModel):
+    params: Dict[str, Any] = {}     # 可选：本次回测临时覆盖（不落盘）
+    coins: list = []                # 可选：缺省 = crypto.yaml coins 段
+
+
+def _ui_result(r: Dict[str, Any]) -> Dict[str, Any]:
+    """引擎结果 → 页面契约（键名归一；净值曲线降采样 ≤400 点）。"""
+    eq = r.pop("equity")
+    dates = r.pop("dates")
+    if len(eq):
+        step = max(1, len(eq) // 400)
+        curve = [[str(dates[i])[:10], round(float(eq[i]), 2)]
+                 for i in range(0, len(eq), step)]
+        if curve and curve[-1][0] != str(dates[-1])[:10]:
+            curve.append([str(dates[-1])[:10], round(float(eq[-1]), 2)])
+    else:
+        curve = []
+    rounds = [{
+        "entry_date": x["entry_date"], "entry": x["entry"],
+        "exit_date": x["exit_date"], "exit": x["exit_price"],
+        "k": x["max_level"], "invested": x["spent_usdt"],
+        "proceeds": x["proceeds_usdt"], "pnl_pct": x["pnl_pct"],
+    } for x in r["rounds"]]
+    o = r["open_round"]
+    open_round = None
+    if o:
+        open_round = {
+            "entry_date": o["entry_date"], "entry": o["entry"],
+            "k": o["k_level"], "spent": o["spent_usdt"],
+            "value": o["value_usdt"], "unrealized_pct": o["unrealized_pct"],
+            "tp_line": o["tp_price"],
+        }
+    spent_total = sum(x["spent_usdt"] for x in r["rounds"])
+    # realized_cash = 净盈亏累计（proceeds − spent）→ 收益率 = 净/投入
+    rpct = (round(r["realized_cash"] / spent_total * 100.0, 2)
+            if spent_total else 0.0)
+    return {
+        "symbol": r["symbol"], "n_bars": r["n_bars"],
+        "start": r["start"], "end": r["end"],
+        "rounds": rounds, "open_round": open_round,
+        "realized_cash": r["realized_cash"], "realized_pnl_pct": rpct,
+        "final_equity": r["final_equity"], "mdd_pct": r["mdd_pct"],
+        "equity_curve": curve,
+    }
+
+
+@core_app.post("/api/backtest")
+def backtest(body: _BacktestBody) -> Dict[str, Any]:
+    """全史回测（湖 1h K 线 → 引擎 → 逐币结果 + 降采样净值曲线）。
+
+    同步执行（3 币全史 ~1s）。params 优先级：请求 > 覆盖文件 > yaml。
+    """
+    from crypto.backtest.runner import run_backtest
+    p, eff = _effective_params(body.params or None)
+    coins = [c for c in (body.coins or []) if c] or CFG["coins"]
+    t0 = time.time()
+    results = run_backtest(coins, p, lake_path=str(DB_PATH))
+    return {"ok": True, "params": eff, "elapsed_s": round(time.time() - t0, 2),
+            "results": [_ui_result(r) for r in results]}
+
+
+# 我的持仓（P2）骨架占位——启动前与 Joel 确认账本归属（crypto_design §9）
+@core_app.get("/api/positions")
+def positions() -> Dict[str, Any]:
+    return {"ready": False, "detail": "我的持仓：框架已搭，功能待完善（P2 手动登记）"}
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,15 @@
 # 加密货币板块设计 v0.3（框架已落地 v7.0.43，内容待完善）
 
+> **v7.0.48 更新（2026-11-11）**：策略 + 回测落实到页面——`/api/strategy`
+> 参数读/存/重置（页面调整存 `data/crypto/strategy_params.json` 运行时覆盖，
+> 不改仓库配置）；`/api/backtest` 全史回测端点（~0.8s 同步，净值曲线降采样）；
+> 前端 StrategyTab（参数表单 + 保存/恢复默认）+ BacktestTab（一键回测 +
+> 逐币结果 + 内联 SVG 净值曲线）。策略参数 Joel 后续调整（页面直接改即可）。
+>
 > **v7.0.47 更新（2026-11-11）**：P3 策略 + 回测实体化——`crypto.yaml`
 > strategy 段（Joel 马丁格尔规格：跌 70% 建仓 / 1% 网格 10×1.05^k 加仓不设
 > 上限 / 10x 止盈重置，两决策门拍板）；`crypto/strategy/engine.py` 状态机 +
 > `python -m crypto.backtest` 全史回测（报告 `data/crypto/backtest_report.md`）。
-> Web 回测 tab（/api/backtest 实体化 + BacktestTab）等回测数字过目后做。
 >
 > **v7.0.45 更新（2026-11-11）**：数据湖正式开工——coins 聚焦
 > BTC/ETH/SOL 三标的；全量历史 = Binance 月度快照（`crypto.sources.
