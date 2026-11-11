@@ -112,18 +112,20 @@ def test_crontab_only_lake_sync_business_line():
     复测**（1-5 01:35/04:05/06:35 UTC 盘中 3 时点，push2delay vs 腾讯 tick 延时，
     设计稿 §5/§6，Gate 0 已批——备源定位判据 >3min 降兜底）。
     团队基础设施行——hermes memory-backup/pipeline-watchdog——不属本项目，按路径过滤。
-    （v7.0.20–v1.1 前为 4 条；Gate 1 观察期批准后才加第 5 条。）"""
+    （v7.0.20–v1.1 前为 4 条；Gate 1 观察期批准后才加第 5 条；v7.0.43 双系统定案
+    后加第 6 条 crypto-sync——加密货币系统独立湖每小时增量，docs/crypto_design §6。）"""
     r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("无 crontab 条目（非部署环境）")
     proj = [l for l in r.stdout.splitlines()
             if l.strip() and not l.strip().startswith("#") and "stock-screener" in l]
-    assert len(proj) == 5, f"stock-screener crontab 业务行应恰为 5（lake-sync + t1-delist + t6-quarterly + signal-touch + gate1-latency），实际 {len(proj)}: {proj}"
+    assert len(proj) == 6, f"stock-screener crontab 业务行应恰为 6（lake-sync + t1-delist + t6-quarterly + signal-touch + gate1-latency + crypto-sync），实际 {len(proj)}: {proj}"
     assert any("run_lake_sync_daily.sh" in l for l in proj)
     assert any("run_t1_delist_weekly.sh" in l for l in proj)
     assert any("run_t6_quarterly.sh" in l for l in proj)
     assert any("run_signal_touch_daily.sh" in l for l in proj)
     assert any("run_observation_latency.sh" in l for l in proj)
+    assert any("crypto.sync" in l for l in proj)
     assert "run_cron" not in r.stdout, "crontab 不得含 run_cron（含注释外任何形态）"
 
 
