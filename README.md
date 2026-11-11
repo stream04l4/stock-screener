@@ -1,4 +1,4 @@
-# stock-screener · v7.0.51（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v7.0.52（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -387,6 +387,19 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.52**：SOL 退役（Joel 2026-11-11："把 sol 去掉吧，也归入到退役币里"）
+  —— 聚焦 BTC/ETH：
+  - `crypto.yaml` coins 移除 SOLUSDT（退役清单 17 → 18 币，注明 v7.0.52）；
+    `coin_master.SOLUSDT.is_active=FALSE`（**54,782 行数据保留**，恢复 =
+    加回 coins 重跑 sync）。
+  - crypto-gateway 重启 → 2 币 WS 组合流（纯内存态文件自动收敛，SOL 不再
+    推送）；crypto-sync cron 读 yaml → 自动停同步 SOL。
+  - 回测默认币 = yaml coins → 自动只跑 BTC/ETH（显式 `--coins` 仍可查
+    SOL 历史）；数据湖 tab 主表 2 币、SOL 入退役折叠区（active 过滤
+    天然支持，文案"聚焦 3 币"→"聚焦 2 币"）。
+  - 验证：/api/lake/status active=[BTC,ETH]、退役 18 币（SOL rows=54782
+    active=False）；/api/gateway connected 2 币；/api/backtest 默认 2 币
+    （BTC 71 事件 / ETH 120 事件）；前端 12/12 + build + 重启 active。
 - **v7.0.51**：回测图时间轴 + 交易事件标记（Joel 2026-11-11："图形里要能
   看出来时间，同时在线段上标注出什么时候建仓、什么时候平仓、什么时候能
   加仓，用不同标记区分"）：

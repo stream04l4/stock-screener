@@ -8,7 +8,7 @@ const st = ref(null);
 const err = ref("");
 const gw = ref(null);
 
-// 聚焦 3 币（v7.0.45 收敛）：主表只列 active；退役币数据保留、折叠展示
+// 聚焦 2 币（v7.0.45 收敛，v7.0.52 SOL 退役）：主表只列 active；退役币数据保留、折叠展示
 const activeSyms = () => (st.value?.per_symbol || []).filter(s => s.active);
 const retiredSyms = () => (st.value?.per_symbol || []).filter(s => !s.active);
 
@@ -74,7 +74,7 @@ onUnmounted(() => {
       </div>
       <p v-else class="hint">尚未同步——跑 <code>python -m crypto.sync</code></p>
 
-      <h3>每币 K 线（1h，Binance，聚焦 3 币）</h3>
+      <h3>每币 K 线（1h，Binance，聚焦 2 币）</h3>
       <table v-if="activeSyms().length">
         <thead>
           <tr><th>币种</th><th>行数</th><th>起</th><th>止</th><th>最新收盘</th></tr>

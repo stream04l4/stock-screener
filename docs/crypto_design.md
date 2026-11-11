@@ -1,6 +1,14 @@
 # 加密货币板块设计 v0.3（框架已落地 v7.0.43，内容待完善）
 
-> **v7.0.48 更新（2026-11-11）**：策略 + 回测落实到页面——`/api/strategy`
+> **v7.0.52 更新（2026-11-11）**：SOL 退役（Joel 指令）——coins 聚焦
+> BTC/ETH；coin_master SOLUSDT is_active=FALSE（54,782 行数据保留，
+> 恢复 = 加回 coins 重跑 sync）；网关 2 币流；回测/数据湖 tab 自动收敛。
+>
+> **v7.0.51 更新（2026-11-11）**：回测图时间轴 + 事件标记——引擎返回
+> events（entry/add/exit 逐 bar），BacktestTab 线性时间轴 + 建仓▼/加仓●/
+> 平仓▲ 标记（悬停看明细）。
+>
+> **v7.0.48 更新（2026-11-11）**：策略 + 回测落实到页面——
 > 参数读/存/重置（页面调整存 `data/crypto/strategy_params.json` 运行时覆盖，
 > 不改仓库配置）；`/api/backtest` 全史回测端点（~0.8s 同步，净值曲线降采样）；
 > 前端 StrategyTab（参数表单 + 保存/恢复默认）+ BacktestTab（一键回测 +
