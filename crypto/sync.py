@@ -89,7 +89,7 @@ def main(argv=None) -> int:
     start = _hour_floor(start)
     end = _hour_floor(now)
 
-    con = models.open_db(ROOT)
+    con = models.open_db(os.path.join(ROOT, cfg["lake"]["path"]))
     models.upsert_coins(con, coins)
 
     per_coin = {}

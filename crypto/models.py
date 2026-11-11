@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """crypto.models —— crypto.duckdb 表 DDL + 幂等 upsert + 统计（框架 v7.0.43）。
 
-独立湖（与 A 股 lake.duckdb 物理隔离）。表：
+独立湖 data/crypto/crypto.duckdb（加密货币系统数据独立目录，与 A 股湖物理隔离）。
+表：
 - coin_master：币种主数据
 - kline_1h：1h K 线（PK(exchange, symbol, ts)，INSERT OR REPLACE 幂等）
 1d/4h 由 1h 本地聚合，不建表（避免多粒度双写不一致）。
+路径一律由调用方从 crypto/config/crypto.yaml 传入（models 不读配置）。
 """
 from __future__ import annotations
 
@@ -40,16 +42,10 @@ CREATE INDEX IF NOT EXISTS idx_kline_1h_symbol_ts ON kline_1h (symbol, ts);
 """
 
 
-def db_path_from_root(root: str) -> str:
-    """repo 根 → 湖文件绝对路径（config.lake.path 相对根）。"""
-    return os.path.join(root, "data", "lake", "crypto.duckdb")
-
-
-def open_db(root: str) -> duckdb.DuckDBPyConnection:
-    """打开湖（自动建目录 + 建表）。root = 仓库根绝对路径。"""
-    p = db_path_from_root(root)
-    Path(p).parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(p)
+def open_db(lake_path: str) -> duckdb.DuckDBPyConnection:
+    """打开湖（自动建目录 + 建表）。lake_path = 湖文件绝对路径（来自配置）。"""
+    Path(lake_path).parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(lake_path)
     con.execute(SCHEMA)
     return con
 
@@ -80,14 +76,13 @@ def upsert_klines(con, exchange: str, symbol: str, bars: list) -> int:
     return len(rows)
 
 
-def stats(root: str) -> dict:
+def stats(lake_path: str) -> dict:
     """数据湖 tab 用：表清单 + 行数 + 每币 K 线范围 + 库大小。湖不存在 → 空结构。"""
-    p = db_path_from_root(root)
-    if not os.path.exists(p):
+    if not os.path.exists(lake_path):
         return {"installed": False, "tables": [], "size_mb": 0.0}
-    con = duckdb.connect(p, read_only=True)
+    con = duckdb.connect(lake_path, read_only=True)
     try:
-        out = {"installed": True, "size_mb": round(os.path.getsize(p) / 1048576, 2),
+        out = {"installed": True, "size_mb": round(os.path.getsize(lake_path) / 1048576, 2),
                "tables": [], "per_symbol": []}
         tables = [r[0] for r in con.execute(
             "SELECT table_name FROM information_schema.tables "

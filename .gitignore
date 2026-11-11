@@ -34,9 +34,7 @@ web/frontend/node_modules/
 config/strategy.yaml.bak
 data/alerts/
 
-# 加密货币系统（v7.0.43）
+# 加密货币系统（v7.0.43）：构建产物与依赖不入库；运行时数据已被 /data/ 覆盖
 crypto/web/dist/
 crypto/web/frontend/node_modules/
-data/lake/crypto.duckdb*
-data/crypto_sync_state.json
 logs/crypto_sync.log

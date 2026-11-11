@@ -13,6 +13,18 @@ martingale/ 包（5 条件股票池 → 逐股状态机回测 → 产物 CSV/MD�
 Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
 ```
 
+## 0. 项目结构（双系统，v7.0.43）
+
+一个仓库，两个独立系统：**股票**（:9090，web/ + lake/ + martingale/ + screener/，
+数据 `data/lake/` 等）与**加密货币**（:9091，`crypto/` 独立单元，数据独占
+`data/crypto/`，湖 = data/crypto/crypto.duckdb）。共享仅：.env 凭据 +
+web/auth.py 登录模块（ssc_session cookie 按 hostname 跨端口，双入口互免登）。
+
+**目录职责 / 扩展落点 / 不可动清单 → 权威文档 `docs/architecture.md`；
+加密货币设计细节 → `docs/crypto_design.md`。** 简记：股票侧是稳定区（防护
+契约锁定，不挪顶层布局）；加密货币新功能一律落 `crypto/` 内（sources/
+positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypto/`。
+
 ## 1. 策略（规格 = brief §3 + 参考实现逐行移植）
 
 池内**每只股票**独立状态机：

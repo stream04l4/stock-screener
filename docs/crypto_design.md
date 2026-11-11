@@ -54,7 +54,7 @@ GitHub 仓库 stream04l4/stock-screener（一个仓库，两个独立系统）
 └── 加密货币系统（新增，完全独立部署单元）
       服务: 新 crypto-web.service → :9091（独立进程，独立端口）
       前端: crypto/web/frontend/（加密货币 SPA，独立 build，独立页面）
-      数据: data/lake/crypto.duckdb（独立湖，crypto-sync 每小时）
+      数据: data/crypto/crypto.duckdb（独立湖，crypto-sync 每小时）
       登录: /login 双入口（按钮二：加密货币）
 
 共享登录（= 旧 Quant 机制 727a3dd，恢复）：
@@ -100,7 +100,7 @@ stock-screener/
 │           └── src/{views/LoginView.vue(双入口), tabs/CoinTable.vue,
 │                    tabs/KlineChart.vue, ...}
 │
-├── data/lake/crypto.duckdb          # 独立湖（gitignore，同 A 股湖惯例）
+├── data/crypto/crypto.duckdb          # 独立湖（gitignore，同 A 股湖惯例）
 └── docs/crypto_design.md            # 本文件
 ```
 

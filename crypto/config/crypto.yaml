@@ -7,9 +7,9 @@ web:
   port: 9091              # 沿用旧 Quant 塔端口（已验证空闲）
 
 lake:
-  # 相对仓库根；与 A 股 data/lake/lake.duckdb 物理隔离（DuckDB 单写锁，禁共库）
-  path: "data/lake/crypto.duckdb"
-  state_file: "data/crypto_sync_state.json"   # 最近同步状态（数据湖 tab 展示）
+  # 加密货币系统数据独立目录（data/crypto/，与 A 股 data/ 其余内容完全隔离）
+  path: "data/crypto/crypto.duckdb"
+  state_file: "data/crypto/sync_state.json"   # 最近同步状态（数据湖 tab 展示）
 
 source:
   primary: binance        # 切备源：改 primary: okx（1 行）

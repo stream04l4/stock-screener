@@ -36,7 +36,7 @@ with open(CFG_PATH, "r", encoding="utf-8") as _f:
     CFG = yaml.safe_load(_f)
 
 STATE_PATH = PROJECT_ROOT / CFG["lake"]["state_file"]
-DB_PATH = PROJECT_ROOT / "data" / "lake" / "crypto.duckdb"
+DB_PATH = PROJECT_ROOT / CFG["lake"]["path"]
 
 app = FastAPI(title="crypto-screener web", version="0.1.0")
 
@@ -119,7 +119,7 @@ def health() -> Dict[str, Any]:
 @app.get("/api/lake/status")
 def lake_status() -> Dict[str, Any]:
     from crypto import models
-    st = models.stats(str(PROJECT_ROOT))
+    st = models.stats(str(DB_PATH))
     try:
         import json
         with open(STATE_PATH, "r", encoding="utf-8") as f:
