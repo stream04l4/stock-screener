@@ -11,8 +11,9 @@ import { useAuthStore } from "../stores/authStore.js";
 const auth = useAuthStore();
 const form = reactive({ username: "", password: "" });
 const busy = ref(false);
-// 股票系统端口（同 hostname，cookie 按 host 不按端口 → 跳转后免登）
-const stockUrl = "http://" + window.location.hostname + ":9090/";
+// 股票入口 = 同域名根路径（443 单域名架构：/ → 股票，/crypto/ → 加密）；
+// 同域 cookie（ssc_session）天然共享，双端互免登。
+const stockUrl = window.location.origin + "/";
 
 async function doLogin(target) {
   if (!form.username.trim() || !form.password) {

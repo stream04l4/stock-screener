@@ -20,15 +20,14 @@ from typing import Any, Dict, Optional
 import duckdb
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.middleware import Middleware
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # 仓库根（crypto/web/app.py → 上三级）；stock 侧 web.auth 直接复用
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-# vite outDir="../dist"（相对 crypto/web/frontend）→ 产物落 crypto/web/dist
+# vite base:'/crypto/' → 产物 assets 前缀 /crypto/assets/，落 crypto/web/dist
 DIST_DIR = Path(__file__).resolve().parent / "dist"
 
 CFG_PATH = PROJECT_ROOT / "crypto" / "config" / "crypto.yaml"
@@ -38,7 +37,11 @@ with open(CFG_PATH, "r", encoding="utf-8") as _f:
 STATE_PATH = PROJECT_ROOT / CFG["lake"]["state_file"]
 DB_PATH = PROJECT_ROOT / CFG["lake"]["path"]
 
-app = FastAPI(title="crypto-screener web", version="0.1.0")
+# 核心应用：全部路由保持 /api/* + 静态根（子应用内视角）。
+# 对外统一挂 /crypto 前缀（见文件底部 app）——浏览器走
+# https://stream04l4.duckdns.org/crypto/...，nginx 按前缀透传；
+# 直连 :9091/crypto/... 同样可用（单一 URL 结构，无环境分支）。
+core_app = FastAPI(title="crypto-screener web", version="0.1.0")
 
 
 def _db() -> duckdb.DuckDBPyConnection:
@@ -58,7 +61,7 @@ _AUTH_PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
 _AUTH_DISABLED = os.environ.get("WEB_TEST_NO_AUTH") == "1"
 
 
-@app.middleware("http")
+@core_app.middleware("http")
 async def _auth_gate(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/") and not _AUTH_DISABLED and path not in _AUTH_PUBLIC_PATHS:
@@ -73,7 +76,7 @@ class _LoginBody(BaseModel):
     password: str = ""
 
 
-@app.post("/api/login")
+@core_app.post("/api/login")
 def login(body: _LoginBody, request: Request, response: Response) -> Dict[str, Any]:
     """与股票系统同一账号；cookie 按 hostname 跨端口 → 股票 :9090 同步免登。"""
     admin_user, admin_pass, secret = load_auth_config()
@@ -92,13 +95,13 @@ def login(body: _LoginBody, request: Request, response: Response) -> Dict[str, A
     return {"ok": True, "user": admin_user}
 
 
-@app.post("/api/logout")
+@core_app.post("/api/logout")
 def logout(response: Response) -> Dict[str, Any]:
     response.delete_cookie(COOKIE_NAME, path="/")
     return {"ok": True}
 
 
-@app.get("/api/auth/me")
+@core_app.get("/api/auth/me")
 def auth_me(request: Request) -> Dict[str, Any]:
     _u, _p, secret = load_auth_config()
     user = parse_token(request.cookies.get(COOKIE_NAME), secret)
@@ -107,7 +110,7 @@ def auth_me(request: Request) -> Dict[str, Any]:
     return {"user": user}
 
 
-@app.get("/api/health")
+@core_app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "system": "crypto-screener", "version": "0.1.0",
             "port": CFG["web"]["port"]}
@@ -116,7 +119,7 @@ def health() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 数据湖（真实）
 # ---------------------------------------------------------------------------
-@app.get("/api/lake/status")
+@core_app.get("/api/lake/status")
 def lake_status() -> Dict[str, Any]:
     from crypto import models
     st = models.stats(str(DB_PATH))
@@ -138,7 +141,7 @@ _INTERVAL_AGG = {
 }
 
 
-@app.get("/api/coins")
+@core_app.get("/api/coins")
 def coins() -> Dict[str, Any]:
     """币列表 + 湖内最新 1h 收盘（实时 24h ticker 后续版本接源缓存）。"""
     con = _db()
@@ -165,7 +168,7 @@ def coins() -> Dict[str, Any]:
         con.close()
 
 
-@app.get("/api/kline")
+@core_app.get("/api/kline")
 def kline(symbol: str = Query(..., description="Binance 格式，如 BTCUSDT"),
           interval: str = "1h",
           from_ts: Optional[int] = Query(None),
@@ -214,17 +217,17 @@ def kline(symbol: str = Query(..., description="Binance 格式，如 BTCUSDT"),
 # ---------------------------------------------------------------------------
 # 四 tab 骨架占位（内容后续慢慢完善）
 # ---------------------------------------------------------------------------
-@app.get("/api/positions")
+@core_app.get("/api/positions")
 def positions() -> Dict[str, Any]:
     return {"ready": False, "detail": "我的持仓：框架已搭，功能待完善（P2 手动登记）"}
 
 
-@app.get("/api/strategy")
+@core_app.get("/api/strategy")
 def strategy() -> Dict[str, Any]:
     return {"ready": False, "detail": "策略：框架已搭，功能待完善"}
 
 
-@app.get("/api/backtest")
+@core_app.get("/api/backtest")
 def backtest() -> Dict[str, Any]:
     return {"ready": False, "detail": "回测：框架已搭，功能待完善"}
 
@@ -235,11 +238,42 @@ def backtest() -> Dict[str, Any]:
 if DIST_DIR.exists():
     assets_dir = DIST_DIR / "assets"
     if assets_dir.exists():
-        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+        core_app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-    @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(str(DIST_DIR / "index.html"))
+    @core_app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(DIST_DIR / "index.html")
+
+
+# ── 对外入口：统一 /crypto 前缀 ────────────────────────────────────
+# nginx 443 单域名分流（见 docs/architecture.md）：
+#   https://stream04l4.duckdns.org/        → :9090 股票
+#   https://stream04l4.duckdns.org/crypto/ → 此处（nginx 按前缀透传，不剥前缀）
+app = FastAPI(title="crypto-screener web", version="0.1.0")
+app.mount("/crypto", core_app)
+
+
+# 外层 auth 门（纵深防御，必须）：经验证，经 Mount 进入子应用时内部
+# _auth_gate 完全不执行（本版本 FastAPI 挂载子应用不套用其 HTTP 中间件，
+# 探针确认 parse_token 零调用）→ 未登录请求直通。此处对外层全部
+# /crypto/api/* 兜底同一套鉴权（公开路径与内部一致：login/logout/health）。
+# 内层门保留：core_app 直用（测试/直连）时仍然生效。
+@app.middleware("http")
+async def _auth_gate_outer(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/crypto/api/") and not _AUTH_DISABLED:
+        inner_path = path[len("/crypto"):]  # → /api/...
+        if inner_path not in _AUTH_PUBLIC_PATHS:
+            _u, _p, secret = load_auth_config()
+            if parse_token(request.cookies.get(COOKIE_NAME), secret) is None:
+                return JSONResponse({"detail": "未登录或会话已过期，请先登录"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/")
+async def root_redirect():
+    # 直连 :9091 根路径 → 引导到带前缀入口
+    return RedirectResponse(url="/crypto/")
 
 
 if __name__ == "__main__":

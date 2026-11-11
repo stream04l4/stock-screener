@@ -5,11 +5,22 @@
 
 ## 1. 总览：一个仓库，两个独立系统
 
+**访问入口（v7.0.44，443 单域名 HTTPS）：**
+- `https://stream04l4.duckdns.org/` → 股票系统
+- `https://stream04l4.duckdns.org/crypto/` → 加密货币系统
+- nginx（443，Let's Encrypt 证书）按路径分流到 127.0.0.1:9090 / :9091；
+  9090/9091 仅本机可达（公网建议只放通 443，9090/9091 在路由层关闭）
+- 同域 cookie（ssc_session）天然跨系统共享 → 双端互免登（不再有跨端口问题）
+- 证书续期：acme.sh ALPN-01（仅 443 可用，80 未开）+ pre/post 钩子自动腾挪 443
+  （/usr/local/sbin/ssl443-pre|post）+ 5 分钟看门狗兜底；nginx 站点配置在
+  /etc/nginx/sites-available/stream04l4（权威副本 docs/nginx-stream04l4.conf）
+
 | | 股票系统（A股） | 加密货币系统 |
 |---|---|---|
+| 入口路径 | / | /crypto/ |
 | 端口 | :9090 | :9091 |
 | 服务 | stock-screener-web.service | crypto-web.service |
-| 后端 | `web/app.py`（web/auth.py 共享登录模块） | `crypto/web/app.py`（import web.auth） |
+| 后端 | `web/app.py`（web/auth.py 共享登录模块） | `crypto/web/app.py`（import web.auth；对外挂 /crypto 前缀 + 外层 auth 门） |
 | 前端 | `web/frontend/`（独立 SPA + build） | `crypto/web/frontend/`（独立 SPA + build） |
 | 代码包 | `lake/` `martingale/` `screener/` `af_rebase.py` | `crypto/`（sources/sync/models/web/positions/strategy/backtest） |
 | 配置 | `config/strategy.yaml` | `crypto/config/crypto.yaml` |
@@ -20,9 +31,10 @@
 
 **共享基础（仅有的跨系统耦合，刻意保持最小）：**
 1. `.env`（WEB_ADMIN_USER/WEB_ADMIN_PASS/WEB_SESSION_SECRET）——同账号密码，
-   ssc_session cookie 按 hostname 跨端口生效 → 任一端登录另一端免登
+   ssc_session cookie 同域共享 → 双端互免登
 2. `web/auth.py`——加密货币后端直接 import（登录机制单一定义点，不复制）
-3. 后续 P2：PushPlus 推送（密钥同 .env）
+3. nginx 443 入口（/ 与 /crypto/ 路径分流）——两系统共享同一 TLS 证书与域名
+4. 后续 P2：PushPlus 推送（密钥同 .env）
 
 **隔离保证（硬指标，已有回归验证）：** 停 crypto-web.service 后 :9090 全功能
 正常；两湖物理独立（DuckDB 单写锁，禁共库）；两前端独立 node_modules/build。
@@ -88,7 +100,9 @@ crypto/
 **加密货币系统新功能** → 一律落 `crypto/` 内：
 - 新数据源 → `crypto/sources/<exchange>.py`（同构接口：klines/ticker）
 - 新湖表 → `crypto/models.py`（DDL 集中一处）
-- 新端点 → `crypto/web/app.py`；新页面 → `crypto/web/frontend/src/tabs/`
+- 新端点 → `crypto/web/app.py` 的 core_app（路由保持 /api/*，对外自动带 /crypto
+  前缀；**新 API 必须走外层 auth 门覆盖范围**，公开端点加进 _AUTH_PUBLIC_PATHS）；
+  新页面 → `crypto/web/frontend/src/tabs/`（vite base '/crypto/'，API 走 api() 单一入口）
 - 持仓/策略/回测 → 各自预留子包（positions/strategy/backtest）
 - 运行时数据 → `data/crypto/`（不碰 A 股 data/ 其余目录）
 - 测试 → `tests/test_crypto_*.py`（并入主套件，随 665+ 全量回归跑）
@@ -107,6 +121,11 @@ crypto/
 
 ## 6. 变更记录
 
+- **v7.0.44（2026-11-11）**：443 单域名 HTTPS 入口。nginx 按路径分流
+  （/ → 股票 :9090，/crypto/ → 加密 :9091，前缀不剥）；Let's Encrypt
+  证书（acme.sh ALPN-01 签发 + 自动续期钩子）；crypto 后端/前端统一 /crypto
+  前缀（vite base + API 单一入口），跨系统跳转改同源路径，cookie 同域共享；
+  修复 Mount 挂载下 auth 中间件不执行的问题（外层 auth 门兜底，探针验证 401）。
 - **v7.0.43（2026-11-11）**：双系统架构落地。加密货币数据从 data/lake/ 迁入
   data/crypto/（独占目录）；crypto/ 预留 positions/strategy/backtest 子包；
   删除 v6 遗留（stages/ 37M、output/ 三个无引用旧目录）；本文建立。

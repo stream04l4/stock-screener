@@ -1,4 +1,4 @@
-# stock-screener · v7.0.43（双系统版：A股 + 加密货币）
+# stock-screener · v7.0.44（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 A股**深回撤金字塔加仓**策略（`drawdown_martingale`）：离线数据湖驱动。v7 起移除了
 多因子选股/日跑体系，仓库只保留一条链路：
@@ -13,12 +13,13 @@ martingale/ 包（5 条件股票池 → 逐股状态机回测 → 产物 CSV/MD�
 Web（FastAPI :9090，四页签：回测 / 查询 / 策略 / 数据湖）
 ```
 
-## 0. 项目结构（双系统，v7.0.43）
+## 0. 项目结构（双系统，v7.0.44）
 
-一个仓库，两个独立系统：**股票**（:9090，web/ + lake/ + martingale/ + screener/，
-数据 `data/lake/` 等）与**加密货币**（:9091，`crypto/` 独立单元，数据独占
-`data/crypto/`，湖 = data/crypto/crypto.duckdb）。共享仅：.env 凭据 +
-web/auth.py 登录模块（ssc_session cookie 按 hostname 跨端口，双入口互免登）。
+一个仓库，两个独立系统：**股票**（`https://stream04l4.duckdns.org/` → :9090，
+web/ + lake/ + martingale/ + screener/，数据 `data/lake/` 等）与**加密货币**
+（`/crypto/` → :9091，`crypto/` 独立单元，数据独占 `data/crypto/`，
+湖 = data/crypto/crypto.duckdb）。443 单域名 HTTPS 入口由 nginx 按路径分流，
+共享仅：.env 凭据 + web/auth.py 登录模块 + nginx 入口（同域 cookie 双端互免登）。
 
 **目录职责 / 扩展落点 / 不可动清单 → 权威文档 `docs/architecture.md`；
 加密货币设计细节 → `docs/crypto_design.md`。** 简记：股票侧是稳定区（防护
@@ -386,11 +387,22 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     前端 248 绿（StrategyTab 标签断言同步；TimingStocks 说明行移入
     data 块修复未加载态读 data.params 崩溃）、线上重启后 /api/timing 与
     /api/strategy_signals 实测。
+- **v7.0.44**：443 单域名 HTTPS 入口（Joel 2026-11-11 放通 443）：
+  - nginx 443（Let's Encrypt 证书，acme.sh ALPN-01 签发 + 续期钩子自动腾挪 443
+    + 看门狗兜底）按路径分流：`https://stream04l4.duckdns.org/` → 股票 :9090，
+    `/crypto/` → 加密货币 :9091（前缀透传不剥，SSE/长连接已配）。
+  - crypto 后端统一挂 /crypto 前缀（子应用 mount + **外层 auth 门兜底**——
+    修复 Mount 挂载下 auth 中间件不执行导致的未登录直通，探针验证 401/200
+    矩阵正确）；前端 vite base '/crypto/' + API 单一入口带前缀。
+  - 跨系统跳转改同源路径（/ ↔ /crypto/），cookie 同域共享，双端互免登。
+  - 文档：docs/architecture.md 升为项目地图权威（含 443 入口/扩展约定/
+    不可动清单）；docs/nginx-stream04l4.conf 为 nginx 配置权威副本。
 - **v7.0.43**：加密货币系统框架（Joel 2026-11-11 定案：同仓库双系统，加密货币
   独立页面/进程/服务/数据湖，参照股票四页签，先搭框架慢慢完善）：
   - 新增顶层包 `crypto/`：Binance 主源 + OKX 交叉校验（EU 直连实测 6/6 200）、
     `python -m crypto.sync`（幂等，cron 每小时 :05，--full 7 年回填）、
-    独立湖 `data/lake/crypto.duckdb`（top 20 币，与 A 股湖物理隔离）。
+    独立湖 `data/crypto/crypto.duckdb`（top 20 币，与 A 股湖物理隔离；
+    v7.0.43 后期目录整理时由 data/lake/ 迁入 data/crypto/ 独占目录）。
   - 独立 Web：`crypto/web/app.py`（:9091，crypto-web.service）+ 独立 Vue SPA
     （crypto/web/frontend/）——登录页双入口（恢复 v7.0.42 解耦的双系统登录，
     ssc_session cookie 按 hostname 跨端口，任一端登录另一端免登），四页签

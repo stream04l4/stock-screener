@@ -12,8 +12,8 @@ import { useAuthStore } from "../stores/authStore.js";
 const auth = useAuthStore();
 const form = reactive({ username: "", password: "" });
 const busy = ref(false);
-// 加密货币系统端口（同 hostname，cookie 按 host 不按端口 → 跳转后免登）
-const cryptoUrl = "http://" + window.location.hostname + ":9091/";
+// 加密货币入口 = 同域名 /crypto/ 路径（443 单域名架构；同域 cookie 跳转免登）
+const cryptoUrl = window.location.origin + "/crypto/";
 
 async function doLogin(target) {
   if (!form.username.trim() || !form.password) {

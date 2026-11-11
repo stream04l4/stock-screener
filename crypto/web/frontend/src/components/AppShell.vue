@@ -19,8 +19,8 @@ const TABS = [
 
 const active = ref("my_positions");
 
-// 股票系统跳转（同 hostname，cookie 按 host 不按端口 → 已登录则免登）
-const stockUrl = "http://" + window.location.hostname + ":9090/";
+// 股票系统跳转（443 单域名：/ → 股票，/crypto/ → 加密；同域 cookie 已登录免登）
+const stockUrl = window.location.origin + "/";
 
 const auth = useAuthStore();
 async function doLogout() {

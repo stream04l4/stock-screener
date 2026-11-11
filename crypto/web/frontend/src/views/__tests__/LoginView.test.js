@@ -1,5 +1,6 @@
 // LoginView（加密货币系统）测试：双入口按钮 + 登录流程。
-// mock fetch：/api/auth/me → 401（未登录）；/api/login → 200 写 user。
+// mock fetch（443 单域名架构：API 一律带 /crypto 前缀）：
+//   /crypto/api/auth/me → 401（未登录）；/crypto/api/login → 200 写 user。
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { createPinia } from "pinia";
@@ -31,7 +32,7 @@ describe("LoginView（加密货币系统，双入口）", () => {
   });
 
   it("渲染双系统标题与两个登录按钮（A股 + 加密货币）", async () => {
-    mockFetch({ "/api/auth/me": { ok: false, status: 401, body: {} } });
+    mockFetch({ "/crypto/api/auth/me": { ok: false, status: 401, body: {} } });
     const w = mountView();
     await flushPromises();
     expect(w.text()).toContain("双系统统一登录");
@@ -42,20 +43,20 @@ describe("LoginView（加密货币系统，双入口）", () => {
   });
 
   it("未填凭据点登录 → 行内错误，不发请求", async () => {
-    const fn = mockFetch({ "/api/auth/me": { ok: false, status: 401, body: {} } });
+    const fn = mockFetch({ "/crypto/api/auth/me": { ok: false, status: 401, body: {} } });
     const w = mountView();
     await flushPromises();
     await w.find("button.login-btn-crypto").trigger("click");
     await flushPromises();
     expect(w.text()).toContain("请输入用户名和密码");
-    expect(fn).not.toHaveBeenCalledWith("/api/login", expect.anything());
+    expect(fn).not.toHaveBeenCalledWith("/crypto/api/login", expect.anything());
   });
 
   it("正确凭据 + 加密货币按钮 → 登录成功 user 置位（停留本站）", async () => {
     const setCookie = vi.fn();
     mockFetch({
-      "/api/auth/me": { ok: false, status: 401, body: {} },
-      "/api/login": { ok: true, status: 200, body: { ok: true, user: "admin" } },
+      "/crypto/api/auth/me": { ok: false, status: 401, body: {} },
+      "/crypto/api/login": { ok: true, status: 200, body: { ok: true, user: "admin" } },
     });
     const w = mountView();
     await flushPromises();
@@ -69,8 +70,8 @@ describe("LoginView（加密货币系统，双入口）", () => {
 
   it("登录失败 401 → 显示错误文案", async () => {
     mockFetch({
-      "/api/auth/me": { ok: false, status: 401, body: {} },
-      "/api/login": { ok: false, status: 401, body: { detail: "用户名或密码错误" } },
+      "/crypto/api/auth/me": { ok: false, status: 401, body: {} },
+      "/crypto/api/login": { ok: false, status: 401, body: { detail: "用户名或密码错误" } },
     });
     const w = mountView();
     await flushPromises();

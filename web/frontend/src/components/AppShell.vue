@@ -24,8 +24,8 @@ const TABS = [
 // 默认激活第一个页签（v7.0.2：我的持仓 = 日常主入口）
 const active = ref("my_positions");
 
-// v7.0.43：加密货币系统跳转（同 hostname，cookie 按 host 不按端口 → 已登录免登）
-const cryptoUrl = "http://" + window.location.hostname + ":9091/";
+// v7.0.44：加密货币系统跳转（443 单域名 /crypto/；同域 cookie 已登录免登）
+const cryptoUrl = window.location.origin + "/crypto/";
 
 // v7.0.14：顶栏显示当前用户 + 退出（回登录页，cookie 清除）
 const auth = useAuthStore();
@@ -41,7 +41,7 @@ async function doLogout() {
       <button v-for="[key, label] in TABS" :key="key" class="tab" :class="{ active: active === key }" @click="active = key">{{ label }}</button>
     </nav>
     <ToastBar />
-    <a class="topbar-jump" :href="cryptoUrl" title="跳转加密货币系统（:9091，已登录免登）">🪙 加密货币</a>
+    <a class="topbar-jump" :href="cryptoUrl" title="跳转加密货币系统（/crypto/，已登录免登）">🪙 加密货币</a>
     <div class="topbar-auth">
       <span class="topbar-user">👤 {{ auth.user }}</span>
       <button type="button" class="topbar-logout" title="退出登录（清除本机会话）" @click="doLogout">退出</button>
