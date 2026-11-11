@@ -108,7 +108,8 @@ def _fmt_row(base, d: float, tp: float, gr: float, m: dict,
 
 
 def run_search(drops: list, tps: list, grs: list, bases: list, coins: list,
-               start: str, end: str, budget: float = 0.0) -> dict:
+               start: str, end: str, budget: float = 0.0,
+               lookback_h: float | None = None) -> dict:
     """执行网格寻优 → {coin: [(base, drop, tp, growth, metrics), ...]}。"""
     with open(CFG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -125,7 +126,8 @@ def run_search(drops: list, tps: list, grs: list, bases: list, coins: list,
                                base_amount_usdt=float(base),
                                growth=gr, take_profit_mult=tp,
                                fee_bps=base_p.fee_bps,
-                               lookback_h=base_p.lookback_h)
+                               lookback_h=int(lookback_h) if lookback_h
+                               else base_p.lookback_h)
             r = run_backtest([coin], p, start=start, end=end,
                              external_cap=budget or None)[0]
             m = _metrics(r, years)
@@ -142,7 +144,7 @@ def run_search(drops: list, tps: list, grs: list, bases: list, coins: list,
 
 def render_report(rows_by_coin: dict, drops: list, tps: list, grs: list,
                   bases: list, start: str, end: str,
-                  years: float, budget: float) -> str:
+                  years: float, budget: float, lookback_h: int = 8760) -> str:
     hdr = ("| 起始资金(U) | 建仓幅度 | 止盈 | 加仓 | 轮次 | 持仓中 | "
            "外部投入/预算 | 预算可至 | 期末净值(U) | 净收益(U) | 回报率 | 周转CAGR | 均持仓(d) | MDD |")
     sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
@@ -150,7 +152,8 @@ def render_report(rows_by_coin: dict, drops: list, tps: list, grs: list,
         "# 加密货币参数寻优",
         "",
         f"窗口：{start} → {end}（UTC 日界，end 含当日；窗口内账户从空开始，"
-        "一年高点用窗口前 8760h 历史做基线）。fee 10bps 双向。",
+        f"{lookback_h / 8760:g} 年高点用窗口前 {lookback_h}h 历史做基线）。"
+        "fee 10bps 双向。",
         f"网格：起始资金 {bases} × 建仓幅度(高点回撤) {drops} × "
         f"止盈 {tps} × 加仓 {grs}，"
         f"每币 {len(bases) * len(drops) * len(tps) * len(grs)} 组合。",
@@ -207,6 +210,8 @@ def main(argv=None) -> int:
     ap.add_argument("--grs", default="1.02,1.05,1.08,1.1", help="加仓倍数，逗号分隔")
     ap.add_argument("--budget", type=float, default=0.0,
                     help="外部投入硬预算 USDT（0 = 不限，缺省）")
+    ap.add_argument("--lookback", type=float, default=0.0,
+                    help="高点回看窗口（年，缺省 = yaml 的 1.0；如 1.5）")
     ap.add_argument("--out", default=os.path.join(
         ROOT, "data", "crypto", "param_search.md"), help="报告输出路径")
     args = ap.parse_args(argv)
@@ -223,13 +228,16 @@ def main(argv=None) -> int:
     drops = _parse_list(args.drops, float)
     tps = _parse_list(args.tps, float)
     grs = _parse_list(args.grs, float)
+    lookback_h = int(args.lookback * 8760) if args.lookback else None
     years = max((datetime.strptime(args.end, "%Y-%m-%d")
                  - datetime.strptime(args.start, "%Y-%m-%d")).days / 365.25, 1e-9)
 
     rows_by_coin = run_search(drops, tps, grs, bases, coins,
-                              args.start, args.end, budget=args.budget)
+                              args.start, args.end, budget=args.budget,
+                              lookback_h=lookback_h)
     report = render_report(rows_by_coin, drops, tps, grs, bases,
-                           args.start, args.end, years, budget=args.budget)
+                           args.start, args.end, years, budget=args.budget,
+                           lookback_h=lookback_h or 8760)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(report)
