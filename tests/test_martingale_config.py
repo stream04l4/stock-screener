@@ -35,9 +35,9 @@ def test_load_real_config():
     assert 0 < p.first_drawdown < 1
     assert 0 < p.add_step < 1
     assert 0 < p.rearm_pct <= 1
-    # 手数 = yaml 原值（v7.0.28 手数口径）
+    # 手数 = yaml 原值（v7.0.28 手数口径；v8.1.2 步长 1→2）
     assert p.lot_size == int(REAL_YAML.read_text().split("lot_size:")[1].split()[0])
-    assert (p.first_lots, p.add_lots_step) == (1, 1)
+    assert (p.first_lots, p.add_lots_step) == (1, 2)
     # 佣金常量 3bps（引擎常量，不进 yaml）
     assert p.commission == COMMISSION_BPS / 1e4 == 3.0 / 1e4
     assert p.stamp == 5.0 / 1e4

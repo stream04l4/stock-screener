@@ -45,3 +45,7 @@
 - summary.md 的"耗时 Xs"行不要求一致 (机器相关)。
 - 重跑复现: .venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21
   --codes <code> --out <tmpdir> (参数取 f6 值, 见 tests/test_f6_regression.py)
+- **2026-11-12 重生成 (v8.1.2 加仓步长 1→2)**: Joel 2026-11-12 定案：
+  加仓手数步长 1→2（首仓1手/加仓3手/再加5手/7手…，加大单股投入规模）。
+  触发时机零改动：7 股 n_buys/日期/价格与 v8.1.0 基线逐笔一致
+  （2/6/9/0/6/1/16 笔），仅 amount 与汇总字段变化。

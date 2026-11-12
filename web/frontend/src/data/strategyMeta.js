@@ -105,7 +105,7 @@ export const FIELD_DESC = {
   "strategy.first_lots":
     "首仓买几手（第 0 档）；当前 1 手",
   "strategy.add_lots_step":
-    "每加一档多买几手：第 k 档 = first_lots + k×本值，即 1手→2手→3手……再武装后新轮从首仓手数重新起算",
+    "每加一档多买几手：第 k 档 = first_lots + k×本值，当前 2 即 1手→3手→5手→7手……（v8.1.2 步长 1→2）再武装后新轮从首仓手数重新起算",
   "strategy.add_step_pct":
     "建首仓后，每再跌这个比例加一档；跳空缺口一天可以连穿多档",
   "strategy.rearm_mode":
@@ -143,7 +143,7 @@ export const FIELD_DESC = {
     "控股强度门豁免（code→理由）：湖数据 top10 标注缺口（实际控股股东为国企但标注为境内/境外法人）导致误伤时按股豁免；holders 数据刷新后复核可摘除项",
   // v8.1.1 央企收紧门（yaml-only 治理键；页面隐藏，改值走 yaml 手工编辑）
   "universe.central_only":
-    "开 = 池在国企门之上再要求「最大国有股东（≥控股强度门槛）为央企」（集团清单见 martingale/central_soe.py，地方国企/国资参股均剔除）；关 = 只要求国资不区分央/地（默认）",
+    "开（v8.1.2 起默认）= 池在国企门之上再要求「最大国有股东（≥控股强度门槛）为央企」（集团清单见 martingale/central_soe.py，地方国企/国资参股均剔除）；关 = 只要求国资不区分央/地",
   // v7.0.13 timing（选股时机）；v7.0.24 起时机门 = ① 单条件；
   // v7.0.26：② 股息率 / ③ 年线彻底删除、首仓建仓回撤自 strategy 段移入
   "timing.price_window_years":

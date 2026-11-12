@@ -294,8 +294,9 @@ def test_validate_strategy_v7013_timing():
 def test_get_pool_funnel_and_members():
     out = wapp.get_pool()
     # v7.0.12：候选池 = 基础 5 条件 ∩ 十年回测为正 ∩ 股息率≥3% ∩ 价格 3~100 元 ∪ 手动
-    # （2026-10-24 生产首跑 = 59 只；留漂移余量）
-    assert out["n_members"] >= 40
+    # （2026-10-24 生产首跑 = 59 只；留漂移余量；**v8.1.2 央企收紧门默认开后
+    #   生产 ≈30 只，守卫下调至 15**）
+    assert out["n_members"] >= 15
     f = out["funnel"]
     keys = ["total", "whitelist", "soe", "mv", "listing", "div",
             "backtest", "yield", "price", "final", "manual"]
@@ -326,7 +327,7 @@ def test_get_pool_funnel_and_members():
 @pytest.mark.skipif(not HAS_LAKE, reason="生产湖不存在")
 def test_get_positions_shape():
     out = wapp.get_positions()
-    assert out["n"] >= 40  # v7.0.12：候选池 59 只（2026-10-24 首跑）
+    assert out["n"] >= 15  # v7.0.12：候选池 59 只（2026-10-24 首跑）；v8.1.2 央企门默认开后 ≈30 只
     assert out["as_of"]
     p0 = out["positions"][0]
     assert {"ts_code", "in_pos", "shares", "avg_cost", "next_add_price",

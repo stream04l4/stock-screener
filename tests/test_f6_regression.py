@@ -9,9 +9,10 @@ v8.1.0（Joel 2026-11-12 定案）：首仓双条件（① 高点回撤 ≥15% �
 load 起点前移 5 年喂分位窗口 → first_ok_series（与页面同口径）→ 切回窗口。
 
 f6 参数（config/strategy.yaml 生产值，逐位一致的前提）：
-lot_size=100, first_lots=1, add_lots_step=1（v7.0.28 手数 C 方案：第 k 档
+lot_size=100, first_lots=1, add_lots_step=2（v7.0.28 手数 C 方案：第 k 档
 0 起 = first_lots+k×add_lots_step 手，再武装后 k 归零重新从 1 手起算；
-2026-11-09 按新 sizing 重新生成基线，触发时机与旧基线逐笔零 diff），
+**v8.1.2（2026-11-12）步长 1→2：首仓1/加仓3/再加5/7…，基线已按新 sizing
+重新生成，触发时机（n_buys/日期/价格）与 v8.1.0 基线逐笔零 diff，仅金额变**），
 dd=0.15, step=0.05, rearm=bounce(0.15), accounting=cash, comm=3bps, stamp=5bps,
 timing=5年分位≤40%, 窗口 2016-01-04 → 2026-10-21。
 """
