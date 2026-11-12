@@ -1,7 +1,8 @@
 // 候选股票池成员列表（v7.0.12，策略页签「股票池」卡片内）。
-// - 数据：GET /api/pool（候选池 = 基础 5 条件 ∩ 十年回测为正 ∩ 股息率≥3%
-//   ∩ 价格 3~100 元 ∪ 手动池；读预计算表 O(1)，服务端已按 10 年回测降序）。
-// - 展示全部候选股（2026-10-24 生产 = 59 只）；SimpleTable 自带搜索 + 点表头排序。
+// - 数据：GET /api/pool（候选池 = 基础池 ∩ 十年回测≥门槛 ∩ 股息率≥门槛
+//   ∩ 价格区间 ∪ 手动池；读预计算表 O(1)，服务端已按 10 年回测降序）。
+// - 展示全部候选股（v8.0.8 起 = 全行业高息央国企，控股强度门保证无伪国企）；
+//   SimpleTable 自带搜索 + 点表头排序。
 // - 候选池 ≠ 买入信号：入选 ≠ 该买；买不买看价格是否到策略触发线
 //   （「我的持仓」页信号 / 微信提醒，同一口径）。
 // - 手动添加/移除后 ManualPoolBar 会 invalidate("pool") 刷新本表。
@@ -17,7 +18,7 @@ const { data, loading, error } = useLiveQuery("pool", () => api("/api/pool"), {}
 const funnelLine = computed(() => {
   const f = data.value && data.value.funnel;
   if (!f) return "";
-  return `全市场 ${f.total} → 基础5条件 ${f.div} → 十年回测为正 ${f.backtest} → 股息率 ${f.yield} → 价格区间 ${f.price} → 候选池 ${f.final}（含手动 ${f.manual}）`;
+  return `全市场 ${f.total} → 基础池 ${f.div} → 十年回测≥门槛 ${f.backtest} → 股息率≥门槛 ${f.yield} → 价格区间 ${f.price} → 候选池 ${f.final}（含手动 ${f.manual}）`;
 });
 
 const rows = computed(() => {

@@ -3,8 +3,11 @@
 
 链路（顺序 = 漏斗输出顺序；调研 ①②，TL 独立 SQL 复算确认 5556→347→289→125→124→~95）：
 1. 全市场 stock_master
-2. ∩ 行业白名单（industry_csric2 前缀匹配）∩ 未退市 ∩ 非ST
+2. ∩ 行业白名单（industry_csric2 前缀匹配；v8.0.8：["*"] = 全放开）∩ 未退市 ∩ 非ST
 3. ∩ 央国企（SOE 双规则，恒强制）
+   v8.0.8 国企控股强度门（可选，默认关闭）：最大单一国有占比 ≥ min_soe_ratio_pct
+   或 top10 国有合计 ≥ min_soe_sum_ratio_pct 或 soe_control_overrides 豁免；
+   另有 exclude_codes 硬剔除名单（伪国企，如隆鑫通用）
 4. ∩ 总市值 ≥ min_total_mv_yi（最新估值日）
 5. ∩ 上市满 listing_min_trading_days 个交易日（K线行数）
 6. ∩ 连续分红（老股规则 + 新股规则，语义 as-is 移植自 v6.x _div_history_ok）
@@ -25,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date as _date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import UniverseParams
 
@@ -109,25 +112,75 @@ def _soe_set(con, soe_keywords: tuple) -> Dict[str, str]:
     return out
 
 
+def _soe_ratio_map(con) -> Dict[str, Tuple[float, float]]:
+    """v8.0.8：每股最新 as_of 的 top10 国有性质（share_nature='国有股'）持股。
+
+    返回 {code: (最大单一国有占比, top10 国有合计占比)}（百分数口径，与
+    min_soe_ratio_pct/min_soe_sum_ratio_pct 同）。无国有 top10 股东的股不出现在
+    结果里（调用方用 .get(c, (0.0, 0.0))——SOE 双规则已保证命中时至少一方非零：
+    规则 A 命中 ⇒ 国有占比 > 0；规则 B 关键词命中而无「国有股」性质标注的，
+    按 0 处理 = 需过合计/豁免档，属设计内从严）。
+    """
+    q = """
+        SELECT h.ts_code, h.hold_ratio
+        FROM holders_snapshot h
+        JOIN (SELECT ts_code, MAX(as_of_date) la
+              FROM holders_snapshot GROUP BY ts_code) l
+          ON h.ts_code = l.ts_code AND h.as_of_date = l.la
+        WHERE h.holder_rank <= 10 AND h.share_nature = '国有股'
+    """
+    acc: Dict[str, List[float]] = {}
+    for code, ratio in con.execute(q).fetchall():
+        acc.setdefault(code, []).append(float(ratio or 0.0))
+    return {c: (max(rs), sum(rs)) for c, rs in acc.items()}
+
+
 def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolResult:
     """构建股票池。:param con: 只读 duckdb 连接；:param run_year: 分红判定的
     "当前年"（缺省 = 当年；测试可注入以复现历史口径）。"""
     run_year = run_year or _date.today().year
 
-    # 2) 白名单 + 存活 + 非ST（industry_csric2 前缀匹配）
-    wl_ors = " OR ".join("sm.industry_csric2 LIKE ?" for _ in up.industry_whitelist_csric2)
-    wl_sql = f"""
-        SELECT ts_code, name, industry_csric2, list_date
-        FROM stock_master sm
-        WHERE ({wl_ors}) AND delist_date IS NULL AND COALESCE(is_st, 0) = 0
-    """
-    con.execute(wl_sql, [f"{c}%" for c in up.industry_whitelist_csric2])
+    # 2) 白名单 + 存活 + 非ST（industry_csric2 前缀匹配；v8.0.8：["*"] = 全放开）
+    if set(up.industry_whitelist_csric2) == {"*"}:
+        wl_sql = """
+            SELECT ts_code, name, industry_csric2, list_date
+            FROM stock_master sm
+            WHERE delist_date IS NULL AND COALESCE(is_st, 0) = 0
+        """
+        con.execute(wl_sql)
+    else:
+        wl_ors = " OR ".join("sm.industry_csric2 LIKE ?" for _ in up.industry_whitelist_csric2)
+        wl_sql = f"""
+            SELECT ts_code, name, industry_csric2, list_date
+            FROM stock_master sm
+            WHERE ({wl_ors}) AND delist_date IS NULL AND COALESCE(is_st, 0) = 0
+        """
+        con.execute(wl_sql, [f"{c}%" for c in up.industry_whitelist_csric2])
     wl_rows = con.fetchall()
     wl = {r[0]: r for r in wl_rows}
 
     # 3) SOE
     soe = _soe_set(con, up.soe_keywords)
     soe_codes = sorted(set(wl) & set(soe))
+    soe_raw = len(soe_codes)  # 漏斗展示用：交后计数（门前的口径）
+
+    # 3-b) v8.0.8 硬剔除名单（控股强度门之上的硬排除，审计留痕见 yaml 注释）
+    if up.exclude_codes:
+        excl = set(up.exclude_codes)
+        soe_codes = [c for c in soe_codes if c not in excl]
+
+    # 3-c) v8.0.8 SOE 控股强度门（两键均 0 = 关闭，回退 v8.0.0 行为）：
+    # 最大单一国有占比 ≥ min_soe_ratio_pct 或 top10 国有合计 ≥ min_soe_sum_ratio_pct
+    # 或命中 soe_control_overrides（湖数据标注缺口豁免）→ 保留。
+    if up.min_soe_ratio_pct > 0 or up.min_soe_sum_ratio_pct > 0:
+        ratios = _soe_ratio_map(con)
+        ov = set(up.soe_control_overrides)
+        soe_codes = [
+            c for c in soe_codes
+            if (ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct
+                or ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct
+                or c in ov)
+        ]
 
     # 4) 市值（最新估值日 total_mv；valuation_daily 日期列名 = date）
     mv_sql = """
@@ -189,7 +242,8 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
     funnel = {
         "total": int(con.execute("SELECT COUNT(*) FROM stock_master").fetchone()[0]),
         "whitelist": len(wl),
-        "soe": len(soe_codes),
+        "soe": soe_raw,
+        "soe_ratio": len(soe_codes),  # v8.0.8 排除+控股强度门后的计数（门关闭时=soe）
         "mv": len(mv_codes),
         "listing": len(listing_codes),
         "div": len(div_codes),

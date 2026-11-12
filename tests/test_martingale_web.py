@@ -47,7 +47,7 @@ def test_get_strategy_five_sections():
     # v7 slim：strategy/universe/lake/datasource 四段（lake + datasource 必须保留）
     assert {"strategy", "universe", "lake", "datasource"} <= keys
     assert len(out["json"]["strategy"]) == 8
-    assert len(out["json"]["universe"]) == 11  # v7.0.12：5 基础条件 + 5 候选池门槛；v7.0.39 + 收益率下限
+    assert len(out["json"]["universe"]) == 15  # v8.0.8：v7.0.39 的 11 键 + 国企控股强度门 4 治理键
     # v7.0.13：timing 段（v7.0.26：②③ 删除、首仓建仓回撤移入；v7.0.30：+
     # approach_pct 显示带 / spot_preselect_pct 实时取价预筛带，web 侧口径）
     assert set(out["json"]["timing"].keys()) == {

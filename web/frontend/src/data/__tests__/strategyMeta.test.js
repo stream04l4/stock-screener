@@ -65,14 +65,18 @@ describe("strategyMeta · v7 结构", () => {
     expect(SECTION_DESC.strategy).toContain("first_lots+k×add_lots_step");
   });
 
-  it("HIDDEN_FIELDS = {strategy.name}（策略标识不作为字段行渲染）", () => {
+  it("HIDDEN_FIELDS = strategy.name + v8.0.8 国企控股强度门 4 治理键（不作为字段行渲染）", () => {
     expect(HIDDEN_FIELDS.has("strategy.name")).toBe(true);
-    expect(HIDDEN_FIELDS.size).toBe(1);
+    expect(HIDDEN_FIELDS.has("universe.min_soe_ratio_pct")).toBe(true);
+    expect(HIDDEN_FIELDS.has("universe.min_soe_sum_ratio_pct")).toBe(true);
+    expect(HIDDEN_FIELDS.has("universe.exclude_codes")).toBe(true);
+    expect(HIDDEN_FIELDS.has("universe.soe_control_overrides")).toBe(true);
+    expect(HIDDEN_FIELDS.size).toBe(5);
   });
 });
 
 describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
-  it("FIELD_TYPE = 24 键（strategy 8 + universe 11 + timing 5），类型逐一断言", () => {
+  it("FIELD_TYPE = 28 键（strategy 8 + universe 15 + timing 5），类型逐一断言", () => {
     const expected = {
       name: "str",
       lot_size: "int",
@@ -93,6 +97,11 @@ describe("strategyMeta · FIELD_TYPE / ENUM_OPTIONS（v7 slim）", () => {
       min_ttm_yield_pct: "float",
       price_min_yuan: "float",
       price_max_yuan: "float",
+      // v8.0.8 国企控股强度门（yaml-only 治理键，隐藏不渲染）
+      min_soe_ratio_pct: "float",
+      min_soe_sum_ratio_pct: "float",
+      exclude_codes: "list",
+      soe_control_overrides: "str",
       // v7.0.13 timing（v7.0.26：②③ 删除、first_drawdown_pct 自 strategy 移入）
       price_window_years: "int",
       price_pctile_max: "float",

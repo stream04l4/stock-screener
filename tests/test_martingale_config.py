@@ -42,12 +42,21 @@ def test_load_real_config():
     assert p.commission == COMMISSION_BPS / 1e4 == 3.0 / 1e4
     assert p.stamp == 5.0 / 1e4
     # universe
-    assert len(u.industry_whitelist_csric2) >= 10
-    assert all(len(c) == 3 and c[0].isalpha() and c[0].isupper() and c[1:3].isdigit()
-               for c in u.industry_whitelist_csric2)
+    # v8.0.8：行业白名单全放开 ["*"]（或 3 位 csric2 行业码）
+    if u.industry_whitelist_csric2 == ("*",):
+        pass  # 全放开哨兵
+    else:
+        assert len(u.industry_whitelist_csric2) >= 10
+        assert all(len(c) == 3 and c[0].isalpha() and c[0].isupper() and c[1:3].isdigit()
+                   for c in u.industry_whitelist_csric2)
     assert u.min_total_mv_yi >= 1
     assert u.min_consecutive_div_years >= 1
     assert 20 <= u.listing_min_trading_days <= 1200
+    # v8.0.8 国企控股强度门（生产定值；可选键，缺省 0=关闭）
+    assert u.min_soe_ratio_pct == 8.0
+    assert u.min_soe_sum_ratio_pct == 30.0
+    assert u.exclude_codes == ("sh.603766",)
+    assert len(u.soe_control_overrides) == 4
     # v7.0.26 timing：生产 yaml 段 = 3 键（5 年 / 40%；首仓建仓回撤亦归本段）
     assert (t.price_window_years, t.price_pctile_max) == (5, 40.0)
     assert p.first_drawdown == pytest.approx(0.15)  # 取自 timing 段

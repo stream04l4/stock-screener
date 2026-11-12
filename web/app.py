@@ -423,9 +423,13 @@ def _validate_strategy(cfg: Dict[str, Any]) -> List[str]:
                 if not isinstance(v, list) or not v:
                     errors.append(f"{section}.{field} 必须是非空字符串数组")
                     continue
-                for p in v:
-                    if not isinstance(p, str) or not re.fullmatch(r"[A-Z]\d{2}", p):
-                        errors.append(f"{section}.{field} 项非法: {p!r}（应形如 B06）")
+                # v8.0.8：["*"] = 行业白名单全放开（与 martingale.config 层同语义）；
+                # 与行业码混用非法（config 层同样拒绝）。
+                if v != ["*"]:
+                    for p in v:
+                        if not isinstance(p, str) or not re.fullmatch(r"[A-Z]\d{2}", p):
+                            errors.append(f"{section}.{field} 项非法: {p!r}"
+                                          "（应形如 B06；全放开用 [\"*\"]）")
             elif typ == "str_list":
                 if not isinstance(v, list) or not v:
                     errors.append(f"{section}.{field} 必须是非空字符串数组")

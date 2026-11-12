@@ -154,14 +154,27 @@ def _cmd_pool(args) -> int:
     finally:
         con.close()
     fu = pool.funnel
-    print("候选池漏斗（基础 5 条件 + 选股门槛；候选池 ≠ 买入信号，买不买看价格）：")
+    print("候选池漏斗（基础池 + 选股门槛；候选池 ≠ 买入信号，买不买看价格）：")
     print(f"  全市场: {fu['total']}")
-    print(f"  ∩行业白名单+存活+非ST: {fu['whitelist']}")
+    if set(up.industry_whitelist_csric2) == {"*"}:
+        print(f"  ∩全行业(v8.0.1 白名单放开)+存活+非ST: {fu['whitelist']}")
+    else:
+        print(f"  ∩行业白名单+存活+非ST: {fu['whitelist']}")
     print(f"  ∩央国企(SOE双规则): {fu['soe']}")
+    if up.min_soe_ratio_pct > 0 or up.min_soe_sum_ratio_pct > 0:
+        gate_desc = []
+        if up.min_soe_ratio_pct > 0:
+            gate_desc.append(f"单一国有≥{up.min_soe_ratio_pct:g}%")
+        if up.min_soe_sum_ratio_pct > 0:
+            gate_desc.append(f"国有合计≥{up.min_soe_sum_ratio_pct:g}%")
+        print(f"  ∩国企控股强度门({'或'.join(gate_desc)}): {fu['soe_ratio']}")
     print(f"  ∩总市值≥{up.min_total_mv_yi:g}亿: {fu['mv']}")
     print(f"  ∩上市≥{up.listing_min_trading_days}交易日: {fu['listing']}")
     print(f"  ∩连续分红≥{up.min_consecutive_div_years}年: {fu['div']}")
-    print(f"  ∩{up.backtest_window_years}年回测为正: {fu['backtest']}")
+    if up.backtest_min_return_pct and up.backtest_min_return_pct > 0:
+        print(f"  ∩{up.backtest_window_years}年回测≥{up.backtest_min_return_pct:g}%: {fu['backtest']}")
+    else:
+        print(f"  ∩{up.backtest_window_years}年回测为正: {fu['backtest']}")
     print(f"  ∩股息率≥{up.min_ttm_yield_pct:g}%: {fu['yield']}")
     print(f"  ∩价格{up.price_min_yuan:g}~{up.price_max_yuan:g}元: {fu['price']}")
     print(f"  候选池: {fu['final']}（含手动添加 {fu['manual']}）")

@@ -9,16 +9,19 @@
 //   因为直接影响首仓后第一个加仓的金额）。
 //
 // 页面渲染 23 个字段行：strategy 8（name 为策略标识，隐藏于 HIDDEN_FIELDS）
-// + universe 10（v7.0.12：基础 5 条件 + 候选池选股门槛 5 键）
+// + universe 11（v7.0.12：基础 5 条件 + 候选池选股门槛 5 键）
 // + timing 5（v7.0.13：选股时机 3 条件开关/参数）。
 // accounting 固定 cash（只读，FIELD_TYPE="readonly"）。
+// v8.0.8：universe 另有 4 个 yaml-only 治理键（国企控股强度门：min_soe_ratio_pct /
+// min_soe_sum_ratio_pct / exclude_codes / soe_control_overrides）——进元数据守卫
+// （防漏说明），但不渲染为表单行（HIDDEN_FIELDS，改值走 yaml 手工编辑）。
 //
 // FIELD_TYPE 约定（沿用旧版）：**按裸字段名**索引（非 section.field）；
 // FieldEditor 用 FIELD_TYPE[field] 取类型，未注册 → 回退 "str"。
 
 export const SECTION_META = {
   strategy: { title: "持仓策略（马丁格尔 · 深回撤金字塔加仓）", icon: "📉" },
-  universe: { title: "股票池（候选池：基础 5 条件 + 选股 3 门槛）", icon: "🗂️" },
+  universe: { title: "股票池（候选池：基础 5 条件 + 国企控股强度门 + 选股 3 门槛）", icon: "🗂️" },
   timing: { title: "选股策略（买入时机筛选）", icon: "🎯" },
 };
 
@@ -41,6 +44,7 @@ export const SECTION_DESC = {
     "注意：再武装后档位归零，新轮从 first_lots 手重新起算。",
   universe:
     "候选池门槛 = 基础 5 条件（行业白名单、央国企、总市值下限、上市天数、连续分红）" +
+    "+ v8.0.8 国企控股强度门（国有持股占比下限，保证无伪国企；治理键，页面只读不改）" +
     "叠加 3 道选股门槛（十年回测收益率、股息率下限、股价区间）；入选 ≠ 买入信号，" +
     "买不买看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。",
   timing:
@@ -73,6 +77,11 @@ export const FIELD_LABELS = {
   "universe.min_ttm_yield_pct": "股息率下限 TTM（%）",
   "universe.price_min_yuan": "股价下限（元）",
   "universe.price_max_yuan": "股价上限（元）",
+  // v8.0.8 国企控股强度门（yaml-only 治理键，隐藏不渲染，改值走 yaml 手工编辑）
+  "universe.min_soe_ratio_pct": "控股强度·最大单一国有占比下限（%）",
+  "universe.min_soe_sum_ratio_pct": "控股强度·top10 国有合计占比下限（%）",
+  "universe.exclude_codes": "硬剔除名单（伪国企代码）",
+  "universe.soe_control_overrides": "控股强度门豁免（数据标注缺口）",
   // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、首仓建仓回撤移入
   "timing.price_window_years": "价格分位窗口（年）【时机门条件①】",
   "timing.price_pctile_max": "价格低位分位上限（%）【时机门唯一条件】",
@@ -120,6 +129,15 @@ export const FIELD_DESC = {
   "universe.min_ttm_yield_pct": "最新估值日 TTM 股息率低于这个数 → 剔除",
   "universe.price_min_yuan": "最新收盘价低于这个价 → 剔除（远离退市风险区）",
   "universe.price_max_yuan": "最新收盘价高于这个价 → 剔除（保证加仓档位整手可行）",
+  // v8.0.8 国企控股强度门（yaml-only 治理键；页面隐藏，改值走 yaml 手工编辑）
+  "universe.min_soe_ratio_pct":
+    "前十大股东中最大单一「国有股」性质占比低于该值 → 剔除（防证金公司类财务性小持股混入；0 = 关闭。2026-11-11 定案 8%）",
+  "universe.min_soe_sum_ratio_pct":
+    "top10 国有占比合计低于该值 → 剔除（与单项下限为「或」关系，覆盖多平台持股型地方国企；0 = 关闭。2026-11-11 定案 30%）",
+  "universe.exclude_codes":
+    "硬剔除名单（控股强度门之上的硬排除）：实际控股为民营的伪国企代码，逐项理由见 yaml 注释",
+  "universe.soe_control_overrides":
+    "控股强度门豁免（code→理由）：湖数据 top10 标注缺口（实际控股股东为国企但标注为境内/境外法人）导致误伤时按股豁免；holders 数据刷新后复核可摘除项",
   // v7.0.13 timing（选股时机）；v7.0.24 起时机门 = ① 单条件；
   // v7.0.26：② 股息率 / ③ 年线彻底删除、首仓建仓回撤自 strategy 段移入
   "timing.price_window_years":
@@ -161,6 +179,11 @@ export const FIELD_TYPE = {
   min_ttm_yield_pct: "float",
   price_min_yuan: "float",
   price_max_yuan: "float",
+  // v8.0.8 国企控股强度门（yaml-only 治理键，隐藏不渲染）
+  min_soe_ratio_pct: "float",
+  min_soe_sum_ratio_pct: "float",
+  exclude_codes: "list",
+  soe_control_overrides: "str",
   // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、first_drawdown_pct 移入
   price_window_years: "int",
   price_pctile_max: "float",
@@ -170,8 +193,15 @@ export const FIELD_TYPE = {
   spot_preselect_pct: "float",
 };
 
-// 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染）。
-export const HIDDEN_FIELDS = new Set(["strategy.name"]);
+// 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染；
+// v8.0.8：+ 国企控股强度门 4 个 yaml-only 治理键——页面只读不改，改值走 yaml 手工编辑）。
+export const HIDDEN_FIELDS = new Set([
+  "strategy.name",
+  "universe.min_soe_ratio_pct",
+  "universe.min_soe_sum_ratio_pct",
+  "universe.exclude_codes",
+  "universe.soe_control_overrides",
+]);
 
 // enum2 选项（按 section.field）：选项文案通俗化（2026-10-23）。
 export const ENUM_OPTIONS = {

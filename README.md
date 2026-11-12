@@ -1,4 +1,4 @@
-# stock-screener · v8.0.7（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.8（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -65,25 +65,40 @@ positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypt
 - **组合聚合**：gdates 全局轴 + 末值向前结转（停牌持仓不消失）。
 - 已知局限：湖内无退市股（幸存者偏差）→ 回测产物带此声明。
 
-## 2. 股票池 = 候选池（v7.0.12，基础 5 条件 + 选股门槛 ∪ 手动添加）
+## 2. 股票池 = 候选池（v7.0.12 门槛 + v8.0.8 行业全放开/国企控股强度门 ∪ 手动添加）
 
 **候选池 ≠ 买入信号**：入选只代表进入策略候选名单；是否买入看价格是否到策略触发线
 （Web「我的持仓」页信号 / 微信 PushPlus 提醒，同一口径，`martingale/signals.py`）。
 
-基础 5 条件（`build_pool`）：`kline_daily 5556 只 → 行业白名单(csric2) → SOE(国资前十大股东)
-→ 总市值≥200亿 → 上市≥250 bars → 连续分红N年`。
+基础池（`build_pool`）：`全市场 → 行业白名单(csric2；v8.0.8：["*"] 全放开) → SOE(国资前十大股东)
+→ v8.0.8 国企控股强度门 → 总市值≥200亿 → 上市≥250 bars → 连续分红N年`。
 选股门槛（v7.0.12，Joel 2026-10-24 拍板；波动率门槛经讨论不加）：
-⑦ **十年滚动回测门槛**（≥1 次触发且净收益率 ≥ backtest_min_return_pct%，默认 20
-——v7.0.39 Joel 定案，原「必须为正」= 0% 门槛；含分红扣佣金；预计算表
+⑦ **十年滚动回测门槛**（≥1 次触发且净收益率 ≥ backtest_min_return_pct%，**v8.0.8 生产 30**
+——v7.0.39 定案 20，v8.0.8 Joel 2026-11-11 提档；含分红扣佣金；预计算表
 `selection_backtest_10y`，fail-closed：缺行/收益率为 NULL 不入选）→
-⑧ **TTM 股息率≥3%** → ⑨ **价格 3~100 元**。
+⑧ **TTM 股息率≥min_ttm_yield_pct%（v8.0.8 生产 3.5，v7 起 3）** → ⑨ **价格 2~100 元**。
 **手动添加**：`data/manual_pool.json`（策略页签股票池卡片内的手动录入条 /
 `GET/POST/DELETE /api/pool/manual`）绕过 ⑦⑧⑨ 恒在候选池；退市自动剔除；
 与自动入选重叠时保留自动版并标记 `is_manual`。
-生产首跑（2026-10-24，as_of 10-23）：98 → 82(⑦) → 60(⑧) → **59 只**。
+生产首跑（2026-10-24，as_of 10-23）：98 → 82(⑦) → 60(⑧) → **59 只**；
+**v8.0.8 扩容后（as_of 2026-11-11）：70 只**（全行业 5,029 → SOE 2,204 →
+控股强度门 1,580 → 市值 426 → 分红 329 → ⑦≥30% 170 → ⑧≥3.5% **70**）。
 
 SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_nature='国有股'
 或名称含 soe_keywords 任一（国务院/国资委/汇金/财政部/国资）。
+
+**国企控股强度门（v8.0.8，Joel 2026-11-11 定案）**：行业全放开后「top10 任一国有股东」
+判定过宽（美的 1.88%/青年服饰 5.58% 这类证金公司财务性小持股也能进池）。口径 =
+holders_snapshot 最新 as_of、top10、share_nature='国有股'：
+**通过 = 最大单一国有占比 ≥ min_soe_ratio_pct（8）或 top10 国有合计 ≥
+min_soe_sum_ratio_pct（30）或 soe_control_overrides 豁免**。
+8/30 定值依据：湖数据实测伪国企（民营控股）最大国有占比全部 ≤5.58%、真国企全部
+≥8.21%（5.6~8.2 为数据自然断层）；合计档覆盖多平台持股型地方国企（江苏银行单一
+6.98% 但合计 35.51%）。纯 30% 单一线被否决（会误杀全部城商行，平台直持 8~25%）。
+配套键：`exclude_codes`（硬剔除，现状 sh.603766 隆鑫通用=民营控股）+
+`soe_control_overrides`（数据标注缺口豁免，现状 4 只：中国海油 BVI 控股/四方股份
+国网系/宇通客车郑州国资/潍柴动力潍坊国资，逐项理由见 yaml）。4 键均为
+**yaml-only 治理键**（Web 元数据守卫覆盖但不渲染表单行，改值走 yaml 手工编辑）。
 
 ## 2.5 选股时机（v7.0.13，候选池之上筛「何时首仓买入」；v7.0.24 起单条件门）
 
@@ -151,16 +166,18 @@ SOE 双规则：holders_snapshot 最新 as_of 的 holder_rank≤10 中，share_n
 | | rearm_mode | `bounce` \| `newhigh` |
 | | rearm_pct | bounce 反弹重记高点阈值（% → 小数） |
 | | accounting | 固定 `cash`（只读，Web 不可改） |
-| universe | industry_whitelist_csric2 | 行业白名单（3 位 csric2 码） |
+| universe | industry_whitelist_csric2 | 行业白名单（3 位 csric2 码；**v8.0.8：`["*"]` = 全放开**，生产已放开） |
 | | soe_keywords | 国资股东名称关键词（SOE 恒强制，无开关） |
 | | min_total_mv_yi | 总市值门槛（亿） |
 | | min_consecutive_div_years | 连续分红年数 |
 | | listing_min_trading_days | 最少上市 bar 数 |
 | | backtest_positive | ⑦ 十年回测门槛开关（v7.0.12） |
 | | backtest_window_years | ⑦ 回测窗口年数（滚动） |
-| | backtest_min_return_pct | ⑦ 十年回测净收益率下限（%，默认 20；v7.0.39，可选键） |
-| | min_ttm_yield_pct | ⑧ TTM 股息率下限（%） |
+| | backtest_min_return_pct | ⑦ 十年回测净收益率下限（%，可选键；v8.0.8 生产 30） |
+| | min_ttm_yield_pct | ⑧ TTM 股息率下限（%；v8.0.8 生产 3.5） |
 | | price_min_yuan / price_max_yuan | ⑨ 最新价区间（元） |
+| | min_soe_ratio_pct / min_soe_sum_ratio_pct | **v8.0.8 国企控股强度门**：最大单一国有占比 ≥ 前者 **或** top10 国有合计 ≥ 后者（%，可选键，0 = 关闭；生产 8 / 30） |
+| | exclude_codes / soe_control_overrides | **v8.0.8** 硬剔除名单（伪国企 ts_code）/ 控股强度门豁免（code→理由，数据标注缺口）；4 治理键 yaml-only（Web 元数据守卫覆盖、不渲染表单行） |
 | timing（**段可缺省**，缺省=默认值；旧快照无此段时 first_drawdown_pct 回退读 strategy 段） | price_window_years | ① 价格分位窗口（年，默认 5） |
 | | price_pctile_max | ① 分位上限（%，默认 40）【时机门唯一条件】 |
 | | first_drawdown_pct | 首仓建仓回撤（%，默认 15）；首仓线 = 本轮高点×(1−该值)；v7.0.26 自 strategy 段移入 |
@@ -342,8 +359,33 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.7）
+## 10. 版本历史（v7.0.11 → v8.0.8）
 
+- **v8.0.8**：A股候选池扩容——行业全放开 + 门槛提档 + 国企控股强度门
+  （Joel 2026-11-11：行业限制漏掉证券/保险/黑有色金属/家电/食品/建筑等行业的
+  央国企；"要全部放开…保证没有伪国企…股息 3.5%、十年回测 30%"）：
+  - **config**（`martingale/config.py`）：`industry_whitelist_csric2: ["*"]` =
+    全放开语义；universe +4 可选键 `min_soe_ratio_pct` / `min_soe_sum_ratio_pct`
+    （均 0 = 门关闭，向后兼容）/ `exclude_codes` / `soe_control_overrides`。
+  - **universe**（`build_pool`）：SOE 交后插入**国企控股强度门**——最大单一
+    国有占比 ≥ 8% **或** top10 国有合计 ≥ 30% **或** overrides 豁免；
+    `exclude_codes` 硬剔除；funnel +`soe_ratio` 计数。8/30 定值 = 湖数据实测
+    断层（伪国企 ≤5.58% / 真国企 ≥8.21%）。
+  - **生产 yaml**：白名单 → `["*"]`；⑦ 20 → **30**；⑧ 3 → **3.5**；
+    `exclude_codes: [sh.603766]`（隆鑫通用=民营控股）；overrides 4 只
+    （中国海油 BVI 控股/四方股份国网系/宇通客车郑州国资/潍柴动力潍坊国资——
+    湖数据 top10 标注缺口豁免，逐项理由留痕）。
+  - **结果**（as_of 2026-11-11，生产湖重算 selection 7.7s / timing 2.0s）：
+    候选池 **59 → 70 只**（全行业 5,029 → SOE 2,204 → 强度门 1,580 →
+    市值 426 → 分红 329 → ⑦ 170 → ⑧ 70）。伪国企 12 只（美的/格力/青年服饰/
+    南山铝业/际华/亿联/海澜之家/新奥/恒电东方/宝丰能源/隆鑫通用/平安银行）
+    全部在池外；旧池出局 3 只：平安银行、新奥股份（伪国企剔除）、中国海油
+    （⑦ 21.78% < 30%，override 救入基础池但被⑦挡——门槛提档的预期结果）。
+  - **Web**：4 治理键进 strategyMeta 元数据守卫（FIELD_LABELS/DESC/TYPE）+
+    HIDDEN_FIELDS（yaml-only 不渲染表单行；PUT 全量 JSON 底回传不丢键）；
+    股票池卡片标题/漏斗文案更新（基础池/回测≥门槛/股息率≥门槛）。
+  - 测试：后端 +11（`tests/test_soe_control.py` 合成湖零网络）；
+    `test_v7_guards` universe 键集守卫 11 → 15 键。
 - **v8.0.7**：我的持仓 tab 实体化 + Gate 模拟盘接入（Joel 2026-11-11：
   "把我的持仓也建起来" / "先页面上落地"）：
   - **`/api/positions`**：策略当前轮（纸面持仓）——每个活跃币按生效参数

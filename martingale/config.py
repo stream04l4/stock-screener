@@ -33,6 +33,7 @@ TL 拍板：不进配置、不进 Web；3bps 买入佣金精确对齐 f6 已验�
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
@@ -115,6 +116,27 @@ class UniverseParams:
     min_ttm_yield_pct: float = 3.0                 # ⑧ TTM 股息率下限（%）
     price_min_yuan: float = 3.0                    # ⑨ 股价区间下限（元；远离退市风险区）
     price_max_yuan: float = 100.0                  # ⑨ 股价区间上限（元；手数粒度约束）
+    # —— v8.0.8 国企控股强度门（Joel 2026-11-11：行业全放开后「top10 任一国有股东」
+    # 判定过宽——美的/青年服饰 靠证金公司 1.88%/5.58% 这类财务性小持股进池）——
+    # 数据口径（holders_snapshot 最新 as_of、top10、share_nature='国有股'）：
+    # 最大单一国有占比 ≥ min_soe_ratio_pct **或** top10 国有合计 ≥
+    # min_soe_sum_ratio_pct → 通过控股强度门（合计档覆盖多平台持股型地方国企：
+    # 江苏银行单一 6.98% 但合计 35.51%）。两键均 0/缺省 = 门关闭（回退 v8.0.0
+    # 行为，向后兼容）。8/30 定值依据：2026-11-11 湖数据实测——伪国企（民营
+    # 控股）最大国有占比全部 ≤5.58%，真国企全部 ≥8.21%，5.6~8.2 为数据自然
+    # 断层（详见 strategy.yaml 注释）。
+    min_soe_ratio_pct: float = 0.0
+    # top10 国有合计占比下限（%）：合计档覆盖多平台持股型地方国企
+    # （江苏银行单一 6.98% 但合计 35.51%）。与 min_soe_ratio_pct 为**或**关系。
+    min_soe_sum_ratio_pct: float = 0.0
+    # 控股强度门之上的硬剔除名单（ts_code 列表，格式同白名单校验）。现状：
+    # sh.603766 隆鑫通用——最大国有渝富 15.52% 过门，但第一大股东宗申新智
+    # 24.55% 民营控股，实际控股=民营 → 伪国企。
+    exclude_codes: Tuple[str, ...] = ()
+    # 控股强度门豁免（code→理由）：湖数据 top10 标注缺口（实际控股股东为国企
+    # 但 nature 标「境内法人/境外法人」）导致误伤时按股豁免，值写明实际控股
+    # 股东留审计痕迹；holders 数据刷新后复核可摘除项。
+    soe_control_overrides: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -234,10 +256,13 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
         if key not in u:
             raise ConfigError(f"universe.{key} 缺失")
     wl = _str_list(u["industry_whitelist_csric2"], "universe.industry_whitelist_csric2")
-    for code in wl:
-        if not (len(code) == 3 and code[0].isalpha() and code[0].isupper()
-                and code[1:3].isdigit()):
-            raise ConfigError(f"universe.industry_whitelist_csric2 项非法: {code!r}（应形如 B06）")
+    if wl != ("*",):
+        # v8.0.8：["*"] = 行业白名单全放开（无行业过滤）；其余项须形如 B06。
+        for code in wl:
+            if not (len(code) == 3 and code[0].isalpha() and code[0].isupper()
+                    and code[1:3].isdigit()):
+                raise ConfigError(f"universe.industry_whitelist_csric2 项非法: {code!r}"
+                                  "（应形如 B06；全放开用 [\"*\"]）")
     kws = _str_list(u["soe_keywords"], "universe.soe_keywords")
     mv = _num(u["min_total_mv_yi"], "universe.min_total_mv_yi", 1, 1e5)
     divy = _int(u["min_consecutive_div_years"], "universe.min_consecutive_div_years", 1, 20)
@@ -258,6 +283,25 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
     if pmin > pmax:
         raise ConfigError(
             f"universe.price_min_yuan({pmin:g}) 不得大于 price_max_yuan({pmax:g})")
+    # —— v8.0.8 国企控股强度门（**可选键**：老 yaml 缺键 → 全 0/空 = 门关闭）——
+    soe_ratio = _num(u.get("min_soe_ratio_pct", 0.0),
+                     "universe.min_soe_ratio_pct", 0, 100)
+    soe_sum = _num(u.get("min_soe_sum_ratio_pct", 0.0),
+                   "universe.min_soe_sum_ratio_pct", 0, 100)
+    excl = _str_list(u.get("exclude_codes", []), "universe.exclude_codes", non_empty=False)
+    for code in excl:
+        if not re.match(r"^(sh|sz|bj)\.\d{6}$", code):
+            raise ConfigError(
+                f"universe.exclude_codes 项非法: {code!r}（格式应为 sh.600519）")
+    ov_raw = u.get("soe_control_overrides", {})
+    if not isinstance(ov_raw, dict):
+        raise ConfigError(f"universe.soe_control_overrides 必须是映射（当前 {ov_raw!r}）")
+    overrides: Dict[str, str] = {}
+    for k, v in ov_raw.items():
+        if not re.match(r"^(sh|sz|bj)\.\d{6}$", str(k)):
+            raise ConfigError(
+                f"universe.soe_control_overrides 键非法: {k!r}（格式应为 sh.600519）")
+        overrides[str(k)] = str(v)
     return UniverseParams(
         industry_whitelist_csric2=wl, soe_keywords=kws,
         min_total_mv_yi=mv, min_consecutive_div_years=divy,
@@ -265,6 +309,8 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
         backtest_positive=bt_pos, backtest_window_years=bt_years,
         backtest_min_return_pct=bt_min,
         min_ttm_yield_pct=min_yield, price_min_yuan=pmin, price_max_yuan=pmax,
+        min_soe_ratio_pct=soe_ratio, min_soe_sum_ratio_pct=soe_sum,
+        exclude_codes=excl, soe_control_overrides=overrides,
     )
 
 

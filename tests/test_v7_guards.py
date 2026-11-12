@@ -165,7 +165,10 @@ def test_strategy_yaml_v7_schema_shape():
         # v7.0.12 候选池选股门槛（v7.0.39：+ 十年回测收益率下限）
         "backtest_positive", "backtest_window_years",
         "backtest_min_return_pct", "min_ttm_yield_pct",
-        "price_min_yuan", "price_max_yuan"}
+        "price_min_yuan", "price_max_yuan",
+        # v8.0.8 国企控股强度门（行业全放开配套，Joel 2026-11-11 定案）
+        "min_soe_ratio_pct", "min_soe_sum_ratio_pct",
+        "exclude_codes", "soe_control_overrides"}
     # v7.0.13 选股时机（v7.0.26：②③ 删除、首仓建仓回撤移入；v7.0.30：+
     # approach_pct 显示带 / spot_preselect_pct 实时取价预筛带，均 web 侧口径）
     assert set(cfg["timing"].keys()) == {
