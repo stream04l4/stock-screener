@@ -241,6 +241,13 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
                 or c in ov)
         ]
 
+    # 3-d) v8.1.1 央企收紧门（PIT；口径同生产版，快照 ≤ as_of）
+    if up.central_only:
+        from .central_soe import CENTRAL_OVERRIDE_CODES, central_soe_codes_asof
+        _minr = up.min_soe_ratio_pct if up.min_soe_ratio_pct > 0 else 8.0
+        central = central_soe_codes_asof(con, a, _minr) | CENTRAL_OVERRIDE_CODES
+        soe_codes = [c for c in soe_codes if c in central]
+
     # 4) 市值（每股 ≤ as_of 最近估值日）
     con.execute("""
         SELECT v.ts_code, v.total_mv FROM valuation_daily v
@@ -362,6 +369,14 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
                 or ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct
                 or c in ov)
         ]
+
+    # 3-d) v8.1.1 央企收紧门（可选；默认关 = 零行为变化）：最大国有股东
+    # （≥ 控股强度门槛，缺省 8%）须为央企（central_soe.CENTRAL_TOKENS）。
+    if up.central_only:
+        from .central_soe import CENTRAL_OVERRIDE_CODES, central_soe_codes_latest
+        _minr = up.min_soe_ratio_pct if up.min_soe_ratio_pct > 0 else 8.0
+        central = central_soe_codes_latest(con, _minr) | CENTRAL_OVERRIDE_CODES
+        soe_codes = [c for c in soe_codes if c in central]
 
     # 4) 市值（最新估值日 total_mv；valuation_daily 日期列名 = date）
     mv_sql = """

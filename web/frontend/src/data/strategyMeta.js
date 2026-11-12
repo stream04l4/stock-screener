@@ -15,6 +15,7 @@
 // v8.0.8：universe 另有 4 个 yaml-only 治理键（国企控股强度门：min_soe_ratio_pct /
 // min_soe_sum_ratio_pct / exclude_codes / soe_control_overrides）——进元数据守卫
 // （防漏说明），但不渲染为表单行（HIDDEN_FIELDS，改值走 yaml 手工编辑）。
+// v8.1.1：+ central_only（央企收紧门）同为 yaml-only 治理键（第 5 个）。
 //
 // FIELD_TYPE 约定（沿用旧版）：**按裸字段名**索引（非 section.field）；
 // FieldEditor 用 FIELD_TYPE[field] 取类型，未注册 → 回退 "str"。
@@ -82,6 +83,8 @@ export const FIELD_LABELS = {
   "universe.min_soe_sum_ratio_pct": "控股强度·top10 国有合计占比下限（%）",
   "universe.exclude_codes": "硬剔除名单（伪国企代码）",
   "universe.soe_control_overrides": "控股强度门豁免（数据标注缺口）",
+  // v8.1.1 央企收紧门（yaml-only 治理键，隐藏不渲染，改值走 yaml 手工编辑）
+  "universe.central_only": "央企收紧门（国资→央企）",
   // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、首仓建仓回撤移入
   "timing.price_window_years": "价格分位窗口（年）【时机门条件①】",
   "timing.price_pctile_max": "价格低位分位上限（%）【时机门唯一条件】",
@@ -138,6 +141,9 @@ export const FIELD_DESC = {
     "硬剔除名单（控股强度门之上的硬排除）：实际控股为民营的伪国企代码，逐项理由见 yaml 注释",
   "universe.soe_control_overrides":
     "控股强度门豁免（code→理由）：湖数据 top10 标注缺口（实际控股股东为国企但标注为境内/境外法人）导致误伤时按股豁免；holders 数据刷新后复核可摘除项",
+  // v8.1.1 央企收紧门（yaml-only 治理键；页面隐藏，改值走 yaml 手工编辑）
+  "universe.central_only":
+    "开 = 池在国企门之上再要求「最大国有股东（≥控股强度门槛）为央企」（集团清单见 martingale/central_soe.py，地方国企/国资参股均剔除）；关 = 只要求国资不区分央/地（默认）",
   // v7.0.13 timing（选股时机）；v7.0.24 起时机门 = ① 单条件；
   // v7.0.26：② 股息率 / ③ 年线彻底删除、首仓建仓回撤自 strategy 段移入
   "timing.price_window_years":
@@ -184,6 +190,8 @@ export const FIELD_TYPE = {
   min_soe_sum_ratio_pct: "float",
   exclude_codes: "list",
   soe_control_overrides: "str",
+  // v8.1.1 央企收紧门（yaml-only 治理键，隐藏不渲染）
+  central_only: "bool",
   // v7.0.13 timing（选股时机）；v7.0.26：②③ 删除、first_drawdown_pct 移入
   price_window_years: "int",
   price_pctile_max: "float",
@@ -194,13 +202,15 @@ export const FIELD_TYPE = {
 };
 
 // 隐藏字段（策略标识 name：卡片标题已体现，不作为可编辑字段行渲染；
-// v8.0.8：+ 国企控股强度门 4 个 yaml-only 治理键——页面只读不改，改值走 yaml 手工编辑）。
+// v8.0.8：+ 国企控股强度门 4 个 yaml-only 治理键——页面只读不改，改值走 yaml 手工编辑；
+// v8.1.1：+ 央企收紧门 central_only 同为 yaml-only 治理键）。
 export const HIDDEN_FIELDS = new Set([
   "strategy.name",
   "universe.min_soe_ratio_pct",
   "universe.min_soe_sum_ratio_pct",
   "universe.exclude_codes",
   "universe.soe_control_overrides",
+  "universe.central_only",
 ]);
 
 // enum2 选项（按 section.field）：选项文案通俗化（2026-10-23）。

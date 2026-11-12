@@ -137,6 +137,12 @@ class UniverseParams:
     # 但 nature 标「境内法人/境外法人」）导致误伤时按股豁免，值写明实际控股
     # 股东留审计痕迹；holders 数据刷新后复核可摘除项。
     soe_control_overrides: Dict[str, str] = field(default_factory=dict)
+    # —— v8.1.1 央企收紧门（Joel 2026-11-12：行业风控复杂机制搁置，央国企
+    # 资质作兜底前置筛选；真央国企 vs 地方国企 vs 国资参股的区分）——
+    # true = 池在 SOE 门之上再要求「最大国有股东（≥ 控股强度门槛）为央企」
+    # （central_soe.CENTRAL_TOKENS 匹配，口径见该模块 docstring）。
+    # 默认 false = 与 v8.0.8 行为完全一致（老 yaml 缺键 → false）。
+    central_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -302,6 +308,11 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
             raise ConfigError(
                 f"universe.soe_control_overrides 键非法: {k!r}（格式应为 sh.600519）")
         overrides[str(k)] = str(v)
+    # —— v8.1.1 央企收紧门（**可选键**：老 yaml 缺键 → false = 门关闭）——
+    central_only_raw = u.get("central_only", False)
+    if not isinstance(central_only_raw, bool):
+        raise ConfigError(
+            f"universe.central_only 必须是布尔（当前 {central_only_raw!r}）")
     return UniverseParams(
         industry_whitelist_csric2=wl, soe_keywords=kws,
         min_total_mv_yi=mv, min_consecutive_div_years=divy,
@@ -311,6 +322,7 @@ def _universe_section(cfg: Dict[str, Any]) -> UniverseParams:
         min_ttm_yield_pct=min_yield, price_min_yuan=pmin, price_max_yuan=pmax,
         min_soe_ratio_pct=soe_ratio, min_soe_sum_ratio_pct=soe_sum,
         exclude_codes=excl, soe_control_overrides=overrides,
+        central_only=central_only_raw,
     )
 
 
