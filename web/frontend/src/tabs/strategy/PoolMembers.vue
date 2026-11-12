@@ -48,6 +48,9 @@ const COLS = [
   ["bt_div_share", "分红占比", true, fmtPct2],
   ["bt_price_share", "上涨占比", true, fmtPct2],
   ["bt_div_pool", "分红余额", true, fmt2],
+  // v8.0.12（Joel：余额 2301 vs 股息率 4.12% 对不上 → 加累计分红透明展示；
+  // 余额=累计−再投，占比口径不变）
+  ["bt_dividends", "累计分红", true, fmt2],
   ["bt_price_pnl", "价差盈亏", true, fmt2],
   ["ttm_yield_pct", "股息率%", true, fmtPct2],
   ["price_latest", "最新价", true, fmt2],

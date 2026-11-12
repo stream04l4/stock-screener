@@ -53,6 +53,7 @@ class Member:
     bt_n_buys: Optional[int] = None       # 十年回测买入次数
     bt_div_pool: Optional[float] = None   # 十年回测分红余额（元，v8.0.11）
     bt_price_pnl: Optional[float] = None  # 十年回测价差盈亏（元，v8.0.11）
+    bt_dividends: Optional[float] = None  # 十年回测累计分红（元，v8.0.12；与余额互补：余额=累计−再投）
     bt_div_share: Optional[float] = None  # 分红占比=分红余额/总盈亏（小数；None=不可拆，v8.0.11）
     bt_price_share: Optional[float] = None  # 上涨占比=价差盈亏/总盈亏（小数；v8.0.11）
     price_latest: Optional[float] = None  # 最新收盘价（元）

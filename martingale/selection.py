@@ -263,6 +263,8 @@ def build_candidate_pool(con, up: UniverseParams,
                         and b.get("pnl_pct") is not None else None),
             bt_n_buys=int(b["n_buys"] or 0) if b is not None else None,
             bt_div_pool=dp_, bt_price_pnl=pp_,
+            bt_dividends=(float(b["dividends"]) if b is not None
+                          and b.get("dividends") is not None else None),  # v8.0.12 累计分红
             bt_div_share=ds_, bt_price_share=ps_,
             price_latest=px,
             is_manual=False))
@@ -324,6 +326,8 @@ def build_candidate_pool(con, up: UniverseParams,
                             and b.get("pnl_pct") is not None else None),
                 bt_n_buys=int(b["n_buys"] or 0) if b is not None else None,
                 bt_div_pool=dp_, bt_price_pnl=pp_,
+                bt_dividends=(float(b["dividends"]) if b is not None
+                              and b.get("dividends") is not None else None),  # v8.0.12 累计分红
                 bt_div_share=ds_, bt_price_share=ps_,
                 price_latest=price_map.get(c),
                 is_manual=True,

@@ -975,6 +975,7 @@ def get_pool() -> Dict[str, Any]:
                 # None = 总盈亏≤0 或旧预计算表无该列 → 前端显示 —）
                 "bt_div_pool": m.bt_div_pool,
                 "bt_price_pnl": m.bt_price_pnl,
+                "bt_dividends": m.bt_dividends,  # v8.0.12 累计分红（元，原值）
                 "bt_div_share": (round(m.bt_div_share * 100.0, 2)
                                  if m.bt_div_share is not None else None),
                 "bt_price_share": (round(m.bt_price_share * 100.0, 2)

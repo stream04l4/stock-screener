@@ -378,6 +378,8 @@ def test_pool_member_div_price_split():
     # a.1：G7 过（25%≥20%）；占比 = 30000/100000=30%、70000/100000=70%
     assert by["a.1"].bt_div_pool == 30000.0 and by["a.1"].bt_price_pnl == 70000.0
     assert by["a.1"].bt_div_share == 0.3 and by["a.1"].bt_price_share == 0.7
+    # v8.0.12：累计分红透传（bt_row 固定 20000.0；与占比无关，负盈亏也有值）
+    assert by["a.1"].bt_dividends == 20000.0
     # b.2：手动池里没有 → 不在池；但验证 _bt_split 对负总盈亏的语义
     dp, pp, ds, ps = sel._bt_split({"total_pnl": -500.0,
                                     "div_pool": 10.0, "price_pnl": -510.0})
@@ -387,6 +389,7 @@ def test_pool_member_div_price_split():
     assert dp is None and pp is None and ds is None and ps is None
     # 手动成员（m.1 不在 bt 表）→ 全 None
     assert by["m.1"].bt_div_share is None and by["m.1"].bt_price_share is None
+    assert by["m.1"].bt_dividends is None   # v8.0.12：无回测行 → 累计分红 None
     con.close()
 
 

@@ -37,13 +37,14 @@ const POOL = {
       n_bars: 2600, list_date: "2007-10-09",
       bt_pnl_pct: 311.89, bt_n_buys: 9,
       bt_div_pool: 17101.019641512157, bt_price_pnl: 58924.06479999999,
+      bt_dividends: 96239.777,   // v8.0.12 累计分红（≈余额+再投）
       bt_div_share: 22.49, bt_price_share: 77.51,
       price_latest: 24.35678, is_manual: false },
     { ts_code: "sz.000651", name: "格力电器", industry_csric2: "C38",
       soe_basis: "手动添加", total_mv: 2165.5, ttm_yield_pct: 7.75,
       n_bars: 2500, list_date: "1996-11-18",
       bt_pnl_pct: null, bt_n_buys: null,
-      bt_div_pool: null, bt_price_pnl: null,
+      bt_div_pool: null, bt_price_pnl: null, bt_dividends: null,
       bt_div_share: null, bt_price_share: null,   // 手动/不可拆 → —
       price_latest: 37.1437, is_manual: true },
   ],
@@ -64,8 +65,8 @@ describe("PoolMembers · 分红占比/上涨占比 + 小数收敛（v8.0.11）",
     await flushPromises();
     const t = w.text();
     // 列头
-    for (const h of ["10年回测%", "分红占比", "上涨占比", "分红余额", "价差盈亏",
-                     "股息率%", "最新价", "总市值(亿)"]) {
+    for (const h of ["10年回测%", "分红占比", "上涨占比", "分红余额", "累计分红",
+                     "价差盈亏", "股息率%", "最新价", "总市值(亿)"]) {
       expect(t).toContain(h);
     }
     // 神华：占比 22.49% / 77.51%；金额 2 位
@@ -73,6 +74,8 @@ describe("PoolMembers · 分红占比/上涨占比 + 小数收敛（v8.0.11）",
     expect(t).toContain("77.51%");
     expect(t).toContain("17101.02");
     expect(t).toContain("58924.06");
+    expect(t).toContain("96239.78");   // v8.0.12 累计分红
+    expect(t).not.toContain("96239.777");
     // 回测/股息率 百分数显示
     expect(t).toContain("311.89%");
     expect(t).toContain("7.75%");
