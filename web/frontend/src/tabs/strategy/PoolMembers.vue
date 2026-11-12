@@ -15,6 +15,19 @@ import SimpleTable from "../../components/SimpleTable.vue";
 
 const { data, loading, error } = useLiveQuery("pool", () => api("/api/pool"), {});
 
+// v8.0.11：展示层格式化（引擎/预计算产物全精度，只在此截断）——
+// 顺修「总市值(亿) 2165.50348228 小数太多」（Joel 2026-11-12）。
+// 服务端 bt_*_pct/share 已是百分数数值（44.04 = 44.04%）→ fmtPct2 加 % 号；
+// None（总盈亏≤0 / 旧预计算表无占比列）→ SimpleTable 显示 —。
+const fmt2 = (v) => {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return isNaN(n) ? String(v) : n.toFixed(2);
+};
+const fmtPct2 = (v) => {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return isNaN(n) ? String(v) : n.toFixed(2) + "%";
+};
+
 const funnelLine = computed(() => {
   const f = data.value && data.value.funnel;
   if (!f) return "";
@@ -29,10 +42,16 @@ const rows = computed(() => {
 const COLS = [
   ["ts_code", "代码"],
   ["name", "名称"],
-  ["bt_pnl_pct", "10年回测%", true],
-  ["ttm_yield_pct", "股息率%", true],
-  ["price_latest", "最新价", true],
-  ["total_mv", "总市值(亿)", true],
+  ["bt_pnl_pct", "10年回测%", true, fmtPct2],
+  // v8.0.11（Joel：低波红利策略——分红占比更大更符合预期）：
+  // 十年回测的分红占比 vs 上涨占比拆解（口径同回测 per_stock 表/summary 拆分行）
+  ["bt_div_share", "分红占比", true, fmtPct2],
+  ["bt_price_share", "上涨占比", true, fmtPct2],
+  ["bt_div_pool", "分红余额", true, fmt2],
+  ["bt_price_pnl", "价差盈亏", true, fmt2],
+  ["ttm_yield_pct", "股息率%", true, fmtPct2],
+  ["price_latest", "最新价", true, fmt2],
+  ["total_mv", "总市值(亿)", true, fmt2],
   ["src", "来源"],
 ];
 </script>

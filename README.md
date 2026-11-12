@@ -1,4 +1,4 @@
-# stock-screener · v8.0.10（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.11（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -359,8 +359,22 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.10）
+## 10. 版本历史（v7.0.11 → v8.0.11）
 
+- **v8.0.11**：候选池「分红占比 vs 上涨占比」拆解 + 总市值小数修复
+  （Joel：四个指标应加在股票池；池的总市值列小数太多）
+  - **预计算表**（`martingale/selection.py`）：`selection_backtest_10y` +
+    `div_pool`（分红余额）/ `price_pnl`（价差盈亏）两列；`ensure_table` 对旧表
+    自动 DROP 重建（整表刷新快照，安全），`refresh_selection` 落盘。
+  - **候选池**（`build_candidate_pool` + `/api/pool`）：成员 +4 字段
+    `bt_div_pool` / `bt_price_pnl` / `bt_div_share` / `bt_price_share`（占比 =
+    分红余额/总盈亏、价差盈亏/总盈亏，百分数口径同 bt_pnl_pct；总盈亏≤0 或
+    旧表 → null）。已重算生产表（329 只，7.68s）。
+  - **候选池表**（`PoolMembers.vue`）：+4 列 分红占比/上涨占比/分红余额/价差盈亏；
+    **市值 2165.50348228 → 2165.50**（全部数值列挂 fmt：金额 2 位、比率带 %）。
+  - 线上实测：神华 分红 22.49%/上涨 77.51%、陕西煤业 4.58%/95.42%、
+    宇通 17.94%/82.06%（70/70 成员占比齐全）。
+  - 测试：后端 +2（54/54 定向）；前端 +2（267/267）+ build。
 - **v8.0.10**：回测结果「分红占比 vs 上涨占比」拆解（Joel：低波红利策略导向——
   分红占比更大更符合预期）
   - **`per_stock.csv`**（`martingale/report.py`）：+`div_pool`（分红余额）列——

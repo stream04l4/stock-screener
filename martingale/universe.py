@@ -51,6 +51,10 @@ class Member:
     # —— v7.0.12 候选池扩展（selection.build_candidate_pool 填充）——
     bt_pnl_pct: Optional[float] = None    # 十年回测净收益率（% 小数，None=未触发）
     bt_n_buys: Optional[int] = None       # 十年回测买入次数
+    bt_div_pool: Optional[float] = None   # 十年回测分红余额（元，v8.0.11）
+    bt_price_pnl: Optional[float] = None  # 十年回测价差盈亏（元，v8.0.11）
+    bt_div_share: Optional[float] = None  # 分红占比=分红余额/总盈亏（小数；None=不可拆，v8.0.11）
+    bt_price_share: Optional[float] = None  # 上涨占比=价差盈亏/总盈亏（小数；v8.0.11）
     price_latest: Optional[float] = None  # 最新收盘价（元）
     is_manual: bool = False               # 手动添加（绕过 G7~G9）
 

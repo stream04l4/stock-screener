@@ -306,7 +306,15 @@ def test_get_pool_funnel_and_members():
     assert isinstance(out["members"], list) and out["members"]
     m0 = out["members"][0]
     assert {"ts_code", "name", "total_mv", "bt_pnl_pct", "ttm_yield_pct",
-            "price_latest", "is_manual"} <= set(m0.keys())
+            "price_latest", "is_manual",
+            # v8.0.11：分红/上涨占比拆解字段
+            "bt_div_pool", "bt_price_pnl", "bt_div_share", "bt_price_share"} <= set(m0.keys())
+    # v8.0.11：池内成员（G7 通过 = 总盈亏>0）占比应齐全且和≈100%（差手续费）
+    for m in out["members"]:
+        if m["is_manual"]:
+            continue
+        if m["bt_div_share"] is not None and m["bt_price_share"] is not None:
+            assert 0.0 < m["bt_div_share"] + m["bt_price_share"] <= 100.5
     # 排序契约：自动成员按十年回测收益降序（无值殿后）
     auto = [m["bt_pnl_pct"] for m in out["members"] if not m["is_manual"]]
     with_val = [x for x in auto if x is not None]

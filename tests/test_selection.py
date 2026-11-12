@@ -76,7 +76,7 @@ def make_lake(bt_rows: List[tuple], prices: Dict[str, float],
         con.execute(sel._SCHEMA)
         if bt_rows:
             con.executemany(
-                f"INSERT INTO {sel.TABLE} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO {sel.TABLE} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 bt_rows)
     if manual_master:
         con.execute("""CREATE TABLE stock_master (ts_code VARCHAR, name VARCHAR,
@@ -99,9 +99,16 @@ def make_lake(bt_rows: List[tuple], prices: Dict[str, float],
     return con
 
 
-def bt_row(code, n_buys, total_pnl, pnl_pct) -> tuple:
+def bt_row(code, n_buys, total_pnl, pnl_pct,
+           div_pool=None, price_pnl=None) -> tuple:
+    # v8.0.11：div_pool/price_pnl（分红余额/价差盈亏）；缺省 = 总盈亏 40%/60% 拆
+    if total_pnl is None:
+        d = p = None
+    else:
+        d = div_pool if div_pool is not None else total_pnl * 0.4
+        p = price_pnl if price_pnl is not None else total_pnl * 0.6
     return (code, "2026-10-23", "2016-10-24", "2026-10-23", 2400, n_buys,
-            100000.0, 150000.0, 20000.0, total_pnl, pnl_pct, -0.1, "open")
+            100000.0, 150000.0, 20000.0, d, p, total_pnl, pnl_pct, -0.1, "open")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +300,9 @@ def test_refresh_selection_writes_table(monkeypatch, tmp_path):
     dates = np.array(["2016-10-24", "2026-10-23"], dtype="datetime64[ns]")
     stats = {
         "a.1": dict(n_bars=2, n_buys=3, total_invested=110000.0,
-                    final_assets=130000.0, dividends=10000.0, total_pnl=20000.0,
+                    final_assets=130000.0, dividends=10000.0,
+                    div_pool=8000.0, price_pnl=12000.0,
+                    total_pnl=20000.0,
                     pnl_pct=0.18, min_unreal_pct=-0.12, last_status="open"),
     }
     monkeypatch.setattr(sel, "load", lambda con, codes=None, start=None, end=None:
@@ -309,11 +318,75 @@ def test_refresh_selection_writes_table(monkeypatch, tmp_path):
     assert out["as_of"] == "2026-10-23"
     assert out["start"] == "2016-10-23"   # as_of 回溯恰好 10 年
     row = con.execute(f"SELECT * FROM {sel.TABLE}").fetchall()
-    assert row[0][0] == "a.1" and row[0][5] == 3 and row[0][9] == 20000.0
+    assert row[0][0] == "a.1" and row[0][5] == 3
+    # v8.0.11：div_pool/price_pnl 落盘（列序 …, dividends[8], div_pool[9],
+    # price_pnl[10], total_pnl[11], …）；恒等式 8000+12000=20000
+    assert row[0][9] == 8000.0 and row[0][10] == 12000.0 and row[0][11] == 20000.0
 
     # 二次刷新 = 整表快照（行数不变，无累积）
     sel.refresh_selection(con, sp=None, up=up, base_codes=["a.1"])
     assert con.execute(f"SELECT COUNT(*) FROM {sel.TABLE}").fetchone()[0] == 1
+    con.close()
+
+
+# ---------------------------------------------------------------------------
+# 4.5) v8.0.11 分红占比 vs 上涨占比（候选池拆解）
+# ---------------------------------------------------------------------------
+def test_ensure_table_migrates_legacy_schema(tmp_path):
+    """旧表（无 div_pool/price_pnl 列，v8.0.10 前产物）→ ensure_table DROP 重建
+    （整表刷新快照表，重建安全）；新表幂等不重建。"""
+    lake = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(lake)
+    con.execute(f"""CREATE TABLE {sel.TABLE} (
+        ts_code VARCHAR PRIMARY KEY, as_of_date DATE, start_date DATE,
+        end_date DATE, n_bars INTEGER, n_buys INTEGER, total_invested DOUBLE,
+        final_assets DOUBLE, dividends DOUBLE, total_pnl DOUBLE,
+        pnl_pct DOUBLE, min_unreal_pct DOUBLE, last_status VARCHAR)""")
+    con.execute(f"INSERT INTO {sel.TABLE} VALUES "
+                "('x.1', DATE '2026-01-01', DATE '2016-01-01', DATE '2026-01-01', "
+                "2400, 5, 1.0, 2.0, 0.5, 1.0, 1.0, -0.1, 'open')")
+    sel.ensure_table(con)
+    cols = {r[1] for r in con.execute(f"PRAGMA table_info({sel.TABLE})").fetchall()}
+    assert {"div_pool", "price_pnl"} <= cols
+    # 重建 = 旧数据清掉（由随后 refresh_selection 全量重写）
+    assert con.execute(f"SELECT COUNT(*) FROM {sel.TABLE}").fetchone()[0] == 0
+    # 幂等：已含新列的表再 ensure 不重建（行数保持）
+    con.execute(f"INSERT INTO {sel.TABLE} VALUES "
+                "('y.1', DATE '2026-01-01', DATE '2016-01-01', DATE '2026-01-01', "
+                "2400, 1, 1.0, 2.0, 0.5, 0.3, 0.7, 1.0, 1.0, -0.1, 'open')")
+    sel.ensure_table(con)
+    assert con.execute(f"SELECT COUNT(*) FROM {sel.TABLE}").fetchone()[0] == 1
+    con.close()
+
+
+def test_pool_member_div_price_split():
+    """候选池成员占比字段：auto 成员 = 分红余额/总盈亏、价差盈亏/总盈亏；
+    总盈亏≤0 → 占比 None（不拆）；手动成员同填充。"""
+    up = make_up()
+    con = make_lake(
+        bt_rows=[
+            bt_row("a.1", 5, 100000.0, 0.25, div_pool=30000.0, price_pnl=70000.0),
+            bt_row("b.2", 1, -500.0, -0.005),   # 总盈亏≤0 → 占比 None
+        ],
+        prices={"a.1": 10.0, "b.2": 10.0},
+        manual_master=[("m.1", "手动甲")],
+    )
+    base = base_pool([("a.1", 4.0), ("b.2", 4.0)])
+    pool = sel.build_candidate_pool(
+        con, up, manual={"m.1": {"name": "手动甲", "added_at": "x"}}, base=base)
+    by = {m.ts_code: m for m in pool.members}
+    # a.1：G7 过（25%≥20%）；占比 = 30000/100000=30%、70000/100000=70%
+    assert by["a.1"].bt_div_pool == 30000.0 and by["a.1"].bt_price_pnl == 70000.0
+    assert by["a.1"].bt_div_share == 0.3 and by["a.1"].bt_price_share == 0.7
+    # b.2：手动池里没有 → 不在池；但验证 _bt_split 对负总盈亏的语义
+    dp, pp, ds, ps = sel._bt_split({"total_pnl": -500.0,
+                                    "div_pool": 10.0, "price_pnl": -510.0})
+    assert dp == 10.0 and pp == -510.0 and ds is None and ps is None
+    # 旧表无 div_pool/price_pnl 键 → 金额 None、占比 None（不崩）
+    dp, pp, ds, ps = sel._bt_split({"total_pnl": 100.0, "pnl_pct": 0.1})
+    assert dp is None and pp is None and ds is None and ps is None
+    # 手动成员（m.1 不在 bt 表）→ 全 None
+    assert by["m.1"].bt_div_share is None and by["m.1"].bt_price_share is None
     con.close()
 
 

@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     total_invested DOUBLE,
     final_assets   DOUBLE,
     dividends      DOUBLE,
+    div_pool       DOUBLE,             -- 分红余额（v8.0.11：分红占比拆解）
+    price_pnl      DOUBLE,             -- 价差盈亏（v8.0.11：上涨占比拆解）
     total_pnl      DOUBLE,
     pnl_pct        DOUBLE,             -- 未投入（从未触发）→ NULL
     min_unreal_pct DOUBLE,
@@ -74,6 +76,14 @@ _BARE_RE = re.compile(r"^(\d{6})$")
 # ---------------------------------------------------------------------------
 def ensure_table(con) -> None:
     con.execute(_SCHEMA)
+    # v8.0.11 旧表迁移：CREATE IF NOT EXISTS 不会给已存在表加列——缺新列时
+    # DROP 重建（本表是整表刷新快照，DELETE+全量重写语义，重建安全；
+    # 重建后由同一次 refresh_selection 立即灌满）。
+    # PRAGMA table_info 行 = (column_index, column_name, column_type, …)
+    cols = {r[1] for r in con.execute(f"PRAGMA table_info({TABLE})").fetchall()}
+    if not {"div_pool", "price_pnl"} <= cols:
+        con.execute(f"DROP TABLE IF EXISTS {TABLE}")
+        con.execute(_SCHEMA)
 
 
 def _latest_kline_date(con) -> Optional[date]:
@@ -136,6 +146,8 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
                      float(stat["total_invested"] or 0.0),
                      float(stat["final_assets"] or 0.0),
                      float(stat["dividends"] or 0.0),
+                     float(stat["div_pool"] or 0.0),      # v8.0.11：分红余额
+                     float(stat["price_pnl"] or 0.0),     # v8.0.11：价差盈亏
                      pnl, pct,
                      float(stat["min_unreal_pct"] or 0.0),
                      str(stat["last_status"])))
@@ -144,7 +156,7 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
     if rows:
         con.executemany(
             f"INSERT INTO {TABLE} VALUES "
-            f"(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            f"(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     out = {
         "as_of": str(latest), "start": str(start),
         "n_codes": len(base_codes), "n_written": len(rows),
@@ -172,6 +184,32 @@ def load_backtest_map(con) -> Dict[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # 候选池构建（请求路径；G7 读预计算表 O(1)）
 # ---------------------------------------------------------------------------
+def _bt_split(b: Optional[Dict[str, Any]]) -> tuple:
+    """(div_pool, price_pnl, div_share, price_share) —— v8.0.11 分红/上涨占比。
+
+    口径与回测 per_stock「拆分」一致：占比 = 分红余额 / 总盈亏 与 价差盈亏 /
+    总盈亏（恒等式 总盈亏≈价差盈亏+分红余额，差额手续费）。总盈亏≤0 不拆；
+    b 为 None 或旧表缺 div_pool/price_pnl 列 → 对应 None（前端显示 —）。
+    """
+    if b is None:
+        return None, None, None, None
+    def _f(k):
+        v = b.get(k)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(f) else f
+    dp, pp, tp = _f("div_pool"), _f("price_pnl"), _f("total_pnl")
+    if tp is None or tp <= 0:
+        return dp, pp, None, None
+    return (dp, pp,
+            (dp / tp) if dp is not None else None,
+            (pp / tp) if pp is not None else None)
+
+
 def build_candidate_pool(con, up: UniverseParams,
                          manual: Optional[Dict[str, Dict[str, Any]]] = None,
                          base: Optional[PoolResult] = None) -> PoolResult:
@@ -218,11 +256,14 @@ def build_candidate_pool(con, up: UniverseParams,
         px = price_map.get(m.ts_code)
         if px is None or not (up.price_min_yuan <= px <= up.price_max_yuan):
             continue
+        dp_, pp_, ds_, ps_ = _bt_split(b)   # v8.0.11：分红/上涨占比
         auto.append(dataclasses.replace(
             m,
             bt_pnl_pct=(float(b["pnl_pct"]) if b is not None
                         and b.get("pnl_pct") is not None else None),
             bt_n_buys=int(b["n_buys"] or 0) if b is not None else None,
+            bt_div_pool=dp_, bt_price_pnl=pp_,
+            bt_div_share=ds_, bt_price_share=ps_,
             price_latest=px,
             is_manual=False))
 
@@ -269,6 +310,7 @@ def build_candidate_pool(con, up: UniverseParams,
             _c, name, industry, list_date, soe_basis, _dl = master[c]
             b = bt.get(c)
             tv = mv_map.get(c)
+            dp_, pp_, ds_, ps_ = _bt_split(b)   # v8.0.11：分红/上涨占比
             manual_members.append(Member(
                 ts_code=c,
                 name=str(name) if name is not None else "",
@@ -281,6 +323,8 @@ def build_candidate_pool(con, up: UniverseParams,
                 bt_pnl_pct=(float(b["pnl_pct"]) if b is not None
                             and b.get("pnl_pct") is not None else None),
                 bt_n_buys=int(b["n_buys"] or 0) if b is not None else None,
+                bt_div_pool=dp_, bt_price_pnl=pp_,
+                bt_div_share=ds_, bt_price_share=ps_,
                 price_latest=price_map.get(c),
                 is_manual=True,
             ))
