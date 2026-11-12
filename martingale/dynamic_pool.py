@@ -29,7 +29,8 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
-from .engine import aggregate_into, load, run_stock
+from .config import TimingParams
+from .engine import aggregate_into, extend_start, first_ok_series, load, run_stock
 from .report import write_outputs
 from .universe import build_pool_asof
 
@@ -51,34 +52,47 @@ def month_starts(dates: np.ndarray) -> np.ndarray:
 
 
 def _rolling_g7(con, sp, codes: List[str], end_d: str,
-                min_return_pct: float) -> Dict[str, dict]:
+                min_return_pct: float,
+                tp: Optional[TimingParams] = None) -> Dict[str, dict]:
     """滚动十年策略回测（窗口 [end-3650d, end]），返回 {code: stat}。
 
     G7 过滤在调用方做（与 selection.build_candidate_pool 同语义：
     n_buys≥1 且 pnl_pct×100 ≥ 门槛）。verbose=False 避免 400 股×120 次
     的日志洪水；进度由上层按重算日期粒度打 [PROGRESS]。
+    tp=v8.1.0 首仓双条件②（timing 段）——G7 回测与生产同口径（PIT）；
+    None = ②关闭（仅单元测试兼容）。
     """
     start10 = str(np.datetime64(end_d, "D") - np.timedelta64(ROLLING_DAYS, "D"))[:10]
-    _names, data, divs = load(con, codes=codes, start=start10, end=end_d)
+    # v8.1.0：分位窗口 → load 起点前移 N 年，算完切回原窗口
+    ext_start = (extend_start(start10, tp.price_window_years)
+                 if tp is not None else start10)
+    _names, data, divs = load(con, codes=codes, start=ext_start, end=end_d)
     out: Dict[str, dict] = {}
     for c in codes:
         d, s, e = data[c]
         if len(d) < 2:
             continue
+        ok = None
+        if tp is not None:
+            ok = first_ok_series(d, s, tp.price_window_years,
+                                 tp.price_pctile_max)
+            i0 = int(np.searchsorted(d, np.datetime64(start10)))
+            d, s, e, ok = d[i0:], s[i0:], e[i0:], ok[i0:]
         stat, _state, _v, _cc, _fl, _buys = run_stock(
-            c, d, s, e, divs.get(c), sp, verbose=False)
+            c, d, s, e, divs.get(c), sp, verbose=False, first_ok=ok)
         out[c] = stat
     return out
 
 
-def _month_pool(con, sp, up, rd: str) -> set:
+def _month_pool(con, sp, up, rd: str,
+                tp: Optional[TimingParams] = None) -> set:
     """单月全漏斗（PIT）：基础 6 门 ∩ G7 滚动十年 ∩ G8 TTM ∩ G9 价格区间。"""
     base = build_pool_asof(con, up, rd)
     members = base.members
     # G7（滚动十年策略回测；up.backtest_positive=False 时关闭 = 基础池直通）
     if up.backtest_positive and members:
         g7 = _rolling_g7(con, sp, [m.ts_code for m in members], rd,
-                         up.backtest_min_return_pct)
+                         up.backtest_min_return_pct, tp=tp)
         codes_g7 = [
             m.ts_code for m in members
             if (b := g7.get(m.ts_code)) is not None
@@ -119,11 +133,12 @@ def compute_month_pool(as_of: str, config_path: Optional[str] = None) -> List[st
     """
     from .config import load_config
     from .data import connect_readonly
-    sp, up, _tp = load_config(config_path or os.path.join(_ROOT, "config", "strategy.yaml"))
+    # v8.1.0：G7 回测首仓双条件② → 子进程同样取 timing 段（生产同口径）
+    sp, up, tp = load_config(config_path or os.path.join(_ROOT, "config", "strategy.yaml"))
     con = connect_readonly(None)
     try:
         con.execute("SET memory_limit='2GB'")
-        return sorted(_month_pool(con, sp, up, as_of))
+        return sorted(_month_pool(con, sp, up, as_of, tp=tp))
     finally:
         con.close()
 
@@ -145,13 +160,16 @@ def _subprocess_month_pool(rd: str, config_path: Optional[str]) -> set:
 def pool_schedule(con, sp, up, start: str, end: str,
                   progress: Callable[[str, int, int], None] = None,
                   use_subprocess: Optional[bool] = None,
-                  config_path: Optional[str] = None) -> Dict[str, set]:
+                  config_path: Optional[str] = None,
+                  tp: Optional[TimingParams] = None) -> Dict[str, set]:
     """计算 [start, end] 内的月度池重算表 {as_of_date: set(ts_code)}。
 
     每次重算 = build_pool_asof（基础 6 门 PIT）∩ G7（滚动十年回测）∩ G8
     （TTM PIT）∩ G9（价格区间 PIT）。:param progress: (label, done, total)。
     :param use_subprocess: None=自动——文件湖走一次性子进程（内存归零，见
       compute_month_pool docstring）；内存湖（测试）走进程内。
+    :param tp: v8.1.0 首仓双条件②（timing 段）——G7 同口径（子进程路径
+      经 config_path 自行加载，此参数只影响进程内路径）。
     """
     con.execute(
         "SELECT DISTINCT date FROM kline_daily WHERE date >= ? AND date <= ? "
@@ -187,7 +205,7 @@ def pool_schedule(con, sp, up, start: str, end: str,
                     progress("pool", done, total)
     else:
         for k, rd in enumerate(rdates, start=1):
-            schedule[rd] = _month_pool(con, sp, up, rd)
+            schedule[rd] = _month_pool(con, sp, up, rd, tp=tp)
             if progress:
                 progress("pool", k, total)
     return schedule
@@ -211,10 +229,13 @@ def build_code_mask(code: str, code_dates: np.ndarray, rdates: List[str],
 
 def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
                               t0: float, db_label: str,
-                              config_path: Optional[str] = None) -> int:
+                              config_path: Optional[str] = None,
+                              tp: Optional[TimingParams] = None) -> int:
     """动态池回测主流程：池重算 → 并集 → 带掩码逐股回测 → 产物。
 
     :param start/: end: None = 数据起点/终点（解析后全程非空）。
+    :param tp: v8.1.0 首仓双条件②（timing 段）——G7 重算 + 主回测同口径；
+        None = ②关闭（仅单元测试兼容）。
     """
     # v8.0.13 内存纪律：DuckDB 默认 memory_limit=物理内存 80%（本机 8.8GB），
     # 月度重算的整湖扫描查询会把缓冲池顶满且不归还 OS → 全局 OOM（10.2GB 实踩）。
@@ -232,7 +253,7 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
                              progress=lambda s, d, t: print(
                                  f"[PROGRESS] stage={s} done={d} total={t}",
                                  flush=True),
-                             config_path=config_path)
+                             config_path=config_path, tp=tp)
     if not schedule:
         print("无交易日数据（窗口内湖无 K线）")
         return 0
@@ -249,8 +270,22 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
           f"max={max(len(s) for s in schedule.values())} · 并集 {len(union)} 只",
           flush=True)
 
-    names, data, divs = load(con, codes=union, start=start, end=end)
-    codes = [c for c in union if len(data[c][0]) >= 2]
+    # v8.1.0：首仓双条件②（5 年分位）窗口 → load 起点前移 N 年，算完分位
+    # 切回原窗口（扩展段只喂分位窗口，不进回测日历/掩码）
+    ext_start = (extend_start(start, tp.price_window_years)
+                 if tp is not None else start)
+    names, data, divs = load(con, codes=union, start=ext_start, end=end)
+    prepared: Dict[str, tuple] = {}
+    for c in union:
+        d, s, e = data[c]
+        if len(d) < 2:
+            continue
+        ok = (first_ok_series(d, s, tp.price_window_years,
+                              tp.price_pctile_max)
+              if tp is not None else None)
+        i0 = int(np.searchsorted(d, np.datetime64(start)))
+        prepared[c] = (d[i0:], s[i0:], e[i0:], ok[i0:] if ok is not None else None)
+    codes = [c for c in union if c in prepared]
     if not codes:
         print("no data")
         return 0
@@ -268,11 +303,11 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
     bench_rets = []
     total = len(codes)
     for i, c in enumerate(codes, start=1):
-        dates, sig, exec_c = data[c]
+        dates, sig, exec_c, ok = prepared[c]
         mask = build_code_mask(c, dates, rdates, schedule)
         stat, _state, v_arr, c_arr, flag, buys = run_stock(
             c, dates, sig, exec_c, divs.get(c), sp, verbose=False,
-            trade_mask=mask)
+            trade_mask=mask, first_ok=ok)
         row = dict(stat)
         row["name"] = names.get(c, "")
         # 池履历（重算粒度 = 月）

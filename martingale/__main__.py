@@ -18,13 +18,14 @@ import argparse
 import os
 import sys
 import time
+from typing import Dict, Tuple
 
 import numpy as np
 
 from . import __version__
 from .config import ConfigError, load_config
 from .data import connect_readonly, default_db_path
-from .engine import aggregate_into, load, run_stock
+from .engine import aggregate_into, extend_start, first_ok_series, load, run_stock
 from .report import write_outputs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,7 +51,7 @@ def _cmd_backtest(args) -> int:
         try:
             return run_dynamic_pool_backtest(
                 con, sp, up, args.start, args.end, args.out, t0, _db_label(),
-                config_path=args.config)
+                config_path=args.config, tp=tp)
         finally:
             con.close()
     if args.codes:
@@ -67,18 +68,34 @@ def _cmd_backtest(args) -> int:
             return 2
     con = connect_readonly(None)
     try:
-        names, data, divs = load(con, codes=codes, start=args.start, end=args.end)
+        # v8.1.0：首仓双条件②（5 年分位）窗口 → load 起点前移 N 年，算完分位
+        # 切回原窗口（extend_start/first_ok_series；与生产页面同口径 PIT）
+        ext_start = (extend_start(args.start, tp.price_window_years)
+                     if args.start else None)
+        names, data, divs = load(con, codes=codes, start=ext_start, end=args.end)
     finally:
         con.close()
 
     codes = sorted(codes)
-    # 与参考一致：跳过 bar 数 < 2 的股
-    codes = [c for c in codes if len(data[c][0]) >= 2]
+    # v8.1.0：分位门（PIT）+ 切回原窗口（扩展段只喂分位窗口，不进回测日历）
+    prepared: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    for c in codes:
+        dates, sig, exec_c = data[c]
+        if len(dates) < 2:
+            continue
+        ok = first_ok_series(dates, sig, tp.price_window_years,
+                             tp.price_pctile_max)
+        if args.start:
+            i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
+            prepared[c] = (dates[i0:], sig[i0:], exec_c[i0:], ok[i0:])
+        else:
+            prepared[c] = (dates, sig, exec_c, ok)
+    codes = [c for c in codes if c in prepared]
     if not codes:
         print("no data")
         return 0
 
-    gdates = np.unique(np.concatenate([data[c][0] for c in codes]))
+    gdates = np.unique(np.concatenate([prepared[c][0] for c in codes]))
     g_value = np.zeros(len(gdates))
     g_cost = np.zeros(len(gdates))
     g_open = np.zeros(len(gdates), dtype=np.int64)
@@ -88,9 +105,9 @@ def _cmd_backtest(args) -> int:
     bench_rets = []
     total = len(codes)
     for i, c in enumerate(codes, start=1):
-        dates, sig, exec_c = data[c]
+        dates, sig, exec_c, ok = prepared[c]
         stat, state, v_arr, c_arr, flag, buys = run_stock(
-            c, dates, sig, exec_c, divs.get(c), sp)
+            c, dates, sig, exec_c, divs.get(c), sp, first_ok=ok)
         row = dict(stat)
         row["name"] = names.get(c, "")
         rows.append(row)
@@ -124,7 +141,11 @@ def _cmd_status(args) -> int:
         else:
             from .universe import build_pool
             codes = build_pool(con, up).codes
-        names, data, divs = load(con, codes=codes, start=args.start, end=None)
+        names, data, divs = load(
+            con, codes=codes,
+            start=(extend_start(args.start, tp.price_window_years)
+                   if args.start else None),
+            end=None)
     finally:
         con.close()
     codes = sorted(c for c in codes if len(data[c][0]) >= 2)
@@ -135,7 +156,14 @@ def _cmd_status(args) -> int:
     total = len(codes)
     for i, c in enumerate(codes, start=1):
         dates, sig, exec_c = data[c]
-        _, state, *_ = run_stock(c, dates, sig, exec_c, divs.get(c), sp)
+        # v8.1.0：首仓双条件②（5 年分位，PIT）+ 切回原窗口
+        ok = first_ok_series(dates, sig, tp.price_window_years,
+                             tp.price_pctile_max)
+        if args.start:
+            i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
+            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+        _, state, *_ = run_stock(c, dates, sig, exec_c, divs.get(c), sp,
+                                 first_ok=ok)
         state["name"] = names.get(c, "")
         states.append(state)
         print(f"[PROGRESS] stage=st done={i} total={total}", flush=True)
@@ -238,7 +266,7 @@ def _cmd_selection(args) -> int:
     con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（与 Web 读并发安全窗口外）
     try:
         _af_prealign(con)
-        out = refresh_selection(con, sp, up, verbose=True)
+        out = refresh_selection(con, sp, up, verbose=True, tp=tp)
     finally:
         con.close()
     print(f"selection 完成 · as_of={out['as_of']} · 写入 {out['n_written']}/{out['n_codes']} "

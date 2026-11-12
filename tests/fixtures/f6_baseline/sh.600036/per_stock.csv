@@ -1,2 +1,2 @@
-ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
-sh.600036,2621,1,35,22,106441.0474,0.0,179216.7894,35008.6,54222.95260000001,72775.74200000001,0.6837187699451369,-0.11387689123687741,2016-02-03T00:00:00.000000000,2026-05-22T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,招商银行
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,div_pool,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sh.600036,2621,3,35,6,27295.9512,0.0,48268.0,7204.6,5988.0,14984.0488,20972.0488,0.7683208636451548,-0.05137268315606799,2022-10-13T00:00:00.000000000,2023-12-01T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,招商银行

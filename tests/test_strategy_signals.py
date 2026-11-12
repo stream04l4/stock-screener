@@ -151,16 +151,18 @@ def _params(**kw):
 
 
 def test_buys_annotation_ladder_and_first_of_round():
-    """H=100；bar1 80 穿 k=0(85)+k=1(80)；bar2 74 穿 k=2(75)；bar3 70 穿 k=3(70)。"""
+    """v8.1.0 P0 锚点：H=100；bar1 80 破首仓线(85) 买 1 手（P0=80）；
+    bar2 74 ≤ P0×0.95=76 买 2 手；bar3 70 ≤ P0×0.90=72 买 3 手。
+    首仓当根不再同日连穿多档（档线全在 P0 下方）。"""
     p = _params()
     _stat, _state, _v, _c, _f, buys = run_stock(
         "t", _dates("2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"),
         np.array([100.0, 80.0, 74.0, 70.0]), np.array([100.0, 80.0, 74.0, 70.0]),
         None, p, verbose=False)
-    assert len(buys) == 4
-    assert [b[3] for b in buys] == [0, 1, 2, 3]            # 档下标
-    assert [b[4] for b in buys] == [True, False, False, False]  # 仅首笔 first_of_round
-    assert [b[5] for b in buys] == [1, 2, 3, 4]            # v7.0.28 手数阶梯
+    assert len(buys) == 3
+    assert [b[3] for b in buys] == [0, 1, 2]            # 档下标
+    assert [b[4] for b in buys] == [True, False, False]  # 仅首笔 first_of_round
+    assert [b[5] for b in buys] == [1, 2, 3]            # v7.0.28 手数阶梯
     # 现金支出 = 股数×价×(1+comm)
     comm = p.commission
     assert buys[0][2] == pytest.approx(100.0 * 80.0 * (1 + comm))
@@ -172,23 +174,25 @@ def test_buys_annotation_ladder_and_first_of_round():
     assert buys[0][2] == pytest.approx(100.0 * 80.0 * (1 + comm))
 
 
-def test_buys_annotation_rearm_k_resets_but_first_of_round_stays_false():
-    """再武装后 k 重置回 0，但 in_pos 恒 True（策略不卖）→ first_of_round=False，
-    该笔是「第1档」而非「首仓」（金额 = base×growth^0，非 initial）。
+def test_buys_annotation_rearm_new_round_first_of_round_true():
+    """v8.1.0：再武装后 k 归零 + P0 清零 → 第二轮首仓是新一轮的 k=0 档，
+    first_of_round=True（S4 第二轮首仓与 S1 同一双条件、同一标注口径）。
 
-    bar0 H=100；bar1 80：买 k=0（首仓 500）+k=1(80)；bar2 100：反弹≥80×1.15→rearm(k=0)；
-    bar3 80：再穿 k=0(85)+k=1(80)——两笔 first_of_round 均 False、金额 1000。
+    bar0 H=100；bar1 80：首仓 1 手（P0=80，k=1 线 76 未到）；
+    bar2 100：反弹≥80×1.15=92 → rearm（k=0, P0=0）；
+    bar3 80：再破首仓线 85 → 第二轮首仓 1 手（first_of_round=True）。
     """
     p = _params(rearm_pct=0.15)
-    _stat, _state, _v, _c, _f, buys = run_stock(
+    stat, _state, _v, _c, _f, buys = run_stock(
         "t", _dates("2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"),
         np.array([100.0, 80.0, 100.0, 80.0]), np.array([100.0, 80.0, 100.0, 80.0]),
         None, p, verbose=False)
-    assert [b[3] for b in buys] == [0, 1, 0, 1]
-    assert [b[4] for b in buys] == [True, False, False, False]
-    # v7.0.28：再武装后 k 归零 → 新轮重新 1/2 手起算
-    assert [b[5] for b in buys] == [1, 2, 1, 2]
-    assert _stat["n_rearms"] == 1  # 发生了一次再武装
+    assert [b[3] for b in buys] == [0, 0]
+    assert [b[4] for b in buys] == [True, True]  # v8.1.0：每轮首仓都标注
+    # v7.0.28：再武装后 k 归零 → 新轮重新 1 手起算
+    assert [b[5] for b in buys] == [1, 1]
+    assert stat["n_rearms"] == 1  # 发生了一次再武装
+    assert stat["n_rounds"] == 2  # v8.1.0：轮次 = 首仓次数
 
 
 # ---------------------------------------------------------------------------

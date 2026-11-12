@@ -308,7 +308,7 @@ def test_refresh_selection_writes_table(monkeypatch, tmp_path):
     monkeypatch.setattr(sel, "load", lambda con, codes=None, start=None, end=None:
                         ({}, {"a.1": (dates, np.array([1.0, 2.0]), np.array([1.0, 2.0]))}, {}))
     monkeypatch.setattr(sel, "run_stock",
-                        lambda c, d, s, e, dv, sp, verbose=False:
+                        lambda c, d, s, e, dv, sp, verbose=False, first_ok=None:
                         (stats[c], {}, np.array([1.0, 1.0]), np.array([1.0, 1.0]),
                          np.array([1, 1]), []))
 

@@ -36,9 +36,10 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import duckdb
+import numpy as np
 
-from .config import StrategyParams, UniverseParams
-from .engine import load, run_stock
+from .config import StrategyParams, TimingParams, UniverseParams
+from .engine import first_ok_series, load, run_stock
 from .universe import Member, PoolResult, build_pool
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -108,11 +109,14 @@ def _nan_to_none(v: Any) -> Optional[float]:
 
 def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
                       base_codes: Optional[List[str]] = None,
-                      verbose: bool = False) -> Dict[str, Any]:
+                      verbose: bool = False,
+                      tp: Optional[TimingParams] = None) -> Dict[str, Any]:
     """基础池逐股十年滚动回测 → 写入 selection_backtest_10y（整表刷新）。
 
     :param con: **写**连接（每日作业在湖增量后独占执行；勿在 Web 请求路径调用）。
     :param base_codes: 缺省 = build_pool 基础池（①~⑤）。
+    :param tp: v8.1.0 首仓双条件②（timing 段）——回测与生产同口径（PIT）；
+        None = ②关闭（仅单元测试兼容，生产路径必传）。
     返回 {as_of, start, n_codes, n_written, n_positive, elapsed_s}。
     """
     t0 = time.time()
@@ -125,8 +129,11 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
         base_codes = build_pool(con, up).codes
     base_codes = sorted(base_codes)
 
+    # v8.1.0：分位窗口 → load 起点前移 N 年，算完切回原窗口
+    ext_start = (str(_years_ago(start, tp.price_window_years))
+                 if tp is not None else str(start))
     names, data, divs = load(con, codes=base_codes,
-                             start=str(start), end=str(latest))
+                             start=ext_start, end=str(latest))
     rows: List[tuple] = []
     n_pos = 0
     for c in base_codes:
@@ -134,8 +141,15 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
         if not series or len(series[0]) < 2:
             continue  # 无足够数据 → 不写行（G7 fail-closed 不入选）
         dates, sig, exec_c = series
+        ok = None
+        if tp is not None:
+            ok = first_ok_series(dates, sig, tp.price_window_years,
+                                 tp.price_pctile_max)
+            i0 = int(np.searchsorted(dates, np.datetime64(start)))
+            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
         stat, _state, _v, _cst, _f, _buys = run_stock(
-            c, dates, sig, exec_c, divs.get(c), sp, verbose=verbose)
+            c, dates, sig, exec_c, divs.get(c), sp, verbose=verbose,
+            first_ok=ok)
         pnl = _nan_to_none(stat["total_pnl"])
         pct = _nan_to_none(stat["pnl_pct"])
         n_buys = int(stat["n_buys"] or 0)

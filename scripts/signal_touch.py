@@ -63,7 +63,8 @@ def run(dry_run: bool = False) -> int:
     # 1) 配置预检（配置错 = 退出码 2，区别于湖不可用 3）+ 候选池 + 账本
     #    → universe（与 /api/strategy_signals 同口径）
     try:
-        load_config(CONFIG_PATH)
+        # v8.1.0：tp = 首仓双条件②参数（状态机与回测同口径）
+        _sp_cfg, _up_cfg, _tp_cfg = load_config(CONFIG_PATH)
     except Exception as exc:  # noqa: BLE001 - ConfigError
         log.error("策略配置错误: %s", exc)
         return 2
@@ -78,7 +79,7 @@ def run(dry_run: bool = False) -> int:
             # 当日 bar（无 pending 事件、零影响）；湖同步失败日兜底生效
             _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
             rows = state_rows(_sp2, con, universe, include_buys=True,
-                              now=_bj_today)
+                              now=_bj_today, tp=_tp_cfg)
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）

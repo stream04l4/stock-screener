@@ -1,2 +1,2 @@
-ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
-sh.601088,2547,1,33,9,24375.9352,0.0,99166.917,24436.0,59383.06480000001,74790.98180000001,3.0682302519412676,-0.1473399533816751,2018-03-19T00:00:00.000000000,2025-02-19T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,中国神华
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,div_pool,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sh.601088,2547,1,33,2,4555.3661999999995,0.0,19188.0,4407.0,4407.0,10225.6338,14632.6338,3.21217508265307,-0.029077259300307495,2020-02-03T00:00:00.000000000,2020-03-19T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,中国神华

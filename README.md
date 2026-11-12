@@ -1,4 +1,4 @@
-# stock-screener · v8.0.13（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.1.0（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -46,19 +46,30 @@ positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypt
 
 ## 1. 策略（规格 = brief §3 + 参考实现逐行移植）
 
-池内**每只股票**独立状态机：
+池内**每只股票**独立状态机（v8.1.0，Joel 2026-11-12 定案：首仓双条件 + 加仓锚点 P0）：
 
 - **信号**：后复权收盘 hfq = raw × adj_factor（隐含除权推导见 engine.py 注释）；**成交**按原始收盘价。
 - **高点 H**：初始 = 窗口首日 hfq 收盘。rearm 两模式：
-  - `bounce`（默认）：价格 ≥ 本周期低点 L × (1+rearm_pct) → 重记 H = 当前价、重置 k=0。
-    每 bar **先**更新 low_since_high **再**判反弹（创新低当日不触发）。
-  - `newhigh`：仅创新高刷新 H。
-- **仓位口径 = 手数（v7.0.28 C 方案）**：1 手 = `lot_size` 股（A 股固定 100）。
-  首仓 = `first_lots` 手（k=0 档）；**加仓**每再跌 `add_step_pct` 一档（档线
-  H×(1−first_dd−k×step)，k=1,2,…）穿一档买一档，第 k 档（0 起）买
-  `first_lots + k×add_lots_step` 手（1→2→3→… 递增），上不封顶；跳空一日穿多档。
-  再武装（rearm）后 k 归零，新轮首买重新从 `first_lots` 手起算。
-- **不卖出、不封顶、无熔断**（无 exit/stop/max_position 参数）。
+  - `bounce`（默认）：价格 ≥ 本周期低点 L × (1+rearm_pct) → 重记 H = 当前价、重置 k=0
+    + **本轮首仓锚点 P0 清零**（再武装 = 新轮，无独立买入权）。每 bar **先**更新
+    low_since_high **再**判反弹（创新低当日不触发）。
+  - `newhigh`：仅创新高刷新 H（同上重置 P0）。
+- **首仓（任何一轮的 k=0 档）= 双条件（v8.1.0 核心变更）**：
+  ① **回撤线**：hfq ≤ H×(1−first_drawdown_pct)；**且** ② **N 年收盘分位** ≤
+  `price_pctile_max`（默认 5 年 40%，逐 bar PIT：窗口 = 当前 bar 前 N 个日历年、
+  含当前 bar、`first_ok_series` 与 selection_timing 页面同口径；窗口 <60 bar
+  fail-closed）。——「保证股价在长期低位**且**在下行通道才开始买入」；
+  再武装后的第二轮首仓**同一双条件**。生产路径（页面「当前信号」/微信推送/
+  触碰判定/G7 回测门/回测引擎）全部同一单点（`run_stock(first_ok=…)`）。
+- **加仓（k≥1）= 锚点 P0 越跌越买（v8.1.0 核心变更）**：P0 = 本轮首仓信号价
+  （首仓当根 bar 的 hfq 收盘）；hfq ≤ P0×(1−k×add_step_pct) 穿一档买一档，
+  第 k 档（0 起）买 `first_lots + k×add_lots_step` 手（1→2→3→… 递增），
+  上不封顶；跳空一日穿多档；加仓**无分位条件**（只认 P0 相对跌幅）。
+  仓位口径 = 手数（v7.0.28 C 方案）：1 手 = `lot_size` 股（A 股固定 100）。
+  （v8.1.0 前锚点 = 轮高 H：档线 H×(1−first_dd−k×step)——语义已变，f6 基线
+  已按新口径重生成。）
+- **不卖出、不封顶、无熔断**（无 exit/stop/max_position 参数）；出资优先分红
+  余额（v7.0.36）。
 - **分红**（cash 口径固定）：除息日前一日收盘持仓 × cash_dps 收现金，当日买入前执行；
   送转按比例加股；停牌期除权事件顺延复牌首个 bar。
 - **成本**（引擎常量，不进配置、不进 Web）：佣金 3bps（买）；印花税 5bps（无卖出，no-op）。
@@ -114,6 +125,10 @@ min_soe_sum_ratio_pct（30）或 soe_control_overrides 豁免**。
 - **首仓建仓回撤（first_drawdown_pct，默认 15%）**：首仓线 = 本轮高点×(1−该值)。
   v7.0.26 自「持仓策略」段移入「选股策略」段管理——首仓属买入时机；
   引擎经 StrategyParams 读取，数学零改动。
+  **v8.1.0（Joel 2026-11-12 定案）**：首仓线（①）与 ① 价格低位（分位门）
+  **合并为引擎首仓双条件**——任何一轮首仓（含再武装后第二轮）须 ① 且 ② 同时
+  成立才买，页面/微信/回测同一单点（此前分位门仅页面观察+推送侧，回测引擎
+  首仓只认回撤线，2856 次历史首仓 83% 买在 5 年分位 >40%——系统性买高）。
 
 **口径**（`martingale/timing.py` 单一定义点，v7.0.24 起观察/提醒同条件）：
 - **页面口径**（「今日选股」表）= ①（`in_watchlist`；`push_eligible` 列保留
@@ -383,7 +398,42 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.13）
+## 10. 版本历史（v7.0.11 → v8.1.0）
+
+- **v8.1.0**：策略语义变更——首仓双条件 + 加仓锚点 P0（Joel 2026-11-12 定案：
+  「不管首次建仓还是二次建仓，都要同时满足高点回撤与 5 年分位两个条件，保证
+  股价在长期低位且在下行通道的时候才开始买入」）
+  - **首仓（任何一轮 k=0，含再武装后第二轮）= 双条件**：① hfq ≤ 本轮高点×
+    (1−first_drawdown_pct) 且 ② N 年收盘分位 ≤ price_pctile_max（默认 5 年 40%，
+    逐 bar PIT，`engine.first_ok_series` 与 selection_timing 页面同口径；窗口
+    <60 bar fail-closed）。再武装只是状态重置（k 归零 + P0 清零 + 刷新高点），
+    **无独立买入权**。
+  - **加仓锚点 = 首仓价 P0**（原为轮高 H）：P0 = 本轮首仓信号价（首仓当根 bar
+    hfq 收盘）；hfq ≤ P0×(1−k×add_step_pct) 买 k+1 手；加仓无分位条件。
+  - **生产/回测统一**：单点 `run_stock(..., first_ok=…)`——页面「当前信号」
+    模拟（state_rows）、微信首仓/加仓推送（v7.0.23 起本就双条件）、触碰判定
+    （signal_touch）、G7 十年回测门（selection.refresh_selection +
+    dynamic_pool._rolling_g7）、静态/动态回测（CLI/Web）全部同口径；回测 load
+    起点前移 5 年喂分位窗口（`engine.extend_start`），算完切回原窗口。
+  - **f6 基线重生成**（策略口径变更标准流程，逐字段漂移留痕）：买点时间表
+    变化——长江电力 1→0 买（双条件未触发，rearm 16 次）、中国神华 9→2 笔（首仓
+    2018-03→2020-02，等分位回落）、五粮液 22→9 笔（首仓 2016-12→2021-08）、
+    格力 43→16 笔（首仓 2018-02→2023-10）、招商银行 22→6 / 中国建筑 18→6 /
+    中国海油 10→1；f6 测试改读 buys.csv（summary.md 时间表段退役）+ never 股
+    nan 断言。
+  - **回测对照**（2016-11-11 ~ 2026-11-11 十年，v8.0.13 → v8.1.0）：
+    - **十年动态池（PIT 诚实口径）**：总收益 +28.2% → **+43.6%**（投入
+      219.9 万 → 56.1 万，盈亏 +62.1 万 → +24.5 万）；触发 117 → 68 只
+      （双条件挡住 103 只）；胜率 64% → **73.5%**（50/18）；买入 719 →
+      254 笔；分红/价差占比 40.4/59.6% → 38.3/61.7%。
+    - **静态 329 池（前视口径，仅对照买法）**：+61.2% → **+78.4%**（投入
+      9,892 万 → 2,842 万）；胜率 78.4% → 83.1%；触发 329 → 320。
+  - 文件：`martingale/engine.py`（first_ok_series/extend_start/run_stock 双
+    条件+P0/state_rows+tp）、`__main__.py`（backtest/status/selection 入口）、
+    `selection.py`（refresh_selection+tp）、`dynamic_pool.py`（_rolling_g7/
+    _month_pool/pool_schedule/主回测+tp）、`web/app.py`（_strategy_state_rows
+    自动带 tp）、`scripts/signal_touch.py`（tp）、`tests/test_f6_regression.py`
+    + fixture 重生成、README。
 
 - **v8.0.13**：动态池回测（Joel：按股票池回测出现一堆没见过的股票——应**先算
   当天股票池**再看建仓/加仓，每天池子不一样）

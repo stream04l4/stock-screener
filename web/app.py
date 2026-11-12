@@ -1107,15 +1107,24 @@ def _beijing_today():
 
 
 def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False,
-                         now=None) -> Dict[str, Dict[str, Any]]:
+                         now=None, tp=None) -> Dict[str, Dict[str, Any]]:
     """状态机投影（单一口径，防漂移）。
 
     v7.0.20：实现下沉至 martingale.engine.state_rows（scripts/signal_touch.py 共用
     同一函数）。now=参照日（实时路径传当天）→ 除权日盘中触发价按 pending 除权
     事件修正到除权后口径（v7.0.32）；回测/回放不传 → 零修正。
+    v8.1.0：tp=首仓双条件②参数（timing 段）——缺省从 CONFIG_PATH 加载
+    （生产路径统一带分位门；显式传 tp=None 关闭 = 仅单元测试）。
     """
     from martingale.engine import state_rows
-    return state_rows(sp, con, codes, end=end, include_buys=include_buys, now=now)
+    if tp is None:
+        from martingale.config import load_config as _mload
+        try:
+            _s, _u, tp = _mload(str(CONFIG_PATH))
+        except Exception:  # noqa: BLE001 - 配置损坏 → fail-open 无门（页面仍可读）
+            tp = None
+    return state_rows(sp, con, codes, end=end, include_buys=include_buys,
+                      now=now, tp=tp)
 
 
 @app.get("/api/positions")
@@ -2025,7 +2034,7 @@ def _rescan_selection_after_save() -> Dict[str, Any]:
             return {"refreshed": False, "reason": "数据湖不存在（新值下次同步生效）"}
         con = duckdb.connect(p)  # 写连接：湖被锁时立即失败（已实测不挂起）
         try:
-            out = refresh_selection(con, _sp, up)
+            out = refresh_selection(con, _sp, up, tp=_tp)
         finally:
             con.close()
         return {"refreshed": True, "as_of": out.get("as_of"),

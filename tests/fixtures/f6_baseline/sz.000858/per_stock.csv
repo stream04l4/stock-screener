@@ -1,2 +1,2 @@
-ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
-sz.000858,2621,1,49,43,1244810.1795,0.0,880040.283,204320.583,-395210.1795,-364769.89650000003,-0.293032546252567,-0.3279135937528698,2018-02-07T00:00:00.000000000,2026-06-23T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,五 粮 液
+ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,final_assets,dividends,div_pool,price_pnl,total_pnl,pnl_pct,min_unreal_pct,first_buy_date,last_buy_date,last_status,end_date,name
+sz.000858,2621,4,49,16,582359.7259,0.0,440020.1415,36794.5415,15220.1415,-157559.72589999993,-142339.58439999993,-0.24441866095740591,-0.2816982675896268,2023-10-10T00:00:00.000000000,2026-06-18T00:00:00.000000000,open,2026-10-21T00:00:00.000000000,五 粮 液
