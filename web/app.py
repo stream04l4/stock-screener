@@ -656,12 +656,15 @@ class BtRunRequest(BaseModel):
     - start/end: YYYY-MM-DD（缺省 = 各股数据起点/终点）；
     - codes: 逗号分隔字符串或数组（与 pool 互斥，都不给 = 股票池）；
     - pool: true 显式股票池（与 codes 同时给 → 400）；
+    - dynamic_pool: v8.0.13 动态池回测（池每月重算 PIT，出池冻结开仓/加仓；
+      与 codes 互斥；耗时 ≈ 20~30 分钟/十年）；
     - 策略 = 当前活动策略 config/strategy.yaml（策略库已退役，不再支持选快照）。
     """
     start: Optional[str] = None
     end: Optional[str] = None
     codes: Optional[Any] = None   # str 或 list[str]
     pool: Optional[bool] = None
+    dynamic_pool: Optional[bool] = None   # v8.0.13
 
 
 class ImportStrategyRequest(BaseModel):
@@ -722,13 +725,17 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     codes = _normalize_codes(req.codes)
     if codes and req.pool:
         raise HTTPException(status_code=400, detail="codes 与 pool 互斥（codes 优先，请二选一）")
+    if req.dynamic_pool and (codes or req.pool):
+        raise HTTPException(status_code=400, detail="dynamic_pool 与 codes/pool 互斥（v8.0.13 动态池=月度重算，无手动标的）")
 
     cmd = [str(VENV_PYTHON), "-m", "martingale", "backtest"]
     if req.start:
         cmd += ["--start", req.start]
     if req.end:
         cmd += ["--end", req.end]
-    if codes:
+    if req.dynamic_pool:
+        cmd += ["--dynamic-pool"]   # v8.0.13
+    elif codes:
         cmd += ["--codes", ",".join(codes)]
     # 无 --codes = 默认股票池（pool=true 显式同义）
     if not VENV_PYTHON.exists():
@@ -738,7 +745,8 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     task_id = "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
     cmd += ["--out", str(BT_RUNS_DIR / task_id)]
     res = tm.start(cmd, {"start": req.start, "end": req.end,
-                         "codes": codes or None, "pool": bool(req.pool) or not codes},
+                         "codes": codes or None, "pool": bool(req.pool) or not codes,
+                         "dynamic_pool": bool(req.dynamic_pool)},
                    ["回测完成"], task_id=task_id)
     res["out_dir"] = str(BT_RUNS_DIR / task_id)
     return res
@@ -819,6 +827,10 @@ def bt_results(task_id: str) -> Dict[str, Any]:
         res["equity_curve"] = []
     sm = out_dir / "summary.md"
     res["summary"] = sm.read_text(encoding="utf-8") if sm.exists() else ""
+    # v8.0.13 动态池产物（静态回测无此文件 → 键缺省，前端 v-if 隐藏）
+    pt = out_dir / "pool_timeline.csv"
+    if pt.exists():
+        res["pool_timeline"] = _read_csv_rows(pt)
     sj = out_dir / "status.json"
     if sj.exists():
         try:

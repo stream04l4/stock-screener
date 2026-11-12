@@ -97,7 +97,8 @@ function onCodesKeydown(e) {
   if (e.key === "Escape") closeSug();
 }
 
-// mode: "pool"（股票池，默认）| "codes"（指定标的，逗号分隔）
+// mode: "pool"（静态股票池，默认）| "dyn"（v8.0.13 动态池：月度重算 PIT）
+//       | "codes"（指定标的，逗号分隔）
 // 策略固定 = 当前策略 config/strategy.yaml（v7.0.29：策略库退役，不再可选快照）
 
 async function onRun() {
@@ -111,6 +112,8 @@ async function onRun() {
       const codes = form.value.codes.split(",").map((s) => s.trim()).filter(Boolean);
       if (!codes.length) { toast.toast("codes 为空：请输入 sh.601088,sz.000651 形式", false); return; }
       params.codes = codes.join(",");
+    } else if (form.value.mode === "dyn") {
+      params.dynamic_pool = true;   // v8.0.13：池每月重算 + 出池冻结开仓/加仓
     } else {
       params.pool = true;
     }
@@ -193,6 +196,8 @@ const PER_STOCK_COLS = [
   ["price_pnl", "价差盈亏", true, fmt2], ["total_pnl", "总盈亏", true, fmt2],
   ["div_share", "分红占比", true, fmtPct1], ["price_share", "上涨占比", true, fmtPct1],
   ["pnl_pct", "盈亏%", true, fmtPct1], ["min_unreal_pct", "最低浮盈%", true, fmtPct1],
+  // v8.0.13 动态池产物（静态回测无此键 → —）
+  ["pool_months", "在池月数"], ["pool_first", "首次入池"], ["pool_last", "最后入池"],
   ["first_buy_date", "首买日", false, fmtDate], ["last_buy_date", "末买日", false, fmtDate],
   ["last_status", "末状态"], ["end_date", "期末", false, fmtDate],
 ];
@@ -201,6 +206,18 @@ const BUYS_COLS = [
   ["ts_code", "代码"], ["seq", "序", true], ["date", "日期", false, fmtDate],
   ["price", "成交价", true, fmt2], ["amount", "金额", true, fmt2],
 ];
+
+// v8.0.13 动态池：月度池漂移时间线（pool_timeline.csv 透传；静态产物无此键）
+const fmtList = (v) => (v && v.length > 60 ? v.slice(0, 60) + "…" : (v || ""));
+const TIMELINE_COLS = [
+  ["as_of_date", "重算日"], ["n_pool", "池规模", true],
+  ["n_entered", "入池", true], ["n_exited", "出池", true],
+  ["entered", "入池名单", false, fmtList],
+  ["exited", "出池名单", false, fmtList],
+];
+const timelineRows = computed(
+  () => (results.value && results.value.pool_timeline) || []
+);
 
 // ---------------------------------------------------------------------------
 // 净值曲线（equity_curve：date × open_value 组合持仓市值）
@@ -346,7 +363,8 @@ onMounted(loadHistory);
         </label>
         <div class="f-row f-scope">
           <span>标的</span>
-          <label class="radio"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 股票池（默认）</label>
+          <label class="radio"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 静态股票池（默认，当前池固定回测）</label>
+          <label class="radio" title="v8.0.13：池每月重算（全漏斗 point-in-time），出池冻结开仓/加仓、不强制平仓；十年窗口约 20~30 分钟"><input type="radio" value="dyn" v-model="form.mode" :disabled="starting || store.state === 'running'"> 动态股票池（月度重算，较慢）</label>
           <label class="radio"><input type="radio" value="codes" v-model="form.mode" :disabled="starting || store.state === 'running'"> 指定标的</label>
         </div>
         <label class="f-row" v-if="form.mode === 'codes'">
@@ -408,6 +426,12 @@ onMounted(loadHistory);
       <div class="card">
         <h3>个股汇总（per_stock）</h3>
         <SimpleTable :rows="perStockRows" :cols="PER_STOCK_COLS" empty="（无个股结果）" />
+      </div>
+
+      <!-- v8.0.13 动态池：月度池漂移时间线（静态产物无 pool_timeline 键 → 隐藏） -->
+      <div v-if="timelineRows.length" class="card">
+        <h3>池漂移时间线（动态池 · 每月重算）</h3>
+        <SimpleTable :rows="timelineRows" :cols="TIMELINE_COLS" empty="（无时间线）" />
       </div>
 
       <div class="card bt-buys">

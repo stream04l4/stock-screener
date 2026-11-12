@@ -40,6 +40,19 @@ def _cmd_backtest(args) -> int:
     t0 = time.time()
     # 配置优先级：--config（web 层策略选择显式传入）> MARTINGALE_CONFIG 环境变量 > 默认 config/strategy.yaml
     sp, up, tp = load_config(args.config or _default_config_path())
+    if args.codes and args.dynamic_pool:
+        print("错误: --codes 与 --dynamic-pool 互斥", file=sys.stderr)
+        return 2
+    # v8.0.13：动态池回测（池每月重算 + 交易门控；产物含 pool_timeline.csv）
+    if args.dynamic_pool:
+        from .dynamic_pool import run_dynamic_pool_backtest
+        con = connect_readonly(None)
+        try:
+            return run_dynamic_pool_backtest(
+                con, sp, up, args.start, args.end, args.out, t0, _db_label(),
+                config_path=args.config)
+        finally:
+            con.close()
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
@@ -263,6 +276,19 @@ def _cmd_timing(args) -> int:
     return 0
 
 
+def _cmd_dynpool_month(args) -> int:
+    """v8.0.13 动态池单月重算（一次性子进程调用；stdout 末行 = JSON）。
+
+    父进程（pool_schedule 子进程模式）消费 codes 列表；独立跑可手工核对
+    某月的 PIT 池。
+    """
+    import json as _json
+    from .dynamic_pool import compute_month_pool
+    codes = compute_month_pool(args.as_of, args.config)
+    print(_json.dumps({"as_of": args.as_of, "codes": codes}))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m martingale",
                                  description="深回撤金字塔加仓策略 CLI (v" + __version__ + ")")
@@ -272,6 +298,9 @@ def main(argv=None) -> int:
     bt.add_argument("--start", default=None, help="YYYY-MM-DD，默认数据起点")
     bt.add_argument("--end", default=None, help="YYYY-MM-DD，默认数据终点")
     bt.add_argument("--codes", default=None, help="逗号分隔 ts_code（默认=股票池）")
+    bt.add_argument("--dynamic-pool", action="store_true",
+                    help="v8.0.13 动态池回测：池每月重算（PIT 全漏斗），"
+                         "出池冻结开仓/加仓不强制平仓；与 --codes 互斥")
     bt.add_argument("--config", default=None,
                     help="策略 yaml 路径（默认 config/strategy.yaml，或 MARTINGALE_CONFIG 环境变量）")
     bt.add_argument("--out", default=DEFAULT_OUT, help="输出目录")
@@ -292,6 +321,12 @@ def main(argv=None) -> int:
     tm = sub.add_parser("timing",
                         help="选股时机预计算（候选池 ①价格分位 ②股息率 ③年线→湖表 selection_timing；v7.0.25 起不推送）")
     tm.set_defaults(func=_cmd_timing)
+
+    dpm = sub.add_parser("dynpool-month",
+                         help="v8.0.13 动态池单月重算（一次性子进程调用，stdout=JSON）")
+    dpm.add_argument("--as-of", required=True, help="YYYY-MM-DD（重算参照日）")
+    dpm.add_argument("--config", default=None, help="策略 yaml 路径")
+    dpm.set_defaults(func=_cmd_dynpool_month)
 
     args = ap.parse_args(argv)
     try:

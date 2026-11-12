@@ -126,9 +126,12 @@ describe("BacktestTab · 表单与触发", () => {
     await flushPromises();
     expect(w.find('input[type="date"]').exists()).toBe(true);
     const radios = w.findAll('input[type="radio"]');
-    expect(radios.length).toBe(2);
+    // v8.0.13：静态池 / 动态池 / 指定标的 三选
+    expect(radios.length).toBe(3);
     expect(radios[0].element.value).toBe("pool");
     expect(radios[0].element.checked).toBe(true);
+    expect(radios[1].element.value).toBe("dyn");
+    expect(radios[2].element.value).toBe("codes");
     expect(w.find("#btn-bt-run").exists()).toBe(true);
     w.unmount();
   });
@@ -152,7 +155,7 @@ describe("BacktestTab · 表单与触发", () => {
     await flushPromises();
     await w.findAll('input[type="date"]')[0].setValue("2016-01-04");
     await w.findAll('input[type="date"]')[1].setValue("2026-10-21");
-    await w.findAll('input[type="radio"]')[1].setValue("codes"); // 切到指定标的
+    await w.findAll('input[type="radio"]')[2].setValue("codes"); // 切到指定标的
     await flushPromises();
     await w.find('input[type="text"][placeholder*="sh.601088"]').setValue("sh.601088, sz.000651");
     await w.find("#btn-bt-run").trigger("click");
@@ -167,7 +170,7 @@ describe("BacktestTab · 表单与触发", () => {
   it("codes 模式空 codes → 本地 toast、不发 POST", async () => {
     const w = mk();
     await flushPromises();
-    await w.findAll('input[type="radio"]')[1].setValue("codes");
+    await w.findAll('input[type="radio"]')[2].setValue("codes");
     await flushPromises();
     await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
@@ -484,7 +487,7 @@ describe("BacktestTab · 历史回测结果（v7.0.34）", () => {
 // ---------------------------------------------------------------------------
 describe("BacktestTab · 指定标的模糊搜索（v8.0.9）", () => {
   async function toCodesMode(w) {
-    await w.findAll('input[type="radio"]')[1].setValue("codes");
+    await w.findAll('input[type="radio"]')[2].setValue("codes"); // v8.0.13 起 codes 为第 3 个
     await flushPromises();
   }
   const codesInput = (w) => w.find(".bt-codes-wrap input");
@@ -548,6 +551,80 @@ describe("BacktestTab · 指定标的模糊搜索（v8.0.9）", () => {
     vi.advanceTimersByTime(300);
     await flushPromises();
     expect(apiMock.mock.calls.some(([p]) => p.startsWith("/api/stocks/search?"))).toBe(false);
+    w.unmount();
+  });
+});
+
+describe("BacktestTab · 动态股票池（v8.0.13，Joel：池要随时间重算）", () => {
+  it("「动态股票池」radio → POST body dynamic_pool=true（无 pool/codes）", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t2", pid: 1, status: "running", out_dir: "/tmp/bt_t2",
+                 meta: { dynamic_pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t2$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    expect(w.text()).toContain("动态股票池（月度重算，较慢）");
+    // 选中动态池 radio
+    const radios = w.findAll('input[type="radio"]');
+    const dyn = radios.find((r) => r.element.value === "dyn");
+    expect(dyn).toBeTruthy();
+    await dyn.setValue(true);
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs");
+    expect(call).toBeTruthy();
+    const body = JSON.parse(call[1].body);
+    expect(body.dynamic_pool).toBe(true);
+    expect(body.pool).toBeFalsy();
+    expect(body.codes).toBeUndefined();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    w.unmount();
+  });
+
+  it("动态池产物行：在池月数/首次入池/最后入池 渲染；静态行缺键 → —", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1",
+                 meta: { dynamic_pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify({
+        ...RESULTS,
+        per_stock: [
+          { ...RESULTS.per_stock[0], pool_months: 118,
+            pool_first: "2018-05-01", pool_last: "2026-10-01" },
+          { ...RESULTS.per_stock[1] },   // 无池履历键（静态/未入池）
+        ],
+        pool_timeline: [
+          { as_of_date: "2024-01-02", n_pool: "17", n_entered: "0",
+            n_exited: "0", entered: null, exited: null },
+          { as_of_date: "2024-02-01", n_pool: "25", n_entered: "16",
+            n_exited: "8", entered: "sh.600066,sh.600236,sh.600329",
+            exited: "sh.600188" },
+        ],
+      }));
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    const t = w.text();
+    for (const h of ["在池月数", "首次入池", "最后入池"]) expect(t).toContain(h);
+    expect(t).toContain("118");
+    expect(t).toContain("2018-05-01");
+    expect(t).toContain("2026-10-01");
+    expect(t).toContain("—");   // 格力行缺键降级
+    // v8.0.13：池漂移时间线表（动态池产物 pool_timeline 透传）
+    expect(t).toContain("池漂移时间线（动态池 · 每月重算）");
+    for (const h of ["重算日", "池规模", "入池", "出池"]) expect(t).toContain(h);
+    expect(t).toContain("sh.600066,sh.600236,sh.600329");
     w.unmount();
   });
 });

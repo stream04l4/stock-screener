@@ -192,19 +192,45 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
 def write_outputs(out_dir: str, sp, db_path: str, gdates: np.ndarray,
                   g_value: np.ndarray, g_cost: np.ndarray, g_open: np.ndarray,
                   rows: List[dict], buys_by_code: Dict[str, List],
-                  bench_rets: List[float], t0: float) -> None:
-    """写 per_stock.csv / buys.csv / equity_curve.csv / summary.md / status.json。"""
+                  bench_rets: List[float], t0: float,
+                  pool_schedule: Optional[Dict[str, set]] = None,
+                  mode: str = "static") -> None:
+    """写 per_stock.csv / buys.csv / equity_curve.csv / summary.md / status.json。
+
+    v8.0.13：pool_schedule 非空（动态池回测）时——per_stock.csv +
+    pool_months/pool_first/pool_last 三列、另写 pool_timeline.csv（月度
+    池规模+入池/出池名单）、status.json +mode/pool 键。静态回测产物不变。
+    """
     import os
 
     os.makedirs(out_dir, exist_ok=True)
     rows = _sort_per_stock(rows)
 
-    # per_stock.csv
+    # per_stock.csv（v8.0.13：动态池行带池履历键 → 追加三列）
+    has_pool = pool_schedule is not None and any("pool_months" in r for r in rows)
+    pcols = list(PER_STOCK_COLUMNS)
+    if has_pool:
+        pcols += ["pool_months", "pool_first", "pool_last"]
     with open(os.path.join(out_dir, "per_stock.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(PER_STOCK_COLUMNS)
+        w.writerow(pcols)
         for r in rows:
-            w.writerow([_fmt(r[c]) for c in PER_STOCK_COLUMNS])
+            w.writerow([_fmt(r[c]) if c in r else None for c in pcols])
+
+    # v8.0.13：pool_timeline.csv（月度重算的池规模 + 入池/出池名单）
+    if pool_schedule:
+        with open(os.path.join(out_dir, "pool_timeline.csv"), "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["as_of_date", "n_pool", "n_entered", "n_exited",
+                        "entered", "exited"])
+            prev: Optional[set] = None
+            for d in sorted(pool_schedule):
+                cur = pool_schedule[d]
+                entered = sorted(cur - prev) if prev is not None else []
+                exited = sorted(prev - cur) if prev is not None else []
+                w.writerow([d, len(cur), len(entered), len(exited),
+                            ",".join(entered), ",".join(exited)])
+                prev = cur
 
     # buys.csv（逐笔；seq 从 1 起；v7.0.28 加 lots 列 = 本笔手数）
     with open(os.path.join(out_dir, "buys.csv"), "w", encoding="utf-8", newline="") as f:
@@ -279,6 +305,13 @@ def write_outputs(out_dir: str, sp, db_path: str, gdates: np.ndarray,
         "n_stocks": len(rows),
         "n_triggered": len([r for r in rows if r["last_status"] != "never"]),
         "n_buys_total": int(sum(int(r["n_buys"]) for r in rows)),
+        # v8.0.13：回测模式 + 动态池重算元信息
+        "mode": mode,
+        **({"pool": {"n_recomputes": len(pool_schedule),
+                     "recompute_dates": sorted(pool_schedule),
+                     "min_pool": int(min(len(s) for s in pool_schedule.values())),
+                     "max_pool": int(max(len(s) for s in pool_schedule.values()))}}
+           if pool_schedule else {}),
     }
     with open(os.path.join(out_dir, "status.json"), "w", encoding="utf-8") as f:
         json.dump(status, f, ensure_ascii=False, indent=2)

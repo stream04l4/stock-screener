@@ -140,6 +140,182 @@ def _soe_ratio_map(con) -> Dict[str, Tuple[float, float]]:
     return {c: (max(rs), sum(rs)) for c, rs in acc.items()}
 
 
+# ---------------------------------------------------------------------------
+# v8.0.13 PIT（point-in-time）版漏斗：动态池回测用「截至 as_of 日的股票池」。
+# 与 build_pool 的语义差（均为设计内近似，README §动态池 有载）：
+# - 退市/ST 按 as_of 判定（delist_date > as_of 仍存活；st_since ≤ as_of 视为 ST
+#   ——无 ST 摘帽日期，从严）；生产 build_pool 用当前快照（delist IS NULL）。
+# - holders 取 ≤ as_of 的最近季度快照（快照缺失期沿用更早快照）。
+# - 估值/价格/分红/K线行数全部 date ≤ as_of 口径。
+# 生产路径（build_pool）零改动。
+# ---------------------------------------------------------------------------
+def _soe_set_asof(con, as_of, soe_keywords: tuple) -> Dict[str, str]:
+    """_soe_set 的 PIT 版：取 ≤ as_of 的最近 holders 快照。"""
+    kw_ors = " OR ".join("h.holder_name LIKE ?" for _ in soe_keywords)
+    sql = f"""
+        SELECT h.ts_code,
+               MAX(CASE WHEN h.share_nature = '国有股' THEN 1 ELSE 0 END) AS is_state,
+               MAX(CASE WHEN ({kw_ors}) THEN 1 ELSE 0 END) AS is_kw
+        FROM holders_snapshot h
+        JOIN (SELECT ts_code, MAX(as_of_date) AS latest
+              FROM holders_snapshot WHERE as_of_date <= ?
+              GROUP BY ts_code) l
+          ON h.ts_code = l.ts_code AND h.as_of_date = l.latest
+        WHERE h.holder_rank <= 10
+        GROUP BY h.ts_code
+    """
+    # 占位符文本序：SELECT 里的 kw_ors 在前，子查询的 as_of 在后
+    con.execute(sql, [f"%{kw}%" for kw in soe_keywords] + [as_of])
+    out: Dict[str, str] = {}
+    for code, is_state, is_kw in con.fetchall():
+        if is_state:
+            out[code] = "国有股性质"
+        elif is_kw:
+            out[code] = "关键词命中"
+    return out
+
+
+def _soe_ratio_map_asof(con, as_of) -> Dict[str, Tuple[float, float]]:
+    """_soe_ratio_map 的 PIT 版：取 ≤ as_of 的最近 holders 快照。"""
+    q = """
+        SELECT h.ts_code, h.hold_ratio
+        FROM holders_snapshot h
+        JOIN (SELECT ts_code, MAX(as_of_date) la
+              FROM holders_snapshot WHERE as_of_date <= ?
+              GROUP BY ts_code) l
+          ON h.ts_code = l.ts_code AND h.as_of_date = l.la
+        WHERE h.holder_rank <= 10 AND h.share_nature = '国有股'
+    """
+    acc: Dict[str, List[float]] = {}
+    for code, ratio in con.execute(q, [as_of]).fetchall():
+        acc.setdefault(code, []).append(float(ratio or 0.0))
+    return {c: (max(rs), sum(rs)) for c, rs in acc.items()}
+
+
+def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
+    """v8.0.13：as_of 日口径的股票池（漏斗与 build_pool 逐门一致，数据全部
+    date ≤ as_of）。:param as_of: date/datetime64/str（YYYY-MM-DD 均可，SQL ?
+    绑定自动适配）。run_year 固定 = as_of 年（连续分红窗口的截止年）。"""
+    a = str(as_of)[:10]
+    run_year = int(str(as_of)[:4])
+
+    # 2) 白名单 + 存活(as_of) + 非ST(as_of)
+    if set(up.industry_whitelist_csric2) == {"*"}:
+        wl_sql = """
+            SELECT ts_code, name, industry_csric2, list_date
+            FROM stock_master sm
+            WHERE (delist_date IS NULL OR delist_date > ?)
+              AND (st_since IS NULL OR st_since > ?)
+        """
+        con.execute(wl_sql, [a, a])
+    else:
+        wl_ors = " OR ".join("sm.industry_csric2 LIKE ?" for _ in up.industry_whitelist_csric2)
+        wl_sql = f"""
+            SELECT ts_code, name, industry_csric2, list_date
+            FROM stock_master sm
+            WHERE ({wl_ors}) AND (delist_date IS NULL OR delist_date > ?)
+              AND (st_since IS NULL OR st_since > ?)
+        """
+        con.execute(wl_sql, [f"{c}%" for c in up.industry_whitelist_csric2] + [a, a])
+    wl_rows = con.fetchall()
+    wl = {r[0]: r for r in wl_rows}
+
+    # 3) SOE（PIT）
+    soe = _soe_set_asof(con, a, up.soe_keywords)
+    soe_codes = sorted(set(wl) & set(soe))
+    soe_raw = len(soe_codes)
+
+    # 3-b) 硬剔除
+    if up.exclude_codes:
+        excl = set(up.exclude_codes)
+        soe_codes = [c for c in soe_codes if c not in excl]
+
+    # 3-c) 控股强度门（PIT）
+    if up.min_soe_ratio_pct > 0 or up.min_soe_sum_ratio_pct > 0:
+        ratios = _soe_ratio_map_asof(con, a)
+        ov = set(up.soe_control_overrides)
+        soe_codes = [
+            c for c in soe_codes
+            if (ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct
+                or ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct
+                or c in ov)
+        ]
+
+    # 4) 市值（每股 ≤ as_of 最近估值日）
+    con.execute("""
+        SELECT v.ts_code, v.total_mv FROM valuation_daily v
+        JOIN (SELECT ts_code, MAX(date) md FROM valuation_daily
+              WHERE date <= ? GROUP BY ts_code) x
+          ON v.ts_code = x.ts_code AND v.date = x.md
+    """, [a])
+    mv_map = {c: mv for c, mv in con.fetchall() if mv is not None}
+    mv_codes = sorted(c for c in soe_codes
+                      if mv_map.get(c) is not None and mv_map[c] >= up.min_total_mv_yi)
+
+    # 5) 上市时长（≤ as_of 的 K线行数）
+    con.execute(
+        "SELECT ts_code, COUNT(*) FROM kline_daily WHERE date <= ? GROUP BY ts_code", [a])
+    bars = dict(con.fetchall())
+    listing_codes = sorted(c for c in mv_codes
+                           if bars.get(c, 0) >= up.listing_min_trading_days)
+
+    # 6) 连续分红（窗口截止年 = as_of 年；只取 ≤ as_of 的除权事件）
+    con.execute("""
+        SELECT ts_code, CAST(strftime(ex_date, '%Y') AS INTEGER) AS y,
+               SUM(COALESCE(cash_dps, 0)) AS dps
+        FROM dividend_events WHERE ex_date IS NOT NULL AND ex_date <= ?
+        GROUP BY ts_code, y
+    """, [a])
+    div_map: Dict[str, Dict[int, float]] = {}
+    for code, y, dps in con.fetchall():
+        div_map.setdefault(code, {})[int(y)] = float(dps or 0.0)
+    div_codes: List[str] = []
+    for c in listing_codes:
+        row = wl[c]
+        list_year = None
+        if row[3] is not None:
+            ld = row[3]
+            list_year = ld.year if hasattr(ld, "year") else int(str(ld)[:4])
+        if _div_history_ok(div_map.get(c, {}), up.min_consecutive_div_years,
+                           run_year, list_year):
+            div_codes.append(c)
+    div_codes = sorted(div_codes)
+
+    # 成员详情（ttm 取 ≤ as_of 最近估值日）
+    members: List[Member] = []
+    for c in div_codes:
+        name = wl[c][1]
+        industry = wl[c][2] or ""
+        ld = wl[c][3]
+        list_date = str(ld)[:10] if ld is not None else None
+        tv = mv_map.get(c)
+        con.execute(
+            "SELECT ttm_yield_pct FROM valuation_daily WHERE ts_code = ? AND date = "
+            "(SELECT MAX(date) FROM valuation_daily WHERE ts_code = ? AND date <= ?) "
+            "ORDER BY date DESC LIMIT 1",
+            [c, c, a])
+        r = con.fetchone()
+        ttm = float(r[0]) if r and r[0] is not None else None
+        members.append(Member(
+            ts_code=c, name=str(name) if name is not None else "",
+            industry_csric2=str(industry), soe_basis=soe[c],
+            total_mv=float(tv) if tv is not None else None, ttm_yield_pct=ttm,
+            n_bars=int(bars.get(c, 0)), list_date=list_date,
+        ))
+
+    funnel = {
+        "total": int(con.execute("SELECT COUNT(*) FROM stock_master").fetchone()[0]),
+        "whitelist": len(wl),
+        "soe": soe_raw,
+        "soe_ratio": len(soe_codes),
+        "mv": len(mv_codes),
+        "listing": len(listing_codes),
+        "div": len(div_codes),
+        "final": len(members),
+    }
+    return PoolResult(funnel=funnel, members=members)
+
+
 def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolResult:
     """构建股票池。:param con: 只读 duckdb 连接；:param run_year: 分红判定的
     "当前年"（缺省 = 当年；测试可注入以复现历史口径）。"""

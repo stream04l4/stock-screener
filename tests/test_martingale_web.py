@@ -597,6 +597,24 @@ def test_bt_run_uses_active_config_only(monkeypatch):
     assert not hasattr(wapp.BtRunRequest, "strategy")
 
 
+def test_bt_run_dynamic_pool_flag(monkeypatch):
+    """v8.0.13：dynamic_pool=True → cmd 带 --dynamic-pool、与 codes/pool 互斥 400。"""
+    fake = _patch_tm(monkeypatch)
+    wapp.trigger_bt_run(wapp.BtRunRequest(dynamic_pool=True,
+                                          start="2016-01-01", end="2026-01-01"))
+    assert "--dynamic-pool" in fake.last_cmd
+    assert "--codes" not in fake.last_cmd
+    assert fake.last_params["dynamic_pool"] is True
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e1:
+        wapp.trigger_bt_run(wapp.BtRunRequest(dynamic_pool=True,
+                                              codes="sh.600000"))
+    assert e1.value.status_code == 400
+    with pytest.raises(HTTPException) as e2:
+        wapp.trigger_bt_run(wapp.BtRunRequest(dynamic_pool=True, pool=True))
+    assert e2.value.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # GET /api/bt/runs 历史回测列表（v7.0.34，Joel 2026-11-10「历史回测结果读取」）
 # ---------------------------------------------------------------------------
@@ -695,6 +713,30 @@ def test_bt_results_per_stock_div_pool_passthrough(monkeypatch, tmp_path):
     row2 = out2["per_stock"][0]
     assert "div_pool" not in row2
     assert row2["price_pnl"] == 183948.34
+
+
+def test_bt_results_pool_timeline_passthrough(monkeypatch, tmp_path):
+    """v8.0.13：pool_timeline.csv 存在 → 响应带行列表（字符串列保持原文、
+    空列 → 空串）；静态产物无该文件 → 键缺省（前端 v-if 隐藏）。"""
+    monkeypatch.setattr(wapp, "BT_RUNS_DIR", tmp_path / "runs")
+    d = _mk_run(wapp.BT_RUNS_DIR, "bt_20261112_110000_cccc")
+    (d / "pool_timeline.csv").write_text(
+        "as_of_date,n_pool,n_entered,n_exited,entered,exited\n"
+        "2024-01-02,17,0,0,,\n"
+        '2024-02-01,25,16,8,"sh.600066,sh.600236","sh.600188"\n',
+        encoding="utf-8")
+    out = wapp.bt_results("bt_20261112_110000_cccc")
+    assert "pool_timeline" in out
+    rows = out["pool_timeline"]
+    assert len(rows) == 2
+    assert rows[1]["n_pool"] == "25"                    # 原文透传（不 float 化）
+    assert rows[1]["entered"] == "sh.600066,sh.600236"
+    assert rows[0]["entered"] == ""                   # 空列 → 空串（前端 cell() 显 —）
+
+    # 静态产物（无 pool_timeline.csv）→ 键缺省
+    d2 = _mk_run(wapp.BT_RUNS_DIR, "bt_20261112_120000_dddd")
+    out2 = wapp.bt_results("bt_20261112_120000_dddd")
+    assert "pool_timeline" not in out2
 
 
 # ---------------------------------------------------------------------------

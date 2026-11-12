@@ -1,4 +1,4 @@
-# stock-screener · v8.0.12（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.13（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -142,10 +142,13 @@ min_soe_sum_ratio_pct（30）或 soe_control_overrides 豁免**。
 .venv/bin/python -m martingale backtest --start 2016-01-04 --end 2026-10-21 \
     --out /tmp/bt_out                                     # 全池回测
 .venv/bin/python -m martingale backtest --codes sh.601088,sz.000651 --out /tmp/bt2
+.venv/bin/python -m martingale backtest --dynamic-pool --out /tmp/bt_dyn
 .venv/bin/python -m martingale status --out /tmp/bt_out   # 读产物：逐股当前状态
 ```
 
-- 窗口留空 = 各股数据起点 → 数据终点。
+- 窗口留空 = 各股数据起点 → 数据终点（**动态池模式例外**：留空自动收敛到
+  **最近 10 年**（`ROLLING_DAYS`）——全跨度 35 年要 430+ 次月度重算，内存/时长
+  爆炸且 2016 前 SOE/分红 PIT 数据稀疏、池无意义）。
 - `selection` = 基础池逐股十年滚动回测 → 整表刷新湖表 `selection_backtest_10y`
   （98 只 ~2s，纯湖内计算零网络零配额）；每日作业在湖增量后自动追加执行，
   失败不阻断（Web 候选池 ⑦ 读旧快照 fail-closed，次日重算）。
@@ -153,6 +156,27 @@ min_soe_sum_ratio_pct（30）或 soe_control_overrides 豁免**。
   （v7.0.25 起纯预计算不推送——微信统一为进入当前信号才推，策略点位提醒）。
 - 进度标记 `[PROGRESS] stage=bt done=k total=N`（Web SSE 分类器消费）。
 - 产物：`<out>/{per_stock.csv, buys.csv, equity_curve.csv, summary.md, status.json}`。
+- **动态池回测**（v8.0.13，`--dynamic-pool`，与 `--codes` 互斥；Web 回测页签
+  「动态股票池（月度重算，较慢）」同参数）：每月第一个交易日**按当天 point-in-time
+  数据**重算全漏斗（基础 6 门 ∩ ⑦滚动十年策略回测 ∩ ⑧TTM 股息率 ∩ ⑨价格区间，
+  不含手动池），重算日之间的 bar 沿用最近一次池（首次重算日前禁交易）。
+  - **PIT 近似**：退市 `delist_date > as_of` 判存活；ST `st_since ≤ as_of` 从严
+    （无摘帽日期）；股东快照取 ≤ as_of 最近季度（缺期沿用更早）；估值/价格/分红/
+    K线行数全部 `date ≤ as_of`。
+  - **出池语义**：冻结新开仓+加仓（引擎 `trade_mask` 只门控买入块；档位不推进=
+    「暂停」，回池后按现价补买）；**不强制平仓**（策略无卖出信号，持仓/分红/
+    浮盈跟踪照常）。
+  - **内存架构（v8.0.13 实踩定案）**：月度重算跑在**一次性子进程**
+    （`martingale dynpool-month`，3 路并行）——DuckDB/mimalloc 的 C 层
+    allocator 滞留 ~100MB/月且不归还 OS（gc/重连均无效；进程内 121 个月
+    → 10GB 全局 OOM 三次实踩），子进程退出即归零；父进程只聚合小体积池
+    集合。单月 ~4.5s → 十年全量 **~5 分钟**。
+  - 产物增量：`per_stock.csv` +`pool_months/pool_first/pool_last`；
+    `pool_timeline.csv`（月度池规模+入池/出池名单）；`status.json` +`mode`/`pool`
+    键。静态模式产物**逐位不变**。
+  - 动机：旧「按股票池回测」= 用**今天**的基础池（329 只，非候选池 70 只）回测
+    全窗口 → 近年才达标的股从第一天就出现（「一堆没见过的股票」）；动态池
+    先算当天池再看建仓/加仓，与生产候选池同口径。
 
 ## 4. 参数（config/strategy.yaml）
 
@@ -359,7 +383,36 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.12）
+## 10. 版本历史（v7.0.11 → v8.0.13）
+
+- **v8.0.13**：动态池回测（Joel：按股票池回测出现一堆没见过的股票——应**先算
+  当天股票池**再看建仓/加仓，每天池子不一样）
+  - **根因**：旧「按股票池回测」实际用 `build_pool` **基础池（329 只）**固定回测
+    全窗口，且非候选池（70 只，G7/G8/G9 未应用）——今天才达标的股从窗口第一天
+    就被回测。
+  - **`martingale/dynamic_pool.py`（新模块）**：`month_starts`（每月第一个交易日）
+    + `pool_schedule`（逐月 PIT 重算全漏斗：基础 6 门 point-in-time ∩ G7 滚动
+    十年策略回测 ∩ G8 TTM ∩ G9 价格区间，不含手动池）+ `build_code_mask`（bar
+    级交易掩码：适用池=日期 ≤ bar 的最近一次重算，首次重算日前禁交易）+
+    `run_dynamic_pool_backtest`（重算→并集→带掩码逐股回测→产物）。
+  - **引擎**（`engine.py`）：`run_stock(..., trade_mask=None)`——False bar 只冻结
+    买入块（首仓/加仓），状态机其余（高点/再武装/分红/浮盈）照常、档位不推进
+    （出池期间跌穿档位不消费，回池当日按现价补买=「暂停」语义）；`None` 缺省
+    **逐位=既有行为**（f6 14 例零 diff 验证）。
+  - **PIT 漏斗**（`universe.py` +`build_pool_asof`/`_soe_set_asof`）：生产
+    `build_pool` **零改动**；退市/ST 按 as_of 从严、股东快照取 ≤ as_of 最近季度、
+    估值/价格/分红/K线行数 `date ≤ as_of`。
+  - **产物**（`report.py`）：动态池 `per_stock.csv` +`pool_months/pool_first/
+    pool_last`；新增 `pool_timeline.csv`（月度池规模+入池/出池名单）；
+    `status.json` +`mode="dynamic_pool"` +`pool{n_recomputes, recompute_dates,
+    min_pool, max_pool}`。静态产物逐位不变。
+  - **CLI/Web**：`--dynamic-pool`（与 `--codes` 互斥）；`/api/bt/runs`
+    `dynamic_pool` 字段（与 codes/pool 互斥 400）；回测页签「动态股票池
+    （月度重算，较慢）」radio 与静态并存（A/B 对比池漂移影响）+ per_stock 表
+    在池月数/首次入池/最后入池 三列。
+  - 测试：`tests/test_dynamic_pool.py` 新增 7 例（合成湖：PIT 漏斗、月度门控、
+    掩码语义、引擎冻结/分红照收/None 恒等）；web +1 例；前端 +2 例 + 既有
+    radio 索引适配（2→3 选）。
 
 - **v8.0.12**：候选池 +「累计分红」列（Joel：中国外运股息率 4.12% 但分红占比
   才 7.15%、余额才 2301——余额口径易误读；占比口径不变，加累计分红透明展示）

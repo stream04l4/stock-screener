@@ -83,20 +83,20 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
         ORDER BY h.ts_code, h.date
     """
     con.execute(sql, params)
-    codes_seen: List[str] = []
-    per: Dict[str, List] = {}
-    for c, d, s, e in con.fetchall():
-        if c not in per:
-            codes_seen.append(c)
-            per[c] = []
-        per[c].append((d, s, e))
-
-    data: Dict[str, StockSeries] = {}
-    for c in codes_seen:
-        rows = per[c]
-        dates = np.array([r[0] for r in rows], dtype="datetime64[D]").astype("datetime64[ns]")
-        vals = np.array([[r[1], r[2]] for r in rows], dtype=np.float64)
-        data[c] = (dates, vals[:, 0], vals[:, 1])
+    # v8.0.13 内存修复：fetchall() 逐行物化 ~百万 Python 元组（~250MB/次），动态池
+    # 121 次月度重算下 glibc arena 碎片不归还 → RSS 单调涨 10GB 全局 OOM（实踩）。
+    # .df() 走 C 速 Arrow 路径、内存连续可归还。
+    df = con.df()
+    if len(df) == 0:
+        return {}, {}, {}
+    per: Dict[str, StockSeries] = {}
+    for c, g in df.groupby("ts_code", sort=False):
+        dates = g["date"].to_numpy(dtype="datetime64[ns]")
+        per[str(c)] = (
+            dates,
+            g["sig_close"].to_numpy(dtype=np.float64),
+            g["exec_close"].to_numpy(dtype=np.float64),
+        )
 
     div_where = "ex_date IS NOT NULL"
     div_params: List[str] = []
@@ -113,13 +113,14 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
         divs.setdefault(c, {})[_to_ns(d)] = (float(cd or 0.0), float(sd or 0.0))
 
     names: Dict[str, str] = {}
-    if codes_seen:
+    if per:
+        codes_seen = list(per.keys())
         fmt = ", ".join(["?"] * len(codes_seen))
         con.execute(f"SELECT ts_code, name FROM stock_master WHERE ts_code IN ({fmt})",
                     codes_seen)
         for c, nm in con.fetchall():
-            names[c] = str(nm) if nm is not None else ""
-    return names, data, divs
+            names[str(c)] = str(nm) if nm is not None else ""
+    return names, per, divs
 
 
 def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
@@ -165,11 +166,17 @@ def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
 
 
 def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarray,
-              exmap: Optional[Dict], p: StrategyParams, verbose: bool = True):
+              exmap: Optional[Dict], p: StrategyParams, verbose: bool = True,
+              trade_mask: Optional[np.ndarray] = None):
     """单股状态机（high-ladder 唯一分支；不卖、不封顶、无熔断）。
 
     :param verbose: True 时逐条打印隐含除权推导（CLI 行为，与参考脚本一致）；
         Web /api/positions 全池跑 101 只时传 False 避免日志洪水。
+    :param trade_mask: v8.0.13 动态池用——bool 数组（与 dates 等长）；
+        False 的 bar **只冻结买入**（首仓/加仓都不执行），状态机其余部分
+        （entry_high/再武装/分红收取/浮盈跟踪）照常推进 = 「冻结开仓+加仓、
+        不强制平仓」语义（Joel 2026-11-12 定案）；None = 恒可交易（缺省，
+        既有行为逐位不变——f6 安全）。
 
     返回 (stat, state, v_arr, c_arr, flag, buys)：
     - stat: 与参考实现 per_stock.csv 字段**逐位对齐**的统计（pnl_pct/min_unreal_pct
@@ -304,41 +311,45 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
             entry_high = sprice
             k_level = 0
         # 3) 今日穿过的每一级都买（跳空可一日多级；v7 无熔断/封顶/次数上限）
-        while True:
-            level = entry_high * (1.0 - p.first_drawdown - k_level * p.add_step)
-            if sprice > level + _EPS:
-                break
-            n_lots = p.first_lots + k_level * p.add_lots_step   # C 方案：1/2/3…手
-            first_of_round = not in_pos
-            buy_shares = float(n_lots * p.lot_size)
-            buy_amt = buy_shares * price * (1.0 + comm)  # 现金支出（含 3bps 佣金）
-            # v7.0.36：分红余额优先出资，缺口外部（Joel 2026-11-10 定案）——
-            # 买入决策不看出资（状态机零改动，buy 时间表与 v7.0.35 逐位一致），
-            # 仅出资归属/净值口径变化：外部净投入 = Σcost − 分红出资
-            div_part = min(buy_amt, cash_div)
-            ext_part = buy_amt - div_part
-            cash_div -= div_part
-            ext_running += ext_part
-            du_cum += div_part
-            _y = int(str(dates[i])[:4])
-            ext_by_year[_y] = ext_by_year.get(_y, 0.0) + ext_part
-            div_by_year[_y] = div_by_year.get(_y, 0.0) + div_part
-            shares += buy_shares
-            open_cost += buy_amt
-            gross_cost += buy_amt
-            n_buys += 1
-            last_buy_i = i
-            if first_of_round:
-                in_pos = True
-                n_rounds += 1
-                if first_buy_i < 0:
-                    first_buy_i = i
-            # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
-            # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）；
-            # n_lots = 本笔手数（v7.0.28 手数口径，Web 历史信号展示用）
-            buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
-                         int(k_level), bool(first_of_round), int(n_lots)))
-            k_level += 1
+        # v8.0.13：trade_mask=False 时整块跳过（冻结开仓+加仓）——
+        # k_level 不推进：出池期间跌穿的档位不消费，回池后当日即按现价补买
+        # （「暂停」语义；entry_high/再武装在上方第 2 步照常，不受影响）
+        if trade_mask is None or trade_mask[i]:
+            while True:
+                level = entry_high * (1.0 - p.first_drawdown - k_level * p.add_step)
+                if sprice > level + _EPS:
+                    break
+                n_lots = p.first_lots + k_level * p.add_lots_step   # C 方案：1/2/3…手
+                first_of_round = not in_pos
+                buy_shares = float(n_lots * p.lot_size)
+                buy_amt = buy_shares * price * (1.0 + comm)  # 现金支出（含 3bps 佣金）
+                # v7.0.36：分红余额优先出资，缺口外部（Joel 2026-11-10 定案）——
+                # 买入决策不看出资（状态机零改动，buy 时间表与 v7.0.35 逐位一致），
+                # 仅出资归属/净值口径变化：外部净投入 = Σcost − 分红出资
+                div_part = min(buy_amt, cash_div)
+                ext_part = buy_amt - div_part
+                cash_div -= div_part
+                ext_running += ext_part
+                du_cum += div_part
+                _y = int(str(dates[i])[:4])
+                ext_by_year[_y] = ext_by_year.get(_y, 0.0) + ext_part
+                div_by_year[_y] = div_by_year.get(_y, 0.0) + div_part
+                shares += buy_shares
+                open_cost += buy_amt
+                gross_cost += buy_amt
+                n_buys += 1
+                last_buy_i = i
+                if first_of_round:
+                    in_pos = True
+                    n_rounds += 1
+                    if first_buy_i < 0:
+                        first_buy_i = i
+                # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
+                # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）；
+                # n_lots = 本笔手数（v7.0.28 手数口径，Web 历史信号展示用）
+                buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
+                             int(k_level), bool(first_of_round), int(n_lots)))
+                k_level += 1
         val = shares * price + cash_div  # cash_div = 分红余额（v7.0.36）
         # v7.0.36：浮亏口径 = 净值(市值+分红余额) − 外部净投入，对外部出资的回报
         if in_pos and ext_running > 0.0:
