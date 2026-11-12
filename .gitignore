@@ -38,3 +38,7 @@ data/alerts/
 crypto/web/dist/
 crypto/web/frontend/node_modules/
 logs/crypto_sync.log
+
+# f6 重生成副产物（测试只读 per_stock.csv/buys.csv；equity_curve/status 不入库）
+tests/fixtures/f6_baseline/*/equity_curve.csv
+tests/fixtures/f6_baseline/*/status.json
