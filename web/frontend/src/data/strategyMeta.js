@@ -103,9 +103,9 @@ export const FIELD_DESC = {
   "strategy.lot_size":
     "1 手 = 多少股；A 股整手固定 100，一般不用改",
   "strategy.first_lots":
-    "首仓买几手（第 0 档）；当前 1 手",
+    "首仓买几手（第 0 档）；当前 2 手（v8.1.3 首仓 1→2）",
   "strategy.add_lots_step":
-    "每加一档多买几手：第 k 档 = first_lots + k×本值，当前 2 即 1手→3手→5手→7手……（v8.1.2 步长 1→2）再武装后新轮从首仓手数重新起算",
+    "每加一档多买几手：第 k 档 = first_lots + k×本值，当前 首仓2手→4手→6手→8手……（v8.1.3 首仓 1→2、v8.1.2 步长 1→2）再武装后新轮从首仓手数重新起算",
   "strategy.add_step_pct":
     "建首仓后，每再跌这个比例加一档；跳空缺口一天可以连穿多档",
   "strategy.rearm_mode":

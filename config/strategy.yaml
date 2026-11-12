@@ -20,11 +20,10 @@ strategy:                           # 深回撤金字塔加仓（唯一策略；
   name: drawdown_martingale         # 策略名（固定；Web 只读展示）
   # —— 仓位口径 = 手数（v7.0.28 C 方案，Joel 2026-11-09 拍板；替代金额 sizing）——
   lot_size: 100                     # 1 手 = 100 股（A 股整手）
-  first_lots: 1                     # 首仓手数：每轮首档(k=0)买 1 手
+  first_lots: 2                     # 首仓手数：每轮首档(k=0)买 2 手（v8.1.3：Joel 2026-11-12 定案 1→2）
   add_lots_step: 2                  # 加仓手数增量：第 k 档 = first_lots + k×add_lots_step 手
-                                    # → 首仓1手/加仓3手/再加5手/7手…（v8.1.2，Joel
-                                    #   2026-11-12：步长 1→2，加大单股投入规模；
-                                    #   再武装后 k 归零重新从 1 手起）
+                                    # → 首仓2手/加仓4手/再加6手/8手…（v8.1.3 首仓 1→2；
+                                    #   v8.1.2 步长 1→2；再武装后 k 归零重新从 2 手起）
   add_step_pct: 5                   # 加仓步长（%）：档线 H×(1−first_dd−k×step)；
                                     # first_dd 现居 timing 段（首仓属选股时机，v7.0.26）
   rearm_mode: bounce                # 高点再武装模式：bounce（默认）| newhigh

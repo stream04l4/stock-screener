@@ -893,7 +893,7 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert s["action"] == "add"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_lots"] == 1  # 第 k=0 档 = 1 手（v7.0.28）
+    assert s["suggested_lots"] == wapp.get_strategy()["json"]["strategy"]["first_lots"]  # 第 k=0 档 = first_lots（生产活动值）
     assert out["positions"][0]["spot_price"] == 40.0
 
 
@@ -969,4 +969,4 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert s["ts_code"] == "sh.600941" and s["action"] == "buy"
     assert s["price"] == 70.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_lots"] == 1  # first_lots（当前策略活动值）
+    assert s["suggested_lots"] == wapp.get_strategy()["json"]["strategy"]["first_lots"]  # first_lots（当前策略活动值）
