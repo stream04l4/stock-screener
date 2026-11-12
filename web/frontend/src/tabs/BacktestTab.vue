@@ -22,6 +22,81 @@ const store = useTaskStore();
 const form = ref({ start: "", end: "", mode: "pool", codes: "" });
 const starting = ref(false);
 
+// ---------------------------------------------------------------------------
+// 指定标的模糊搜索（v8.0.9，与「我的持仓」/手动池录入条同口径）
+// 只对**最后一个逗号段**做候选；选中回写 ts_code + 逗号（续填下一只）；
+// include_delisted=1（历史回测可含退市股）；503 lake_locked → 静默降级仍可手输。
+// ---------------------------------------------------------------------------
+const sug = ref([]);
+const sugOpen = ref(false);
+const sugHi = ref(-1);
+let sugTimer = null;
+let sugSeq = 0;
+
+function lastSegment(v) {
+  const i = (v || "").lastIndexOf(",");
+  return i === -1 ? (v || "") : v.slice(i + 1);
+}
+
+function codeSearchable(v) {
+  const s = (v || "").trim();
+  if (!s) return false;
+  if (/^(?:sh|sz|bj)?\.?\d+$/i.test(s)) {   // 代码/纯数字：≥3 位才查（服务端同规则）
+    return s.replace(/^[a-z]+\.?/i, "").length >= 3;
+  }
+  return true; // 中文 / 拼音：1 位起查
+}
+
+async function onCodesInput() {
+  if (sugTimer) clearTimeout(sugTimer);
+  const seg = lastSegment(form.value.codes).trim();
+  if (!codeSearchable(seg)) { closeSug(); return; }
+  sugTimer = setTimeout(async () => {
+    const seq = ++sugSeq;
+    try {
+      const d = await api("/api/stocks/search?q=" + encodeURIComponent(seg)
+        + "&include_delisted=1");
+      if (seq !== sugSeq) return; // 过期响应丢弃
+      sug.value = d.results || [];
+      sugHi.value = -1;
+      sugOpen.value = sug.value.length > 0;
+    } catch {
+      if (seq === sugSeq) { sug.value = []; sugOpen.value = false; }
+    }
+  }, 250);
+}
+
+function closeSug() {
+  if (sugTimer) clearTimeout(sugTimer);
+  sugSeq++;
+  sug.value = []; sugOpen.value = false; sugHi.value = -1;
+}
+
+function pickSug(r) {
+  const v = form.value.codes || "";
+  const i = v.lastIndexOf(",");
+  const prefix = i === -1 ? "" : v.slice(0, i + 1);
+  form.value.codes = prefix + r.ts_code + ",";
+  closeSug();
+}
+
+function onCodesKeydown(e) {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!sugOpen.value || !sug.value.length) return;
+    e.preventDefault();
+    const n = sug.value.length;
+    sugHi.value = e.key === "ArrowDown"
+      ? (sugHi.value + 1) % n : (sugHi.value - 1 + n) % n;
+    return;
+  }
+  if (e.key === "Enter" && sugOpen.value) {
+    e.preventDefault();
+    pickSug(sug.value[Math.max(0, sugHi.value)]);
+    return;
+  }
+  if (e.key === "Escape") closeSug();
+}
+
 // mode: "pool"（股票池，默认）| "codes"（指定标的，逗号分隔）
 // 策略固定 = 当前策略 config/strategy.yaml（v7.0.29：策略库退役，不再可选快照）
 
@@ -249,8 +324,20 @@ onMounted(loadHistory);
         </div>
         <label class="f-row" v-if="form.mode === 'codes'">
           <span>代码</span>
-          <input type="text" v-model="form.codes" placeholder="sh.601088,sz.000651（逗号分隔）"
-                 :disabled="starting || store.state === 'running'">
+          <span class="bt-codes-wrap">
+            <input type="text" v-model="form.codes"
+                   placeholder="sh.601088,sz.000651（逗号分隔；代码/名称/拼音可搜）"
+                   :disabled="starting || store.state === 'running'"
+                   @input="onCodesInput" @keydown="onCodesKeydown"
+                   @blur="() => setTimeout(closeSug, 150)">
+            <ul v-if="sugOpen" class="bt-codes-sug">
+              <li v-for="(r, i) in sug" :key="r.ts_code" :class="{ hi: i === sugHi }"
+                  @mousedown.prevent="pickSug(r)">
+                {{ r.ts_code }} {{ r.name }}<span class="bt-codes-ind">{{ r.industry }}</span>
+                <span v-if="r.delisted" class="bt-codes-ind">（退市）</span>
+              </li>
+            </ul>
+          </span>
         </label>
         <div class="f-row">
           <button id="btn-bt-run" class="primary-btn" :disabled="starting || store.state === 'running'"
@@ -315,3 +402,19 @@ onMounted(loadHistory);
     </div>
   </section>
 </template>
+
+<style scoped>
+/* v8.0.9：指定标的代码模糊搜索下拉（与手动池录入条同款） */
+.bt-codes-wrap { position: relative; display: inline-block; }
+.bt-codes-wrap input { width: 320px; }
+.bt-codes-sug {
+  position: absolute; top: 100%; left: 0; right: 0; z-index: 30;
+  margin: 2px 0 0; padding: 4px 0; list-style: none;
+  background: var(--bg, #fff); border: 1px solid var(--line, #d8d8e0);
+  border-radius: 8px; box-shadow: 0 6px 18px rgba(20, 20, 40, .12);
+  max-height: 240px; overflow: auto;
+}
+.bt-codes-sug li { padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.bt-codes-sug li.hi, .bt-codes-sug li:hover { background: var(--bg-soft, #eef0f8); }
+.bt-codes-ind { color: #888; margin-left: 8px; font-size: 12px; }
+</style>

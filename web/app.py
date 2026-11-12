@@ -1805,7 +1805,7 @@ def delete_trade(trade_id: str) -> Dict[str, Any]:
 _STOCK_SEARCH_CACHE: Dict[str, Any] = {"key": None, "index": None}
 
 
-def _stock_search_index() -> List[Dict[str, str]]:
+def _stock_search_index() -> List[Dict[str, Any]]:
     """stock_master → 内存搜索索引。湖不可用 → 抛 Lake* 异常（端点归一为 503）。"""
     from pypinyin import lazy_pinyin
 
@@ -1823,12 +1823,12 @@ def _stock_search_index() -> List[Dict[str, str]]:
     con = connect_readonly(None)
     try:
         rows = con.execute(
-            "SELECT ts_code, name, industry_name FROM stock_master "
-            "WHERE delist_date IS NULL ORDER BY ts_code").fetchall()
+            "SELECT ts_code, name, industry_name, delist_date FROM stock_master "
+            "ORDER BY ts_code").fetchall()
     finally:
         con.close()
-    index: List[Dict[str, str]] = []
-    for ts_code, name, industry in rows:
+    index: List[Dict[str, Any]] = []
+    for ts_code, name, industry, dl in rows:
         name = name or ""
         pys = lazy_pinyin(name) or []
         index.append({
@@ -1836,6 +1836,7 @@ def _stock_search_index() -> List[Dict[str, str]]:
             "code_digits": ts_code.split(".", 1)[1],
             "py_full": "".join(pys).lower(),
             "py_initials": "".join((c[0] if c else "") for c in pys).lower(),
+            "delisted": dl is not None,  # v8.0.9：退市标记（默认过滤；include_delisted 放行）
         })
     _STOCK_SEARCH_CACHE["key"] = key
     _STOCK_SEARCH_CACHE["index"] = index
@@ -1845,12 +1846,14 @@ def _stock_search_index() -> List[Dict[str, str]]:
 _CODE_QUERY_RE = re.compile(r"^(?:sh|sz|bj)?\.?(\d+)$")
 
 
-def _search_stocks(q: str) -> List[Dict[str, str]]:
+def _search_stocks(q: str, include_delisted: bool = False) -> List[Dict[str, str]]:
     """模糊匹配：代码数字 / 中文名子串 / 拼音首字母 / 全拼子串。
 
     评分（小=优先）：代码精确 0 → 代码前缀 1 → 代码包含 2 → 名精确 0 → 名前缀 1
     → 名包含 2 → 首字母前缀 3 → 首字母包含 4 → 全拼前缀 5 → 全拼包含 6；
     同分按 ts_code 排序；取前 10。
+    v8.0.9：include_delisted=False（默认）跳过退市股（持仓录入不该建议退市）；
+    True = 数据湖/回测搜索栏（历史回测可含退市股，对齐旧 /api/lake/search 全表语义）。
     """
     q = (q or "").strip().lower()
     m = _CODE_QUERY_RE.fullmatch(q)
@@ -1859,6 +1862,8 @@ def _search_stocks(q: str) -> List[Dict[str, str]]:
         q = m.group(1)
     out: List[Tuple[int, Dict[str, str]]] = []
     for it in _stock_search_index():
+        if it["delisted"] and not include_delisted:
+            continue
         score: Optional[int] = None
         if digit_mode:
             cd = it["code_digits"]
@@ -1891,12 +1896,14 @@ def _search_stocks(q: str) -> List[Dict[str, str]]:
 
 
 @app.get("/api/stocks/search")
-def search_stocks(q: str = "") -> Dict[str, Any]:
+def search_stocks(q: str = "", include_delisted: bool = False) -> Dict[str, Any]:
     """候选股票模糊搜索（录入条下拉用）。
 
     支持：代码数字（600036 / sh.600036，≥3 位）、中文名子串（电力）、
     拼音首字母（zgsh）、全拼子串（shenhua）。湖被灌数进程锁定 → 503 lake_locked
     （前端降级为手动输入代码）。
+    v8.0.9：include_delisted=1 → 候选含退市股（数据湖/回测搜索栏用；
+    持仓录入/手动池保持缺省 False——不该建议退市股）。
     """
     q = (q or "").strip()
     if not q:
@@ -1905,7 +1912,7 @@ def search_stocks(q: str = "") -> Dict[str, Any]:
     if m and len(m.group(1)) < 3:
         raise HTTPException(status_code=400, detail="纯数字代码至少 3 位")
     try:
-        results = _search_stocks(q)
+        results = _search_stocks(q, include_delisted=include_delisted)
     except Exception as exc:  # noqa: BLE001 - 归一化为 503（锁/缺失/坏文件）
         from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
         if isinstance(exc, (LakeLocked, LakeMissing, LakeInvalidFile)):

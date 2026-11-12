@@ -86,6 +86,12 @@ function mockApi() {
       return JSON.parse(JSON.stringify({ ...RESULTS, task_id: "bt_20261110_140739_4a63" }));
     }
     if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
+    if (path.startsWith("/api/stocks/search?")) {   // v8.0.9 指定标的模糊搜索
+      return { q: "mock", results: [
+        { ts_code: "sh.601088", name: "中国神华", industry: "煤炭开采", delisted: false },
+        { ts_code: "sz.300001", name: "退市特退", industry: "测试行业", delisted: true },
+      ] };
+    }
     throw new Error("unmocked: " + path + " " + (opts.method || "GET"));
   });
 }
@@ -386,6 +392,79 @@ describe("BacktestTab · 历史回测结果（v7.0.34）", () => {
     expect(t).toContain("产物 bt_20261110_140739_4a63");
     // 下拉复位（可再次选择）
     expect(w.find("#bt-history-select").element.value).toBe("");
+    w.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 指定标的模糊搜索（v8.0.9）：末段候选 / 选中续填 / 多段只搜末段 / 短码不请求
+// ---------------------------------------------------------------------------
+describe("BacktestTab · 指定标的模糊搜索（v8.0.9）", () => {
+  async function toCodesMode(w) {
+    await w.findAll('input[type="radio"]')[1].setValue("codes");
+    await flushPromises();
+  }
+  const codesInput = (w) => w.find(".bt-codes-wrap input");
+
+  it("末段中文输入 → 防抖后请求 include_delisted=1 → 候选渲染（含退市标记）", async () => {
+    const w = mk();
+    await flushPromises();
+    await toCodesMode(w);
+    await codesInput(w).setValue("神华");
+    vi.advanceTimersByTime(300);
+    await flushPromises();
+    expect(apiMock.mock.calls.some(
+      ([p]) => p === "/api/stocks/search?q=" + encodeURIComponent("神华") + "&include_delisted=1"
+    )).toBe(true);
+    const items = w.findAll(".bt-codes-sug li");
+    expect(items.length).toBe(2);
+    expect(items[0].text()).toContain("sh.601088");
+    expect(items[0].text()).toContain("中国神华");
+    expect(items[1].text()).toContain("（退市）");
+    w.unmount();
+  });
+
+  it("选中候选 → 末段替换为 ts_code 并追加逗号（续填下一只）", async () => {
+    const w = mk();
+    await flushPromises();
+    await toCodesMode(w);
+    await codesInput(w).setValue("神华");
+    vi.advanceTimersByTime(300);
+    await flushPromises();
+    await w.findAll(".bt-codes-sug li")[0].trigger("mousedown");
+    await flushPromises();
+    expect(codesInput(w).element.value).toBe("sh.601088,");
+    expect(w.find(".bt-codes-sug").exists()).toBe(false);
+    w.unmount();
+  });
+
+  it("多段输入只搜末段：'sz.000651,神火' → q=神火；选中 → 前段保留", async () => {
+    const w = mk();
+    await flushPromises();
+    await toCodesMode(w);
+    await codesInput(w).setValue("sz.000651,神火");
+    vi.advanceTimersByTime(300);
+    await flushPromises();
+    expect(apiMock.mock.calls.some(
+      ([p]) => p === "/api/stocks/search?q=" + encodeURIComponent("神火") + "&include_delisted=1"
+    )).toBe(true);
+    await w.findAll(".bt-codes-sug li")[0].trigger("mousedown");
+    await flushPromises();
+    expect(codesInput(w).element.value).toBe("sz.000651,sh.601088,");
+    w.unmount();
+  });
+
+  it("纯数字 <3 位 / 逗号后空段 → 不发请求（服务端 400 同规则前置）", async () => {
+    const w = mk();
+    await flushPromises();
+    await toCodesMode(w);
+    await codesInput(w).setValue("60");
+    vi.advanceTimersByTime(300);
+    await flushPromises();
+    await codesInput(w).setValue("sz.000651,");
+    vi.advanceTimersByTime(300);
+    await flushPromises();
+    expect(apiMock.mock.calls.some(([p]) => p.startsWith("/api/stocks/search?"))).toBe(false);
     w.unmount();
   });
 });

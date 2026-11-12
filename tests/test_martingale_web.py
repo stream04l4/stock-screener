@@ -708,6 +708,30 @@ def test_stocks_search_short_code_400(bt_copy):
     assert ei.value.status_code == 400
 
 
+def test_stocks_search_include_delisted(tmp_path, monkeypatch):
+    """v8.0.9：缺省排除退市股（持仓录入不该建议退市）；include_delisted=True 含退市。
+
+    对齐旧 /api/lake/search 的 stock_master 全表语义（数据湖/回测搜索栏传 True，
+    历史回测可含退市股）。独立 tmp 合成湖（bt_copy 合成回测湖无退市股）。
+    """
+    import duckdb
+    import martingale.data as mdata
+    p = tmp_path / "lake_delisted.duckdb"
+    con = duckdb.connect(str(p))
+    con.execute("""CREATE TABLE stock_master (
+        ts_code VARCHAR, name VARCHAR, industry_name VARCHAR, delist_date DATE)""")
+    con.execute("INSERT INTO stock_master VALUES "
+                "('sh.900001', '退市甲', '测试行业', DATE '2020-01-01'), "
+                "('sh.900002', '上市乙', '测试行业', NULL)")
+    con.close()
+    monkeypatch.setattr(mdata, "default_db_path", lambda: str(p))
+    got_default = wapp.search_stocks("900001")["results"]
+    assert all(r["ts_code"] != "sh.900001" for r in got_default)
+    got_incl = wapp.search_stocks("900001", include_delisted=True)["results"]
+    hit = [r for r in got_incl if r["ts_code"] == "sh.900001"]
+    assert hit and hit[0]["delisted"] is True
+
+
 def test_stocks_search_lake_missing_503(tmp_path, monkeypatch):
     """湖文件缺失 → 503 lake_locked（前端降级手动输入）。"""
     import martingale.data as mdata

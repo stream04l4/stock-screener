@@ -1,4 +1,4 @@
-# stock-screener · v8.0.8（双系统版：A股 + 加密货币，443 单域名 HTTPS）
+# stock-screener · v8.0.9（双系统版：A股 + 加密货币，443 单域名 HTTPS）
 
 **v8 = 双系统版**：一个仓库、两个独立的马丁格尔（Martingale）系统，均由离线
 DuckDB 数据湖驱动（v7 起已移除多因子选股/日跑体系）：
@@ -359,8 +359,21 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
 - 保留：`lake/` 包（`git diff 8c49f71 -- lake/` 为空）、lake-sync cron、数据湖页签。
 - 旧多因子 output/ 产物保留未清（清理交 Joel 定夺）。
 
-## 10. 版本历史（v7.0.11 → v8.0.8）
+## 10. 版本历史（v7.0.11 → v8.0.9）
 
+- **v8.0.9**：股票搜索栏统一模糊匹配（Joel：策略/回测/数据湖搜索栏做成「我的持仓」那种模糊匹配）
+  - **`/api/stocks/search`**（`web/app.py`）：+`include_delisted` 参数（缺省 False =
+    持仓录入/手动池不出现退市股；True = 含退市，对齐旧 `/api/lake/search` 的
+    stock_master 全表语义）；索引项 +`delisted` 标记。
+  - **数据湖搜索栏**（`LakeSearchBar.vue`）：端点 `/api/lake/search`（仅
+    ts_code/name LIKE）→ `/api/stocks/search?include_delisted=1`——与「我的持仓」同口径：
+    代码数字 / 中文名 / 拼音首字母（zgsh）/ 全拼（shenhua）；退市股下拉带「（退市）」标记；
+    503 lake_locked 与 409 灌数锁同中性处理（不弹红横幅）。
+  - **回测「指定标的」输入**（`BacktestTab.vue`）：新增末段模糊搜索下拉——只对最后一个
+    逗号段做候选，选中回写 `ts_code,`（续填下一只）；含退市股；短码/空段不发请求。
+  - **策略页**：手动池录入条（ManualPoolBar）v7.0.12 起已是同口径，无改动。
+  - 测试：前端 +10（LakeSearchBar 6 / BacktestTab 4，263/263）；后端 +1
+    （include_delisted 分支，test_martingale_web 41/41）。
 - **v8.0.8**：A股候选池扩容——行业全放开 + 门槛提档 + 国企控股强度门
   （Joel 2026-11-11：行业限制漏掉证券/保险/黑有色金属/家电/食品/建筑等行业的
   央国企；"要全部放开…保证没有伪国企…股息 3.5%、十年回测 30%"）：
