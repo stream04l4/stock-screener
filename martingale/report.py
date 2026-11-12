@@ -24,10 +24,12 @@ import numpy as np
 
 PER_STOCK_COLUMNS = [
     "ts_code", "n_bars", "n_rounds", "n_rearms", "n_buys", "total_invested",
-    "realized_pnl", "final_assets", "dividends", "price_pnl", "total_pnl",
+    "realized_pnl", "final_assets", "dividends", "div_pool", "price_pnl", "total_pnl",
     "pnl_pct", "min_unreal_pct", "first_buy_date", "last_buy_date", "last_status",
     "end_date", "name",
 ]
+# v8.0.10：div_pool（分红余额）从报告专用键进 CSV——Web per_stock 表
+# 「分红占比 vs 上涨占比」拆解的数据来源（列追加，f6 按 fixture 键遍历不受影响）。
 
 EQUITY_COLUMNS = ["date", "open_stocks", "open_cost", "open_value", "open_pnl", "open_pnl_pct"]
 
@@ -168,12 +170,20 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                                ("Bottom", list(reversed(_sort_per_stock(triggered)))[:10])):
                 A(f"### {label}")
                 A("")
-                A("| code | name | buys | invested | pnl | pnl% | status |")
-                A("|---|---|---|---|---|---|---|")
+                A("| code | name | buys | invested | pnl | pnl% | 分红/上涨 | status |")
+                A("|---|---|---|---|---|---|---|---|")
                 for r in sub:
+                    tp = float(r["total_pnl"])
+                    # v8.0.10：分红/上涨占比（与个股明细「拆分」行同口径：
+                    # 分红余额 vs 价差盈亏；总盈亏≤0 不拆，显示 —）
+                    if tp > 0:
+                        split = (f"{float(r.get('div_pool', 0.0)) / tp:.0%} / "
+                                 f"{float(r['price_pnl']) / tp:.0%}")
+                    else:
+                        split = "—"
                     A(f"| {r['ts_code']} | {r['name']} | {r['n_buys']} | "
                       f"{float(r['total_invested']):,.0f} | {float(r['total_pnl']):,.0f} | "
-                      f"{float(r['pnl_pct']):.1%} | {r['last_status']} |")
+                      f"{float(r['pnl_pct']):.1%} | {split} | {r['last_status']} |")
                 A("")
     A(f"耗时 {time.time() - t0:.1f}s")
     return lines

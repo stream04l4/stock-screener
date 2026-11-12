@@ -650,6 +650,44 @@ def test_bt_runs_list_empty_and_limit(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/bt/results/{id} per_stock div_pool 列（v8.0.10，分红占比拆解数据源）
+# ---------------------------------------------------------------------------
+def test_bt_results_per_stock_div_pool_passthrough(monkeypatch, tmp_path):
+    """per_stock.csv 含 div_pool 列 → JSON 行带 div_pool float；旧格式（无该列）
+    → 行无此键（前端占比列显示 —，不崩溃）。"""
+    monkeypatch.setattr(wapp, "BT_RUNS_DIR", tmp_path / "runs")
+    d = _mk_run(wapp.BT_RUNS_DIR, "bt_20261112_100000_aaaa")
+    (d / "per_stock.csv").write_text(
+        "ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,"
+        "final_assets,dividends,div_pool,price_pnl,total_pnl,pnl_pct,min_unreal_pct,"
+        "first_buy_date,last_buy_date,last_status,end_date,name\n"
+        "sh.601088,2600,3,2,11,210510.0,0.0,660997.72,51234.5,60000.0,390487.72,"
+        "450487.72,2.14,-0.1,2018-03-01,2024-02-05,open,2026-10-21,中国神华\n",
+        encoding="utf-8",
+    )
+    out = wapp.bt_results("bt_20261112_100000_aaaa")
+    row = out["per_stock"][0]
+    assert row["div_pool"] == 60000.0
+    assert row["price_pnl"] == 390487.72
+    assert row["total_pnl"] == 450487.72
+
+    # 旧产物（v8.0.10 前 per_stock.csv 无 div_pool 列）→ 无此键
+    d2 = _mk_run(wapp.BT_RUNS_DIR, "bt_20261101_090000_bbbb")
+    (d2 / "per_stock.csv").write_text(
+        "ts_code,n_bars,n_rounds,n_rearms,n_buys,total_invested,realized_pnl,"
+        "final_assets,dividends,price_pnl,total_pnl,pnl_pct,min_unreal_pct,"
+        "first_buy_date,last_buy_date,last_status,end_date,name\n"
+        "sz.000651,2500,2,1,21,326102.0,0.0,540050.34,60000.0,183948.34,"
+        "213948.34,0.656,-0.05,2019-01-15,2025-01-10,open,2026-10-21,格力电器\n",
+        encoding="utf-8",
+    )
+    out2 = wapp.bt_results("bt_20261101_090000_bbbb")
+    row2 = out2["per_stock"][0]
+    assert "div_pool" not in row2
+    assert row2["price_pnl"] == 183948.34
+
+
+# ---------------------------------------------------------------------------
 # /api/stocks/search 模糊搜索（v7.0.3）：代码/中文名/拼音首字母/全拼 + 503/400 分支
 # ---------------------------------------------------------------------------
 

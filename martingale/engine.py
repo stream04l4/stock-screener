@@ -176,8 +176,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
       为比率而非百分数；first/last_buy_date 为 datetime64[ns] 的 str，缺买为 ""）；
       v7.0.36 起 total_invested=外部净投入（分红余额优先出资，缺口外部）、
       price_pnl=市值−外部净投入、pnl_pct=总盈亏/外部净投入；dividends=累计收到
-      （口径不变）；另含报告专用键 div_pool/annual（不进 f6 字段集/per_stock.csv
-      列）；
+      （口径不变）；另含报告专用键 annual（不进 f6 字段集/per_stock.csv）。
+      div_pool（分红余额）自 v8.0.10 起进 per_stock.csv——Web 表「分红占比 vs
+      上涨占比」拆解的数据来源（f6 按 fixture 键遍历断言，加列安全）；
     - state: 当前持仓状态投影（status 子命令 / /api/positions 用；cash_div=分红余额）；
     - v_arr/c_arr/flag: 逐 bar 组合价值/外部净成本/持仓标记；
     - buys: [(date_str, price, amount, k, first_of_round, lots), ...]

@@ -155,17 +155,44 @@ const fmt2 = (v) => {
   const n = typeof v === "number" ? v : parseFloat(v);
   return isNaN(n) ? String(v) : n.toFixed(2);
 };
+// v8.0.10：比率 → 百分比（1 位）。per_stock 的 pnl_pct / min_unreal_pct / 占比
+// 均为比率（pnl_pct=2.14 实为 +214%），此前 fmt2 裸显示成「2.14」挂在 % 列名下
+// ——与 summary.md 的 214.0% 对不上，Joel 看占比拆解时一并修正。
+const fmtPct1 = (v) => {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return isNaN(n) ? String(v) : (n * 100).toFixed(1) + "%";
+};
 const fmtDate = (v) => {
   const s = String(v);
   const i = s.indexOf("T");
   return i > 0 ? s.slice(0, i) : s;
 };
+// v8.0.10（Joel：低波红利策略，回测要看分红占比 vs 上涨占比）：
+// 前端预计算每行占比字段（SimpleTable 的 fmt 只接单值不接整行）。
+// 口径与 summary.md「拆分」行一致：分红占比=分红余额(div_pool)/总盈亏、
+// 上涨占比=价差盈亏(price_pnl)/总盈亏（恒等式 总盈亏≈价差盈亏+分红余额，
+// 差额为手续费）。总盈亏≤0 或旧产物无 div_pool 列 → null（表内显示 —）。
+const perStockRows = computed(() => {
+  const rows = (results.value && results.value.per_stock) || [];
+  return rows.map((r) => {
+    const num = (x) => (typeof x === "number" ? x : parseFloat(x));
+    const tp = num(r.total_pnl);
+    const dp = num(r.div_pool);
+    const pp = num(r.price_pnl);
+    const ok = Number.isFinite(tp) && tp > 0 && Number.isFinite(dp) && Number.isFinite(pp);
+    return ok
+      ? { ...r, div_share: dp / tp, price_share: pp / tp }
+      : { ...r, div_share: null, price_share: null };
+  });
+});
 const PER_STOCK_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["n_bars", "bar数", true],
   ["n_rounds", "轮次", true], ["n_rearms", "再武装", true], ["n_buys", "买入笔数", true],
   ["total_invested", "总投入", true, fmt2], ["final_assets", "期末资产", true, fmt2],
-  ["dividends", "累计分红", true, fmt2], ["total_pnl", "总盈亏", true, fmt2],
-  ["pnl_pct", "盈亏%", true, fmt2], ["min_unreal_pct", "最低浮盈%", true, fmt2],
+  ["dividends", "累计分红", true, fmt2], ["div_pool", "分红余额", true, fmt2],
+  ["price_pnl", "价差盈亏", true, fmt2], ["total_pnl", "总盈亏", true, fmt2],
+  ["div_share", "分红占比", true, fmtPct1], ["price_share", "上涨占比", true, fmtPct1],
+  ["pnl_pct", "盈亏%", true, fmtPct1], ["min_unreal_pct", "最低浮盈%", true, fmtPct1],
   ["first_buy_date", "首买日", false, fmtDate], ["last_buy_date", "末买日", false, fmtDate],
   ["last_status", "末状态"], ["end_date", "期末", false, fmtDate],
 ];
@@ -380,7 +407,7 @@ onMounted(loadHistory);
 
       <div class="card">
         <h3>个股汇总（per_stock）</h3>
-        <SimpleTable :rows="results.per_stock || []" :cols="PER_STOCK_COLS" empty="（无个股结果）" />
+        <SimpleTable :rows="perStockRows" :cols="PER_STOCK_COLS" empty="（无个股结果）" />
       </div>
 
       <div class="card bt-buys">

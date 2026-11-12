@@ -42,11 +42,13 @@ const RESULTS = {
   task_id: "bt_t1",
   per_stock: [
     { ts_code: "sh.601088", name: "中国神华", n_bars: 2600, n_rounds: 3, n_rearms: 2, n_buys: 11,
-      total_invested: 210510, final_assets: 660997.72, dividends: 51234.5, total_pnl: 450487.72,
+      total_invested: 210510, final_assets: 660997.72, dividends: 51234.5,
+      div_pool: 60000, price_pnl: 390487.72, total_pnl: 450487.72,
       pnl_pct: 2.14, min_unreal_pct: -0.1, first_buy_date: "2018-03-01", last_buy_date: "2024-02-05",
       last_status: "open", end_date: "2026-10-21" },
     { ts_code: "sz.000651", name: "格力电器", n_bars: 2500, n_rounds: 2, n_rearms: 1, n_buys: 21,
-      total_invested: 326102, final_assets: 540050.34, dividends: 60000, total_pnl: 213948.34,
+      total_invested: 326102, final_assets: 540050.34, dividends: 60000,
+      div_pool: 30000, price_pnl: 183948.34, total_pnl: 213948.34,
       pnl_pct: 0.656, min_unreal_pct: -0.05, first_buy_date: "2019-01-15", last_buy_date: "2025-01-10",
       last_status: "open", end_date: "2026-10-21" },
   ],
@@ -273,6 +275,7 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
           ts_code: "sz.302132", name: "中航成飞", n_bars: 3843, n_rounds: 1,
           n_rearms: 118, n_buys: 125, total_invested: 887013.0240999996,
           final_assets: 4207827.437903744, dividends: 79359.52794443406,
+          div_pool: 40000, price_pnl: 3280814.4138037446,
           total_pnl: 3320814.4138037446, pnl_pct: 3.743816971766769,
           min_unreal_pct: -0.3369759158631754,
           first_buy_date: "2010-09-29T00:00:00.000000000",
@@ -291,11 +294,13 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
     sse.message(JSON.stringify({ type: "done" }));
     for (let i = 0; i < 8; i++) await flushPromises();
     const t = w.text();
-    // 金额/百分比 → 2 位小数
+    // 金额 → 2 位小数
     expect(t).toContain("887013.02");
     expect(t).toContain("4207827.44");
-    expect(t).toContain("3.74");
-    expect(t).toContain("-0.34");
+    // v8.0.10：pnl_pct/min_unreal_pct 是比率 → 百分比显示（此前 fmt2 裸显示
+    // 3.74 挂在「盈亏%」列名下，实为 +374.4%）
+    expect(t).toContain("374.4%");
+    expect(t).toContain("-33.7%");
     // 全精度长小数不得出现
     expect(t).not.toContain("887013.0240999996");
     expect(t).not.toContain("3.743816971766769");
@@ -306,6 +311,84 @@ describe("BacktestTab · 结果区（SSE done → /api/bt/results）", () => {
     expect(t).not.toContain("T00:00:00");
     // 整数列不受影响
     expect(t).toContain("3843");
+    w.unmount();
+  });
+});
+
+describe("BacktestTab · 分红占比 vs 上涨占比（v8.0.10，Joel：低波红利策略导向）", () => {
+  it("有 div_pool/price_pnl 的行：显示分红余额/价差盈亏金额 + 两占比列（与 summary.md 拆分开口径一致）", async () => {
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 4242, status: "running", out_dir: "/tmp/bt_t1",
+                 meta: { start: null, end: null, codes: null, pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify(RESULTS));
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    const t = w.text();
+    // 新列头
+    expect(t).toContain("分红余额");
+    expect(t).toContain("价差盈亏");
+    expect(t).toContain("分红占比");
+    expect(t).toContain("上涨占比");
+    // 中国神华：60000/450487.72 → 13.3%；390487.72/450487.72 → 86.7%
+    expect(t).toContain("60000.00");
+    expect(t).toContain("390487.72");
+    expect(t).toContain("13.3%");
+    expect(t).toContain("86.7%");
+    // 格力电器：30000/213948.34 → 14.0%；183948.34/213948.34 → 86.0%
+    expect(t).toContain("14.0%");
+    expect(t).toContain("86.0%");
+    w.unmount();
+  });
+
+  it("旧产物（无 div_pool 列）与总盈亏≤0 → 占比 null（表内显示 —），不崩溃", async () => {
+    const legacyRow = {
+      ts_code: "sh.600900", name: "长江电力", n_bars: 2000, n_rounds: 1,
+      n_rearms: 1, n_buys: 4, total_invested: 150000, final_assets: 180000,
+      dividends: 12000, total_pnl: 30000, pnl_pct: 0.2, min_unreal_pct: -0.08,
+      first_buy_date: "2015-01-05", last_buy_date: "2020-01-06",
+      last_status: "open", end_date: "2026-11-10",
+    };  // 旧 per_stock.csv：无 div_pool / price_pnl 键
+    const lossRow = {
+      ts_code: "sh.601006", name: "大华股份", n_bars: 2000, n_rounds: 1,
+      n_rearms: 1, n_buys: 3, total_invested: 100000, final_assets: 92000,
+      dividends: 2000, div_pool: 2000, price_pnl: -8000, total_pnl: -8000,
+      pnl_pct: -0.08, min_unreal_pct: -0.15, first_buy_date: "2020-01-01",
+      last_buy_date: "2022-01-01", last_status: "open", end_date: "2026-11-10",
+    };  // 总盈亏为负 → 不拆占比
+    apiMock.mockImplementation(async (path, opts = {}) => {
+      if (path === "/api/bt/runs" && opts.method === "POST") {
+        return { task_id: "bt_t1", pid: 1, status: "running", out_dir: "/tmp/bt_t1",
+                 meta: { start: null, end: null, codes: null, pool: true } };
+      }
+      if (/^\/api\/bt\/results\/bt_t1$/.test(path)) return JSON.parse(JSON.stringify({
+        ...RESULTS, per_stock: [legacyRow, lossRow],
+      }));
+      throw new Error("unmocked: " + path);
+    });
+    const w = mk();
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    sse.message(JSON.stringify({ type: "done" }));
+    for (let i = 0; i < 8; i++) await flushPromises();
+    const rows = w.vm.perStockRows;
+    expect(rows).toHaveLength(2);
+    expect(rows[0].div_share).toBeNull();   // 旧产物无 div_pool
+    expect(rows[0].price_share).toBeNull();
+    expect(rows[1].div_share).toBeNull();   // 总盈亏≤0 不拆
+    expect(rows[1].price_share).toBeNull();
+    const t = w.text();
+    expect(t).toContain("长江电力");
+    expect(t).toContain("大华股份");
+    expect(t).toContain("—");
     w.unmount();
   });
 });
