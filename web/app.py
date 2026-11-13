@@ -1259,6 +1259,7 @@ def get_my_positions() -> Dict[str, Any]:
             "pnl_pct": None,
             "updated_at": u.get("updated_at"),
             "since_date": u.get("since_date"),  # v8.2.0：建仓日（理论持仓锚点）
+            "buys": list(u.get("buys") or []),  # v8.2.0：手动加仓时间线（自动记录）
             # 策略状态机参考（池外股/湖中无数据时字段为 None）
             "in_pos": s.get("in_pos"),
             "strat_shares": strat_shares,
@@ -1700,15 +1701,39 @@ def get_strategy_signals() -> Dict[str, Any]:
 
 
 def _up_entry(old: Optional[Dict[str, Any]], shares: float, cost: float,
-              now: str) -> Dict[str, Any]:
-    """v8.2.0 持仓条目构造：since_date = 建仓日（理论持仓锚点，Joel 2026-11-13
-    定案）——仅首次建仓记录（无旧记录/旧记录缺 since_date → 当天），其后加仓/
-    减仓/改价沿用不动（锚点 = 这轮建仓的开始，不是最近一次修改）。清仓重买 =
-    新条目新锚点（调用方 pop 后重建）。
+              now: str, buy_event: Optional[Dict[str, Any]] = None,
+              since_override: Optional[str] = None) -> Dict[str, Any]:
+    """v8.2.0 持仓条目构造（Joel 2026-11-13 定案）。
+
+    - since_date = 建仓日锚点（理论持仓起算点）：
+      ① since_override 显式传入（用户手填）→ 覆盖并记 manual；
+      ② 旧条目已 manual → 沿用；
+      ③ 有 buys 时间线 → 最早加仓日（真实建仓日，自动）；
+      ④ 无 → 今天。
+    - buys = 手动加仓时间线 [{date, shares, price}]：buy_event 非空时追加
+      （每次加仓自动记录，时间锚定计算 + 详情展示用）。
+    - 清仓重买 = 新条目新锚点（调用方 pop 后重建）。
     """
-    since = (old or {}).get("since_date") if isinstance(old, dict) else None
-    return {"shares": shares, "cost_price": cost, "updated_at": now,
-            "since_date": str(since)[:10] if since else str(_beijing_today())[:10]}
+    old = old if isinstance(old, dict) else {}
+    e: Dict[str, Any] = {"shares": shares, "cost_price": cost, "updated_at": now}
+    buys = list(old.get("buys") or [])
+    if buy_event:
+        buys.append(buy_event)
+    if since_override:
+        e["since_date"] = str(since_override)[:10]
+        e["since_date_manual"] = True
+    elif old.get("since_date_manual") and old.get("since_date"):
+        e["since_date"] = str(old["since_date"])[:10]
+        e["since_date_manual"] = True
+    elif buys:
+        e["since_date"] = min(str(b.get("date", ""))[:10] for b in buys)
+        e["since_date_manual"] = False
+    else:
+        e["since_date"] = str(_beijing_today())[:10]
+        e["since_date_manual"] = False
+    if buys:
+        e["buys"] = buys
+    return e
 
 
 @app.put("/api/my_positions")
@@ -1738,10 +1763,22 @@ def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
     if shares_f == 0:
         positions.pop(code, None)
     else:
-        e = _up_entry(positions.get(code), shares_f, cost_f, now)
-        if since_raw:
-            e["since_date"] = since_raw
-        positions[code] = e
+        old = positions.get(code) or {}
+        # v8.2.0：加仓自动记录（Joel 2026-11-13）——股数增加 → buys 时间线
+        # 追加一笔（日期=建仓日输入，未填=今天）；旧条目首次填建仓日 →
+        # 按「自该日起持有当前股数」回填一笔（不造虚假增量）。
+        old_buys = list(old.get("buys") or [])
+        buy_event = None
+        if since_raw and not old_buys and not old.get("since_date_manual"):
+            buy_event = {"date": since_raw, "shares": round(shares_f, 2),
+                         "price": cost_f}
+        elif shares_f > float(old.get("shares") or 0):
+            buy_event = {"date": since_raw or str(_beijing_today())[:10],
+                         "shares": round(shares_f - float(old.get("shares") or 0), 2),
+                         "price": cost_f}
+        positions[code] = _up_entry(old, shares_f, cost_f, now,
+                                    buy_event=buy_event,
+                                    since_override=since_raw or None)
     _up_write(positions)
     return {"ok": True, "ts_code": code, "n": len(positions)}
 
@@ -1831,7 +1868,11 @@ def record_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
     if new_shares <= 0:
         positions.pop(code, None)
     else:
-        positions[code] = _up_entry(positions.get(code), new_shares, new_cost, now)
+        # v8.2.0：登记买入 → 加仓时间线自动记录（日期=登记日，支持回填）
+        _bev = ({"date": date_s, "shares": float(shares_i), "price": price_f}
+                if shares_i > 0 else None)
+        positions[code] = _up_entry(positions.get(code), new_shares, new_cost, now,
+                                    buy_event=_bev)
     _up_write(positions)
 
     trades = _trades_read()

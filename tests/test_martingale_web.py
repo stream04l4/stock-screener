@@ -515,20 +515,87 @@ def test_my_positions_update_and_delete(tmp_positions_file, bt_copy):
     assert wapp.get_my_positions()["n"] == 0
 
 
+def test_my_positions_buys_timeline_auto_recorded(tmp_positions_file, bt_copy):
+    """v8.2.0 加仓自动记录（Joel 2026-11-13）：buys 时间线 + 锚点自动推导。
+    - 新建仓（无日期）→ 一笔全量（当天）；加仓 → 追加差值一笔；
+    - 减仓/改价 → 不记录；锚点 = 最早加仓日（自动，manual=False）；
+    - 手填建仓日 → 锚点固定（manual=True）；
+    - 旧条目（无 buys）首填建仓日 → 回填「自该日起持当前股数」一笔；
+    - get_my_positions 行内暴露 buys。"""
+    import json as _j
+
+    def _entry(code="sh.600036"):
+        return _j.loads(tmp_positions_file.read_text(encoding="utf-8"))["positions"][code]
+
+    # 1) 新建仓（无日期）→ 当天一笔全量，锚点=当天（自动）
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
+    e0 = _entry()
+    assert e0["buys"] == [{"date": e0["since_date"], "shares": 500.0, "price": 10.0}]
+    assert e0["since_date_manual"] is False
+    # 2) 加仓 300（无日期）→ 追差值一笔，锚点不动
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 800, "cost_price": 12.0})
+    e1 = _entry()
+    assert len(e1["buys"]) == 2
+    assert e1["buys"][1] == {"date": e1["buys"][1]["date"], "shares": 300.0, "price": 12.0}
+    assert e1["since_date"] == e0["since_date"]
+    # 3) 减仓/改价 → 不记录
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 700, "cost_price": 12.0})
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 700, "cost_price": 13.0})
+    assert len(_entry()["buys"]) == 2
+    # 4) 手填建仓日 → 锚点固定 manual
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 700, "cost_price": 13.0,
+                           "since_date": "2026-10-01"})
+    e3 = _entry()
+    assert e3["since_date"] == "2026-10-01" and e3["since_date_manual"] is True
+    assert len(e3["buys"]) == 2  # 不重复记录
+    # 5) 旧条目（无 buys）首填建仓日 → 回填当前全量一笔
+    _cur = wapp._up_read()
+    _cur["sh.601988"] = {"shares": 400.0, "cost_price": 8.0,
+                         "updated_at": "2026-10-01T00:00:00Z"}
+    wapp._up_write(_cur)
+    wapp.put_my_positions({"ts_code": "sh.601988", "shares": 400, "cost_price": 8.0,
+                           "since_date": "2026-09-15"})
+    e5 = _entry("sh.601988")
+    assert e5["buys"] == [{"date": "2026-09-15", "shares": 400.0, "price": 8.0}]
+    assert e5["since_date"] == "2026-09-15" and e5["since_date_manual"] is True
+    # 6) get_my_positions 行内暴露 buys + since_date
+    p = {x["ts_code"]: x for x in wapp.get_my_positions()["positions"]}
+    assert len(p["sh.600036"]["buys"]) == 2 and p["sh.600036"]["since_date"] == "2026-10-01"
+    assert p["sh.601988"]["buys"][0]["date"] == "2026-09-15"
+
+
+def test_record_trade_buy_records_buys_timeline(tmp_positions_file, bt_copy):
+    """v8.2.0：交易登记买入 → 持仓 buys 自动记一笔（日期=登记日，支持回填；
+    锚点自动移到最早加仓日）。卖出 → 不记。"""
+    import json as _j
+
+    def _entry():
+        return _j.loads(tmp_positions_file.read_text(encoding="utf-8"))["positions"]["sh.600036"]
+
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 100, "cost_price": 10.0})
+    d0 = _entry()["since_date"]
+    out = wapp.record_trade({"ts_code": "sh.600036", "shares": 200, "price": 11.0,
+                             "date": "2026-10-20"})
+    assert out["ok"] is True and out["position"]["shares"] == 300.0
+    e = _entry()
+    assert {"date": "2026-10-20", "shares": 200.0, "price": 11.0} in e["buys"]
+    assert e["since_date"] == "2026-10-20" and e["since_date_manual"] is False  # 锚点自动前移
+    # 卖出 → 不追加
+    wapp.record_trade({"ts_code": "sh.600036", "shares": -100, "price": 12.0})
+    assert len(_entry()["buys"]) == 2 and _entry()["shares"] == 200.0
+    assert d0 is not None
+
+
 def test_my_positions_gap_fields_consistency(tmp_positions_file, bt_copy):
-    """v8.2.0：持仓行含 策略理论(手)/实际(手)/差值(手)。理论 = 当前轮已执行档数
-    k_level（in_pos 时）的 cycle_lots，与 k_level/in_pos/策略参数自洽；
-    差值 = max(0, 理论−实际)；_sp 不可用时理论/差值为 None。"""
+    """v8.2.0：持仓行含 策略理论(手)/实际(手)/差值(手)。理论 = 建仓日起策略
+    买入累计（shares_since，状态机真实口径）/ 手；新建仓（since_date=今天）→
+    建仓日后策略买入为 0 → 理论 0；差值 = max(0, 理论−实际)。"""
     wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
     p = wapp.get_my_positions()["positions"][0]
     assert p["actual_lots"] == 5.0  # 500 股 / 100
-    st = wapp.get_strategy()["json"]["strategy"]
-    fl, step = st["first_lots"], st["add_lots_step"]
-    k = p["k_level"] or 0
-    n = k if p["in_pos"] else 0  # 当前轮已执行档数
-    expected = n * fl + step * n * (n - 1) / 2
-    assert p["theory_lots"] == expected
-    assert abs(p["gap_lots"] - max(0.0, expected - 5.0)) < 0.011
+    assert p["strat_shares_since"] == 0.0  # 新锚点=今天，湖数据均早于今天
+    assert p["theory_lots"] == 0.0
+    assert p["gap_lots"] == 0.0
 
 
 def test_my_positions_rejects_bad_code(tmp_positions_file):

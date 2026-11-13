@@ -591,6 +591,14 @@ tr.lake-row-muted .badge { opacity: .85; }
 .trade-hist tbody tr:hover { background: #f6f9ff; }
 .ghost-btn.tiny { padding: 0 6px; font-size: 12px; line-height: 20px; }
 
+/* ---------- v8.2.0 手动加仓时间线（我的持仓弹层，自动记录） ---------- */
+.buys-timeline { margin: 10px 0 4px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: 8px; }
+.buys-timeline h4 { margin: 0 0 4px; font-size: 13px; }
+.buys-tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
+.buys-tbl th, .buys-tbl td { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.buys-tbl thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.buys-tbl td.num, .buys-tbl th.num { text-align: right; font-family: var(--mono); }
+
 /* ---------- v7.0.37 回测页统一排版（Joel 2026-11-10「字体之类的统一排版」） ----------
    表单区此前 .bt-form-grid/.f-row/.radio 无 CSS 定义 → 浏览器默认布局
    （date 输入原生尺寸、radio 挤在一行、select 无边框），与其他页签 13px

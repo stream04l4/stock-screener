@@ -636,6 +636,20 @@ function pnlColor(v) {
             <span class="d-val">{{ modalRow[k] ?? "—" }}</span>
           </div>
         </div>
+        <!-- v8.2.0 手动加仓时间线（自动记录，时间锚定计算依据） -->
+        <div v-if="(modalRow.buys || []).length" class="buys-timeline">
+          <h4>🕒 建仓时间线 <span class="muted small">（手动加仓自动记录 · 锚点 = 最早一笔 {{ modalRow.since_date }}）</span></h4>
+          <table class="buys-tbl">
+            <thead><tr><th>日期</th><th>加仓(股)</th><th>价格</th></tr></thead>
+            <tbody>
+              <tr v-for="(b, i) in modalRow.buys" :key="i">
+                <td>{{ b.date }}</td>
+                <td class="num">{{ b.shares }}</td>
+                <td class="num">{{ b.price }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
         <div class="edit-bar">
           <label class="edit-field">
             <span>股数</span>
@@ -648,7 +662,7 @@ function pnlColor(v) {
           <label class="edit-field">
             <span>建仓日</span>
             <input v-model="edit.since" class="inp num" type="date"
-                   title="理论持仓锚点：策略从该日起的买入累计才计入「策略理论」" />
+                   title="理论持仓锚点：留空=自动（最早加仓日），填了=手动固定该锚点" />
           </label>
           <button class="primary-btn" @click="saveEdit">保存</button>
           <button class="ghost-btn" @click="deleteRow">删除</button>

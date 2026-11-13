@@ -24,6 +24,8 @@ const MY = {
     { ts_code: "sh.601088", name: "中国神华", shares: 1200, cost_price: 25.0,
       last_price: 33.9, market_value: 40680, pnl: 10680, pnl_pct: 36.0,
       updated_at: "2026-10-22T01:00:00Z",
+      since_date: "2026-10-20",
+      buys: [{ date: "2026-10-20", shares: 1200, price: 25.0 }],
       in_pos: true, strat_shares: 12345.67, k_level: 0,
       next_add_price: 115.79, next_rearm_price: 179.61,
       next_add_price_raw: 42.07, next_rearm_price_raw: 56.34, end_date: "2026-10-21" },
@@ -486,12 +488,15 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     expect(w.text()).toContain("42.07"); // 弹层展示原始口径（与最新价同单位）
     expect(w.find(".d-row").exists()).toBe(true);
     expect(w.text()).toContain("再武装触发价");
-    // 编辑 input 预填（股数/成本/建仓日——v8.2.0 无 since_date 时预填空）
+    // 编辑 input 预填（股数/成本/建仓日——v8.2.0 行内 since_date 预填）
     const editInputs = w.findAll(".edit-bar input");
     expect(editInputs).toHaveLength(3);
     expect(editInputs[0].element.value).toBe("1200");
     expect(editInputs[1].element.value).toBe("25");
-    expect(editInputs[2].element.value).toBe("");
+    expect(editInputs[2].element.value).toBe("2026-10-20");
+    // v8.2.0 建仓时间线（手动加仓自动记录）展示
+    expect(w.text()).toContain("建仓时间线");
+    expect(w.text()).toContain("2026-10-20");
     // 改股数 → 保存
     await editInputs[0].setValue("1500");
     const editBtns = w.findAll(".edit-bar button");
@@ -499,7 +504,7 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     await flushPromises();
     expect(puts()).toHaveLength(1);
     expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "" });
+      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "2026-10-20" });
     // 删除（confirm stub=true）→ PUT shares=0
     await editBtns.find((b) => b.text() === "删除").trigger("click");
     await flushPromises();
