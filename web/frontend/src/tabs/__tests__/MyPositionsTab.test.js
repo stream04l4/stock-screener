@@ -475,8 +475,8 @@ describe("MyPositionsTab · 代码模糊搜索（v7.0.3）", () => {
   });
 });
 
-describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
-  it("行点击 → 策略参考字段 + 编辑预填 + 保存 PUT + 删除 PUT shares=0", async () => {
+describe("MyPositionsTab · 行点击弹层（策略参考 + 交易登记 + 删除）", () => {
+  it("行点击 → 策略参考字段 + 建仓时间线 + 删除 PUT shares=0（弹层无编辑区）", async () => {
     mockApi(MY);
     const w = mk();
     await flushPromises();
@@ -488,27 +488,18 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     expect(w.text()).toContain("42.07"); // 弹层展示原始口径（与最新价同单位）
     expect(w.find(".d-row").exists()).toBe(true);
     expect(w.text()).toContain("再武装触发价");
-    // 编辑 input 预填（股数/成本——建仓日只在顶部录入条，弹层不再含输入）
-    const editInputs = w.findAll(".edit-bar input");
-    expect(editInputs).toHaveLength(2);
-    expect(editInputs[0].element.value).toBe("1200");
-    expect(editInputs[1].element.value).toBe("25");
+    // v8.2.0：弹层编辑区已移除（更新走顶部录入条），只留提示 + 删除
+    expect(w.findAll(".edit-bar input")).toHaveLength(0);
+    expect(w.text()).toContain("添加/更新持仓");
     // v8.2.0 建仓时间线（手动加仓自动记录）展示
     expect(w.text()).toContain("建仓时间线");
     expect(w.text()).toContain("2026-10-20");
-    // 改股数 → 保存
-    await editInputs[0].setValue("1500");
+    // 删除持仓（confirm stub=true）→ PUT shares=0
     const editBtns = w.findAll(".edit-bar button");
-    await editBtns.find((b) => b.text() === "保存").trigger("click");
+    await editBtns.find((b) => b.text() === "删除持仓").trigger("click");
     await flushPromises();
     expect(puts()).toHaveLength(1);
     expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "" });
-    // 删除（confirm stub=true）→ PUT shares=0
-    await editBtns.find((b) => b.text() === "删除").trigger("click");
-    await flushPromises();
-    expect(puts()).toHaveLength(2);
-    expect(JSON.parse(puts()[1][1].body)).toEqual(
       { ts_code: "sh.601088", shares: 0, cost_price: 25, since_date: "" });
     w.unmount();
   });
@@ -585,9 +576,10 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     await flushPromises();
     await openRow(w);
     const ins = buyInputs(w);
-    expect(ins).toHaveLength(2);
+    expect(ins).toHaveLength(3); // 股数/价格/交易日期（v8.2.0 日期留空=今天）
     expect(ins[0].element.value).toBe("100"); // 1 手 × 100 股
     expect(ins[1].element.value).toBe("33.9"); // 最新价预填
+    expect(ins[2].element.value).toBe(""); // 日期默认空（=今天）
     expect(w.find(".buy-preview").exists()).toBe(true);
     w.unmount();
   });
@@ -603,7 +595,7 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     w.unmount();
   });
 
-  it("正数登记（买入）→ POST /api/my_trades 加权更新 + 成功文案 + 编辑框同步", async () => {
+  it("正数登记（买入）→ POST /api/my_trades 加权更新 + 成功文案 + 账本快照同步", async () => {
     mockApi(MY); // 1200 股 @ 25
     const w = mk();
     await flushPromises();
@@ -617,11 +609,8 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     await flushPromises();
     expect(posts()).toHaveLength(1);
     expect(JSON.parse(posts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 200, price: 30, name: "中国神华" });
+      { ts_code: "sh.601088", shares: 200, price: 30, date: "", name: "中国神华" });
     expect(w.text()).toContain("已登记买入 200 股 @ 30 → 1400 股 @ 25.714");
-    const editInputs = w.findAll(".edit-bar input");
-    expect(editInputs[0].element.value).toBe("1400"); // 编辑框同步新值
-    expect(editInputs[1].element.value).toBe("25.714");
     // 交易历史即时出现新记录（登记后 loadTrades 刷新）
     expect(w.find(".trade-hist").exists()).toBe(true);
     expect(w.text()).toContain("已登记买入");
@@ -644,9 +633,6 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     expect(posts()).toHaveLength(1);
     expect(JSON.parse(posts()[0][1].body).shares).toBe(-200);
     expect(w.text()).toContain("已登记卖出 200 股 @ 30 → 1000 股 @ 25.000");
-    const editInputs = w.findAll(".edit-bar input");
-    expect(editInputs[0].element.value).toBe("1000");
-    expect(editInputs[1].element.value).toBe("25"); // 卖出后剩余均价不变
     w.unmount();
   });
 
@@ -662,6 +648,30 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     await flushPromises();
     expect(posts()).toHaveLength(1);
     expect(w.text()).toContain("清仓移除");
+    w.unmount();
+  });
+
+  it("交易日期：手填历史日期回填（body date）；留空=今天（body date 空串）", async () => {
+    mockApi(MY);
+    const w = mk();
+    await flushPromises();
+    await openRow(w);
+    const ins = buyInputs(w);
+    // 手填历史日期 → 回填
+    await ins[0].setValue("200");
+    await ins[1].setValue("30");
+    await ins[2].setValue("2026-11-01");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(posts()).toHaveLength(1);
+    expect(JSON.parse(posts()[0][1].body).date).toBe("2026-11-01");
+    // 日期成功后清空 → 再登记一笔留空 = 今天
+    await ins[0].setValue("100");
+    await ins[1].setValue("31");
+    await buyBtn(w).trigger("click");
+    await flushPromises();
+    expect(posts()).toHaveLength(2);
+    expect(JSON.parse(posts()[1][1].body).date).toBe("");
     w.unmount();
   });
 

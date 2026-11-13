@@ -287,46 +287,26 @@ async function addNew() {
 }
 
 // ---------------------------------------------------------------------------
-// 行点击弹层（策略参考 + 编辑股数/成本）
+// 行点击弹层（策略参考 + 建仓时间线 + 交易登记 + 交易历史 + 回测逐笔）
+// 更新股数/成本统一走顶部「添加/更新持仓」录入条（Joel 2026-11-13：弹层不重复编辑）
 // ---------------------------------------------------------------------------
 const modalRow = ref(null);
-const edit = reactive({ shares: "", cost: "" });
 const saveMsg = ref("");
 const saveErr = ref("");
 
 function onRow(r) {
   modalRow.value = r;
-  edit.shares = String(r.shares ?? "");
-  edit.cost = String(r.cost_price ?? "");
   saveMsg.value = "";
   saveErr.value = "";
   // 买入登记预填：该股有活跃信号 → 建议股数（建议手数×100，v7.0.28 手数口径）；价格默认最新价
   const s = activeSignal(r.ts_code);
   buy.shares = s ? suggestShares(s) : "";
   buy.price = r.last_price != null ? String(r.last_price) : "";
+  buy.date = "";
   buyMsg.value = "";
   buyErr.value = "";
   tradeErr.value = "";
   loadTrades(); // 实盘交易历史（v7.0.17）
-}
-
-async function saveEdit() {
-  saveErr.value = "";
-  saveMsg.value = "";
-  const code = modalRow.value.ts_code;
-  const shares = Number(edit.shares);
-  const cost = Number(edit.cost);
-  if (!Number.isFinite(shares) || shares < 0) { saveErr.value = "股数应为非负数"; return; }
-  if (!Number.isFinite(cost) || cost < 0) { saveErr.value = "成本价应为非负数"; return; }
-  try {
-    // 建仓日只在顶部「添加/更新持仓」录入条首次建仓时确认；弹层保存不再带
-    await putPos(code, shares, cost, "");
-    saveMsg.value = shares === 0 ? "已删除" : "已保存";
-    if (shares === 0) modalRow.value = null;
-    refresh();
-  } catch (e) {
-    saveErr.value = e.message;
-  }
 }
 
 async function deleteRow() {
@@ -350,7 +330,7 @@ async function deleteRow() {
 //    剩余均价不变、清仓自动移除）② 追加实盘交易历史（data/my_trades.json）。
 // 刷新后策略档位（状态机按账本重播种）自动按新持仓重算。
 // ---------------------------------------------------------------------------
-const buy = reactive({ shares: "", price: "" });
+const buy = reactive({ shares: "", price: "", date: "" });
 const buyMsg = ref("");
 const buyErr = ref("");
 // 实盘交易历史（v7.0.17）：弹层内按当前行股票加载；删除仅移除记录不回改持仓
@@ -389,11 +369,11 @@ const buyPreview = computed(() => {
     ` → ${newShares} 股 @ ${oldCost}（已实现盈亏 ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}）`;
 });
 
-async function postTrade(code, shares, price) {
+async function postTrade(code, shares, price, date) {
   return api("/api/my_trades", {
     method: "POST",
     body: JSON.stringify({
-      ts_code: code, shares, price: Number(price),
+      ts_code: code, shares, price: Number(price), date: date || "",
       name: (modalRow.value && modalRow.value.name) || "",
     }),
   });
@@ -406,12 +386,14 @@ async function recordTrade() {
   if (!r) return;
   const ns = Number(buy.shares);
   const np = Number(buy.price);
+  const bd = (buy.date || "").trim();
   if (!Number.isInteger(ns) || ns === 0) { buyErr.value = "本次股数应为非零整数（正=买入，负=卖出）"; return; }
   if (ns > 0 && ns % 100 !== 0) { buyErr.value = "A 股买入按整手（100 股倍数）"; return; }
   if (ns < 0 && -ns > (r.shares || 0)) { buyErr.value = `卖出不能超过持仓：当前 ${r.shares || 0} 股`; return; }
   if (!Number.isFinite(np) || np <= 0) { buyErr.value = "本次价格应为正数"; return; }
+  if (bd && !SINCE_RE.test(bd)) { buyErr.value = "交易日期应为 YYYY-MM-DD（留空=今天）"; return; }
   try {
-    const res = await postTrade(r.ts_code, ns, np);
+    const res = await postTrade(r.ts_code, ns, np, bd);
     const pos = res.position;
     if (pos.removed) {
       buyMsg.value = `已登记卖出 ${-ns} 股 @ ${np}，清仓移除`;
@@ -419,13 +401,12 @@ async function recordTrade() {
       buyMsg.value = ns > 0
         ? `已登记买入 ${ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`
         : `已登记卖出 ${-ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`;
-      // 弹层内同步：编辑框 + 账本快照字段（策略档位列刷新后重开弹层可见新值）
-      edit.shares = String(pos.shares);
-      edit.cost = String(pos.cost_price);
+      // 弹层内同步：账本快照字段（策略档位列刷新后重开弹层可见新值）
       Object.assign(r, { shares: pos.shares, cost_price: pos.cost_price });
     }
     buy.shares = "";
     buy.price = "";
+    buy.date = "";
     saveMsg.value = "";
     refresh();
     loadTrades(); // 交易历史即时刷新（新记录排最前）
@@ -563,7 +544,7 @@ function pnlColor(v) {
         <p class="muted small" v-if="myData.n">
           数据截至 {{ myData.as_of || "—" }}（状态机） · 价源：{{ myData.price_source === "spot"
             ? `实时行情${myData.spot_time ? " " + myData.spot_time : ""}` : "最新收盘（T+1）" }}
-          · 行点击可编辑股数/成本或删除
+          · 行点击看详情 / 建仓时间线 / 交易登记
         </p>
         <div v-if="t && myData.n" class="totals-bar">
           <span>总市值 <b>{{ fmtW(t.market_value) }}</b></span>
@@ -639,7 +620,7 @@ function pnlColor(v) {
         <div v-if="(modalRow.buys || []).length" class="buys-timeline">
           <h4>🕒 建仓时间线 <span class="muted small">（手动加仓自动记录 · 锚点 = 最早一笔 {{ modalRow.since_date }}）</span></h4>
           <table class="buys-tbl">
-            <thead><tr><th>日期</th><th>加仓(股)</th><th>价格</th></tr></thead>
+            <thead><tr><th>日期</th><th class="num">加仓(股)</th><th class="num">价格</th></tr></thead>
             <tbody>
               <tr v-for="(b, i) in modalRow.buys" :key="i">
                 <td>{{ b.date }}</td>
@@ -650,16 +631,8 @@ function pnlColor(v) {
           </table>
         </div>
         <div class="edit-bar">
-          <label class="edit-field">
-            <span>股数</span>
-            <input v-model="edit.shares" class="inp num" />
-          </label>
-          <label class="edit-field">
-            <span>成本价</span>
-            <input v-model="edit.cost" class="inp num" />
-          </label>
-          <button class="primary-btn" @click="saveEdit">保存</button>
-          <button class="ghost-btn" @click="deleteRow">删除</button>
+          <span class="muted small">更新股数/成本用顶部「添加/更新持仓」录入条（同一代码再次保存即更新）</span>
+          <button class="ghost-btn" @click="deleteRow">删除持仓</button>
           <span v-if="saveMsg" class="msg-ok">{{ saveMsg }}</span>
           <span v-if="saveErr" class="msg-err">{{ saveErr }}</span>
         </div>
@@ -676,6 +649,11 @@ function pnlColor(v) {
               <span>本次价格</span>
               <input v-model="buy.price" class="inp num" placeholder="元" />
             </label>
+            <label class="edit-field">
+              <span>交易日期</span>
+              <input v-model="buy.date" class="inp num" type="date"
+                     title="留空=默认今天；可手动填历史日期回填" />
+            </label>
             <button class="primary-btn" @click="recordTrade">登记</button>
             <span v-if="buyMsg" class="msg-ok">{{ buyMsg }}</span>
             <span v-if="buyErr" class="msg-err">{{ buyErr }}</span>
@@ -687,7 +665,7 @@ function pnlColor(v) {
           <h4>📜 交易历史 <span class="muted small">（{{ tradeHist.length }} 条 · 删除仅移除记录，不回改当前持仓）</span></h4>
           <table v-if="tradeHist.length" class="trade-hist">
             <thead>
-              <tr><th>日期</th><th>方向</th><th>股数</th><th>价格</th><th>金额</th><th>已实现盈亏</th><th></th></tr>
+              <tr><th>日期</th><th>方向</th><th class="num">股数</th><th class="num">价格</th><th class="num">金额</th><th class="num">已实现盈亏</th><th></th></tr>
             </thead>
             <tbody>
               <tr v-for="t in tradeHist" :key="t.id">

@@ -584,17 +584,23 @@ tr.lake-row-muted .badge { opacity: .85; }
 .sig-seg button.on { background: #1565c0; border-color: #1565c0; color: #fff; font-weight: 600; }
 
 /* ---------- v7.0.17 实盘交易历史（我的持仓弹层） ---------- */
-.trade-hist { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+.trade-hist { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; table-layout: fixed; }
 .trade-hist th, .trade-hist td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .trade-hist thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .trade-hist td.num, .trade-hist th.num { text-align: right; font-family: var(--mono); }
 .trade-hist tbody tr:hover { background: #f6f9ff; }
+/* v8.2.0 列对齐（Joel 2026-11-13）：固定布局 + 两表日期列同宽，
+   数值表头与数值同向（右对齐 mono） */
+.buys-tbl th:first-child, .buys-tbl td:first-child,
+.trade-hist th:first-child, .trade-hist td:first-child { width: 110px; }
+.trade-hist th:nth-child(2), .trade-hist td:nth-child(2) { width: 52px; }
+.buys-tbl th:nth-child(2), .buys-tbl td:nth-child(2) { width: 45%; }
 .ghost-btn.tiny { padding: 0 6px; font-size: 12px; line-height: 20px; }
 
 /* ---------- v8.2.0 手动加仓时间线（我的持仓弹层，自动记录） ---------- */
 .buys-timeline { margin: 10px 0 4px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: 8px; }
 .buys-timeline h4 { margin: 0 0 4px; font-size: 13px; }
-.buys-tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
+.buys-tbl { border-collapse: collapse; width: 100%; font-size: 13px; table-layout: fixed; }
 .buys-tbl th, .buys-tbl td { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .buys-tbl thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .buys-tbl td.num, .buys-tbl th.num { text-align: right; font-family: var(--mono); }
