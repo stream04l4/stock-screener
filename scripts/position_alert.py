@@ -191,15 +191,25 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
         gap_note = (f"（策略理论累计 {s['theory_lots']} 手 / 现持 {s['actual_lots']} 手）"
                     if s.get("theory_lots") is not None and s.get("actual_lots") is not None
                     else "")
-        if s["action"] == "add":
+        if s["action"] == "add" and s.get("new_round"):
+            # v8.2.0 补（Joel 2026-11-13 二次定案）：再武装后新一轮首档触线 =
+            # 二次建仓 → 提醒的是「建仓 N 手」，不是「加仓」
+            line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
+                     f"（再武装·二次建仓）")
+            tail = (f"二次建仓，{s['suggested_lots']} 手{gap_note}"
+                    if s.get("suggested_lots") else "二次建仓")
+        elif s["action"] == "add":
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>加仓线 第 {s['k_level']} 档</b>")
             tail = (f"建议补至第 {s['next_level']} 档，{s['suggested_lots']} 手{gap_note}"
                     if s.get("suggested_lots") else "建议加仓一档")
         else:
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
                      + (f"（{s['note']}）" if s.get("note") else ""))
-            tail = (f"首仓触发，{s['suggested_lots']} 手{gap_note}"
-                    if s.get("suggested_lots") else "首仓触发")
+            # new_round（持仓股、模拟从未持仓轮次的首仓触线）→「建仓」口径；
+            # 非持仓首仓通道（4b）无 new_round → 沿用「首仓触发」
+            prefix = "建仓" if s.get("new_round") else "首仓触发"
+            tail = (f"{prefix}，{s['suggested_lots']} 手{gap_note}"
+                    if s.get("suggested_lots") else prefix)
         if s.get("delayed"):
             # v7.0.31 补推兜底：信号日非当日（前几轮应推未推成功/时机当晚才
             # 达成）→ 显式标注，避免当成新信号误读
@@ -353,7 +363,15 @@ def run(force: bool = False, dry_run: bool = False,
         })
     from martingale.signals import build_signals
 
-    signals = build_signals(positions, _sp)
+    # v8.2.0 补（Joel 2026-11-13 二次定案）：首档（k=0）触线 = 建仓（再武装
+    # 后新一轮 = 「二次建仓」）→ 须过当前时机门才提醒（实时分位 ≤
+    # price_pctile_max，与首仓通道同口径，fail-closed：无分位数据 = 未过）；
+    # 轮内加仓档（k≥1）不受约束（「不受约束」定案只豁免加仓档）
+    timing_map: Dict[str, bool] = {}
+    for c in held_codes:
+        pct = live_pct.get(c)
+        timing_map[c] = bool(pct is not None and pct <= tp.price_pctile_max)
+    signals = build_signals(positions, _sp, timing_map=timing_map)
     for sig in signals:
         sig["sig_date"] = today  # 加仓信号日 = 当日（档位当前已到达）
 

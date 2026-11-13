@@ -22,10 +22,22 @@ v8.2.0 累计差值口径（Joel 2026-11-13 定案）：
 - 差值 = 理论 − 实际：>0 → suggested_lots = 差值（向上取整到整手，至少 1
   手），信号行附 theory_lots/actual_lots/gap_lots；≤0（持仓够了/超配）→
   **不产信号**（不提醒）；
+- **shares_since=0（建仓日起策略零买入）→ 不做差值判定**，保持正常信号
+  （本档手数）：建仓日起策略从未说买 = 仓位与策略未对齐（心血来潮/高位建仓
+  ——建仓点高于时机门），差值判定对这类仓位无意义；高位仓位的加仓策略照常
+  提醒（Joel 2026-11-13 定案「不受约束」）。差值判定只约束有策略跟上的仓位
+  （shares_since>0）；
 - strat_shares_since/shares 缺失（湖中无数据等）→ 回退旧行为（建议本档手数，
   不附差值字段），保持旧调用方形状不变。
-- 该口径**仅持仓判断路径**（Web 我的持仓 / 微信持仓通道）生效；回测与新建仓
-  逻辑零影响（shares_since 由 state_rows(since_map=…) 单独计算，缺省不产）。
+- **首档（k=0）时机门**（build_signals 的 timing_map 参数，Joel 2026-11-13
+  二次定案「二次建仓也要符合时机门才能提示」）：再武装后新一轮的首仓
+  （持仓股 k=0 触线 = 二次建仓）或模拟从未持仓轮次的首仓触线，须**当前**
+  时机门通过才产信号（fail-closed：缺条目 = 未过）——「不受约束」只覆盖
+  轮内加仓档（k≥1）。信号行附 new_round（k=0 → True，「建仓」而非「加仓」）
+  与 in_pos（文案区分「二次建仓」/「建仓」）。
+- 该口径**仅持仓判断路径**（Web 我的持仓 / 策略中心持仓股 / 微信持仓通道）
+  生效；回测与新建仓逻辑零影响（shares_since 由 state_rows(since_map=…)
+  单独计算，缺省不产；状态机本身 v8.1.0 首仓双条件含 PIT 时机门）。
 """
 from __future__ import annotations
 
@@ -97,7 +109,9 @@ def _gap_suggested(sp: Optional[Any], pos: Dict[str, Any], k: int, in_pos: bool,
 
     :return: (suggested_lots, extra, judged)；extra = {theory_lots, actual_lots,
         gap_lots}。judged=True 表示差值已判定：此时 suggested=None = 不提醒
-        （持仓够了）。strat_shares_since/shares/lot_size 缺失 →
+        （持仓够了）。strat_shares_since/shares/lot_size 缺失，或
+        **strat_shares_since=0**（建仓日起策略零买入 = 心血来潮/高位建仓，
+        仓位与策略未对齐 → 不做差值判定，正常信号照常提醒）→
         (base_suggested, None, False)：未判定，回退旧行为（含 sp=None 的
         防御性调用方）。
     """
@@ -105,6 +119,12 @@ def _gap_suggested(sp: Optional[Any], pos: Dict[str, Any], k: int, in_pos: bool,
     shares = pos.get("shares")
     if sp is None or not getattr(sp, "lot_size", None) \
             or theory_shares is None or shares is None:
+        return base_suggested, None, False
+    # v8.2.0 补（Joel 2026-11-13：「不受约束」）：建仓日起策略零买入 → 仓位与
+    # 策略未对齐（建仓点高于时机门的心血来潮/高位建仓）→ 差值判定无意义
+    # （「理论 < 实际 → 够了」会把这类仓位的正常加仓提醒误杀），保持正常
+    # 信号。差值判定只约束有策略跟上的仓位（shares_since>0）。
+    if theory_shares == 0:
         return base_suggested, None, False
     stage_lots = (sp.first_lots + k * sp.add_lots_step) if in_pos else sp.first_lots
     theory_lots = float(theory_shares) / sp.lot_size + stage_lots
@@ -121,20 +141,22 @@ def judge_held_lots(sp: Optional[Any], k: int, in_pos: bool,
                     base_suggested: Optional[int],
                     theory_shares: Optional[float],
                     shares: Optional[float]) -> Tuple[Optional[int], Optional[Dict[str, float]], bool]:
-    """v8.2.1 持仓股判定逻辑（公开入口，单一定义点，Joel 2026-11-13：两处信号
+    """v8.2.0 补 持仓股判定逻辑（公开入口，单一定义点，Joel 2026-11-13：两处信号
     一致）。策略中心 /api/strategy_signals 的持仓股行动用它（与
     /api/my_positions、微信 position_alert 同一口径）：
 
     - 差值 >0 → 建议补差值手数（至少 1 手）；
     - 差值 ≤0（持仓够了/超配）→ (None, extra, True)：不产动作；
-    - 数据缺失（theory_shares/shares/sp 缺）→ (base_suggested, None, False)：
-      未判定，回退旧行为（展示原动作）。
+    - **shares_since=0（建仓日起策略零买入 = 心血来潮/高位建仓）** 或数据
+      缺失 → (base_suggested, None, False)：未判定，回退旧行为（展示原动作，
+      高位仓位照常提醒，Joel 2026-11-13「不受约束」）。
     """
     return _gap_suggested(sp, {"strat_shares_since": theory_shares, "shares": shares},
                           k, in_pos, base_suggested)
 
 
-def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Dict[str, Any]]:
+def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any],
+                  timing_map: Optional[Dict[str, bool]] = None) -> List[Dict[str, Any]]:
     """对 positions（含 spot_price/next_add_price_raw/in_pos/k_level/shares/
     strat_shares_since）产信号列表。
 
@@ -143,11 +165,19 @@ def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Di
     （本档执行后）→ 不产信号；差值 >0 → 建议补差值手数（行内附 theory_lots/
     actual_lots/gap_lots）。缺 strat_shares_since 回退旧行为。
 
+    v8.2.0 补（Joel 2026-11-13 二次定案）：首档（k=0）触线 = 建仓信号
+    （再武装后新一轮 = 「二次建仓」），须当前时机门通过才提示——
+    :param timing_map: {ts_code: 时机是否通过}；提供时 k=0 信号仅在该条目为
+        True 时产出（fail-closed：缺条目 = 未过），轮内加仓档（k≥1）不受
+        约束（「不受约束」定案只豁免加仓档）。None = 无时机门（旧行为）。
+
     :param positions: 每行须含 ts_code/name/spot_price/last_price/
         next_add_price_raw/in_pos/k_level；
     :param sp: 策略参数对象（.first_lots/.add_lots_step/.lot_size）；
         None 时 suggested_lots 置 None（策略参考缺省不报错）。
-    :return: 按 ts_code 升序的信号列表（形状同 Web /api/my_positions.signals）。
+    :param timing_map: 见上（可选）。
+    :return: 按 ts_code 升序的信号列表（形状同 Web /api/my_positions.signals；
+        每行附 new_round/in_pos 两字段）。
     """
     signals: List[Dict[str, Any]] = []
     for pos in positions:
@@ -162,6 +192,11 @@ def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Di
         if c["status"] != "active":
             continue
         k = pos.get("k_level") or 0
+        # v8.2.0 补：首档（k=0）= 建仓（再武装后新一轮即「二次建仓」）→
+        # 须过当前时机门才提示；k≥1 轮内加仓档不受约束
+        if k == 0 and timing_map is not None \
+                and not timing_map.get(pos.get("ts_code") or "", False):
+            continue
         next_level = k + 1
         suggested, extra, judged = _gap_suggested(sp, pos, k, bool(pos.get("in_pos")),
                                                   c["suggested_lots"])
@@ -176,6 +211,10 @@ def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Di
             "next_level": next_level,
             "suggested_lots": int(suggested) if suggested is not None else None,
             "action": c["action"],
+            # v8.2.0 补：首档触线 = 建仓（k=0）；in_pos 供文案区分「二次建仓」
+            # （已有轮次、再武装后新轮）与「建仓」（模拟从未持仓）
+            "new_round": (k == 0),
+            "in_pos": bool(pos.get("in_pos")),
         }
         if extra is not None:
             sig.update(extra)

@@ -97,14 +97,18 @@ function btText(s) {
   return sign + s.bt_pnl_pct + "% · " + (s.bt_n_buys ?? "—") + "档";
 }
 function timingText(s) {
-  if (s.held) return "—";
-  // timing_reasons 已是逐条件 ✓/✗ 明细（每条带数值+阈值）——不再叠加
-  // 总判定前缀（全 ✓ 即过、任一 ✗ 即未过，前缀属冗余且易误读为两个条件）
+  // 持仓股轮内加仓档不受时机限制 → 「—」；首档（二次建仓）须过时机门 →
+  // timing_ok 有 true/false（v8.2.0 补）→ 展示分位明细；非持仓照旧
+  if (s.held && s.timing_ok === null && s.timing_ok !== false) return "—";
   return s.timing_reasons || "—";
 }
 function actionText(s) {
-  if (!s.action) return s.held ? "持仓已够" : "时机未过";
-  if (s.held) return s.action === "buy" ? "买入·首仓" : "加仓";
+  if (!s.action) return s.held ? (s.timing_ok === false ? "时机未过" : "持仓已够") : "时机未过";
+  if (s.held) {
+    // v8.2.0 补：首档触线 = 建仓（再武装后新一轮 = 二次建仓），不是「加仓」
+    if (s.new_round) return s.in_pos ? "二次建仓" : "建仓";
+    return s.action === "buy" ? "买入·首仓" : "加仓";
+  }
   // 非持仓统一「买入·首仓」（v7.0.23：触发线恒为首仓线，无「第N档加入」口径）
   return "买入·首仓";
 }
@@ -113,7 +117,8 @@ const sigShown = computed(() => {
     return sigActive.value.map((s) => ({ ...s,
       status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
-      level_label: s.held && s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）",
+      level_label: s.new_round ? (s.in_pos ? "再武装·建仓（第1档）" : "建仓（第1档）")
+        : (s.held && s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）"),
       lots_s: s.suggested_lots == null ? "—" : `${s.suggested_lots} 手`,
       amount_w: s.suggested_lots != null && s.price
         ? fmtWan(s.suggested_lots * 100 * s.price) : "—",
@@ -176,7 +181,10 @@ const MY_COLS = [
 const signalSet = computed(() => new Map((myData.value?.signals || []).map((s) => [s.ts_code, s])));
 const displayRows = computed(() => (myData.value?.positions || []).map((p) => {
   const s = signalSet.value.get(p.ts_code);
-  return { ...p, signal: s ? (s.action === "buy" ? "🔔 买入" : "🔔 加仓") : "" };
+  // v8.2.0 补：首档触线（再武装后新一轮 = 二次建仓）→ 标「建仓」而非「加仓」
+  const tag = s ? (s.new_round ? (s.in_pos ? "🔔 二次建仓" : "🔔 建仓")
+    : (s.action === "buy" ? "🔔 买入" : "🔔 加仓")) : "";
+  return { ...p, signal: tag };
 }));
 
 // ---------------------------------------------------------------------------
@@ -516,13 +524,14 @@ function pnlColor(v) {
       </div>
       <div v-for="s in myData.signals" :key="s.ts_code" class="signal-row">
         <span class="signal-tag" :class="s.action === 'buy' ? 'tag-buy' : 'tag-add'">
-          {{ s.action === "buy" ? "买入·首仓" : "加仓" }}
+          {{ s.new_round ? (s.in_pos ? "二次建仓" : "建仓") : (s.action === "buy" ? "买入·首仓" : "加仓") }}
         </span>
         <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
         <span>现价 {{ s.price }} ≤ 触发价 {{ s.next_add_price }}</span>
-        <span>{{ s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档` }}</span>
+        <span>{{ s.new_round ? (s.in_pos ? "再武装·首仓（第 1 档）" : "首仓（第 1 档）")
+          : (s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档`) }}</span>
         <span v-if="s.suggested_lots != null">
-          建议{{ s.action === "buy" ? "买入" : "补" }}
+          建议{{ s.new_round ? "建仓" : (s.action === "buy" ? "买入" : "补") }}
           <b>{{ s.suggested_lots }} 手</b>
           <span v-if="s.theory_lots != null" class="muted small">
             （理论累计 {{ s.theory_lots }} 手 / 现持 {{ s.actual_lots }} 手）

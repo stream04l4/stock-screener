@@ -33,19 +33,20 @@ import position_alert as pa  # noqa: E402
 from martingale.signals import build_signals  # noqa: E402
 
 FAKE_NOW = "2026-10-26T14:30:00+08:00"   # 周一 14:30 北京（交易时段内）
-# v8.2.0 差值口径（建仓日锚定）：601728 账本 100 股=1 手 < 理论 2 手（SP
-# 1/1，k=1 本档 = 1+1×1；shares_since=0：建仓日=FAKE_NOW 当天，历史买入
-# 均早于建仓日）→ 补 1 手；若账本 ≥2 手则不推（持仓够了）
+# v8.2.0 差值口径（建仓日锚定）：601728 shares_since=100（1 手，策略有跟上）
+# → 理论 = 1 + 本档 1+1×1 = 3 手；账本 1 手 → 补 2 手；账本 3 手 → 恰好够不推
+# （v8.2.0 补：shares_since=0 = 心血来潮/高位建仓 → 不判定，正常信号照常提醒，
+# 见 test_run_unanchored_position_still_pushes）
 USER = {
     "sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
     "sh.601398": {"shares": 1000.0, "cost_price": 8.0, "updated_at": FAKE_NOW},
 }
 # 601728 触发（5.98 ≤ 6.00，in_pos k=1）；601398 未触发（8.50 > 8.00）
-# shares_since：v8.2.0 建仓日起策略买入累计（=0，模拟状态机全历史买入均
-# 早于用户建仓日——「理论加仓了很多轮后才建仓」场景）
+# shares_since：v8.2.0 建仓日起策略买入累计（601728=1 手，「策略有跟上」场景；
+# 601398=0，未触发不影响断言）
 ROWS = {
     "sh.601728": {"name": "中国神华", "last_price": 6.02, "in_pos": True,
-                  "k_level": 1, "next_add_price_raw": 6.0, "shares_since": 0.0},
+                  "k_level": 1, "next_add_price_raw": 6.0, "shares_since": 100.0},
     "sh.601398": {"name": "工商银行", "last_price": 8.55, "in_pos": True,
                   "k_level": 0, "next_add_price_raw": 8.0, "shares_since": 0.0},
 }
@@ -176,10 +177,10 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     content = body["content"]
     assert "中国神华" in content and "sh.601728" in content
     assert "5.980" in content and "6.000" in content   # 现价/触发价
-    # v8.2.0 建仓日锚定：理论 = shares_since(0)/100 + 本档 1+1×1 = 2 手，
-    # 账本 1 手 → 补 1 手
-    assert "1 手" in content
-    assert "策略理论累计 2.0 手 / 现持 1.0 手" in content
+    # v8.2.0 建仓日锚定：理论 = shares_since(1)/100 + 本档 1+1×1 = 3 手，
+    # 账本 1 手 → 补 2 手
+    assert "2 手" in content
+    assert "策略理论累计 3.0 手 / 现持 1.0 手" in content
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
@@ -208,11 +209,11 @@ def test_run_no_repush_after_pushed(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # v8.2.0 建仓日锚定口径（管道级：账本 vs shares_since + 本档）
 # SP（first_lots=1/step=1）+ ROWS 601728（k=1 触发 → 本档 1+1×1=2 手；
-# shares_since=0 → 理论 2 手）
+# shares_since=1 手 → 理论 3 手）
 # ---------------------------------------------------------------------------
 
 def test_run_gap_sufficient_no_push(monkeypatch, tmp_path):
-    """账本 3 手 ≥ 理论 2 手 → gap<0 → 不推（持仓够了/超配）。"""
+    """账本 3 手 = 理论 3 手（since 1 手 + 本档 2 手）→ 不推（恰好够）。"""
     user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
             "sh.601398": USER["sh.601398"]}
     posts, state_path = _wire(monkeypatch, tmp_path, user=user)
@@ -222,7 +223,7 @@ def test_run_gap_sufficient_no_push(monkeypatch, tmp_path):
 
 
 def test_run_gap_short_pushes_fill(monkeypatch, tmp_path):
-    """账本 1 手 < 理论 2 手 → 补 1 手并标注差值。"""
+    """账本 1 手 < 理论 3 手 → 补 2 手并标注差值。"""
     user = {"sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
             "sh.601398": USER["sh.601398"]}
     posts, state_path = _wire(monkeypatch, tmp_path, user=user)
@@ -231,9 +232,52 @@ def test_run_gap_short_pushes_fill(monkeypatch, tmp_path):
     assert len(posts) == 1, posts
     content = posts[0]["json"]["content"]
     assert "sh.601728" in content
-    assert "建议补至第 2 档，1 手" in content
-    assert "策略理论累计 2.0 手 / 现持 1.0 手" in content
+    assert "建议补至第 2 档，2 手" in content
+    assert "策略理论累计 3.0 手 / 现持 1.0 手" in content
     assert "工商银行" not in content
+
+
+def test_run_unanchored_position_still_pushes(monkeypatch, tmp_path):
+    """v8.2.0 补「不受约束」（Joel 2026-11-13：中粮糖业型高位建仓）：建仓日起策略
+    零买入（shares_since=0）→ 不做差值判定，账本再厚也照常提醒（本档 2 手，
+    无差值文案）。"""
+    rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"], "shares_since": 0.0}}
+    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+            "sh.601398": USER["sh.601398"]}
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user, rows=rows)
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1, f"高位仓位应照常提醒: {posts}"
+    content = posts[0]["json"]["content"]
+    assert "建议补至第 2 档，2 手" in content
+    assert "策略理论累计" not in content  # 未判定 → 无差值文案
+
+
+def test_run_second_round_first_position_requires_timing(monkeypatch, tmp_path):
+    """v8.2.0 补（Joel 2026-11-13 二次定案）：二次建仓（再武装后新一轮首仓线
+    k=0 触线）→ 须当前时机门（实时分位 ≤ price_pctile_max=40）通过才提醒，
+    且文案是「二次建仓，N 手」（建仓口径），不是「加仓」；轮内加仓档（k≥1）
+    不受约束（见上方 k=1 用例）。"""
+    rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"],
+                                  "k_level": 0, "shares_since": 0.0}}
+    user = {"sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+            "sh.601398": USER["sh.601398"]}
+    # 时机未过（实时分位 79.1% > 40）→ 不推
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user, rows=rows,
+                              tmap={"sh.601728": 79.1})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert posts == [], f"二次建仓时机未过不该推: {posts}"
+    # 时机过（实时分位 35% ≤ 40）→ 推「二次建仓，1 手」（first_lots=1）
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user, rows=rows,
+                              tmap={"sh.601728": 35.0})
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1, f"二次建仓时机过应推: {posts}"
+    content = posts[0]["json"]["content"]
+    assert "再武装·二次建仓" in content
+    assert "二次建仓，1 手" in content
+    assert "策略理论累计" not in content  # since=0 → 无差值文案
 
 
 def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):

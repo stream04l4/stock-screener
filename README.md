@@ -105,7 +105,18 @@ positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypt
 - **机制边界（Joel 定案）**：建仓日锚定**只在判断「我的持仓」时生效**——
   `state_rows(since_map=…)` 仅 Web 持仓页 / 微信持仓通道传入；**回测、新建仓
   信号、策略状态页一律不传**（`since_map=None` → 整段跳过，零影响，f6 基线不变）。
-- 实现单点 = `martingale/signals.py::build_signals`（Web 与微信共用）；
+- **「不受约束」（Joel 2026-11-13 定案）**：`shares_since=0`（建仓日起策略零
+  买入 = 心血来潮/高位建仓，建仓点高于时机门）→ **不做差值判定**，正常信号
+  （本档手数）照常提醒——差值判定只约束有策略跟上的仓位（`shares_since>0`）；
+  轮内加仓档（k≥1）不受时机门约束。
+- **二次建仓时机门（Joel 2026-11-13 二次定案）**：再武装后新一轮的首仓
+  （持仓股 k=0 触线 = **二次建仓**，提醒口径「建仓 N 手」而非「加仓」）须
+  **当前时机门**通过才提醒（5 年分位 ≤ 40%；Web 用 `push_eligible` 快照、
+  微信用实时分位，fail-closed：无分位数据/池外无时机行 = 未过）；
+  「不管首次建仓是否在时机门」——首仓历史状态不作豁免，每轮首仓独立判门。
+  轮内加仓档（k≥1）与差值判定不受此门约束。
+- 实现单点 = `martingale/signals.py::build_signals`（Web 与微信共用，
+  `timing_map` 参数 = 时机门；`new_round`/`in_pos` 字段区分「二次建仓」文案）；
   `shares_since` 由 `martingale/engine.py::state_rows(since_map=…)` 计算；缺数据
   （湖中无该股 / 字段缺失）回退旧行为（建议本档手数）；无新增配置键；`since_date`
   是账本字段（data/my_positions.json），非策略参数。

@@ -127,18 +127,49 @@ def test_build_signals_unchanged_shape_and_sort():
     assert [s["ts_code"] for s in out] == ["sh.600001", "sz.000002"]  # 升序
     a = out[0]
     assert set(a.keys()) == {"ts_code", "name", "price", "next_add_price",
-                             "k_level", "next_level", "suggested_lots", "action"}
+                             "k_level", "next_level", "suggested_lots", "action",
+                             "new_round", "in_pos"}  # v8.2.0 补：首档=建仓字段
+    assert a["new_round"] is False and a["in_pos"] is True
     assert a["action"] == "add" and a["next_level"] == 2
     assert a["suggested_lots"] == 2  # 第 k=1 档
     b = out[1]
     assert b["action"] == "buy" and b["next_level"] == 1 and b["suggested_lots"] == 1
+    assert b["new_round"] is True and b["in_pos"] is False
+
+
+def test_build_signals_k0_timing_gate():
+    """v8.2.0 补（Joel 2026-11-13 二次定案「二次建仓也要符合时机门」）：
+    首档（k=0）触线 = 建仓（再武装后新一轮 = 二次建仓）→ 须当前时机门通过
+    才提示（fail-closed：缺条目 = 未过）；轮内加仓档（k≥1）不受约束
+    （「不受约束」定案只豁免加仓档）。"""
+    pos_k0 = {"ts_code": "sh.600036", "name": "中粮糖业", "spot_price": 13.0,
+              "last_price": 13.2, "next_add_price_raw": 13.5, "in_pos": True,
+              "k_level": 0, "shares": 400.0, "strat_shares_since": 0.0}
+    pos_k1 = {"ts_code": "sh.600546", "name": "山煤国际", "spot_price": 5.0,
+              "last_price": 5.2, "next_add_price_raw": 5.5, "in_pos": True,
+              "k_level": 1, "shares": 100.0, "strat_shares_since": 100.0}
+    # k=0 时机未过（含 fail-closed 缺条目）→ 不产信号
+    assert build_signals([pos_k0], SP, timing_map={"sh.600036": False}) == []
+    assert build_signals([pos_k0], SP, timing_map={}) == []
+    # k=0 时机过 → 二次建仓信号（shares_since=0 不判差值 → 本档 first_lots=1 手）
+    out = build_signals([pos_k0], SP, timing_map={"sh.600036": True})
+    assert len(out) == 1
+    assert out[0]["new_round"] is True and out[0]["in_pos"] is True
+    assert out[0]["action"] == "add" and out[0]["suggested_lots"] == 1
+    # k≥1 轮内加仓不受约束：timing_map=False 也照常产信号
+    out1 = build_signals([pos_k1], SP, timing_map={"sh.600546": False})
+    assert len(out1) == 1 and out1[0]["new_round"] is False
+    # timing_map=None → 旧行为（无时机门）
+    assert len(build_signals([pos_k0], SP)) == 1
 
 
 # ---------------------------------------------------------------------------
 # v8.2.0 累计差值口径（Joel 2026-11-13 定案）：
 # 理论持仓 = 用户**建仓日起**策略买入累计（strat_shares_since）+ 本档手数；
 # 实际 = 账本股数；差值 > 0 → 建议补差值（向上取整到整手）；≤ 0（够了/超配）
-# → 不产信号。本档手数 = in_pos 第 k 档 → first_lots+k×step；未持仓 → first_lots。
+# → 不产信号。**strat_shares_since=0（建仓日起策略零买入 = 心血来潮/高位建仓）
+# → 不做差值判定，正常信号照常提醒（v8.2.0 补「不受约束」定案）**。本档手数 =
+# in_pos 第 k 档 → first_lots+k×step；未持仓 → first_lots。
 # 生产 sizing：first_lots=2 / add_lots_step=2 / lot_size=100（2/4/6/8 手）。
 # ---------------------------------------------------------------------------
 
@@ -155,11 +186,24 @@ def _gap_pos(**kw):
     return base
 
 
-def test_gap_first_buy_sufficient_no_signal():
-    """Joel 例 1：首仓档已触发、建仓后策略仅买 0、持仓已有 2 手 → 够了不提醒。"""
+def test_gap_unanchored_position_normal_signal():
+    """v8.2.0 补「不受约束」（Joel 例：中粮糖业型高位建仓）：建仓日起策略零买入
+    （shares_since=0）→ 不做差值判定，正常信号照常提醒（本档手数，无差值字段）。"""
     sigs = build_signals(
         [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=200)], SP2)
-    assert sigs == []
+    assert len(sigs) == 1
+    assert sigs[0]["action"] == "buy" and sigs[0]["suggested_lots"] == 2
+    assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
+
+
+def test_gap_unanchored_addon_still_reminds():
+    """高位持仓 4 手 > 本档 4 手，但建仓日起策略零买入 → 照常提醒加仓 4 手
+    （不被「持仓已够」误杀）。"""
+    sigs = build_signals(
+        [_gap_pos(in_pos=True, k_level=1, strat_shares_since=0.0, shares=400)], SP2)
+    assert len(sigs) == 1
+    assert sigs[0]["action"] == "add" and sigs[0]["suggested_lots"] == 4
+    assert "gap_lots" not in sigs[0]
 
 
 def test_gap_first_addon_short_suggests_fill():
@@ -179,19 +223,20 @@ def test_gap_exact_match_no_signal():
 
 
 def test_gap_overweight_no_signal():
-    """实际 > 理论（自买超配策略建仓后买入）→ 不提醒。"""
+    """有策略跟上（since>0）且实际 > 理论（自买超配）→ 不提醒。"""
     sigs = build_signals(
-        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=900)], SP2)
+        [_gap_pos(in_pos=True, k_level=1, strat_shares_since=200, shares=700)], SP2)
     assert sigs == []
 
 
 def test_gap_first_buy_unheld_suggests_first_lots():
-    """未持仓首仓档触发：建仓后策略买 0 + 本档 2 手、实际 0 → 补 2 手（buy）。"""
+    """未持仓首仓档触发：建仓后策略买 0 → 不做差值判定（未持仓本就无账本），
+    正常信号 buy 本档 2 手（无差值字段）。"""
     sigs = build_signals(
         [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=0)], SP2)
     assert len(sigs) == 1
     assert sigs[0]["action"] == "buy" and sigs[0]["suggested_lots"] == 2
-    assert sigs[0]["theory_lots"] == 2.0 and sigs[0]["gap_lots"] == 2.0
+    assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
 
 
 def test_gap_fractional_actual_ceil_lots():
@@ -673,15 +718,22 @@ def test_strategy_signals_empty_universe(monkeypatch, tmp_path):
 
 
 def test_strategy_signals_user_only_ledger_codes(monkeypatch, tmp_path):
-    """账本里有池外股 → universe = 池 ∪ 账本，池外股照常出状态。"""
+    """账本里有池外股 → universe = 池 ∪ 账本，池外股照常出状态。
+
+    v8.2.0 补：池外持仓股首档（k=0）触线也须过时机门 → 给该码时机行（分位
+    20% ✓）；池外且无时机行 → fail-closed 不提醒（设计行为）。"""
     user = dict(USER, **{"sz.000999": {"shares": 10.0, "cost_price": 1.0,
                                         "updated_at": "2026-11-07T00:00:00Z"}})
     rows = dict(ROWS, **{"sz.000999": {"name": "戊股", "last_price": 5.0,
-                                        "in_pos": False, "k_level": 0,
-                                        "next_add_price_raw": 5.0,
-                                        "first_level_raw": 6.0,
-                                        "end_date": "2026-11-06", "buys": []}})
-    _wire(monkeypatch, tmp_path, user=user, rows=rows,
+                                       "in_pos": False, "k_level": 0,
+                                       "next_add_price_raw": 5.0,
+                                       "first_level_raw": 6.0,
+                                       "end_date": "2026-11-06", "buys": []}})
+    tmap = {**TIMING, "sz.000999": {"ts_code": "sz.000999", "in_watchlist": False,
+                                    "push_eligible": True, "reasons": "5年分位 20%",
+                                    "cond_price_low": True, "cond_yield": True,
+                                    "pctile_window": 20.0, "ttm_yield_pct": 4.0}}
+    _wire(monkeypatch, tmp_path, user=user, rows=rows, tmap=tmap,
           spot={**SPOT, "sz.000999": {"price": 5.9, "timestamp": "20261107093000"}})
     out = wapp.get_strategy_signals()
     assert out["n_stocks"] == 6
@@ -718,65 +770,104 @@ def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v8.2.1 持仓股建仓日锚定判定（Joel 2026-11-13：两处信号一致）
+# v8.2.0 补 持仓股建仓日锚定判定（Joel 2026-11-13：两处信号一致）
 # ---------------------------------------------------------------------------
 
 def test_strategy_signals_held_anchor_gap_gate(monkeypatch, tmp_path):
-    """持仓股动作/手数走建仓日锚定判定（与 /api/my_positions、微信同一口径）：
-    理论（shares_since/lot + 本档）≤ 实际 → 无动作（持仓已够，价格态照展示）；
-    差值 >0 → 建议补差值手数；非持仓股完全不受影响（正常逻辑 + 时机门）；
-    shares_since 缺失 → 回退旧行为。"""
+    """持仓股动作/手数走建仓日锚定判定 + 首档时机门（与 /api/my_positions、
+    微信同一口径）：
+    - 有策略跟上的仓位（shares_since>0）→ 差值判定（≤实际=持仓已够/差值>0=补差）；
+    - 建仓日起策略零买入（心血来潮/高位建仓）→ 不做差值判定，正常信号照常提醒；
+    - 首档（k=0，再武装后新一轮 = 二次建仓）→ 须当前时机门通过才提醒
+      （fail-closed：无时机行 = 未过）；
+    - 非持仓股完全不受影响（正常逻辑 + 时机门）；shares_since 缺失 → 回退旧行为。"""
     rows = {
-        # A 持仓充足：k=1 本档 2 手，shares_since=0 → 理论 2 手 ≤ 实际 3 手
+        # A 高位建仓（since=0）+ k=1 轮内加仓档 → 不判定、不受时机约束，
+        #    照常提醒加仓（本档 2 手）
         "sh.600101": {"name": "甲", "last_price": 9.9, "in_pos": True, "k_level": 1,
                       "next_add_price_raw": 10.0, "first_level_raw": 12.0,
                       "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # B 恰好够：k=0 本档 1 手 = 实际 1 手（gap=0 → 不提醒）
+        # B 对齐仓位恰好够（k=0，须时机过才到差值判定）：since=2 手 + 本档 1 手
+        #    = 3 手 = 实际 3 手 → 不提醒
         "sh.600102": {"name": "乙", "last_price": 29.0, "in_pos": True, "k_level": 0,
                       "next_add_price_raw": 30.0, "first_level_raw": 30.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # C 差值 +2：k=2 本档 3 手，实际 1 手 → 补 2 手
+                      "end_date": "2026-11-06", "shares_since": 200.0, "buys": []},
+        # C 对齐仓位差值 +2：since=1 手 + 本档 3 手 = 4 手，实际 2 手 → 补 2 手
         "sh.600103": {"name": "丙", "last_price": 19.0, "in_pos": True, "k_level": 2,
                       "next_add_price_raw": 20.0, "first_level_raw": 22.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+                      "end_date": "2026-11-06", "shares_since": 100.0, "buys": []},
         # D 非持仓 + 时机✓：正常逻辑买入·首仓 1 手（shares_since 对其无效）
         "sh.600104": {"name": "丁", "last_price": 24.5, "in_pos": True, "k_level": 2,
                       "next_add_price_raw": 24.0, "first_level_raw": 25.0,
                       "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # E 持仓但 shares_since 缺失（湖中无数据等）→ 未判定，回退旧行为
+        # E k=0 + 时机✓ 但 shares_since 缺失（湖中无数据等）→ 过门后回退旧行为
         "sh.600105": {"name": "戊", "last_price": 14.0, "in_pos": True, "k_level": 0,
                       "next_add_price_raw": 15.0, "first_level_raw": 15.0,
                       "end_date": "2026-11-06", "buys": []},
+        # F 二次建仓（k=0 再武装后新一轮）+ 时机✓ + since=0 → 照常提醒「建仓」
+        #    本档 1 手（new_round=True），无差值明细
+        "sh.600106": {"name": "己", "last_price": 14.0, "in_pos": True, "k_level": 0,
+                      "next_add_price_raw": 15.0, "first_level_raw": 15.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+        # G 二次建仓 + 时机未过（无时机行 → fail-closed）→ 不提醒（时机未过）
+        "sh.600107": {"name": "庚", "last_price": 15.0, "in_pos": True, "k_level": 0,
+                      "next_add_price_raw": 16.0, "first_level_raw": 16.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
     }
     user = {c: {"shares": 100.0, "cost_price": 10.0,
                 "updated_at": "2026-11-07T00:00:00Z"} for c in
-            ("sh.600101", "sh.600102", "sh.600103", "sh.600105")}
+            ("sh.600101", "sh.600102", "sh.600103", "sh.600105", "sh.600106",
+             "sh.600107")}
     user["sh.600101"] = dict(user["sh.600101"], shares=300.0)
+    user["sh.600102"] = dict(user["sh.600102"], shares=300.0)
+    user["sh.600103"] = dict(user["sh.600103"], shares=200.0)
     spot = {c: {"price": rows[c]["last_price"], "timestamp": "20261107093000"}
             for c in rows}
     tmap = {"sh.600104": {"ts_code": "sh.600104", "push_eligible": True,
-                          "cond_price_low": True, "pctile_window": 20.0}}
+                          "cond_price_low": True, "pctile_window": 20.0},
+            # B/E/F 的 k=0 时机门通过；G 故意无行（fail-closed）
+            "sh.600102": {"ts_code": "sh.600102", "push_eligible": True,
+                          "cond_price_low": True, "pctile_window": 25.0},
+            "sh.600105": {"ts_code": "sh.600105", "push_eligible": True,
+                          "cond_price_low": True, "pctile_window": 30.0},
+            "sh.600106": {"ts_code": "sh.600106", "push_eligible": True,
+                          "cond_price_low": True, "pctile_window": 35.0}}
     _wire(monkeypatch, tmp_path, rows=rows, pool=list(rows), user=user,
           spot=spot, tmap=tmap)
     out = wapp.get_strategy_signals()
     by = {s["ts_code"]: s for s in out["stocks"]}
-    # A：持仓已够 → 无动作，价格态 active 照展示，附判定明细
+    # A：高位建仓（策略零买入）+ 轮内加仓档 → 不做差值判定、不受时机约束，
+    #    正常信号（加仓本档 2 手），价格态 active 照展示
     assert by["sh.600101"]["status"] == "active"
-    assert by["sh.600101"]["action"] is None
-    assert by["sh.600101"]["suggested_lots"] is None
+    assert by["sh.600101"]["action"] == "add"
+    assert by["sh.600101"]["suggested_lots"] == 2
     assert (by["sh.600101"]["theory_lots"], by["sh.600101"]["actual_lots"],
-            by["sh.600101"]["gap_lots"]) == (2.0, 3.0, 0.0)
-    # B：gap=0 → 不提醒
+            by["sh.600101"]["gap_lots"]) == (None, None, None)
+    # B：k=0 时机过 → 差值判定：对齐仓位恰好够 → 不提醒，附判定明细
     assert by["sh.600102"]["action"] is None and by["sh.600102"]["suggested_lots"] is None
-    # C：差值 +2 → 加仓 2 手
+    assert by["sh.600102"]["timing_ok"] is True
+    assert (by["sh.600102"]["theory_lots"], by["sh.600102"]["actual_lots"],
+            by["sh.600102"]["gap_lots"]) == (3.0, 3.0, 0.0)
+    # C：对齐仓位差值 +2 → 补 2 手
     assert by["sh.600103"]["action"] == "add"
     assert by["sh.600103"]["suggested_lots"] == 2
     assert by["sh.600103"]["gap_lots"] == 2.0
+    assert by["sh.600103"]["theory_lots"] == 4.0
     # D：非持仓正常逻辑（时机✓ → 买入·首仓 1 手；shares_since 不参与）
     assert by["sh.600104"]["action"] == "buy" and by["sh.600104"]["suggested_lots"] == 1
     assert by["sh.600104"]["theory_lots"] is None
-    # E：缺 shares_since → 回退旧行为（加仓 1 手）
+    # E：k=0 时机✓ + 缺 shares_since → 回退旧行为（建仓 1 手，new_round 标记在）
     assert by["sh.600105"]["action"] == "add" and by["sh.600105"]["suggested_lots"] == 1
+    assert by["sh.600105"]["new_round"] is True
+    assert by["sh.600105"]["timing_pctile"] == 30.0
+    # F：二次建仓（k=0）时机✓ → 提醒「建仓」本档 1 手，new_round=True
+    assert by["sh.600106"]["action"] == "add" and by["sh.600106"]["suggested_lots"] == 1
+    assert by["sh.600106"]["new_round"] is True and by["sh.600106"]["in_pos"] is True
+    assert by["sh.600106"]["timing_ok"] is True
+    assert by["sh.600106"]["theory_lots"] is None  # since=0 不判差值
+    # G：二次建仓时机未过（无时机行 → fail-closed）→ 不提醒
+    assert by["sh.600107"]["action"] is None and by["sh.600107"]["new_round"] is False
+    assert by["sh.600107"]["timing_ok"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -786,10 +877,16 @@ def test_strategy_signals_held_anchor_gap_gate(monkeypatch, tmp_path):
 def test_strategy_signals_touch_current_retained(monkeypatch, tmp_path):
     """盘中触线又反弹：600003 现价 30.6（+2% approaching）但当日最低 29.9 已摸过
     触发线 30.0（行情日=全池最新）→ status=touched 保留在当前段，动作/金额按
-    active 口径补齐（持仓 in_pos k=0 → 加仓 1 万）。"""
+    active 口径补齐（持仓 in_pos k=0 二次建仓 → 须时机✓，动作 1 手）。"""
     spot = {**SPOT, "sh.600003": {"price": 30.6, "low": 29.9,
                                   "timestamp": "20261107093000"}}
-    _wire(monkeypatch, tmp_path, spot=spot)
+    # v8.2.0 补：首档（k=0 = 二次建仓）须当前时机门过 → 600003 改判时机✓
+    tmap = {**TIMING, "sh.600003": {"ts_code": "sh.600003", "in_watchlist": True,
+                                    "push_eligible": True,
+                                    "reasons": "5年分位 28%",
+                                    "cond_price_low": True, "cond_yield": True,
+                                    "pctile_window": 28.0, "ttm_yield_pct": 4.6}}
+    _wire(monkeypatch, tmp_path, spot=spot, tmap=tmap)
     out = wapp.get_strategy_signals()
     s3 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600003")
     assert s3["status"] == "touched" and s3["touched"] is True

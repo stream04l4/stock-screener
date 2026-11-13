@@ -959,6 +959,10 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     - 实时价 40.0 ≤ 41.225 → 信号，建议加仓 = base×growth^0 = 10000。
     """
     wapp._up_write({"sh.601088": {"shares": 100, "cost_price": 45.0}})
+    # v8.2.0 补：首档（k=0）须过当前时机门才提示 → 给时机行（分位 20% ✓）
+    monkeypatch.setattr("martingale.timing.load_timing_map",
+                        lambda con: {"sh.601088": {"push_eligible": True,
+                                                   "pctile_window": 20.0}})
     _mock_spot(monkeypatch, {})
     out0 = wapp.get_my_positions()
     assert out0["price_source"] == "lake"
@@ -977,14 +981,14 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert s["action"] == "add"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    # v8.2.0 累计差值口径（当前轮）：k=0（本轮未启动）→ 持仓行理论 0；
-    # 首仓档触发 → 本档执行后 1 档 = first_lots；实际 = 账本 1 手；建议 = 差值
+    # v8.2.0 补（「不受约束」定案）：k=0（本轮未启动）且 shares_since=0
+    # （建仓日起策略零买入）→ 不做差值判定 → 无差值字段，建议 = 本档
+    # first_lots；持仓行理论仍按 shares_since 展示 0
     p = out["positions"][0]
     fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
     assert p["theory_lots"] == 0.0
-    assert s["theory_lots"] == fl and s["actual_lots"] == 1.0
-    assert s["suggested_lots"] == max(1, math.ceil(fl - 1.0))
-    assert s["gap_lots"] == round(fl - 1.0, 2)
+    assert s["suggested_lots"] == fl
+    assert "theory_lots" not in s  # 未判定 → 无差值明细
     assert out["positions"][0]["spot_price"] == 40.0
 
 
@@ -1046,14 +1050,18 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     cfg["timing"]["first_drawdown_pct"] = 25   # v7.0.26：dd 居 timing 段
     strict.write_text(_y.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(wapp, "CONFIG_PATH", strict)
+    # v8.2.0 补：首档（k=0）须过当前时机门才提示 → 给时机行（分位 20% ✓）
+    monkeypatch.setattr("martingale.timing.load_timing_map",
+                        lambda con: {"sh.600941": {"push_eligible": True,
+                                                   "pctile_window": 20.0}})
     _mock_spot(monkeypatch, {})  # 湖价回退：96.59 > 75.0 → 不误报
     out0 = wapp.get_my_positions()
     p0 = out0["positions"][0]
     assert p0["in_pos"] is False and p0["k_level"] == 0
     assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
     assert out0["signals"] == []
-    # 实时价 70.0 ≤ 75.0 → buy 信号；v8.2.0 差值口径：严格策略下从未触线
-    # （状态机累计 0）→ 理论 = first_lots，实际 = 账本 1 手 → 建议 = 差值
+    # 实时价 70.0 ≤ 75.0 → buy 信号；v8.2.0 补（「不受约束」定案）：从未触线
+    # （shares_since=0）→ 不做差值判定 → 无差值字段，建议 = first_lots
     _mock_spot(monkeypatch, {"sh.600941": 70.0})
     out = wapp.get_my_positions()
     assert len(out["signals"]) == 1
@@ -1064,9 +1072,8 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
     p = out["positions"][0]
     assert p["theory_lots"] == 0.0  # 从未触线 → 状态机累计 0 股
-    assert s["theory_lots"] == fl and s["actual_lots"] == 1.0
-    assert s["suggested_lots"] == max(1, math.ceil(fl - 1.0))  # 差值 = fl − 1
-    assert s["gap_lots"] == round(fl - 1.0, 2)
+    assert s["suggested_lots"] == fl
+    assert "theory_lots" not in s  # 未判定 → 无差值明细
 
 
 # ---------------------------------------------------------------------------

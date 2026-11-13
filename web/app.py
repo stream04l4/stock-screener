@@ -1437,9 +1437,13 @@ def get_my_positions() -> Dict[str, Any]:
     # （状态机「触线即买」→ 湖最后 bar 处湖价恒高于触发价，必须实时价判定）
     # v7.0.11：口径抽至 martingale.signals.build_signals（微信点位提醒脚本共用，
     # 单一定义点防漂移）
+    # v8.2.0 补：首档（k=0）= 建仓（再武装后新一轮 = 二次建仓）→ 须过当前
+    # 时机门才提示（与策略中心同口径）；轮内加仓档（k≥1）不受约束
     from martingale.signals import build_signals
 
-    signals = build_signals(positions, _sp)
+    _tmap = proj["tmap"]
+    signals = build_signals(positions, _sp, timing_map={
+        c: bool((_tmap.get(c) or {}).get("push_eligible")) for c in user})
     return {
         "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
         "lake_locked": lake_locked,
@@ -1505,12 +1509,13 @@ def get_strategy_signals() -> Dict[str, Any]:
       第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
       （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
       动作恒为买入·首仓、手数 = first_lots，v7.0.28）。
-    - **持仓股动作/手数走建仓日锚定判定（v8.2.1，Joel 2026-11-13：两处信号
+    - **持仓股动作/手数走建仓日锚定判定（v8.2.0 补，Joel 2026-11-13：两处信号
       一致）**：judge_held_lots 与 /api/my_positions、微信 position_alert 同一
-      单一定义点——理论（建仓日起策略买入累计 shares_since + 本档手数）≤ 实际
-      持仓 → action=None（持仓已够，不提醒）；差值 >0 → 建议补差值手数；数据
-      缺失回退旧行为。非持仓股完全不变（正常逻辑 + 时机门）。判定明细见行内
-      theory_lots/actual_lots/gap_lots。
+      单一定义点——有策略跟上的仓位（shares_since>0）：理论（建仓日起策略买入
+      累计 + 本档手数）≤ 实际持仓 → action=None（持仓已够，不提醒）；差值 >0
+      → 建议补差值手数；**建仓日起策略零买入（心血来潮/高位建仓）或数据缺失
+      → 正常信号（本档手数，照常提醒）**。非持仓股完全不变（正常逻辑 + 时机门）。
+      判定明细见行内 theory_lots/actual_lots/gap_lots（未判定为 None）。
     - 时机门（v7.0.24 定案：① 价格分位单条件）：非持仓股的买入信号须先过
       选股时机提醒口径（timing.push_eligible = ① 5年分位≤40%，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
@@ -1549,7 +1554,7 @@ def get_strategy_signals() -> Dict[str, Any]:
 
     # v8.2.0 补：与 /api/my_positions 共享同一投影缓存（不再每次重跑全状态机 +
     # 时机/回测快照）；湖锁定 → 投影缓存已按账本降级。rows（无 since_map）供
-    # 非持仓股（正常逻辑）；rows_since（建仓日锚定）供持仓股判定（v8.2.1：
+    # 非持仓股（正常逻辑）；rows_since（建仓日锚定）供持仓股判定（v8.2.0 补：
     # 两处信号一致，Joel 2026-11-13）。
     proj = _state_projection(need_since=True)
     lake_locked = proj["lake_locked"]
@@ -1696,13 +1701,26 @@ def get_strategy_signals() -> Dict[str, Any]:
             if timing_ok is not True:
                 action = None
                 suggested = None
+        held_first = held and action is not None and k == 0
+        if held_first:
+            # v8.2.0 补（Joel 2026-11-13 二次定案「二次建仓也要符合时机门
+            # 才能提示」）：持仓股首档（k=0）触线 = 再武装后新一轮的建仓
+            # （二次建仓，提醒应为「建仓 N 手」而非「加仓」）→ 须过**当前**
+            # 时机门才提醒（「不受约束」只豁免轮内加仓档 k≥1）；未过 → 无动作
+            # （前端标「时机未过」，价格状态照展示）；无时机行 → fail-closed
+            trow = tmap.get(c) or {}
+            timing_ok = bool(trow.get("push_eligible"))
+            timing_reasons = _timing_breakdown(trow, tp_obj)
+            if timing_ok is not True:
+                action, suggested = None, None
         held_extra: Optional[Dict[str, float]] = None
         if held and action is not None and sp_obj is not None:
-            # v8.2.1（Joel 2026-11-13：两处信号一致）：持仓股遵循建仓日锚定
+            # v8.2.0 补（Joel 2026-11-13：两处信号一致）：持仓股遵循建仓日锚定
             # 判定逻辑（与 /api/my_positions、微信 position_alert 同一口径，
-            # judge_held_lots 单一定义点）——理论（建仓日起策略买入累计 + 本档）
-            # ≤ 实际持仓 → 不产动作（持仓已够）；差值 >0 → 建议补差值手数。
-            # 非持仓股不受影响（正常逻辑）。
+            # judge_held_lots 单一定义点）——有策略跟上的仓位（shares_since>0）：
+            # 理论（建仓日起策略买入累计 + 本档）≤ 实际 → 不产动作（持仓已够）；
+            # 差值 >0 → 建议补差值手数；建仓日起策略零买入（心血来潮/高位建仓）
+            # 或数据缺失 → 正常信号（本档手数，照常提醒）。非持仓股不受影响。
             adj, held_extra, judged = judge_held_lots(
                 sp_obj, k, in_pos, suggested,
                 (rows_since.get(c) or {}).get("shares_since"),
@@ -1729,16 +1747,20 @@ def get_strategy_signals() -> Dict[str, Any]:
             "distance_pct": cls["distance_pct"],
             "action": action,
             "suggested_lots": suggested,
-            # v8.2.1：持仓股差值判定明细（与我的持仓页同口径；非持仓/未判定 → None）
+            # v8.2.0 补：持仓股首档触线（再武装后新一轮 = 二次建仓）且动作在
+            # → 前端标「二次建仓」而非「加仓」
+            "new_round": bool(held_first and action is not None),
+            # v8.2.0 补：持仓股差值判定明细（与我的持仓页同口径；非持仓/未判定 → None）
             "theory_lots": (held_extra or {}).get("theory_lots"),
             "actual_lots": (held_extra or {}).get("actual_lots"),
             "gap_lots": (held_extra or {}).get("gap_lots"),
             "timing_ok": timing_ok,
             # v7.0.31（C 案，Joel 定案）：5 年分位数值——前端「即将进入」段
             # 对非持仓股按 ≤50% 展示（timing 40% 门未过但价格临区 = 最有提前
-            # 量价值的信号；持仓股不受时机限制 → None）
+            # 量价值的信号；持仓股轮内加仓档不受时机限制 → None，但首档
+            # 二次建仓须过时机门 → 展示分位明细）
             "timing_pctile": ((tmap.get(c) or {}).get("pctile_window")
-                              if not held else None),
+                              if (not held or held_first) else None),
             "timing_reasons": timing_reasons,
             # 十年回测参考（推荐买入时展示；池外/无回测 → None）
             "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)
