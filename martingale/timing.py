@@ -166,7 +166,10 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
 
 def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
                     tp, now=None) -> Dict[str, Optional[float]]:
-    """实时分位（v7.0.31）：以当前价替换 5 年前复权窗口末值重算分位①。
+    """实时分位（v7.0.31）：当前价（前复权折算）在 5 年前复权收盘分布中的秩
+    = #{窗口收盘 ≤ 当前价} / 窗口长度 ×100（v8.1.3 审计 F1：docstring 原
+    「替换窗口末值」为不精确表述——实现是标准秩口径，参考分布不含被检点，
+    下行日较「替换末值」语义低 1/W，仅微信推送通道，量级 ~0.08pp@W≈1250）。
 
     微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
     收盘快照滞后一天——「价格破线 + 分位破 40%」同日达成时，快照只在当晚
