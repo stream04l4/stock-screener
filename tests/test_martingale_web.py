@@ -1067,3 +1067,117 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert s["theory_lots"] == fl and s["actual_lots"] == 1.0
     assert s["suggested_lots"] == max(1, math.ceil(fl - 1.0))  # 差值 = fl − 1
     assert s["gap_lots"] == round(fl - 1.0, 2)
+
+
+# ---------------------------------------------------------------------------
+# v8.2.0 补 页面刷新提速缓存（状态机投影 + 实时行情 TTL）
+# 注：缓存重置由 tests/conftest.py 的全局 autouse fixture 统一处理
+# ---------------------------------------------------------------------------
+
+
+class _FakeCon:
+    def close(self):
+        pass
+
+
+class _FakePool:
+    def __init__(self, codes):
+        self.codes = list(codes)
+
+
+def test_state_projection_cache_shared_and_invalidation(tmp_positions_file, monkeypatch):
+    """两接口共享投影缓存（3 请求只算 1 次）；账本 mtime 变→重算；湖锁降级不缓存。"""
+    import json as _json
+    import martingale.timing as mtiming
+    import martingale.selection as msel
+    from martingale.data import LakeLocked
+
+    calls = {"rows": 0, "ctx": 0}
+    sp_stub = type("SP", (), {"lot_size": 100, "first_lots": 2,
+                              "add_lots_step": 2, "add_step": 0.05})()
+    pool_stub = _FakePool(["sh.600000"])
+
+    def fake_ctx(cfg_path=None):
+        calls["ctx"] += 1
+        return sp_stub, {}, _FakeCon(), pool_stub
+
+    def fake_rows(sp, con, codes, **kw):
+        calls["rows"] += 1
+        return {c: {"name": c, "end_date": "2026-11-11"} for c in codes}
+
+    monkeypatch.setattr(wapp, "_load_pool_ctx", fake_ctx)
+    monkeypatch.setattr(wapp, "_strategy_state_rows", fake_rows)
+    monkeypatch.setattr(mtiming, "load_timing_map", lambda con: {})
+    monkeypatch.setattr(msel, "load_backtest_map", lambda con: {})
+    _mock_spot(monkeypatch, {"sh.600000": 10.0})
+    tmp_positions_file.write_text(_json.dumps({"updated_at": "x", "positions": {
+        "sh.600000": {"shares": 100.0, "cost_price": 10.0, "updated_at": "x"}}}),
+        encoding="utf-8")
+
+    wapp.get_my_positions()
+    wapp.get_my_positions()
+    wapp.get_strategy_signals()
+    # 3 请求：rows（无 since）+ rows_since（带 since）各算一次，ctx 一次
+    assert calls["rows"] == 2 and calls["ctx"] == 1
+
+    # 账本变更（内容哈希变）→ 键变 → 重算（双变体）
+    tmp_positions_file.write_text(_json.dumps({"updated_at": "y", "positions": {
+        "sh.600000": {"shares": 200.0, "cost_price": 10.0, "updated_at": "y"}}}),
+        encoding="utf-8")
+    wapp.get_my_positions()
+    assert calls["rows"] == 4
+
+    # 湖锁定（lake-sync 灌数持锁 → 账本/湖内容变 → 键变）→ 降级但不入缓存：
+    # 连续请求每次都重试（fail-fast），灌数完成后内容再变 → 自动恢复
+    def locked_ctx(cfg_path=None):
+        calls["ctx"] += 1
+        raise LakeLocked("test")
+
+    monkeypatch.setattr(wapp, "_load_pool_ctx", locked_ctx)
+    tmp_positions_file.write_text(_json.dumps({"updated_at": "z", "positions": {
+        "sh.600000": {"shares": 200.0, "cost_price": 10.0, "updated_at": "z"}}}),
+        encoding="utf-8")  # 内容变 → 键变 → 触发重算（此时已锁定）
+    o1 = wapp.get_my_positions()
+    o2 = wapp.get_my_positions()
+    assert calls["ctx"] == 4  # 1 首次 + 1 账本变更 + 2 锁定探测（未缓存）
+    assert o1["lake_locked"] is True and o2["lake_locked"] is True
+
+
+def test_fetch_spot_cached_ttl_and_failure(monkeypatch):
+    """TTL 命中零网络；过期重取；部分缺失只补缺；失败回退缓存价；无缓存失败→{}。"""
+    import screener.data.realtime as rt
+
+    calls = {"n": 0, "last": None}
+
+    def fake_fetch(codes, timeout=5.0, max_attempts=1):
+        calls["n"] += 1
+        calls["last"] = list(codes)
+        return ({c: {"price": 1.0, "timestamp": "20261113100000"} for c in codes}, None)
+
+    monkeypatch.setattr(rt, "fetch_spot", fake_fetch)
+    wapp._SPOT_CACHE["ts"] = 0.0
+    wapp._SPOT_CACHE["data"] = {}
+
+    r1 = wapp._fetch_spot_cached(["sh.600000", "sh.600036"])
+    assert calls["n"] == 1 and set(r1) == {"sh.600000", "sh.600036"}
+    # TTL 内命中 → 零网络
+    r2 = wapp._fetch_spot_cached(["sh.600000"])
+    assert calls["n"] == 1 and r2["sh.600000"]["price"] == 1.0
+    # 部分缺失 → 只取缺失集
+    r3 = wapp._fetch_spot_cached(["sh.600000", "sh.601088"])
+    assert calls["n"] == 2 and calls["last"] == ["sh.601088"]
+    assert r3["sh.600000"]["price"] == 1.0 and r3["sh.601088"]["price"] == 1.0
+    # 过期 → 重取
+    wapp._SPOT_CACHE["ts"] -= wapp._SPOT_TTL_S + 1
+    wapp._fetch_spot_cached(["sh.600000"])
+    assert calls["n"] == 3
+    # 取价失败 → 返回缓存价（best-effort，比回退湖价新鲜）
+    monkeypatch.setattr(rt, "fetch_spot",
+                        lambda codes, timeout=5.0, max_attempts=1: (_ for _ in ()).throw(RuntimeError("net down")))
+    wapp._SPOT_CACHE["ts"] -= wapp._SPOT_TTL_S + 1
+    r4 = wapp._fetch_spot_cached(["sh.600000"])
+    assert r4 == {"sh.600000": {"price": 1.0, "timestamp": "20261113100000"}}
+    # 无缓存 + 失败 → {}（调用方回退湖价，旧语义）
+    wapp._SPOT_CACHE["ts"] = 0.0
+    wapp._SPOT_CACHE["data"] = {}
+    assert wapp._fetch_spot_cached(["sh.600000"]) == {}

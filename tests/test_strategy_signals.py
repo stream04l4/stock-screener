@@ -369,6 +369,12 @@ PUSHED_STATE = {"alerts": {"sh.600001|add|1|10.0":
 
 def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
           tmap=TIMING, bmap=BMAP, pushed=PUSHED_STATE, touch=None, lake_exc=None):
+    # v8.2.0 补：替换数据源 → 失效 web 投影/行情缓存（否则上一调用按真实数据
+    # 文件键缓存的 stub 值会被继续伺服，用例间互相污染）
+    wapp._STATE_CACHE["key"] = None
+    wapp._STATE_CACHE["value"] = None
+    wapp._SPOT_CACHE["ts"] = 0.0
+    wapp._SPOT_CACHE["data"] = {}
     monkeypatch.setattr(wapp, "_up_read", lambda: dict(user))
     monkeypatch.setattr(timing_mod, "load_timing_map", lambda con: dict(tmap))
     monkeypatch.setattr(sel_mod, "load_backtest_map", lambda con: dict(bmap))

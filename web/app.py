@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -1181,6 +1183,145 @@ def _up_write(positions: Dict[str, Any]) -> None:
     os.replace(tmp, USER_POSITIONS_PATH)  # 原子替换，防半截账本
 
 
+# ---------------------------------------------------------------------------
+# v8.2.0 补 页面刷新提速（Joel 2026-11-13：我的持仓每次刷新十几秒）
+# 我的持仓页每 30s 轮询 /api/my_positions + /api/strategy_signals，原先每次
+# 请求都重跑 候选池构建(~1s) + 全历史状态机投影(池∪持仓 ~3.5s) + 实时行情
+# 网络取价(1~10s)。两处进程内缓存，不新增配置键：
+# 1) 状态机投影缓存：键 = 湖/策略配置/持仓账本/手动池 的 mtime+size + 北京日期。
+#    数据不变 → 零重算；lake-sync 灌数 / 改配置 / 改账本 → mtime 变 → 自动重算。
+#    两接口共享同一投影（include_buys + since_map 一次算齐，strategy_signals
+#    多出的 shares_since 字段无害；tmap/bmap 快照同缓存）。
+# 2) 实时行情 TTL 15s 缓存：页面 30s 轮询 → 多数轮次命中；取价失败不写缓存
+#    （有空缓存则 best-effort 返回，比回退湖价新鲜）。
+# ---------------------------------------------------------------------------
+_STATE_CACHE: Dict[str, Any] = {"key": None, "value": None}
+_SPOT_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
+_STATE_LOCK = threading.Lock()
+_SPOT_LOCK = threading.Lock()
+# TTL 35s > 页面轮询 30s：隔轮共享一次取价（两接口共享同一缓存），
+# 价格至多滞后 ~35s（30s 轮询页面上不可感知）；盘中每轮平均网络 ≈ 1 次。
+_SPOT_TTL_S = 35.0
+
+
+def _state_cache_key() -> tuple:
+    """投影缓存键：湖(mtime+size) + 小文件内容哈希 + 北京日期。
+
+    本机文件系统 mtime 量化粗（实测 10ms 内两次写同 mtime）→ 小文件（策略
+    配置/持仓账本/手动池，KB 级）直接内容哈希，任何改动即失效；湖是大文件
+    （仅 lake-sync 日写），mtime+size 足够。
+    """
+    from martingale.data import default_db_path
+    try:
+        st = Path(default_db_path()).stat()
+        lake_sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        lake_sig = None
+
+    def _sig(p: Path):
+        try:
+            return hashlib.sha1(p.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    return (lake_sig, _sig(CONFIG_PATH), _sig(USER_POSITIONS_PATH),
+            _sig(Path(PROJECT_ROOT) / "data" / "manual_pool.json"),
+            str(_beijing_today()))
+
+
+def _state_projection(need_since: bool = False) -> Dict[str, Any]:
+    """候选池 + 状态机投影（池∪持仓，include_buys）共享缓存。
+
+    两份投影共享同一数据键（各自每数据键至多算一次，惰性）：
+    - rows（无 since_map）→ /api/strategy_signals（与 v8.2.0 前调用签名一致）；
+    - rows_since（带 since_map，v8.2.0 建仓日锚定）→ /api/my_positions 持仓判断路径。
+    慢路径持锁（并发轮询串行化）；湖锁定/缺失 → 降级值**不入缓存**（瞬态，
+    fail-fast 重试）；HTTPException（配置 400 / 池构建 500）原样上抛不缓存。
+    """
+    user = _up_read()
+    key = _state_cache_key()
+    _today = str(_beijing_today())[:10]
+    with _STATE_LOCK:
+        entry = _STATE_CACHE["value"] if _STATE_CACHE["key"] == key else None
+        if entry is not None and entry.get("rows") is not None and (
+                not need_since or entry.get("rows_since") is not None):
+            return entry
+        from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
+        # v8.2.0：用户建仓日锚定（缺省=今天）；仅账本股携带
+        since_map: Dict[str, str] = {}
+        for c, u in user.items():
+            u = u if isinstance(u, dict) else {}
+            since_map[c] = str(u.get("since_date") or "")[:10] or _today
+        try:
+            _sp, _up, con, pool = _load_pool_ctx()
+        except (LakeLocked, LakeMissing, LakeInvalidFile):
+            # 湖锁定/缺失 → 降级值**不入缓存**：锁定是瞬态的（lake-sync 灌数
+            # 持锁数分钟），缓存会让降级卡到 mtime 变化；每次请求 fail-fast
+            # 重试（连接层即失败，代价 <1s）。
+            return {"sp": None, "pool_codes": [],
+                    "universe": sorted(user.keys()), "rows": {}, "rows_since": {},
+                    "tmap": {}, "bmap": {}, "lake_locked": True}
+        try:
+            if entry is None:
+                universe = sorted(set(pool.codes) | set(user.keys()))
+                entry = {"sp": _sp, "pool_codes": list(pool.codes),
+                         "universe": universe, "rows": None, "rows_since": None,
+                         "tmap": None, "bmap": None, "lake_locked": False}
+            if entry["rows"] is None:
+                entry["rows"] = _strategy_state_rows(
+                    _sp, con, entry["universe"], include_buys=True, now=_today)
+            if need_since and entry["rows_since"] is None:
+                entry["rows_since"] = _strategy_state_rows(
+                    _sp, con, entry["universe"], include_buys=True, now=_today,
+                    since_map=since_map)
+            if entry["tmap"] is None:
+                from martingale.selection import load_backtest_map
+                from martingale.timing import load_timing_map
+                entry["tmap"] = load_timing_map(con)
+                entry["bmap"] = load_backtest_map(con)
+        finally:
+            con.close()
+        _STATE_CACHE["key"] = key
+        _STATE_CACHE["value"] = entry
+        return entry
+
+
+def _fetch_spot_cached(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """fetch_spot + 15s TTL 缓存（v8.2.0 补）。
+
+    命中（TTL 内且已有价）→ 零网络；未命中取缺失集合并合并回缓存；
+    取价失败/空 → 返回仍可用的缓存价（含过期，best-effort 比回退湖价新鲜）；
+    首取失败且无缓存 → {}（调用方回退湖价，与旧语义一致）。
+    """
+    if not codes:
+        return {}
+    need = list(dict.fromkeys(codes))  # 去重保序
+    with _SPOT_LOCK:
+        ts = _SPOT_CACHE["ts"]
+        cached = dict(_SPOT_CACHE["data"])
+    missing = [c for c in need
+               if time.monotonic() - ts >= _SPOT_TTL_S
+               or (cached.get(c) or {}).get("price") is None]
+    if not missing:
+        return {c: cached[c] for c in need}
+    try:
+        from screener.data.realtime import fetch_spot
+        fresh, _ = fetch_spot(missing, timeout=5.0, max_attempts=1)
+    except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
+        fresh = {}
+    if fresh:
+        with _SPOT_LOCK:
+            merged = dict(_SPOT_CACHE["data"])
+            merged.update(fresh)
+            _SPOT_CACHE["data"] = merged
+            _SPOT_CACHE["ts"] = time.monotonic()
+        out = {c: cached[c] for c in need if c in cached and c not in fresh}
+        out.update(fresh)
+    else:
+        out = {c: cached[c] for c in need if c in cached}
+    return out
+
+
 @app.get("/api/my_positions")
 def get_my_positions() -> Dict[str, Any]:
     """我的持仓 = 用户账本（股数/成本）× 展示价 + 策略状态机参考（档/触发价）+ 加仓信号。
@@ -1203,31 +1344,13 @@ def get_my_positions() -> Dict[str, Any]:
     if not user:
         return {"as_of": None, "n": 0, "positions": [], "signals": [], "strategy": "current",
                 "totals": {"market_value": 0, "cost": 0, "pnl": 0, "pnl_pct": None}}
-    # 湖锁定/缺失 → 降级：只列账本（无价格/无策略参考），前端显示灌数提示条
-    from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
-
-    lake_locked = False
-    rows: Dict[str, Dict[str, Any]] = {}
-    _sp = None
-    # v8.2.0：用户建仓日锚定（Joel 2026-11-13 定案：理论持仓从「我建仓时」
-    # 开始算）。since_date 缺失（升级前旧账本）→ 有效建仓日 = 今天（基准从
-    # 升级日起算，下次更新该股时记准确日期）。仅持仓股传入，池内其余股不受
-    # 影响（回测/新建仓路径不传 since_map，零影响）。
-    _today = str(_beijing_today())[:10]
-    since_map: Dict[str, str] = {}
-    for c in user:
-        u = user[c] if isinstance(user[c], dict) else {}
-        since_map[c] = str(u.get("since_date") or "")[:10] or _today
-    try:
-        _sp, _up, con, pool = _load_pool_ctx()
-        try:
-            rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())),
-                                    now=_today, since_map=since_map)
-        finally:
-            con.close()
-    except (LakeLocked, LakeMissing, LakeInvalidFile):
-        lake_locked = True
-        rows = {}
+    # v8.2.0 补：状态机投影走共享缓存（数据哈希+日期为键，见 _state_projection）
+    # ——页面 30s 轮询不再每次重跑全状态机；rows_since 带 since_map（v8.2.0
+    # 建仓日锚定，缺省=今天；旧账本升级兼容）。
+    proj = _state_projection(need_since=True)
+    lake_locked = proj["lake_locked"]
+    rows: Dict[str, Dict[str, Any]] = proj["rows_since"]
+    _sp = proj["sp"]
     positions: List[Dict[str, Any]] = []
     tot_cost = 0.0
     for c in sorted(user):
@@ -1280,13 +1403,9 @@ def get_my_positions() -> Dict[str, Any]:
     # 用湖价判"已触线"永远为假。故信号用**实时价**（腾讯行情）对比触发价；
     # 实时行情失败 → 回退湖最后价（price_source="lake"，此时信号只会漏报不会误报）。
     # v1.1（Gate 3，设计 §5）：一主一备统一入口（腾讯主 → push2delay 备，整批切换）
-    spot: Dict[str, Dict[str, Any]] = {}
-    try:
-        from screener.data.realtime import fetch_spot
-        spot, _ = fetch_spot(
-            [p["ts_code"] for p in positions], timeout=5.0, max_attempts=1)
-    except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
-        spot = {}
+    # v8.2.0 补：15s TTL 缓存（页面 30s 轮询 → 多数命中，不再每次网络取价）
+    spot: Dict[str, Dict[str, Any]] = _fetch_spot_cached(
+        [p["ts_code"] for p in positions])
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
     for pos in positions:
@@ -1422,32 +1541,16 @@ def get_strategy_signals() -> Dict[str, Any]:
         from martingale.config import TimingParams
         tp_obj = TimingParams()
 
-    from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
-
-    lake_locked = False
-    rows: Dict[str, Dict[str, Any]] = {}
-    sp_obj = None
-    universe: List[str] = []
-    tmap: Dict[str, Dict[str, Any]] = {}   # 选股时机（selection_timing 快照）
-    bmap: Dict[str, Dict[str, Any]] = {}   # 十年回测（selection_backtest_10y）
-    try:
-        _sp, _up, con, pool = _load_pool_ctx()
-        sp_obj = _sp
-        try:
-            universe = sorted(set(pool.codes) | set(user.keys()))
-            rows = _strategy_state_rows(_sp, con, universe, include_buys=True,
-                                        now=_beijing_today())
-            from martingale.selection import load_backtest_map
-            from martingale.timing import load_timing_map
-            tmap = load_timing_map(con)
-            bmap = load_backtest_map(con)
-        finally:
-            con.close()
-    except (LakeLocked, LakeMissing, LakeInvalidFile):
-        # 湖锁定/缺失 → 降级：只能列账本代码（无触发价 → 全部 no_data）
-        lake_locked = True
-        rows = {}
-        universe = sorted(user.keys())
+    # v8.2.0 补：与 /api/my_positions 共享同一投影缓存（不再每次重跑全状态机 +
+    # 时机/回测快照）；本接口用 rows（无 since_map，v8.2.0 前同签名）；
+    # 湖锁定 → 投影缓存已按账本降级
+    proj = _state_projection()
+    lake_locked = proj["lake_locked"]
+    rows: Dict[str, Dict[str, Any]] = proj["rows"]
+    sp_obj = proj["sp"]
+    universe: List[str] = proj["universe"]
+    tmap: Dict[str, Dict[str, Any]] = proj["tmap"]
+    bmap: Dict[str, Dict[str, Any]] = proj["bmap"]
     as_of = max((r["end_date"] for r in rows.values() if r.get("end_date")),
                 default=None)
     if not universe:
@@ -1488,13 +1591,8 @@ def get_strategy_signals() -> Dict[str, Any]:
                 fetch_codes.append(c)
     # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
     # 只漏报不误报）。v1.1（Gate 3，设计 §5）：一主一备统一入口
-    spot: Dict[str, Dict[str, Any]] = {}
-    try:
-        from screener.data.realtime import fetch_spot
-        spot, _ = fetch_spot(
-            fetch_codes, timeout=5.0, max_attempts=1)
-    except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
-        spot = {}
+    # v8.2.0 补：15s TTL 缓存（两接口共享，多数轮次零网络）
+    spot: Dict[str, Dict[str, Any]] = _fetch_spot_cached(fetch_codes)
     price_source = "spot" if any(v.get("price") is not None for v in spot.values()) else "lake"
     spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
     # 最新行情日（v7.0.20 盘中触碰判定基准）：全池最大 quote_date——停牌股行情

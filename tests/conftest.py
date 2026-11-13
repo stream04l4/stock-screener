@@ -21,11 +21,36 @@ sys.path.insert(0, os.path.dirname(__file__))
 # ===========================================================================
 import pytest  # noqa: E402
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import web.app as _wapp  # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def _v61_isolate_multisource(monkeypatch):
     monkeypatch.setenv("LAKE_MULTISOURCE", "0")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_web_v821_caches():
+    """v8.2.0 补：每测前后重置 web 状态机投影/实时行情缓存（模块级）。
+
+    端点测试用 stub 替换 _load_pool_ctx/_strategy_state_rows/fetch_spot——
+    不重置会让前一个用例的 stub 值按「真实数据文件键」缓存并污染后续用例
+    （跨文件）。
+    """
+    _wapp._STATE_CACHE["key"] = None
+    _wapp._STATE_CACHE["value"] = None
+    _wapp._SPOT_CACHE["ts"] = 0.0
+    _wapp._SPOT_CACHE["data"] = {}
+    yield
+    _wapp._STATE_CACHE["key"] = None
+    _wapp._STATE_CACHE["value"] = None
+    _wapp._SPOT_CACHE["ts"] = 0.0
+    _wapp._SPOT_CACHE["data"] = {}
 
 
 # ===========================================================================
