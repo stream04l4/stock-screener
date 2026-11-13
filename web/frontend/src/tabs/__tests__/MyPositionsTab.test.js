@@ -488,12 +488,11 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     expect(w.text()).toContain("42.07"); // 弹层展示原始口径（与最新价同单位）
     expect(w.find(".d-row").exists()).toBe(true);
     expect(w.text()).toContain("再武装触发价");
-    // 编辑 input 预填（股数/成本/建仓日——v8.2.0 行内 since_date 预填）
+    // 编辑 input 预填（股数/成本——建仓日只在顶部录入条，弹层不再含输入）
     const editInputs = w.findAll(".edit-bar input");
-    expect(editInputs).toHaveLength(3);
+    expect(editInputs).toHaveLength(2);
     expect(editInputs[0].element.value).toBe("1200");
     expect(editInputs[1].element.value).toBe("25");
-    expect(editInputs[2].element.value).toBe("2026-10-20");
     // v8.2.0 建仓时间线（手动加仓自动记录）展示
     expect(w.text()).toContain("建仓时间线");
     expect(w.text()).toContain("2026-10-20");
@@ -504,7 +503,7 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     await flushPromises();
     expect(puts()).toHaveLength(1);
     expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "2026-10-20" });
+      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "" });
     // 删除（confirm stub=true）→ PUT shares=0
     await editBtns.find((b) => b.text() === "删除").trigger("click");
     await flushPromises();

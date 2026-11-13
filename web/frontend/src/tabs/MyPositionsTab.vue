@@ -290,7 +290,7 @@ async function addNew() {
 // 行点击弹层（策略参考 + 编辑股数/成本）
 // ---------------------------------------------------------------------------
 const modalRow = ref(null);
-const edit = reactive({ shares: "", cost: "", since: "" });
+const edit = reactive({ shares: "", cost: "" });
 const saveMsg = ref("");
 const saveErr = ref("");
 
@@ -298,7 +298,6 @@ function onRow(r) {
   modalRow.value = r;
   edit.shares = String(r.shares ?? "");
   edit.cost = String(r.cost_price ?? "");
-  edit.since = String(r.since_date ?? "").slice(0, 10);
   saveMsg.value = "";
   saveErr.value = "";
   // 买入登记预填：该股有活跃信号 → 建议股数（建议手数×100，v7.0.28 手数口径）；价格默认最新价
@@ -317,12 +316,11 @@ async function saveEdit() {
   const code = modalRow.value.ts_code;
   const shares = Number(edit.shares);
   const cost = Number(edit.cost);
-  const since = (edit.since || "").trim();
   if (!Number.isFinite(shares) || shares < 0) { saveErr.value = "股数应为非负数"; return; }
   if (!Number.isFinite(cost) || cost < 0) { saveErr.value = "成本价应为非负数"; return; }
-  if (since && !SINCE_RE.test(since)) { saveErr.value = "建仓日应为 YYYY-MM-DD"; return; }
   try {
-    await putPos(code, shares, cost, since);
+    // 建仓日只在顶部「添加/更新持仓」录入条首次建仓时确认；弹层保存不再带
+    await putPos(code, shares, cost, "");
     saveMsg.value = shares === 0 ? "已删除" : "已保存";
     if (shares === 0) modalRow.value = null;
     refresh();
@@ -500,7 +498,8 @@ function pnlColor(v) {
     <div class="card">
       <h3>添加 / 更新持仓</h3>
       <p class="muted small">
-        录入你实际持有的股票（代码 + 股数 + 成本价）；同一代码再次保存即更新。
+        录入你实际持有的股票（代码 + 股数 + 成本价）；<b>首次建仓时填建仓日</b>
+        （之后自动锚定，无需再动），同一代码再次保存即更新持仓。
         策略参考列来自状态机模拟——「下次加仓价 / 再武装价」即该跌到的触发价位。
       </p>
       <div class="add-bar">
@@ -626,7 +625,7 @@ function pnlColor(v) {
         <div class="detail-grid">
           <div v-for="[k, label] in [
             ['ts_code', '代码'], ['in_pos', '策略持仓中'], ['strat_shares', '策略模拟股数'],
-            ['since_date', '建仓日'], ['strat_shares_since', '建仓日起策略股数'],
+            ['since_date', '建仓日（顶部录入条填）'], ['strat_shares_since', '建仓日起策略股数'],
             ['theory_lots', '策略理论(手)'], ['actual_lots', '实际(手)'], ['gap_lots', '差值(手)'],
             ['k_level', '当前档位 k'],
             ['next_add_price_raw', '下一加仓触发价'], ['next_rearm_price_raw', '再武装触发价'],
@@ -658,11 +657,6 @@ function pnlColor(v) {
           <label class="edit-field">
             <span>成本价</span>
             <input v-model="edit.cost" class="inp num" />
-          </label>
-          <label class="edit-field">
-            <span>建仓日</span>
-            <input v-model="edit.since" class="inp num" type="date"
-                   title="理论持仓锚点：留空=自动（最早加仓日），填了=手动固定该锚点" />
           </label>
           <button class="primary-btn" @click="saveEdit">保存</button>
           <button class="ghost-btn" @click="deleteRow">删除</button>
