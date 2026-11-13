@@ -1438,12 +1438,21 @@ def get_my_positions() -> Dict[str, Any]:
     # v7.0.11：口径抽至 martingale.signals.build_signals（微信点位提醒脚本共用，
     # 单一定义点防漂移）
     # v8.2.0 补：首档（k=0）= 建仓（再武装后新一轮 = 二次建仓）→ 须过当前
-    # 时机门才提示（与策略中心同口径）；轮内加仓档（k≥1）不受约束
+    # 时机门才提示（与策略中心同口径 _held_first_timing：池内=快照，池外=
+    # 实时现算，fail-closed）；轮内加仓档（k≥1）不受约束
     from martingale.signals import build_signals
 
     _tmap = proj["tmap"]
-    signals = build_signals(positions, _sp, timing_map={
-        c: bool((_tmap.get(c) or {}).get("push_eligible")) for c in user})
+    timing_map: Dict[str, bool] = {}
+    for c in user:
+        trow = _tmap.get(c)
+        if trow is not None:
+            timing_map[c] = bool(trow.get("push_eligible"))
+        else:
+            _p = ((spot.get(c) or {}).get("price")
+                  or (rows.get(c) or {}).get("last_price"))
+            timing_map[c] = _held_first_timing(c, _tmap, _p)[0]
+    signals = build_signals(positions, _sp, timing_map=timing_map)
     return {
         "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
         "lake_locked": lake_locked,
@@ -1486,6 +1495,74 @@ def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
     parts.append(f"{'✓' if ok1 else '✗'} {tp.price_window_years}年分位 "
                  f"{v1}（需≤{tp.price_pctile_max:g}%）")
     return " · ".join(parts)
+
+
+def _held_first_timing(c: str, tmap: Dict[str, Dict[str, Any]],
+                       price: Optional[float]):
+    """v8.2.0 补（Joel 2026-11-13 二次定案）：持仓股首档（k=0 = 再武装后新一轮
+    「二次建仓」/ 模拟从未持仓轮次的首仓）的时机判定——策略中心与我的持仓
+    共用（单一定义点，与微信 position_alert 通道同口径对齐）。
+
+    池内（tmap 有行）= 预计算快照 push_eligible（O(1)，与非持仓时机门同源）；
+    池外/无行（自选持仓股，如中粮糖业）→ 现算**实时分位**（与微信持仓通道的
+    live_pctile_map 同一口径：现价替换窗口末值重算 5 年分位 ≤ 40%）——否则
+    池外持仓股 fail-closed 恒不过门，微信能推而页面不显示，两处不一致。
+    失败/湖占用/无数据 → (False, None, 原因)（fail-closed：未过）。
+
+    :return: (ok, pctile, reasons)
+    """
+    trow = tmap.get(c)
+    if trow is not None:
+        return (bool(trow.get("push_eligible")),
+                trow.get("pctile_window"), _timing_breakdown(trow, tp_obj_global()))
+    # 无时机行（池外持仓）→ 现算实时分位（微信同口径，fail-closed）
+    # 300s TTL 进程内缓存：页面 30s 轮询不每次开湖（5 年分位对现价变动不敏感，
+    # 边界抖动与微信实时通道同量级）
+    now_ts = time.time()
+    hit = _HELD_PCT_CACHE.get(c)
+    if hit is not None and now_ts - hit[0] < 300.0:
+        pct = hit[1]
+    else:
+        try:
+            from martingale.data import connect_readonly
+            from martingale.timing import live_pctile_map
+            con = connect_readonly(None)
+            try:
+                pm: Dict[str, Optional[float]] = {c: price} if price is not None else {}
+                pcts = live_pctile_map(con, [c], pm, tp_obj_global())
+            finally:
+                con.close()
+            pct = pcts.get(c)
+        except Exception:  # noqa: BLE001 - 湖占用/结构异常 → fail-closed（不缓存）
+            return False, None, "无时机数据（fail-closed）"
+        if pct is not None:
+            _HELD_PCT_CACHE[c] = (now_ts, pct)
+    if pct is None:
+        return False, None, "无时机数据（fail-closed）"
+    tp = tp_obj_global()
+    ok = pct <= tp.price_pctile_max
+    return ok, round(pct, 1), (f"实时 {tp.price_window_years}年分位 {pct:.1f}%"
+                               f"（需≤{tp.price_pctile_max:g}%，池外现算）")
+
+
+def tp_obj_global():
+    """v8.2.0 补：timing 参数（模块级缓存；配置热改后按 mtime 重读）。"""
+    global _TP_CACHE
+    p = str(CONFIG_PATH)
+    try:
+        mtime = os.path.getmtime(p)
+    except OSError:
+        mtime = None
+    if _TP_CACHE is None or _TP_CACHE[0] != mtime:
+        from martingale.config import load_config as _mload  # 与端点同源
+        _s0, _u0, _tp = _mload(p)
+        _TP_CACHE = (mtime, _tp)
+    return _TP_CACHE[1]
+
+
+_TP_CACHE: Optional[tuple] = None
+# v8.2.0 补：池外持仓股 k=0 现算实时分位的 TTL 缓存 {code: (ts, pct|None)}
+_HELD_PCT_CACHE: Dict[str, tuple] = {}
 
 
 @app.get("/api/strategy_signals")
@@ -1702,15 +1779,16 @@ def get_strategy_signals() -> Dict[str, Any]:
                 action = None
                 suggested = None
         held_first = held and action is not None and k == 0
+        held_first_pctile: Optional[float] = None
         if held_first:
             # v8.2.0 补（Joel 2026-11-13 二次定案「二次建仓也要符合时机门
             # 才能提示」）：持仓股首档（k=0）触线 = 再武装后新一轮的建仓
             # （二次建仓，提醒应为「建仓 N 手」而非「加仓」）→ 须过**当前**
             # 时机门才提醒（「不受约束」只豁免轮内加仓档 k≥1）；未过 → 无动作
-            # （前端标「时机未过」，价格状态照展示）；无时机行 → fail-closed
-            trow = tmap.get(c) or {}
-            timing_ok = bool(trow.get("push_eligible"))
-            timing_reasons = _timing_breakdown(trow, tp_obj)
+            # （前端标「时机未过」，价格状态照展示）；池外持仓无时机行 →
+            # 现算实时分位（微信同口径），无数据 → fail-closed
+            timing_ok, held_first_pctile, timing_reasons = _held_first_timing(
+                c, tmap, price)
             if timing_ok is not True:
                 action, suggested = None, None
         held_extra: Optional[Dict[str, float]] = None
@@ -1758,9 +1836,10 @@ def get_strategy_signals() -> Dict[str, Any]:
             # v7.0.31（C 案，Joel 定案）：5 年分位数值——前端「即将进入」段
             # 对非持仓股按 ≤50% 展示（timing 40% 门未过但价格临区 = 最有提前
             # 量价值的信号；持仓股轮内加仓档不受时机限制 → None，但首档
-            # 二次建仓须过时机门 → 展示分位明细）
-            "timing_pctile": ((tmap.get(c) or {}).get("pctile_window")
-                              if (not held or held_first) else None),
+            # 二次建仓须过时机门 → 展示分位明细：池内=快照，池外=实时现算）
+            "timing_pctile": (held_first_pctile if held_first else
+                              ((tmap.get(c) or {}).get("pctile_window")
+                               if not held else None)),
             "timing_reasons": timing_reasons,
             # 十年回测参考（推荐买入时展示；池外/无回测 → None）
             "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)

@@ -46,11 +46,15 @@ def _reset_web_v821_caches():
     _wapp._STATE_CACHE["value"] = None
     _wapp._SPOT_CACHE["ts"] = 0.0
     _wapp._SPOT_CACHE["data"] = {}
+    _wapp._HELD_PCT_CACHE.clear()
+    _wapp._TP_CACHE = None
     yield
     _wapp._STATE_CACHE["key"] = None
     _wapp._STATE_CACHE["value"] = None
     _wapp._SPOT_CACHE["ts"] = 0.0
     _wapp._SPOT_CACHE["data"] = {}
+    _wapp._HELD_PCT_CACHE.clear()
+    _wapp._TP_CACHE = None
 
 
 # ===========================================================================

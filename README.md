@@ -111,10 +111,14 @@ positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypt
   轮内加仓档（k≥1）不受时机门约束。
 - **二次建仓时机门（Joel 2026-11-13 二次定案）**：再武装后新一轮的首仓
   （持仓股 k=0 触线 = **二次建仓**，提醒口径「建仓 N 手」而非「加仓」）须
-  **当前时机门**通过才提醒（5 年分位 ≤ 40%；Web 用 `push_eligible` 快照、
-  微信用实时分位，fail-closed：无分位数据/池外无时机行 = 未过）；
-  「不管首次建仓是否在时机门」——首仓历史状态不作豁免，每轮首仓独立判门。
-  轮内加仓档（k≥1）与差值判定不受此门约束。
+  **当前时机门**通过才提醒（5 年分位 ≤ 40%）——「不管首次建仓是否在时机门」：
+  首仓历史状态不作豁免，每轮首仓独立判门。判定单点
+  `web/app.py::_held_first_timing`（策略中心/我的持仓共用）：池内 = 预计算
+  快照 `push_eligible`；**池外持仓（无时机行，如中粮糖业）= 现算实时分位**
+  （与微信 `live_pctile_map` 同口径，300s TTL 缓存）——否则池外持仓股页面
+  恒 fail-closed 而微信能推，两处不一致；无数据/湖占用 → fail-closed 不提醒。
+  微信持仓通道恒用实时分位（universe = 池 ∪ 持仓）。轮内加仓档（k≥1）与
+  差值判定不受此门约束。
 - 实现单点 = `martingale/signals.py::build_signals`（Web 与微信共用，
   `timing_map` 参数 = 时机门；`new_round`/`in_pos` 字段区分「二次建仓」文案）；
   `shares_since` 由 `martingale/engine.py::state_rows(since_map=…)` 计算；缺数据

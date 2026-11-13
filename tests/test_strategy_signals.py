@@ -163,6 +163,32 @@ def test_build_signals_k0_timing_gate():
     assert len(build_signals([pos_k0], SP)) == 1
 
 
+def test_held_first_timing_pool_outside_live(monkeypatch):
+    """v8.2.0 补：池外持仓股（无 tmap 行，如中粮糖业）k=0 时机门 → 现算实时
+    分位（与微信 position_alert 的 live_pctile_map 同口径），避免「微信能推
+    而页面恒 fail-closed」的两处不一致；湖不可用 → fail-closed。"""
+    # tmap 空 → 走现算分支；实时分位 35% ≤ 40 → 过
+    monkeypatch.setattr("martingale.timing.live_pctile_map",
+                        lambda con, codes, prices, tp, **kw:
+                        {c: 35.0 for c in codes})
+    ok, pct, reasons = wapp._held_first_timing("sh.600737", {}, 13.0)
+    assert ok is True and pct == 35.0 and "池外现算" in reasons
+    # 分位 55% > 40 → 未过
+    monkeypatch.setattr("martingale.timing.live_pctile_map",
+                        lambda con, codes, prices, tp, **kw:
+                        {c: 55.0 for c in codes})
+    wapp._HELD_PCT_CACHE.clear()
+    ok2, pct2, _ = wapp._held_first_timing("sh.600737", {}, 13.0)
+    assert ok2 is False and pct2 == 55.0
+    # 湖占用（connect_readonly 异常）→ fail-closed（不缓存失败）
+    def _boom(cfg=None):
+        raise RuntimeError("测试注入：湖占用")
+    monkeypatch.setattr("martingale.data.connect_readonly", _boom)
+    wapp._HELD_PCT_CACHE.clear()
+    ok3, pct3, reasons3 = wapp._held_first_timing("sh.600737", {}, 13.0)
+    assert ok3 is False and pct3 is None and "fail-closed" in reasons3
+
+
 # ---------------------------------------------------------------------------
 # v8.2.0 累计差值口径（Joel 2026-11-13 定案）：
 # 理论持仓 = 用户**建仓日起**策略买入累计（strat_shares_since）+ 本档手数；
