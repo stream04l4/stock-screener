@@ -117,6 +117,23 @@ def _gap_suggested(sp: Optional[Any], pos: Dict[str, Any], k: int, in_pos: bool,
     return max(1, math.ceil(gap)), extra, True
 
 
+def judge_held_lots(sp: Optional[Any], k: int, in_pos: bool,
+                    base_suggested: Optional[int],
+                    theory_shares: Optional[float],
+                    shares: Optional[float]) -> Tuple[Optional[int], Optional[Dict[str, float]], bool]:
+    """v8.2.1 持仓股判定逻辑（公开入口，单一定义点，Joel 2026-11-13：两处信号
+    一致）。策略中心 /api/strategy_signals 的持仓股行动用它（与
+    /api/my_positions、微信 position_alert 同一口径）：
+
+    - 差值 >0 → 建议补差值手数（至少 1 手）；
+    - 差值 ≤0（持仓够了/超配）→ (None, extra, True)：不产动作；
+    - 数据缺失（theory_shares/shares/sp 缺）→ (base_suggested, None, False)：
+      未判定，回退旧行为（展示原动作）。
+    """
+    return _gap_suggested(sp, {"strat_shares_since": theory_shares, "shares": shares},
+                          k, in_pos, base_suggested)
+
+
 def build_signals(positions: List[Dict[str, Any]], sp: Optional[Any]) -> List[Dict[str, Any]]:
     """对 positions（含 spot_price/next_add_price_raw/in_pos/k_level/shares/
     strat_shares_since）产信号列表。

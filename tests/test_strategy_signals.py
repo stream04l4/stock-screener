@@ -401,7 +401,7 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
         monkeypatch.setattr(wapp, "_load_pool_ctx", _pool_ctx)
     monkeypatch.setattr(
         wapp, "_strategy_state_rows",
-        lambda sp, con, codes, end=None, include_buys=False, now=None:
+        lambda sp, con, codes, end=None, include_buys=False, now=None, **kw:
         (lambda r: {k: dict(v, **({"buys": list(v["buys"])} if include_buys else {}))
                     for k, v in r.items()})(dict(rows)))
     monkeypatch.setattr(tencent_mod, "TencentClient",
@@ -715,6 +715,68 @@ def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):
     # 湖价 10.1 > 触发 10.0 但 +1%（3% 带内）→ approaching（非 active）
     assert by["sh.600001"]["price"] == 10.1
     assert by["sh.600001"]["status"] == "approaching"
+
+
+# ---------------------------------------------------------------------------
+# v8.2.1 持仓股建仓日锚定判定（Joel 2026-11-13：两处信号一致）
+# ---------------------------------------------------------------------------
+
+def test_strategy_signals_held_anchor_gap_gate(monkeypatch, tmp_path):
+    """持仓股动作/手数走建仓日锚定判定（与 /api/my_positions、微信同一口径）：
+    理论（shares_since/lot + 本档）≤ 实际 → 无动作（持仓已够，价格态照展示）；
+    差值 >0 → 建议补差值手数；非持仓股完全不受影响（正常逻辑 + 时机门）；
+    shares_since 缺失 → 回退旧行为。"""
+    rows = {
+        # A 持仓充足：k=1 本档 2 手，shares_since=0 → 理论 2 手 ≤ 实际 3 手
+        "sh.600101": {"name": "甲", "last_price": 9.9, "in_pos": True, "k_level": 1,
+                      "next_add_price_raw": 10.0, "first_level_raw": 12.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+        # B 恰好够：k=0 本档 1 手 = 实际 1 手（gap=0 → 不提醒）
+        "sh.600102": {"name": "乙", "last_price": 29.0, "in_pos": True, "k_level": 0,
+                      "next_add_price_raw": 30.0, "first_level_raw": 30.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+        # C 差值 +2：k=2 本档 3 手，实际 1 手 → 补 2 手
+        "sh.600103": {"name": "丙", "last_price": 19.0, "in_pos": True, "k_level": 2,
+                      "next_add_price_raw": 20.0, "first_level_raw": 22.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+        # D 非持仓 + 时机✓：正常逻辑买入·首仓 1 手（shares_since 对其无效）
+        "sh.600104": {"name": "丁", "last_price": 24.5, "in_pos": True, "k_level": 2,
+                      "next_add_price_raw": 24.0, "first_level_raw": 25.0,
+                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+        # E 持仓但 shares_since 缺失（湖中无数据等）→ 未判定，回退旧行为
+        "sh.600105": {"name": "戊", "last_price": 14.0, "in_pos": True, "k_level": 0,
+                      "next_add_price_raw": 15.0, "first_level_raw": 15.0,
+                      "end_date": "2026-11-06", "buys": []},
+    }
+    user = {c: {"shares": 100.0, "cost_price": 10.0,
+                "updated_at": "2026-11-07T00:00:00Z"} for c in
+            ("sh.600101", "sh.600102", "sh.600103", "sh.600105")}
+    user["sh.600101"] = dict(user["sh.600101"], shares=300.0)
+    spot = {c: {"price": rows[c]["last_price"], "timestamp": "20261107093000"}
+            for c in rows}
+    tmap = {"sh.600104": {"ts_code": "sh.600104", "push_eligible": True,
+                          "cond_price_low": True, "pctile_window": 20.0}}
+    _wire(monkeypatch, tmp_path, rows=rows, pool=list(rows), user=user,
+          spot=spot, tmap=tmap)
+    out = wapp.get_strategy_signals()
+    by = {s["ts_code"]: s for s in out["stocks"]}
+    # A：持仓已够 → 无动作，价格态 active 照展示，附判定明细
+    assert by["sh.600101"]["status"] == "active"
+    assert by["sh.600101"]["action"] is None
+    assert by["sh.600101"]["suggested_lots"] is None
+    assert (by["sh.600101"]["theory_lots"], by["sh.600101"]["actual_lots"],
+            by["sh.600101"]["gap_lots"]) == (2.0, 3.0, 0.0)
+    # B：gap=0 → 不提醒
+    assert by["sh.600102"]["action"] is None and by["sh.600102"]["suggested_lots"] is None
+    # C：差值 +2 → 加仓 2 手
+    assert by["sh.600103"]["action"] == "add"
+    assert by["sh.600103"]["suggested_lots"] == 2
+    assert by["sh.600103"]["gap_lots"] == 2.0
+    # D：非持仓正常逻辑（时机✓ → 买入·首仓 1 手；shares_since 不参与）
+    assert by["sh.600104"]["action"] == "buy" and by["sh.600104"]["suggested_lots"] == 1
+    assert by["sh.600104"]["theory_lots"] is None
+    # E：缺 shares_since → 回退旧行为（加仓 1 手）
+    assert by["sh.600105"]["action"] == "add" and by["sh.600105"]["suggested_lots"] == 1
 
 
 # ---------------------------------------------------------------------------

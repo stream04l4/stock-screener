@@ -494,6 +494,15 @@ output/            # 回测产物（gitignore；旧多因子产物保留未清�
     （瞬态，fail-fast 重试）。② 实时行情 35s TTL 缓存（> 30s 轮询周期 →
     隔轮共享一次取价，两接口共用）；取价失败回退缓存价（best-effort 比湖价
     新鲜）。
+  - **策略中心持仓股信号一致（Joel 2026-11-13：两处信号应该一致）**：
+    `/api/strategy_signals` 的持仓股动作/手数改走建仓日锚定判定
+    （`judge_held_lots`，与 /api/my_positions、微信 position_alert 同一
+    单一定义点）——理论（建仓日起策略买入累计 + 本档手数）≤ 实际持仓 →
+    无动作（前端标「持仓已够」，价格态照展示）；差值 >0 → 建议补差值手数；
+    数据缺失回退旧行为。非持仓股完全不变（正常逻辑 + 时机门）。判定明细
+    在行内 theory_lots/actual_lots/gap_lots；前端当前信号段持仓股无动作
+    标「持仓已够」（非持仓仍「时机未过」）。测试：端点 5 例（充足/恰好/
+    差值+2/非持仓不受影响/缺数据回退）+ 前端 270/270。
   - 实现单点 `martingale/signals.py::build_signals`（Web/微信共用）＋
     `martingale/engine.py::state_rows(since_map=…)`；缺数据回退旧行为；无新增
     配置键；`since_date`/`buys` 是账本字段（data/user_positions.json），非策略参数。

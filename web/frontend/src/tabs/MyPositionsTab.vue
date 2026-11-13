@@ -103,7 +103,7 @@ function timingText(s) {
   return s.timing_reasons || "—";
 }
 function actionText(s) {
-  if (!s.action) return "时机未过";
+  if (!s.action) return s.held ? "持仓已够" : "时机未过";
   if (s.held) return s.action === "buy" ? "买入·首仓" : "加仓";
   // 非持仓统一「买入·首仓」（v7.0.23：触发线恒为首仓线，无「第N档加入」口径）
   return "买入·首仓";
