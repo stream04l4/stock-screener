@@ -1107,7 +1107,7 @@ def _beijing_today():
 
 
 def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False,
-                         now=None, tp=None) -> Dict[str, Dict[str, Any]]:
+                         now=None, tp=None, since_map=None) -> Dict[str, Dict[str, Any]]:
     """状态机投影（单一口径，防漂移）。
 
     v7.0.20：实现下沉至 martingale.engine.state_rows（scripts/signal_touch.py 共用
@@ -1115,6 +1115,8 @@ def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False,
     事件修正到除权后口径（v7.0.32）；回测/回放不传 → 零修正。
     v8.1.0：tp=首仓双条件②参数（timing 段）——缺省从 CONFIG_PATH 加载
     （生产路径统一带分位门；显式传 tp=None 关闭 = 仅单元测试）。
+    v8.2.0：since_map=用户建仓日 {code: date}（仅持仓判断路径）→ 行内附
+    shares_since（建仓日起策略买入累计）。
     """
     from martingale.engine import state_rows
     if tp is None:
@@ -1124,7 +1126,7 @@ def _strategy_state_rows(sp, con, codes, end=None, include_buys: bool = False,
         except Exception:  # noqa: BLE001 - 配置损坏 → fail-open 无门（页面仍可读）
             tp = None
     return state_rows(sp, con, codes, end=end, include_buys=include_buys,
-                      now=now, tp=tp)
+                      now=now, tp=tp, since_map=since_map)
 
 
 @app.get("/api/positions")
@@ -1207,11 +1209,20 @@ def get_my_positions() -> Dict[str, Any]:
     lake_locked = False
     rows: Dict[str, Dict[str, Any]] = {}
     _sp = None
+    # v8.2.0：用户建仓日锚定（Joel 2026-11-13 定案：理论持仓从「我建仓时」
+    # 开始算）。since_date 缺失（升级前旧账本）→ 有效建仓日 = 今天（基准从
+    # 升级日起算，下次更新该股时记准确日期）。仅持仓股传入，池内其余股不受
+    # 影响（回测/新建仓路径不传 since_map，零影响）。
+    _today = str(_beijing_today())[:10]
+    since_map: Dict[str, str] = {}
+    for c in user:
+        u = user[c] if isinstance(user[c], dict) else {}
+        since_map[c] = str(u.get("since_date") or "")[:10] or _today
     try:
         _sp, _up, con, pool = _load_pool_ctx()
         try:
             rows = _strategy_state_rows(_sp, con, sorted(set(pool.codes) | set(user.keys())),
-                                    now=_beijing_today())
+                                    now=_today, since_map=since_map)
         finally:
             con.close()
     except (LakeLocked, LakeMissing, LakeInvalidFile):
@@ -1224,6 +1235,19 @@ def get_my_positions() -> Dict[str, Any]:
         s = rows.get(c, {})
         shares = float(u.get("shares") or 0)
         cost = float(u.get("cost_price") or 0)
+        # v8.2.0 累计差值口径（Joel 2026-11-13 定案）：理论持仓 = 用户建仓日起
+        # 策略买入的累计股数（shares_since，状态机真实口径——含建仓后所有轮次
+        # 的买入；建仓早于时机/晚于多轮均正确）；实际 = 账本股数；差值 =
+        # max(0, 理论−实际)。湖中无数据 → 三字段 None。实时新档触发的补差见
+        # signals（build_signals 同口径 + 本档手数）。
+        strat_shares = s.get("shares")  # 状态机全历史模拟累计股数（仅展示参考）
+        shares_since = s.get("shares_since")  # v8.2.0：建仓日起策略买入累计
+        lot = int(_sp.lot_size) if _sp is not None else 100
+        theory_lots = (round(shares_since / lot, 2)
+                       if shares_since is not None else None)
+        actual_lots = round(shares / lot, 2)
+        gap_lots = (round(max(0.0, theory_lots - actual_lots), 2)
+                    if theory_lots is not None else None)
         positions.append({
             "ts_code": c,
             "name": s.get("name") or c,
@@ -1234,9 +1258,14 @@ def get_my_positions() -> Dict[str, Any]:
             "pnl": None,
             "pnl_pct": None,
             "updated_at": u.get("updated_at"),
+            "since_date": u.get("since_date"),  # v8.2.0：建仓日（理论持仓锚点）
             # 策略状态机参考（池外股/湖中无数据时字段为 None）
             "in_pos": s.get("in_pos"),
-            "strat_shares": s.get("shares"),
+            "strat_shares": strat_shares,
+            "strat_shares_since": shares_since,  # v8.2.0：建仓日起策略买入累计
+            "theory_lots": theory_lots,
+            "actual_lots": actual_lots,
+            "gap_lots": gap_lots,
             "k_level": s.get("k_level"),
             "next_add_price": s.get("next_add_price"),
             "next_rearm_price": s.get("next_rearm_price"),
@@ -1670,9 +1699,25 @@ def get_strategy_signals() -> Dict[str, Any]:
     }
 
 
+def _up_entry(old: Optional[Dict[str, Any]], shares: float, cost: float,
+              now: str) -> Dict[str, Any]:
+    """v8.2.0 持仓条目构造：since_date = 建仓日（理论持仓锚点，Joel 2026-11-13
+    定案）——仅首次建仓记录（无旧记录/旧记录缺 since_date → 当天），其后加仓/
+    减仓/改价沿用不动（锚点 = 这轮建仓的开始，不是最近一次修改）。清仓重买 =
+    新条目新锚点（调用方 pop 后重建）。
+    """
+    since = (old or {}).get("since_date") if isinstance(old, dict) else None
+    return {"shares": shares, "cost_price": cost, "updated_at": now,
+            "since_date": str(since)[:10] if since else str(_beijing_today())[:10]}
+
+
 @app.put("/api/my_positions")
 def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """upsert 单只持仓：shares=0 为删除。"""
+    """upsert 单只持仓：shares=0 为删除。
+
+    v8.2.0：可选 since_date（建仓日 YYYY-MM-DD）——理论持仓锚点；显式传入
+    （非空）→ 覆盖（含修正旧持仓的真实建仓日），未传 → 沿用既有/首建当天。
+    """
     code = str(payload.get("ts_code", "")).strip()
     if not _TS_CODE_RE.fullmatch(code):
         raise HTTPException(status_code=400, detail="ts_code 应为 sh.600000 / sz.000001 形式")
@@ -1685,12 +1730,18 @@ def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="shares/cost_price 应为数字")
     if shares_f < 0 or cost_f < 0:
         raise HTTPException(status_code=400, detail="shares/cost_price 不能为负")
+    since_raw = str(payload.get("since_date") or "").strip()[:10]
+    if since_raw and not _DATE_RE.fullmatch(since_raw):
+        raise HTTPException(status_code=400, detail="since_date 应为 YYYY-MM-DD")
     positions = _up_read()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if shares_f == 0:
         positions.pop(code, None)
     else:
-        positions[code] = {"shares": shares_f, "cost_price": cost_f, "updated_at": now}
+        e = _up_entry(positions.get(code), shares_f, cost_f, now)
+        if since_raw:
+            e["since_date"] = since_raw
+        positions[code] = e
     _up_write(positions)
     return {"ok": True, "ts_code": code, "n": len(positions)}
 
@@ -1780,7 +1831,7 @@ def record_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
     if new_shares <= 0:
         positions.pop(code, None)
     else:
-        positions[code] = {"shares": new_shares, "cost_price": new_cost, "updated_at": now}
+        positions[code] = _up_entry(positions.get(code), new_shares, new_cost, now)
     _up_write(positions)
 
     trades = _trades_read()

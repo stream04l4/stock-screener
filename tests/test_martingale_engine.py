@@ -362,6 +362,41 @@ def test_state_projection_fields():
     assert flag[-1] == 1
 
 
+def test_state_rows_shares_since_anchored():
+    """v8.2.0 shares_since：用户建仓日起（含当日）策略买入累计；
+    since_map=None（回测/状态页路径）不产字段——零影响红线。"""
+    import duckdb
+    from martingale.engine import state_rows
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE kline_daily_hfq (ts_code VARCHAR, date DATE, close DOUBLE)")
+    con.execute("CREATE TABLE kline_daily (ts_code VARCHAR, date DATE, close DOUBLE)")
+    con.execute("CREATE TABLE dividend_events (ts_code VARCHAR, ex_date DATE, "
+                "cash_dps DOUBLE, stk_div DOUBLE)")
+    con.execute("CREATE TABLE stock_master (ts_code VARCHAR, name VARCHAR)")
+    # 100 → 84（回撤 16% >= 15% 首仓 1 手）→ 79.8（<= P0*0.95 加仓 2 手）
+    for dt, c in (("2024-01-02", 100.0), ("2024-01-03", 84.0),
+                  ("2024-01-04", 79.8), ("2024-01-05", 79.8)):
+        con.execute("INSERT INTO kline_daily_hfq VALUES ('sh.600001', ?, ?)", [dt, c])
+        con.execute("INSERT INTO kline_daily VALUES ('sh.600001', ?, ?)", [dt, c])
+    con.execute("INSERT INTO stock_master VALUES ('sh.600001', '测试')")
+    p = _params()  # first_lots=1 / step=1 / lot=100
+    r0 = state_rows(p, con, ["sh.600001"])
+    assert "shares_since" not in r0["sh.600001"]  # 回测路径零影响
+    assert r0["sh.600001"]["shares"] == 300.0  # 1 手 + 2 手（全历史）
+    # 建仓日锚定：01-04 起（含当日）→ 仅加仓 2 手
+    r1 = state_rows(p, con, ["sh.600001"], since_map={"sh.600001": "2024-01-04"})
+    assert r1["sh.600001"]["shares_since"] == 200.0
+    # 含当日：01-03（首仓日）起 → 1 + 2 手
+    r2 = state_rows(p, con, ["sh.600001"], since_map={"sh.600001": "2024-01-03"})
+    assert r2["sh.600001"]["shares_since"] == 300.0
+    # 全历史早于建仓日 → 0
+    r3 = state_rows(p, con, ["sh.600001"], since_map={"sh.600001": "2024-02-01"})
+    assert r3["sh.600001"]["shares_since"] == 0.0
+    # 非 since_map 成员股不产字段（池内非持仓股守卫）
+    r4 = state_rows(p, con, ["sh.600001"], since_map={"sh.999999": "2024-01-01"})
+    assert "shares_since" not in r4["sh.600001"]
+
+
 def test_aggregate_into_fill_last_value():
     """组合聚合末值结转：停牌后持仓不消失（g_value 末值向前结转）。"""
     from martingale.engine import aggregate_into

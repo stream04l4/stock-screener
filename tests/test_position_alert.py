@@ -33,16 +33,21 @@ import position_alert as pa  # noqa: E402
 from martingale.signals import build_signals  # noqa: E402
 
 FAKE_NOW = "2026-10-26T14:30:00+08:00"   # 周一 14:30 北京（交易时段内）
+# v8.2.0 差值口径（建仓日锚定）：601728 账本 100 股=1 手 < 理论 2 手（SP
+# 1/1，k=1 本档 = 1+1×1；shares_since=0：建仓日=FAKE_NOW 当天，历史买入
+# 均早于建仓日）→ 补 1 手；若账本 ≥2 手则不推（持仓够了）
 USER = {
-    "sh.601728": {"shares": 500.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+    "sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
     "sh.601398": {"shares": 1000.0, "cost_price": 8.0, "updated_at": FAKE_NOW},
 }
 # 601728 触发（5.98 ≤ 6.00，in_pos k=1）；601398 未触发（8.50 > 8.00）
+# shares_since：v8.2.0 建仓日起策略买入累计（=0，模拟状态机全历史买入均
+# 早于用户建仓日——「理论加仓了很多轮后才建仓」场景）
 ROWS = {
     "sh.601728": {"name": "中国神华", "last_price": 6.02, "in_pos": True,
-                  "k_level": 1, "next_add_price_raw": 6.0},
+                  "k_level": 1, "next_add_price_raw": 6.0, "shares_since": 0.0},
     "sh.601398": {"name": "工商银行", "last_price": 8.55, "in_pos": True,
-                  "k_level": 0, "next_add_price_raw": 8.0},
+                  "k_level": 0, "next_add_price_raw": 8.0, "shares_since": 0.0},
 }
 SP = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=1,
                      add_lots_step=1)  # v7.0.28 手数口径
@@ -171,7 +176,10 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     content = body["content"]
     assert "中国神华" in content and "sh.601728" in content
     assert "5.980" in content and "6.000" in content   # 现价/触发价
-    assert "2 手" in content                           # 第 k=1 档 = 2 手（v7.0.28）
+    # v8.2.0 建仓日锚定：理论 = shares_since(0)/100 + 本档 1+1×1 = 2 手，
+    # 账本 1 手 → 补 1 手
+    assert "1 手" in content
+    assert "策略理论累计 2.0 手 / 现持 1.0 手" in content
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
@@ -195,6 +203,37 @@ def test_run_no_repush_after_pushed(monkeypatch, tmp_path):
     monkeypatch.setattr(pa, "_beijing_now", lambda: next_day)
     assert pa.run(force=True, state_path=state_path) == 0
     assert len(posts) == 1, "已推 → 次日不重推（新档位/新点位才是新键）"
+
+
+# ---------------------------------------------------------------------------
+# v8.2.0 建仓日锚定口径（管道级：账本 vs shares_since + 本档）
+# SP（first_lots=1/step=1）+ ROWS 601728（k=1 触发 → 本档 1+1×1=2 手；
+# shares_since=0 → 理论 2 手）
+# ---------------------------------------------------------------------------
+
+def test_run_gap_sufficient_no_push(monkeypatch, tmp_path):
+    """账本 3 手 ≥ 理论 2 手 → gap<0 → 不推（持仓够了/超配）。"""
+    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+            "sh.601398": USER["sh.601398"]}
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user)
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert posts == [], f"持仓够了不该推: {posts}"
+
+
+def test_run_gap_short_pushes_fill(monkeypatch, tmp_path):
+    """账本 1 手 < 理论 2 手 → 补 1 手并标注差值。"""
+    user = {"sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+            "sh.601398": USER["sh.601398"]}
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user)
+    rc = pa.run(force=True, state_path=state_path)
+    assert rc == 0
+    assert len(posts) == 1, posts
+    content = posts[0]["json"]["content"]
+    assert "sh.601728" in content
+    assert "建议补至第 2 档，1 手" in content
+    assert "策略理论累计 2.0 手 / 现持 1.0 手" in content
+    assert "工商银行" not in content
 
 
 def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):

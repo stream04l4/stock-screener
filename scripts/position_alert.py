@@ -186,14 +186,19 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
     for s in signals:
         code, name = s["ts_code"], (s.get("name") or s["ts_code"])
         names.append(name)
+        # v8.2.0 累计差值口径：建议量 = 理论累计 vs 现持的差值（build_signals
+        # 已算）；持仓够了的信号根本不会到这里（不产信号）。
+        gap_note = (f"（策略理论累计 {s['theory_lots']} 手 / 现持 {s['actual_lots']} 手）"
+                    if s.get("theory_lots") is not None and s.get("actual_lots") is not None
+                    else "")
         if s["action"] == "add":
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>加仓线 第 {s['k_level']} 档</b>")
-            tail = (f"建议加仓至第 {s['next_level']} 档，{s['suggested_lots']} 手"
+            tail = (f"建议补至第 {s['next_level']} 档，{s['suggested_lots']} 手{gap_note}"
                     if s.get("suggested_lots") else "建议加仓一档")
         else:
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
                      + (f"（{s['note']}）" if s.get("note") else ""))
-            tail = (f"首仓触发，{s['suggested_lots']} 手"
+            tail = (f"首仓触发，{s['suggested_lots']} 手{gap_note}"
                     if s.get("suggested_lots") else "首仓触发")
         if s.get("delayed"):
             # v7.0.31 补推兜底：信号日非当日（前几轮应推未推成功/时机当晚才
@@ -269,6 +274,12 @@ def run(force: bool = False, dry_run: bool = False,
         return 3
     # v7.0.32 除权日修正参照日（北京日期——A 股 ex_date 是北京时间日期）
     _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
+    # v8.2.0：用户建仓日锚定（理论持仓从建仓时算；since_date 缺失 → 今天）
+    _bj_today_s = str(_bj_today)[:10]
+    since_map: Dict[str, str] = {}
+    for c in held_codes:
+        u = user[c] if isinstance(user[c], dict) else {}
+        since_map[c] = str(u.get("since_date") or "")[:10] or _bj_today_s
     try:
         universe = set(pool.codes) | set(held_codes)
         # include_buys=True 必须与 Web 同口径（v7.0.31 山煤国际实案）：
@@ -276,7 +287,8 @@ def run(force: bool = False, dry_run: bool = False,
         # 首仓触发线恒 None，首仓推送通道结构性全关（Web 显示首仓线、
         # 推送侧却拿不到线 = 口径漂移）
         rows = (_strategy_state_rows(_sp, con, sorted(universe),
-                                     include_buys=True, now=_bj_today)
+                                     include_buys=True, now=_bj_today,
+                                     since_map=since_map)
                 if universe else {})
     except Exception as exc:  # noqa: BLE001
         con.close()
@@ -334,6 +346,10 @@ def run(force: bool = False, dry_run: bool = False,
             "next_add_price_raw": s.get("next_add_price_raw"),
             "spot_price": (spot.get(c) or {}).get("price"),
             "shares": float(u.get("shares") or 0),
+            # v8.2.0 累计差值口径：建仓日起策略买入累计（build_signals 据此算
+            # 理论 vs 实际差值——持仓够了不提醒）；strat_shares 全历史累计仅参考
+            "strat_shares_since": s.get("shares_since"),
+            "strat_shares": s.get("shares"),
         })
     from martingale.signals import build_signals
 

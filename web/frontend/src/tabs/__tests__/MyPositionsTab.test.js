@@ -322,7 +322,7 @@ describe("MyPositionsTab · 录入条", () => {
     const w = mk();
     await flushPromises();
     const inputs = w.findAll(".add-bar input");
-    expect(inputs).toHaveLength(3);
+    expect(inputs).toHaveLength(4); // 代码/股数/成本价/建仓日（v8.2.0）
     await inputs[0].setValue("601088"); // 缺 sh. 前缀
     await inputs[1].setValue("100");
     await inputs[2].setValue("30");
@@ -336,7 +336,7 @@ describe("MyPositionsTab · 录入条", () => {
     await flushPromises();
     expect(puts()).toHaveLength(1);
     expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 100, cost_price: 30 });
+      { ts_code: "sh.601088", shares: 100, cost_price: 30, since_date: "" });
     expect(w.text()).toContain("已保存 sh.601088");
     w.unmount();
   });
@@ -486,11 +486,12 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     expect(w.text()).toContain("42.07"); // 弹层展示原始口径（与最新价同单位）
     expect(w.find(".d-row").exists()).toBe(true);
     expect(w.text()).toContain("再武装触发价");
-    // 编辑 input 预填（股数/成本）
+    // 编辑 input 预填（股数/成本/建仓日——v8.2.0 无 since_date 时预填空）
     const editInputs = w.findAll(".edit-bar input");
-    expect(editInputs).toHaveLength(2);
+    expect(editInputs).toHaveLength(3);
     expect(editInputs[0].element.value).toBe("1200");
     expect(editInputs[1].element.value).toBe("25");
+    expect(editInputs[2].element.value).toBe("");
     // 改股数 → 保存
     await editInputs[0].setValue("1500");
     const editBtns = w.findAll(".edit-bar button");
@@ -498,13 +499,13 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 编辑）", () => {
     await flushPromises();
     expect(puts()).toHaveLength(1);
     expect(JSON.parse(puts()[0][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 1500, cost_price: 25 });
+      { ts_code: "sh.601088", shares: 1500, cost_price: 25, since_date: "" });
     // 删除（confirm stub=true）→ PUT shares=0
     await editBtns.find((b) => b.text() === "删除").trigger("click");
     await flushPromises();
     expect(puts()).toHaveLength(2);
     expect(JSON.parse(puts()[1][1].body)).toEqual(
-      { ts_code: "sh.601088", shares: 0, cost_price: 25 });
+      { ts_code: "sh.601088", shares: 0, cost_price: 25, since_date: "" });
     w.unmount();
   });
 

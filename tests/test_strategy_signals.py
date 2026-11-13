@@ -135,6 +135,97 @@ def test_build_signals_unchanged_shape_and_sort():
 
 
 # ---------------------------------------------------------------------------
+# v8.2.0 累计差值口径（Joel 2026-11-13 定案）：
+# 理论持仓 = 用户**建仓日起**策略买入累计（strat_shares_since）+ 本档手数；
+# 实际 = 账本股数；差值 > 0 → 建议补差值（向上取整到整手）；≤ 0（够了/超配）
+# → 不产信号。本档手数 = in_pos 第 k 档 → first_lots+k×step；未持仓 → first_lots。
+# 生产 sizing：first_lots=2 / add_lots_step=2 / lot_size=100（2/4/6/8 手）。
+# ---------------------------------------------------------------------------
+
+SP2 = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=2,
+                      add_lots_step=2)
+
+
+def _gap_pos(**kw):
+    base = {"ts_code": "sh.600036", "name": "招商银行", "spot_price": 30.0,
+            "last_price": 30.0, "next_add_price_raw": 31.0,
+            "in_pos": True, "k_level": 1, "strat_shares_since": 0.0,
+            "shares": 0.0}  # 默认：首次加仓档已触发（本档 2+1×2=4 手）
+    base.update(kw)
+    return base
+
+
+def test_gap_first_buy_sufficient_no_signal():
+    """Joel 例 1：首仓档已触发、建仓后策略仅买 0、持仓已有 2 手 → 够了不提醒。"""
+    sigs = build_signals(
+        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=200)], SP2)
+    assert sigs == []
+
+
+def test_gap_first_addon_short_suggests_fill():
+    """首次加仓档触发：建仓后策略已买 2 手（首仓）+ 本档 4 手 = 理论 6 手，
+    实际 4 手 → 补 2 手。"""
+    sigs = build_signals([_gap_pos(strat_shares_since=200, shares=400)], SP2)
+    assert len(sigs) == 1
+    s = sigs[0]
+    assert s["action"] == "add" and s["suggested_lots"] == 2
+    assert s["theory_lots"] == 6.0 and s["actual_lots"] == 4.0
+    assert s["gap_lots"] == 2.0
+
+
+def test_gap_exact_match_no_signal():
+    """建仓后策略已买 2 + 本档 4 = 6 手；实际 6 手 → 相等不提醒。"""
+    assert build_signals([_gap_pos(strat_shares_since=200, shares=600)], SP2) == []
+
+
+def test_gap_overweight_no_signal():
+    """实际 > 理论（自买超配策略建仓后买入）→ 不提醒。"""
+    sigs = build_signals(
+        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=900)], SP2)
+    assert sigs == []
+
+
+def test_gap_first_buy_unheld_suggests_first_lots():
+    """未持仓首仓档触发：建仓后策略买 0 + 本档 2 手、实际 0 → 补 2 手（buy）。"""
+    sigs = build_signals(
+        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=0)], SP2)
+    assert len(sigs) == 1
+    assert sigs[0]["action"] == "buy" and sigs[0]["suggested_lots"] == 2
+    assert sigs[0]["theory_lots"] == 2.0 and sigs[0]["gap_lots"] == 2.0
+
+
+def test_gap_fractional_actual_ceil_lots():
+    """实际 4.5 手 vs 理论 6 手 → gap 1.5 → 向上取整建议 2 手。"""
+    sigs = build_signals([_gap_pos(strat_shares_since=200, shares=450)], SP2)
+    assert sigs[0]["suggested_lots"] == 2
+    assert sigs[0]["gap_lots"] == 1.5
+
+
+def test_gap_missing_strat_fallback_legacy_shape():
+    """strat_shares_since/shares 缺失（湖中无数据/旧调用方）→ 旧行为：建议本档
+    手数、不附差值字段（形状守护 test_build_signals_unchanged_shape_and_sort）。"""
+    p = _gap_pos()
+    p.pop("strat_shares_since")
+    p.pop("shares")
+    sigs = build_signals([p], SP2)  # k=1 → 本档 2+1×2=4 手
+    assert len(sigs) == 1
+    assert sigs[0]["suggested_lots"] == 4
+    assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
+
+
+def test_gap_since_anchored_not_full_history():
+    """口径钉死（2026-11-13 定案）：理论用**建仓日起**策略买入累计
+    （strat_shares_since），而非全历史模拟累计（strat_shares，backtest 尺度）。
+    建仓后策略仅买 2 手、k=1 触发本档 4 手 → 理论 6 手、账本 1 手 → 补 5 手
+    （即使全历史 strat_shares 高达数百手也不计入）。"""
+    sigs = build_signals(
+        [_gap_pos(strat_shares_since=200, shares=100, strat_shares=80389)], SP2)
+    assert len(sigs) == 1
+    assert sigs[0]["suggested_lots"] == 5
+    assert sigs[0]["theory_lots"] == 6.0 and sigs[0]["actual_lots"] == 1.0
+
+
+# ---------------------------------------------------------------------------
 # engine buys 标注（合成数据，同 test_martingale_engine 风格）
 # ---------------------------------------------------------------------------
 

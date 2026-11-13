@@ -8,6 +8,7 @@ pool / positions（as_of 校验）/ _validate_strategy 错误分支 / lake route
 from __future__ import annotations
 
 import copy
+import math
 import sys
 from pathlib import Path
 
@@ -514,6 +515,22 @@ def test_my_positions_update_and_delete(tmp_positions_file, bt_copy):
     assert wapp.get_my_positions()["n"] == 0
 
 
+def test_my_positions_gap_fields_consistency(tmp_positions_file, bt_copy):
+    """v8.2.0：持仓行含 策略理论(手)/实际(手)/差值(手)。理论 = 当前轮已执行档数
+    k_level（in_pos 时）的 cycle_lots，与 k_level/in_pos/策略参数自洽；
+    差值 = max(0, 理论−实际)；_sp 不可用时理论/差值为 None。"""
+    wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
+    p = wapp.get_my_positions()["positions"][0]
+    assert p["actual_lots"] == 5.0  # 500 股 / 100
+    st = wapp.get_strategy()["json"]["strategy"]
+    fl, step = st["first_lots"], st["add_lots_step"]
+    k = p["k_level"] or 0
+    n = k if p["in_pos"] else 0  # 当前轮已执行档数
+    expected = n * fl + step * n * (n - 1) / 2
+    assert p["theory_lots"] == expected
+    assert abs(p["gap_lots"] - max(0.0, expected - 5.0)) < 0.011
+
+
 def test_my_positions_rejects_bad_code(tmp_positions_file):
     for bad in ("600036", "sh.12345", "SH.600036", "sh.600036x", ""):
         with pytest.raises(HTTPException) as e:
@@ -893,7 +910,14 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert s["action"] == "add"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_lots"] == wapp.get_strategy()["json"]["strategy"]["first_lots"]  # 第 k=0 档 = first_lots（生产活动值）
+    # v8.2.0 累计差值口径（当前轮）：k=0（本轮未启动）→ 持仓行理论 0；
+    # 首仓档触发 → 本档执行后 1 档 = first_lots；实际 = 账本 1 手；建议 = 差值
+    p = out["positions"][0]
+    fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
+    assert p["theory_lots"] == 0.0
+    assert s["theory_lots"] == fl and s["actual_lots"] == 1.0
+    assert s["suggested_lots"] == max(1, math.ceil(fl - 1.0))
+    assert s["gap_lots"] == round(fl - 1.0, 2)
     assert out["positions"][0]["spot_price"] == 40.0
 
 
@@ -961,7 +985,8 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert p0["in_pos"] is False and p0["k_level"] == 0
     assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
     assert out0["signals"] == []
-    # 实时价 70.0 ≤ 75.0 → buy 信号，建议手数 = first_lots = 1
+    # 实时价 70.0 ≤ 75.0 → buy 信号；v8.2.0 差值口径：严格策略下从未触线
+    # （状态机累计 0）→ 理论 = first_lots，实际 = 账本 1 手 → 建议 = 差值
     _mock_spot(monkeypatch, {"sh.600941": 70.0})
     out = wapp.get_my_positions()
     assert len(out["signals"]) == 1
@@ -969,4 +994,9 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert s["ts_code"] == "sh.600941" and s["action"] == "buy"
     assert s["price"] == 70.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    assert s["suggested_lots"] == wapp.get_strategy()["json"]["strategy"]["first_lots"]  # first_lots（当前策略活动值）
+    fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
+    p = out["positions"][0]
+    assert p["theory_lots"] == 0.0  # 从未触线 → 状态机累计 0 股
+    assert s["theory_lots"] == fl and s["actual_lots"] == 1.0
+    assert s["suggested_lots"] == max(1, math.ceil(fl - 1.0))  # 差值 = fl − 1
+    assert s["gap_lots"] == round(fl - 1.0, 2)

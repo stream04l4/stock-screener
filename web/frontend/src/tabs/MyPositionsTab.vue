@@ -161,6 +161,10 @@ const SIG_HISTORY_COLS = [
 const MY_COLS = [
   ["ts_code", "代码"], ["name", "名称"],
   ["shares", "股数", true], ["cost_price", "成本价", true], ["last_price", "最新价", true],
+  // v8.2.0 累计差值口径（Joel 2026-11-13）：理论=状态机累计手数、实际=账本手数、
+  // 差值=max(0,理论−实际)；湖中无数据的股为 "—"。实时新档触发的补差见顶部信号条。
+  ["theory_lots", "策略理论(手)", true], ["actual_lots", "实际(手)", true],
+  ["gap_lots", "差值(手)", true],
   ["market_value", "持仓市值", true], ["pnl", "浮动盈亏", true], ["pnl_pct", "盈亏%", true],
   ["k_level", "策略档", true],
   ["next_add_price_raw", "下次加仓价", true], ["next_rearm_price_raw", "再武装价", true],
@@ -178,7 +182,7 @@ const displayRows = computed(() => (myData.value?.positions || []).map((p) => {
 // ---------------------------------------------------------------------------
 // 顶部录入条（添加/更新）
 // ---------------------------------------------------------------------------
-const add = reactive({ code: "", shares: "", cost: "" });
+const add = reactive({ code: "", shares: "", cost: "", since: "" });
 const addMsg = ref("");
 const addErr = ref("");
 const CODE_RE = /^[a-z]{2}\.\d{6}$/;
@@ -251,12 +255,15 @@ function onCodeKeyup(e) {
   if (e.key === "Enter") addNew();
 }
 
-async function putPos(code, shares, cost) {
+async function putPos(code, shares, cost, since) {
   return api("/api/my_positions", {
     method: "PUT",
-    body: JSON.stringify({ ts_code: code, shares: Number(shares), cost_price: Number(cost) }),
+    body: JSON.stringify({ ts_code: code, shares: Number(shares), cost_price: Number(cost),
+                           since_date: since || "" }),
   });
 }
+
+const SINCE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 async function addNew() {
   addErr.value = "";
@@ -264,13 +271,15 @@ async function addNew() {
   const code = add.code.trim().toLowerCase();
   const shares = Number(add.shares);
   const cost = Number(add.cost);
+  const since = (add.since || "").trim();
   if (!CODE_RE.test(code)) { addErr.value = "代码应为 sh.600000 / sz.000001 形式"; return; }
   if (!Number.isFinite(shares) || shares <= 0) { addErr.value = "股数应为正数"; return; }
   if (!Number.isFinite(cost) || cost < 0) { addErr.value = "成本价应为非负数"; return; }
+  if (since && !SINCE_RE.test(since)) { addErr.value = "建仓日应为 YYYY-MM-DD"; return; }
   try {
-    await putPos(code, shares, cost);
+    await putPos(code, shares, cost, since);
     addMsg.value = `已保存 ${code}`;
-    add.code = ""; add.shares = ""; add.cost = "";
+    add.code = ""; add.shares = ""; add.cost = ""; add.since = "";
     refresh();
   } catch (e) {
     addErr.value = e.message;
@@ -281,7 +290,7 @@ async function addNew() {
 // 行点击弹层（策略参考 + 编辑股数/成本）
 // ---------------------------------------------------------------------------
 const modalRow = ref(null);
-const edit = reactive({ shares: "", cost: "" });
+const edit = reactive({ shares: "", cost: "", since: "" });
 const saveMsg = ref("");
 const saveErr = ref("");
 
@@ -289,6 +298,7 @@ function onRow(r) {
   modalRow.value = r;
   edit.shares = String(r.shares ?? "");
   edit.cost = String(r.cost_price ?? "");
+  edit.since = String(r.since_date ?? "").slice(0, 10);
   saveMsg.value = "";
   saveErr.value = "";
   // 买入登记预填：该股有活跃信号 → 建议股数（建议手数×100，v7.0.28 手数口径）；价格默认最新价
@@ -307,10 +317,12 @@ async function saveEdit() {
   const code = modalRow.value.ts_code;
   const shares = Number(edit.shares);
   const cost = Number(edit.cost);
+  const since = (edit.since || "").trim();
   if (!Number.isFinite(shares) || shares < 0) { saveErr.value = "股数应为非负数"; return; }
   if (!Number.isFinite(cost) || cost < 0) { saveErr.value = "成本价应为非负数"; return; }
+  if (since && !SINCE_RE.test(since)) { saveErr.value = "建仓日应为 YYYY-MM-DD"; return; }
   try {
-    await putPos(code, shares, cost);
+    await putPos(code, shares, cost, since);
     saveMsg.value = shares === 0 ? "已删除" : "已保存";
     if (shares === 0) modalRow.value = null;
     refresh();
@@ -506,6 +518,8 @@ function pnlColor(v) {
         </div>
         <input v-model="add.shares" class="inp num" placeholder="股数" @keyup.enter="addNew" />
         <input v-model="add.cost" class="inp num" placeholder="成本价" @keyup.enter="addNew" />
+        <input v-model="add.since" class="inp num" type="date" title="建仓日（可选；理论持仓锚点，默认今天）"
+               @keyup.enter="addNew" />
         <button class="primary-btn" @click="addNew">保存</button>
         <span v-if="addMsg" class="msg-ok">{{ addMsg }}</span>
         <span v-if="addErr" class="msg-err">{{ addErr }}</span>
@@ -528,8 +542,11 @@ function pnlColor(v) {
         <span>现价 {{ s.price }} ≤ 触发价 {{ s.next_add_price }}</span>
         <span>{{ s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档` }}</span>
         <span v-if="s.suggested_lots != null">
-          建议{{ s.action === "buy" ? "买入" : "加仓" }}
+          建议{{ s.action === "buy" ? "买入" : "补" }}
           <b>{{ s.suggested_lots }} 手</b>
+          <span v-if="s.theory_lots != null" class="muted small">
+            （理论累计 {{ s.theory_lots }} 手 / 现持 {{ s.actual_lots }} 手）
+          </span>
           <span v-if="s.price" class="muted small">≈ ¥{{ ((s.suggested_lots * 100 * s.price) / 10000).toFixed(1) }}万</span>
         </span>
       </div>
@@ -609,6 +626,8 @@ function pnlColor(v) {
         <div class="detail-grid">
           <div v-for="[k, label] in [
             ['ts_code', '代码'], ['in_pos', '策略持仓中'], ['strat_shares', '策略模拟股数'],
+            ['since_date', '建仓日'], ['strat_shares_since', '建仓日起策略股数'],
+            ['theory_lots', '策略理论(手)'], ['actual_lots', '实际(手)'], ['gap_lots', '差值(手)'],
             ['k_level', '当前档位 k'],
             ['next_add_price_raw', '下一加仓触发价'], ['next_rearm_price_raw', '再武装触发价'],
             ['last_price', '最新价'], ['end_date', '数据截至'],
@@ -625,6 +644,11 @@ function pnlColor(v) {
           <label class="edit-field">
             <span>成本价</span>
             <input v-model="edit.cost" class="inp num" />
+          </label>
+          <label class="edit-field">
+            <span>建仓日</span>
+            <input v-model="edit.since" class="inp num" type="date"
+                   title="理论持仓锚点：策略从该日起的买入累计才计入「策略理论」" />
           </label>
           <button class="primary-btn" @click="saveEdit">保存</button>
           <button class="ghost-btn" @click="deleteRow">删除</button>

@@ -583,7 +583,8 @@ def pending_exrights_factor(con, codes, now) -> Dict[str, float]:
 
 def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
                include_buys: bool = False, now=None,
-               tp: Optional[TimingParams] = None) -> Dict[str, Dict[str, Any]]:
+               tp: Optional[TimingParams] = None,
+               since_map: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
     """对 codes 逐股跑状态机 → {code: 持仓行}（Web /api/positions、
     /api/my_positions、/api/strategy_signals 与 scripts/signal_touch.py 共用——
     单一口径，防漂移；v7.0.20 由 web/app.py._strategy_state_rows 下沉至此）。
@@ -598,6 +599,11 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
     tp=v8.1.0 首仓双条件②（timing 段 price_window_years/price_pctile_max）——
     生产路径（页面/推送/触碰判定）必传，模拟状态机与回测同一口径；None = ②
     关闭（单元测试/旧调用方兼容，勿在生产路径依赖）。
+    since_map=v8.2.0 额外持仓提醒专用（Joel 2026-11-13 定案）：{code: 用户建仓
+    日 YYYY-MM-DD} → 行内附 shares_since = 该日起（含当日）策略买入的累计股数
+    （「理论上当前应该持仓」= 用户建仓时点起策略会买的部分，而非全历史累计）。
+    **仅持仓判断路径传入**；回测/新建仓/状态页不传（None → 零影响，f6 红线
+    不变）。
     """
     names, data, divs = load(con, codes=list(codes), start=None, end=end)
     rows: Dict[str, Dict[str, Any]] = {}
@@ -655,6 +661,13 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
             rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
         else:
             rows[c]["next_rearm_price_raw"] = None
+        # v8.2.0：用户建仓日起的策略买入累计（仅持仓判断路径；since_map=None
+        # 时整段跳过——回测/新建仓/状态页零影响）
+        if since_map is not None and c in since_map:
+            since = str(since_map[c])[:10]
+            shares_since = sum(b[5] * sp.lot_size for b in _buys
+                               if str(b[0])[:10] >= since)
+            rows[c]["shares_since"] = round(float(shares_since), 2)
         if include_buys:
             # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
             # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」；
