@@ -60,24 +60,37 @@ const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里�
 const sigStocks = computed(() => sigData.value?.stocks || []);
 // 当前信号 = active（现价在区内）+ touched（v7.0.20：今日已触线、现价回出——
 // 盘中达成过信号就保留到当日，次日行情日滚动后自动移出、移入历史段）
-// 且（v7.0.23 Joel 定案「非持仓首仓 = 时机成熟 且 价跌破首仓线，双条件」）：
-// 持仓股（加仓信号，不受时机限制）或非持仓股**时机达标**（timing_ok=true——
-// 非持仓信号 = 买入·首仓，时机未过/无时机行 fail-closed 不入段，与「即将进入」
-// 同一门）。旧 v7.0.20 的 in_pos 排除（非持仓模拟加仓档无意义）随口径废除：
-// 非持仓触发线已恒为首仓线，active 即真实首仓信号。
+// 且 **action 非空 = 有真实信号**（v8.2.0 补，Joel 2026-11-13：「这种属于没有
+// 信号，不应该出现在当前信号里」——无动作的一律不入段）：
+// - 持仓股 k≥1 加仓（不受时机限制，差值判定后仍有差值才入段）/
+//   首档 k=0 过时机门（二次建仓，v8.2.0 补）；
+// - 非持仓股 = 买入·首仓，须时机达标（action 由后端时机门保证非空）；
+// - 时机未过 / 持仓已够（action=null）→ 不入本段；价格已在区但分位临近
+//   时机线（40%<分位≤50%）→ 移入「即将进入」段（见 sigApproach）。
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
-         && (s.held || s.timing_ok === true)));
+         && s.action != null));
 // 即将进入（v7.0.22 定案；v7.0.31 Joel 定案 C：非持仓股分位放宽到 ≤50%
 // 展示——40% 时机门未过但价格已临区的股票 = 最有提前量价值的信号，标
 // 「时机未过」明细；原「timing_ok 才展示」会让这类股票在时机翻转前完全
-// 不可见，翻转当晚才突然出信号（山煤国际 2026-11-10 实案））：价格带
-// （5% 内临线）——持仓股照展示（加仓不受时机限制）；非持仓股须
-// timing_pctile ≤ 50（无分位数据 fail-closed 不展示）。
-const sigApproach = computed(() => sigStocks.value.filter(
-  (s) => s.status === "approaching"
-         && (s.held || (typeof s.timing_pctile === "number"
-                        && s.timing_pctile <= 50))));
+// 不可见，翻转当晚才突然出信号（山煤国际 2026-11-10 实案））：
+// ① 价格带（5% 内临线）——持仓股照展示（加仓不受时机限制）；非持仓股须
+//    timing_pctile ≤ 50（无分位数据 fail-closed 不展示）；
+// ② 临近时机线（v8.2.0 补，Joel 2026-11-13：「直到它跌到距离时机线比较近
+//    的时候，就可以出现在即将进入的信号区」）——价格已在信号区（active/
+//    touched）但无信号（时机门未过，如持仓股二次建仓位）且 40% < 分位 ≤50%
+//    → 入段标「临近时机线」；分位远离（>50%）= 两区均不展示（避免噪音）；
+//    分位 ≤40% 本应已出信号（action 非空 → 当前信号段），此处兜底不重复展示。
+const sigApproach = computed(() => sigStocks.value.filter((s) => {
+  if (s.status === "approaching") {
+    return s.held || (typeof s.timing_pctile === "number"
+                      && s.timing_pctile <= 50);
+  }
+  return (s.status === "active" || s.status === "touched")
+         && s.action == null
+         && typeof s.timing_pctile === "number"
+         && s.timing_pctile > 40 && s.timing_pctile <= 50;
+}));
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 
@@ -127,9 +140,18 @@ const sigShown = computed(() => {
   }
   if (sigSel.value === "approaching") {
     return sigApproach.value.map((s) => ({ ...s,
-      status_tag: s.held ? "● 持仓" : "○ 非持仓",
+      // 仅 ②（价已在区、无信号）行标「临近时机线」；① 价格临区行原样
+      //（approaching 的 held k=0 也可能 action=null——门未过，属「价未到位」
+      // 而非「临近时机线」，不打标）
+      status_tag: (s.held ? "● 持仓" : "○ 非持仓")
+        + (((s.status === "active" || s.status === "touched") && s.action == null)
+           ? " · 临近时机线" : ""),
       distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
-      level_label: s.held && s.in_pos ? "第" + ((s.k_level ?? 0) + 1) + "档" : "首仓（第1档）",
+      // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓
+      level_label: (s.held && s.in_pos)
+        ? (s.k_level === 0 ? "再武装·建仓（第1档）"
+           : "第" + ((s.k_level ?? 0) + 1) + "档")
+        : "首仓（第1档）",
       bt_s: btText(s), timing_s: timingText(s) }));
   }
   return sigHistory.value.map((h) => ({ ...h,
@@ -572,11 +594,13 @@ function pnlColor(v) {
       <p class="muted small">
         股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
         {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号区 = 下一档触发价 ·
-        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 5 }}% 以内
-        （持仓股照列；非持仓股须 5 年分位 ≤50%——40% 时机门未过但价格已临区，标
-        「未过（分位 X%）」，见「时机」列）
-        · 当前 = 现价在区内 或 今日已触线（「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史）；
-        仅持仓加仓信号 + 非持仓买入信号（首仓线），非持仓模拟已建仓的加仓档不入当前信号（触碰记录见历史信号）
+        「当前」= 现价在区内 或 今日已触线，且为真实信号（持仓加仓/二次
+        建仓 + 非持仓买入首仓，均过时机门）；无信号（时机未过/持仓已够）
+        不入当前信号 ·
+        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 5 }}% 以内，
+        或价格已在区但无信号且分位临近时机线（40% &lt; 5 年分位 ≤50%，标
+        「临近时机线」）（持仓股照列；非持仓股须 5 年分位 ≤50%，见「时机」列）
+        ·「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
         · 10年回测 = 策略十年回放

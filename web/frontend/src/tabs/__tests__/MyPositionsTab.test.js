@@ -72,8 +72,12 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 非持仓恒走首仓线，价格态 active + 时机✓ → 当前信号·买入首仓】+ 非持仓
 // 时机未过【江苏银行：不入当前信号段，v7.0.23 时机门】+ 非持仓模拟已建仓
 // 时机未过【紫金矿业：不入段】）/ 1 touched（持仓盘中触碰已触回）/
-// 3 即将进入（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1【不入段】）/
-// 4 历史（含微信推送标记 + 1 条触碰事件）
+// 3 即将进入价格带（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1
+// 【不入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
+// v8.2.0 补（Joel 2026-11-13 分区定案）：无信号（action=null）不入
+// 「当前信号」——持仓二次建仓位【中粮糖业：分位 76.8% 远离时机线 → 两区
+// 均不展示】+ 价格已在区但分位临近时机线【中国石化：45% ∈ (40%,50%] →
+// 「即将进入」段标「临近时机线」】。
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   spot_preselect_pct: 10, spot_fetched: 9,
@@ -151,6 +155,26 @@ const SIG = {
     { ts_code: "sh.600546", name: "山煤国际", held: false, in_pos: false, k_level: 0,
       price: 11.01, next_add_price_raw: 11.2478, status: "approaching", touched: false,
       day_low: 10.96, distance_pct: 2.14,
+      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
+      timing_ok: false, timing_pctile: 45.0,
+      timing_reasons: "✗ 5年分位 45.0%（需≤40%）",
+      bt_pnl_pct: null, bt_n_buys: null },
+    // v8.2.0 补（Joel 2026-11-13，中粮糖业实案）：持仓 + 再武装后新一轮首仓
+    // （in_pos k=0 = 二次建仓位）+ 价已在区但时机门未过（分位 76.8% > 50%
+    // 放宽带）→ 无信号：不入「当前信号」，也不入「即将进入」（远离时机线
+    // = 两区均不展示，避免噪音）
+    { ts_code: "sh.600737", name: "中粮糖业", held: true, in_pos: true, k_level: 0,
+      price: 11.94, next_add_price_raw: 13.5913, status: "active", touched: false,
+      day_low: 11.8, distance_pct: -12.2,
+      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
+      timing_ok: false, timing_pctile: 76.8,
+      timing_reasons: "✗ 实时 5年分位 76.8%（需≤40%，池外现算）",
+      bt_pnl_pct: null, bt_n_buys: null },
+    // v8.2.0 补（中国石化实例）：同上但分位 45% ∈ (40%, 50%] = 临近时机线
+    // → 入「即将进入」段标「临近时机线」（分位回落到 ≤40% 当晚即出信号）
+    { ts_code: "sh.600500", name: "中国石化", held: true, in_pos: true, k_level: 0,
+      price: 6.12, next_add_price_raw: 6.48, status: "active", touched: false,
+      day_low: 6.1, distance_pct: -5.6,
       action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
       timing_ok: false, timing_pctile: 45.0,
       timing_reasons: "✗ 5年分位 45.0%（需≤40%）",
@@ -795,9 +819,11 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 分段计数（当前 = active 显示 3 + touched 1；active 价格态 5 只中非持仓
     // 时机未过 2 只被 v7.0.23 时机门滤出）；即将进入 = 价格临区 4 只：
     // 长江电力（持仓）+ 交通银行（分位 33.5%≤50%）+ 山煤国际（v7.0.31 C 案：
-    // 分位 45% 未过 40% 门但 ≤50% 放宽带）；中国海油（85.7%）被滤出
+    // 分位 45% 未过 40% 门但 ≤50% 放宽带）+ 中国石化（v8.2.0 补：价已在区但
+    // 分位临近时机线 45% ∈ (40%,50%]）；中国海油（85.7%）与中粮糖业
+    // （76.8%，远离时机线）被滤出
     expect(w.text()).toContain("当前信号（4）");
-    expect(w.text()).toContain("即将进入（3）");
+    expect(w.text()).toContain("即将进入（4）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
     expect(w.text()).toContain("● 持仓");
@@ -820,6 +846,11 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("✓ 5年分位 19.1%（需≤40%） · ✓ 股息率 4.58%（需≥4.5%）");
     expect(w.text()).not.toContain("江苏银行");
     expect(w.text()).not.toContain("紫金矿业");
+    // v8.2.0 补（Joel 2026-11-13）：无信号（action=null）不入当前信号——
+    // 中粮糖业（持仓二次建仓位·时机未过 76.8%）/ 中国石化（临近时机线 45%）
+    // 价格态 active 也不入段（中国石化移入「即将进入」段展示）
+    expect(w.text()).not.toContain("中粮糖业");
+    expect(w.text()).not.toContain("中国石化");
     // 时机门：逐条件 ✓/✓ 明细（无总判定前缀——全 ✓ 即过、任一 ✗ 即未过）
     expect(w.text()).toContain("✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）");
     // 十年回测列：+88.5% · 6档（持仓神华）/ 无回测 → —
@@ -845,6 +876,13 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("山煤国际");
     expect(w.text()).toContain("✗ 5年分位 45.0%（需≤40%）");
     expect(w.text()).not.toContain("中国海油");
+    // v8.2.0 补（Joel 2026-11-13）：价格已在区但无信号、分位 45% ∈ (40%,50%]
+    // = 临近时机线 → 入段标「临近时机线」，档位 = 再武装·建仓（第1档）
+    // （持仓 in_pos k=0 = 新一轮首仓）；中粮糖业 76.8% 远离时机线 → 不入段
+    expect(w.text()).toContain("中国石化");
+    expect(w.text()).toContain("临近时机线");
+    expect(w.text()).toContain("再武装·建仓（第1档）");
+    expect(w.text()).not.toContain("中粮糖业");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // 历史日期降序：2026-11-02 在前，2026-10-11 在后

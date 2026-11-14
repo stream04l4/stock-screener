@@ -119,6 +119,15 @@ positions/strategy/backtest 子包 + web/），运行时数据只进 `data/crypt
   恒 fail-closed 而微信能推，两处不一致；无数据/湖占用 → fail-closed 不提醒。
   微信持仓通道恒用实时分位（universe = 池 ∪ 持仓）。轮内加仓档（k≥1）与
   差值判定不受此门约束。
+- **信号中心分区口径（Joel 2026-11-13 定案）**：「当前信号」= 有**真实
+  信号**的行（action 非空：持仓加仓/二次建仓 + 非持仓买入首仓）；**无信号
+  （时机未过/持仓已够）不入当前信号**（原「持仓股 active 恒入段」会显示
+  无动作的『时机未过』行，造成『像有信号』的误解）。价格已在区但无信号
+  且 **40% &lt; 5 年分位 ≤ 50%（临近时机线）** → 移入「即将进入」段标
+  「临近时机线」（与 v7.0.31 C 案价格临区放宽带同一 50% 展示带；分位
+  &gt;50% 远离 = 两区均不展示，避免噪音；分位 ≤40% 本应已出信号不重复
+  展示）。纯前端分区（`MyPositionsTab.vue` sigActive/sigApproach），后端
+  数据不变。
 - 实现单点 = `martingale/signals.py::build_signals`（Web 与微信共用，
   `timing_map` 参数 = 时机门；`new_round`/`in_pos` 字段区分「二次建仓」文案）；
   `shares_since` 由 `martingale/engine.py::state_rows(since_map=…)` 计算；缺数据
