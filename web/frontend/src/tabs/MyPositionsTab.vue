@@ -70,26 +70,29 @@ const sigStocks = computed(() => sigData.value?.stocks || []);
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
          && s.action != null));
-// 即将进入（v7.0.22 定案；v7.0.31 Joel 定案 C：非持仓股分位放宽到 ≤50%
-// 展示——40% 时机门未过但价格已临区的股票 = 最有提前量价值的信号，标
-// 「时机未过」明细；原「timing_ok 才展示」会让这类股票在时机翻转前完全
-// 不可见，翻转当晚才突然出信号（山煤国际 2026-11-10 实案））：
-// ① 价格带（5% 内临线）——持仓股照展示（加仓不受时机限制）；非持仓股须
-//    timing_pctile ≤ 50（无分位数据 fail-closed 不展示）；
-// ② 临近时机线（v8.2.0 补，Joel 2026-11-13：「直到它跌到距离时机线比较近
-//    的时候，就可以出现在即将进入的信号区」）——价格已在信号区（active/
-//    touched）但无信号（时机门未过，如持仓股二次建仓位）且 40% < 分位 ≤50%
-//    → 入段标「临近时机线」；分位远离（>50%）= 两区均不展示（避免噪音）；
-//    分位 ≤40% 本应已出信号（action 非空 → 当前信号段），此处兜底不重复展示。
+// 即将进入（v8.2.0 补，Joel 2026-11-13 三分类定案「重新规整」）——按股票
+// 状态分类给入口条件：
+// ① **已建仓·未再武装**（持仓 in_pos 且 k≥1，轮内加仓档，无时机门）：
+//    **临近加仓线 5% 以内**（status=approaching 价格带）→ 入段；
+// ② **未建仓**（非持仓股）：双条件信号（首仓线 + 时机门）→ **临近时机线
+//    10% 以内**（40% &lt; 5年分位 ≤50%，与 v7.0.31 C 案同一展示带）且价格
+//    已在区（active/touched，action=null 即时机未过）或临近首仓线 5%
+//    （approaching，分位 ≤50% 含已过门只等价到线）→ 入段；价远（idle）不入；
+// ③ **已建仓·已再武装·未二次建仓**（持仓 k=0，二次建仓位，须时机门）：
+//    同 ② 的时机口径（临近时机线 10% 以内）——v7.0.22 旧「持仓 approaching
+//    恒展示」随 k=0 时机门废除（k=0 是双条件信号，时机远离时展示 = 噪音）。
+// 分位缺失（无时机数据 fail-closed）→ ②③ 不入段。
 const sigApproach = computed(() => sigStocks.value.filter((s) => {
-  if (s.status === "approaching") {
-    return s.held || (typeof s.timing_pctile === "number"
-                      && s.timing_pctile <= 50);
-  }
-  return (s.status === "active" || s.status === "touched")
-         && s.action == null
-         && typeof s.timing_pctile === "number"
-         && s.timing_pctile > 40 && s.timing_pctile <= 50;
+  const pct = s.timing_pctile;
+  const hasPct = typeof pct === "number";
+  const inZone = s.status === "active" || s.status === "touched";
+  const nearLine = s.status === "approaching";
+  // ① 持仓轮内加仓档（k≥1）：无时机限制，临近加仓线 5% 即入段
+  if (s.held && s.in_pos && (s.k_level ?? 0) > 0) return nearLine;
+  // ② 非持仓（未建仓）/ ③ 持仓 k=0（再武装未二次建仓）：临近时机线 10%
+  if (nearLine) return hasPct && pct <= 50;
+  if (inZone) return s.action == null && hasPct && pct > 40 && pct <= 50;
+  return false;
 }));
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
@@ -597,9 +600,11 @@ function pnlColor(v) {
         「当前」= 现价在区内 或 今日已触线，且为真实信号（持仓加仓/二次
         建仓 + 非持仓买入首仓，均过时机门）；无信号（时机未过/持仓已够）
         不入当前信号 ·
-        「即将进入」= 现价在触发价上方 {{ sigData?.approach_pct ?? 5 }}% 以内，
-        或价格已在区但无信号且分位临近时机线（40% &lt; 5 年分位 ≤50%，标
-        「临近时机线」）（持仓股照列；非持仓股须 5 年分位 ≤50%，见「时机」列）
+        「即将进入」三分类（v8.2.0 补）：已建仓·未再武装（轮内加仓档）=
+        临近加仓线 {{ sigData?.approach_pct ?? 5 }}% 以内；未建仓 / 已再武装
+        未二次建仓（k=0）= 临近时机线 10% 以内（40% &lt; 5 年分位 ≤50%）且
+        价格已在区或距线 ≤{{ sigData?.approach_pct ?? 5 }}%（标「临近时机线」，
+        见「时机」列）
         ·「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）

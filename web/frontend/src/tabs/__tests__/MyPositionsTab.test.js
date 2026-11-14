@@ -74,10 +74,15 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 时机未过【紫金矿业：不入段】）/ 1 touched（持仓盘中触碰已触回）/
 // 3 即将进入价格带（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1
 // 【不入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
-// v8.2.0 补（Joel 2026-11-13 分区定案）：无信号（action=null）不入
-// 「当前信号」——持仓二次建仓位【中粮糖业：分位 76.8% 远离时机线 → 两区
-// 均不展示】+ 价格已在区但分位临近时机线【中国石化：45% ∈ (40%,50%] →
-// 「即将进入」段标「临近时机线」】。
+// v8.2.0 补（Joel 2026-11-13 分区定案 + 三分类规整）：
+// 「当前信号」= 有真实信号（action 非空）——无信号不入段（中粮糖业：
+// 持仓二次建仓位·分位 76.8% 远离时机线 → 两区均不展示）。
+// 「即将进入」三分类：① 持仓 in_pos k≥1（未再武装·轮内加仓档）= 临近
+// 加仓线 5%（无时机门）；② 未建仓（非持仓）/ ③ 持仓 k=0（已再武装未二次
+// 建仓）= 临近时机线 10% 以内（40%<分位≤50%）且价格已在区或距线 ≤5%
+// ——中国石化（45% 已在区，标「临近时机线」）/ 长江电力（k=0 临区 + 38%
+// 已过门只等价）入段；国电电力（k=0 临区但 76.8% 远离时机线）/ 中国海油
+// （85.7%）不入段。
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   spot_preselect_pct: 10, spot_fetched: 9,
@@ -129,7 +134,8 @@ const SIG = {
       price: 28.56, next_add_price_raw: 28.0, status: "approaching", touched: false,
       day_low: 27.9, distance_pct: 2.0,
       action: "add", suggested_lots: 1, n_history: 1, end_date: "2026-11-06",
-      timing_ok: null, timing_pctile: null, timing_reasons: null,
+      timing_ok: true, timing_pctile: 38.0,
+      timing_reasons: "✓ 5年分位 38.0%（需≤40%）",
       bt_pnl_pct: 30.1, bt_n_buys: 3 },
     // v7.0.22 时机门入「即将进入」段：非持仓 + 时机达标 + 价格临区 → 展示
     //（临区跌破即产生真实买入信号）
@@ -178,6 +184,16 @@ const SIG = {
       action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
       timing_ok: false, timing_pctile: 45.0,
       timing_reasons: "✗ 5年分位 45.0%（需≤40%）",
+      bt_pnl_pct: null, bt_n_buys: null },
+    // v8.2.0 补三分类反例（国电电力实例）：持仓 k=0 再武装位 + 价格临区
+    // （5% 带）但分位 76.8% 远离时机线（>50%）→ 不入段（旧 v7.0.22「持仓
+    // approaching 恒展示」随 k=0 时机门废除：双条件信号时机远离 = 噪音）
+    { ts_code: "sh.600795", name: "国电电力", held: true, in_pos: true, k_level: 0,
+      price: 6.72, next_add_price_raw: 6.58, status: "approaching", touched: false,
+      day_low: 6.68, distance_pct: 2.1,
+      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
+      timing_ok: false, timing_pctile: 76.8,
+      timing_reasons: "✗ 5年分位 76.8%（需≤40%）",
       bt_pnl_pct: null, bt_n_buys: null },
   ],
   history: [
@@ -883,6 +899,8 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("临近时机线");
     expect(w.text()).toContain("再武装·建仓（第1档）");
     expect(w.text()).not.toContain("中粮糖业");
+    // 三分类 ③ 反例：持仓 k=0 价格临区但分位 76.8% 远离时机线 → 不入段
+    expect(w.text()).not.toContain("国电电力");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // 历史日期降序：2026-11-02 在前，2026-10-11 在后
