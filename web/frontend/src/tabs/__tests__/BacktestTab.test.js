@@ -133,12 +133,13 @@ describe("BacktestTab · 表单与触发", () => {
     const quick = w.findAll(".bt-quick");
     expect(quick.map((b) => b.text())).toEqual(["近 20 年", "近 10 年", "近 5 年"]);
     const radios = w.findAll('input[type="radio"]');
-    // v8.0.13：静态池 / 动态池 / 指定标的 三选
-    expect(radios.length).toBe(3);
+    // v8.2.0 补：四选 = 静态股票池 / 当前候选池 / 动态池 / 指定标的
+    expect(radios.length).toBe(4);
     expect(radios[0].element.value).toBe("pool");
     expect(radios[0].element.checked).toBe(true);
-    expect(radios[1].element.value).toBe("dyn");
-    expect(radios[2].element.value).toBe("codes");
+    expect(radios[1].element.value).toBe("cand");
+    expect(radios[2].element.value).toBe("dyn");
+    expect(radios[3].element.value).toBe("codes");
     expect(w.find("#btn-bt-run").exists()).toBe(true);
     w.unmount();
   });
@@ -155,6 +156,24 @@ describe("BacktestTab · 表单与触发", () => {
     const store = useTaskStore(appPinia);
     expect(store.state).toBe("running");
     expect(sse.url).toBe("/api/bt/runs/bt_t1/events");
+    w.unmount();
+  });
+
+  it("cand 模式触发 → POST /api/bt/runs {candidate_pool:true, end:今天}（不带 pool/codes，v8.2.0 补）", async () => {
+    vi.setSystemTime(new Date("2026-11-13T08:00:00+08:00"));
+    const w = mk();
+    await flushPromises();
+    const cand = w.findAll('input[type="radio"]').find((r) => r.element.value === "cand");
+    await cand.setChecked(true);
+    await flushPromises();
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
+    const body = JSON.parse(call[1].body);
+    expect(body.candidate_pool).toBe(true);
+    expect(body.end).toBe("2026-11-13");
+    expect(body.pool).toBeUndefined();
+    expect(body.codes).toBeUndefined();
     w.unmount();
   });
 
@@ -192,7 +211,7 @@ describe("BacktestTab · 表单与触发", () => {
     await flushPromises();
     await w.findAll('input[type="date"]')[0].setValue("2016-01-04");
     await w.findAll('input[type="date"]')[1].setValue("2026-10-21");
-    await w.findAll('input[type="radio"]')[2].setValue("codes"); // 切到指定标的
+    await w.findAll('input[type="radio"]')[3].setValue("codes"); // 切到指定标的
     await flushPromises();
     await w.find('input[type="text"][placeholder*="sh.601088"]').setValue("sh.601088, sz.000651");
     await w.find("#btn-bt-run").trigger("click");
@@ -207,7 +226,7 @@ describe("BacktestTab · 表单与触发", () => {
   it("codes 模式空 codes → 本地 toast、不发 POST", async () => {
     const w = mk();
     await flushPromises();
-    await w.findAll('input[type="radio"]')[2].setValue("codes");
+    await w.findAll('input[type="radio"]')[3].setValue("codes");
     await flushPromises();
     await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
@@ -524,7 +543,7 @@ describe("BacktestTab · 历史回测结果（v7.0.34）", () => {
 // ---------------------------------------------------------------------------
 describe("BacktestTab · 指定标的模糊搜索（v8.0.9）", () => {
   async function toCodesMode(w) {
-    await w.findAll('input[type="radio"]')[2].setValue("codes"); // v8.0.13 起 codes 为第 3 个
+    await w.findAll('input[type="radio"]')[3].setValue("codes"); // v8.0.13 起 codes 为第 3 个
     await flushPromises();
   }
   const codesInput = (w) => w.find(".bt-codes-wrap input");

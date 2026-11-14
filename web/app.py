@@ -653,19 +653,22 @@ def _infer_terminal_state(tail: List[str], done_markers: List[str]) -> str:
 # Pydantic 模型
 # ---------------------------------------------------------------------------
 class BtRunRequest(BaseModel):
-    """POST /api/bt/runs：{start?, end?, codes? | pool}（v7.0.29 起固定当前策略）。
+    """POST /api/bt/runs：{start?, end?, codes? | pool | candidate_pool}（v7.0.29 起固定当前策略）。
 
     - start/end: YYYY-MM-DD（缺省 = 各股数据起点/终点）；
-    - codes: 逗号分隔字符串或数组（与 pool 互斥，都不给 = 股票池）；
-    - pool: true 显式股票池（与 codes 同时给 → 400）；
+    - codes: 逗号分隔字符串或数组（与 pool/candidate_pool 互斥，都不给 = 股票池）；
+    - pool: true 显式股票池 = 5 条件全链池（当前时点冻结，与 codes/candidate_pool 互斥）；
+    - candidate_pool: true 当前候选池（111 股票池 ∩ G7 ∩ G8 ∩ G9 ∪ 手动，与 Web
+      策略中心同口径；⚠ 候选池本身由十年回测结果选出，回测含选择偏差，v8.2.0 补）；
     - dynamic_pool: v8.0.13 动态池回测（池每月重算 PIT，出池冻结开仓/加仓；
-      与 codes 互斥；耗时 ≈ 20~30 分钟/十年）；
+      与 codes/pool/candidate_pool 互斥；耗时 ≈ 20~30 分钟/十年）；
     - 策略 = 当前活动策略 config/strategy.yaml（策略库已退役，不再支持选快照）。
     """
     start: Optional[str] = None
     end: Optional[str] = None
     codes: Optional[Any] = None   # str 或 list[str]
     pool: Optional[bool] = None
+    candidate_pool: Optional[bool] = None   # v8.2.0 补：当前候选池（G7~G9+手动）
     dynamic_pool: Optional[bool] = None   # v8.0.13
 
 
@@ -722,13 +725,17 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     """触发一次按需回测（子进程 python -m martingale backtest，SSE 推进度）。
 
     策略固定 = 当前活动策略 config/strategy.yaml（v7.0.29：策略库退役）。
+    标的三选一（互斥）：codes（指定）/ pool（5 条件全链股票池，默认）/
+    candidate_pool（当前候选池 G7~G9+手动，⚠ 选择偏差，v8.2.0 补）。
     """
     _validate_bt_dates(req.start, req.end)
     codes = _normalize_codes(req.codes)
-    if codes and req.pool:
-        raise HTTPException(status_code=400, detail="codes 与 pool 互斥（codes 优先，请二选一）")
-    if req.dynamic_pool and (codes or req.pool):
-        raise HTTPException(status_code=400, detail="dynamic_pool 与 codes/pool 互斥（v8.0.13 动态池=月度重算，无手动标的）")
+    if codes and (req.pool or req.candidate_pool):
+        raise HTTPException(status_code=400, detail="codes 与 pool/candidate_pool 互斥（codes 优先，请三选一）")
+    if req.pool and req.candidate_pool:
+        raise HTTPException(status_code=400, detail="pool 与 candidate_pool 互斥（静态股票池 111 vs 当前候选池 30，请二选一）")
+    if req.dynamic_pool and (codes or req.pool or req.candidate_pool):
+        raise HTTPException(status_code=400, detail="dynamic_pool 与 codes/pool/candidate_pool 互斥（v8.0.13 动态池=月度重算，无手动标的）")
 
     cmd = [str(VENV_PYTHON), "-m", "martingale", "backtest"]
     if req.start:
@@ -737,6 +744,8 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
         cmd += ["--end", req.end]
     if req.dynamic_pool:
         cmd += ["--dynamic-pool"]   # v8.0.13
+    elif req.candidate_pool:
+        cmd += ["--candidate-pool"]   # v8.2.0 补
     elif codes:
         cmd += ["--codes", ",".join(codes)]
     # 无 --codes = 默认股票池（pool=true 显式同义）
@@ -748,6 +757,7 @@ def trigger_bt_run(req: BtRunRequest) -> Dict[str, Any]:
     cmd += ["--out", str(BT_RUNS_DIR / task_id)]
     res = tm.start(cmd, {"start": req.start, "end": req.end,
                          "codes": codes or None, "pool": bool(req.pool) or not codes,
+                         "candidate_pool": bool(req.candidate_pool),
                          "dynamic_pool": bool(req.dynamic_pool)},
                    ["回测完成"], task_id=task_id)
     res["out_dir"] = str(BT_RUNS_DIR / task_id)

@@ -705,6 +705,29 @@ def test_bt_run_dynamic_pool_flag(monkeypatch):
     assert e2.value.status_code == 400
 
 
+def test_bt_run_candidate_pool_flag(monkeypatch):
+    """v8.2.0 补：candidate_pool=True → cmd 带 --candidate-pool（不带 --codes）；
+    与 codes/pool/dynamic_pool 互斥 400。"""
+    fake = _patch_tm(monkeypatch)
+    wapp.trigger_bt_run(wapp.BtRunRequest(candidate_pool=True, end="2026-11-13"))
+    assert "--candidate-pool" in fake.last_cmd
+    assert "--codes" not in fake.last_cmd
+    assert "--dynamic-pool" not in fake.last_cmd
+    assert fake.last_params["candidate_pool"] is True
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e1:
+        wapp.trigger_bt_run(wapp.BtRunRequest(candidate_pool=True,
+                                              codes="sh.600000"))
+    assert e1.value.status_code == 400
+    with pytest.raises(HTTPException) as e2:
+        wapp.trigger_bt_run(wapp.BtRunRequest(candidate_pool=True, pool=True))
+    assert e2.value.status_code == 400
+    with pytest.raises(HTTPException) as e3:
+        wapp.trigger_bt_run(wapp.BtRunRequest(candidate_pool=True,
+                                              dynamic_pool=True))
+    assert e3.value.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # GET /api/bt/runs 历史回测列表（v7.0.34，Joel 2026-11-10「历史回测结果读取」）
 # ---------------------------------------------------------------------------

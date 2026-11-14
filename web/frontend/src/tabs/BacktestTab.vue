@@ -110,7 +110,9 @@ function onCodesKeydown(e) {
   if (e.key === "Escape") closeSug();
 }
 
-// mode: "pool"（静态股票池，默认）| "dyn"（v8.0.13 动态池：月度重算 PIT）
+// mode: "pool"（静态股票池=5 条件全链池，当前时点冻结，默认）
+//       | "cand"（当前候选池=G7~G9+手动，⚠ 选择偏差，v8.2.0 补）
+//       | "dyn"（v8.0.13 动态池：月度重算 PIT）
 //       | "codes"（指定标的，逗号分隔）
 // 策略固定 = 当前策略 config/strategy.yaml（v7.0.29：策略库退役，不再可选快照）
 
@@ -127,6 +129,8 @@ async function onRun() {
       params.codes = codes.join(",");
     } else if (form.value.mode === "dyn") {
       params.dynamic_pool = true;   // v8.0.13：池每月重算 + 出池冻结开仓/加仓
+    } else if (form.value.mode === "cand") {
+      params.candidate_pool = true;   // v8.2.0 补：当前候选池（⚠ 选择偏差，UI 已警示）
     } else {
       params.pool = true;
     }
@@ -364,7 +368,9 @@ onMounted(loadHistory);
       <h3>🧪 按需回测</h3>
       <p class="muted small">
         结束日默认今天；「近 20/10/5 年」一键设窗口（起始 = 今天 − N 年）。
-        起止均留空 = 各股数据起点 → 数据终点。标的默认全股票池（5 条件全链）。
+        起止均留空 = 各股数据起点 → 数据终点。
+        标的：静态股票池 = 5 条件全链池（当前时点冻结，回测应以此为准）；
+        当前候选池 = 策略中心同款 30 只（再经十年回测/股息率/价格带选出，⚠ 拿它回测有选择偏差、收益系统性高估，仅用于单独回看当前候选组合）。
         回测为异步子进程，进度经 SSE 实时推送。
       </p>
       <div class="bt-form-grid">
@@ -384,7 +390,8 @@ onMounted(loadHistory);
         </div>
         <div class="f-row f-scope">
           <span>标的</span>
-          <label class="radio"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 静态股票池（默认，当前池固定回测）</label>
+          <label class="radio" title="5 条件全链股票池（行业白名单→央国企→央企收紧门→市值→上市时长→连续分红），成员按当前时点冻结回看历史；回测无选择偏差，应以此为准"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 静态股票池（默认，5 条件全链池·当前时点冻结）</label>
+          <label class="radio" title="⚠ 当前候选池 = 静态池再经 G7（十年回测触发且净收益≥20%）∩ G8（股息率）∩ G9（价格带）+ 手动添加。候选池本身由十年回测结果选出，拿它回测有选择偏差，收益会系统性高估；仅用于单独回看当前候选组合"><input type="radio" value="cand" v-model="form.mode" :disabled="starting || store.state === 'running'"> 当前候选池（策略中心同款，⚠ 选择偏差）</label>
           <label class="radio" title="v8.0.13：池每月重算（全漏斗 point-in-time），出池冻结开仓/加仓、不强制平仓；十年窗口约 20~30 分钟"><input type="radio" value="dyn" v-model="form.mode" :disabled="starting || store.state === 'running'"> 动态股票池（月度重算，较慢）</label>
           <label class="radio"><input type="radio" value="codes" v-model="form.mode" :disabled="starting || store.state === 'running'"> 指定标的</label>
         </div>

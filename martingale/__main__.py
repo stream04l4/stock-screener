@@ -44,6 +44,9 @@ def _cmd_backtest(args) -> int:
     if args.codes and args.dynamic_pool:
         print("错误: --codes 与 --dynamic-pool 互斥", file=sys.stderr)
         return 2
+    if args.candidate_pool and (args.codes or args.dynamic_pool):
+        print("错误: --candidate-pool 与 --codes/--dynamic-pool 互斥", file=sys.stderr)
+        return 2
     # v8.0.13：动态池回测（池每月重算 + 交易门控；产物含 pool_timeline.csv）
     if args.dynamic_pool:
         from .dynamic_pool import run_dynamic_pool_backtest
@@ -54,7 +57,19 @@ def _cmd_backtest(args) -> int:
                 config_path=args.config, tp=tp)
         finally:
             con.close()
-    if args.codes:
+    if args.candidate_pool:
+        # 当前候选池（与 Web「策略中心」同口径：111 股票池 ∩ G7 ∩ G8 ∩ G9 ∪ 手动）。
+        # 注意：候选池本身由十年回测结果选出，拿它回测有选择偏差（Web 层已警示）。
+        from .selection import build_candidate_pool, load_manual_pool
+        con = connect_readonly(None)
+        try:
+            codes = build_candidate_pool(con, up, manual=load_manual_pool()).codes
+        finally:
+            con.close()
+        if not codes:
+            print("候选池为空（检查 G7~G9 门槛与 data/manual_pool.json）", file=sys.stderr)
+            return 2
+    elif args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     else:
         from .universe import build_pool
@@ -326,6 +341,9 @@ def main(argv=None) -> int:
     bt.add_argument("--start", default=None, help="YYYY-MM-DD，默认数据起点")
     bt.add_argument("--end", default=None, help="YYYY-MM-DD，默认数据终点")
     bt.add_argument("--codes", default=None, help="逗号分隔 ts_code（默认=股票池）")
+    bt.add_argument("--candidate-pool", action="store_true",
+                    help="当前候选池（G7~G9 选股+手动，与 Web 策略中心同口径；"
+                         "与 --codes/--dynamic-pool 互斥）")
     bt.add_argument("--dynamic-pool", action="store_true",
                     help="v8.0.13 动态池回测：池每月重算（PIT 全漏斗），"
                          "出池冻结开仓/加仓不强制平仓；与 --codes 互斥")
