@@ -611,7 +611,7 @@ tr.lake-row-muted .badge { opacity: .85; }
    控件语言不一致。对齐全站约定：控件 13px/8px 圆角/1px --line 边框，
    标签 13px #374151，说明 12px muted（.muted.small），数字输入等宽。 */
 .bt-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 16px; align-items: center; }
-.bt-form .f-row, .bt-history .f-row { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #374151; min-width: 0; }
+.bt-form .f-row, .bt-history .f-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 13px; color: #374151; min-width: 0; }
 .bt-form .f-row > span, .bt-history .f-row > span { flex: none; width: 44px; }
 .bt-history .f-row > span { width: 60px; }  /* 「历史运行」4 字防折行 */
 .bt-form input[type="date"], .bt-form input[type="text"], .bt-history select {
