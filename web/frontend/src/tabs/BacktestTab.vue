@@ -205,22 +205,24 @@ const perStockRows = computed(() => {
       : { ...r, div_share: null, price_share: null };
   });
 });
+// 状态机终态 → 中文（与报告术语表同口径；未知值原样）
+const fmtStatus = (v) => ({ open: "持仓中", closed: "已了结", never: "未建仓" }[v] ?? (v || ""));
 const PER_STOCK_COLS = [
-  ["ts_code", "代码"], ["name", "名称"], ["n_bars", "bar数", true],
+  ["ts_code", "代码"], ["name", "名称"], ["n_bars", "交易日数", true],
   ["n_rounds", "轮次", true], ["n_rearms", "再武装", true], ["n_buys", "买入笔数", true],
   ["total_invested", "总投入", true, fmt2], ["final_assets", "期末资产", true, fmt2],
   ["dividends", "累计分红", true, fmt2], ["div_pool", "分红余额", true, fmt2],
   ["price_pnl", "价差盈亏", true, fmt2], ["total_pnl", "总盈亏", true, fmt2],
   ["div_share", "分红占比", true, fmtPct1], ["price_share", "上涨占比", true, fmtPct1],
-  ["pnl_pct", "盈亏%", true, fmtPct1], ["min_unreal_pct", "最低浮盈%", true, fmtPct1],
+  ["pnl_pct", "收益率", true, fmtPct1], ["min_unreal_pct", "最差浮亏", true, fmtPct1],
   // v8.0.13 动态池产物（静态回测无此键 → —）
   ["pool_months", "在池月数"], ["pool_first", "首次入池"], ["pool_last", "最后入池"],
   ["first_buy_date", "首买日", false, fmtDate], ["last_buy_date", "末买日", false, fmtDate],
-  ["last_status", "末状态"], ["end_date", "期末", false, fmtDate],
+  ["last_status", "状态", false, fmtStatus], ["end_date", "期末", false, fmtDate],
 ];
 
 const BUYS_COLS = [
-  ["ts_code", "代码"], ["seq", "序", true], ["date", "日期", false, fmtDate],
+  ["ts_code", "代码"], ["seq", "第几笔", true], ["date", "日期", false, fmtDate],
   ["price", "成交价", true, fmt2], ["amount", "金额", true, fmt2],
 ];
 

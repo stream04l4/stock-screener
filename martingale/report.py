@@ -53,6 +53,10 @@ def _fmt(v) -> str:
     return str(v)
 
 
+# 状态机终态 → 中文（报告展示用；未知值原样透传）
+_STATUS_CN = {"open": "持仓中", "closed": "已了结", "never": "未建仓"}
+
+
 def _sort_per_stock(rows: List[dict]) -> List[dict]:
     """pnl_pct 降序、nan 垫底（等价参考 pd.sort_values(ascending=False, na_position='last')）。"""
     ok = [r for r in rows if not (isinstance(r.get("pnl_pct"), float) and math.isnan(r["pnl_pct"]))]
@@ -71,33 +75,35 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
     d0, d1 = str(gdates[0]) if n_dates else "", str(gdates[-1]) if n_dates else ""
     lines: List[str] = []
     A = lines.append
-    A("# 马丁格尔深回撤加仓回测 summary")
+    A("# 马丁格尔深回撤加仓回测报告")
     A("")
-    A(f"- 参数: lot_size={sp.lot_size}, first_lots={sp.first_lots}, "
-      f"add_lots_step={sp.add_lots_step}, first_drawdown_pct={sp.first_drawdown * 100:g}%, "
-      f"add_step_pct={sp.add_step * 100:g}%, rearm_mode={sp.rearm_mode}, "
-      f"rearm_pct={sp.rearm_pct * 100:g}%, accounting={sp.accounting}, "
-      f"comm={sp.commission * 1e4:g}bps, stamp={sp.stamp * 1e4:g}bps")
+    A(f"- 参数: 每手 {sp.lot_size} 股, 首仓 {sp.first_lots} 手, 加仓手数步长 {sp.add_lots_step} 手/档, "
+      f"首仓回撤线 {sp.first_drawdown * 100:g}%, 加仓价格步长 {sp.add_step * 100:g}%/档, "
+      f"再武装模式 {sp.rearm_mode}({'低点反弹' if sp.rearm_mode == 'bounce' else '新高'}, "
+      f"{'反弹幅度' if sp.rearm_mode == 'bounce' else '高点刷新幅度'} {sp.rearm_pct * 100:g}%), "
+      f"结算 cash(现金: 原始价成交+分红单列), 佣金 {sp.commission * 1e4:g}bp/边, "
+      f"印花税 {sp.stamp * 1e4:g}bp(卖)")
     A(f"- 数据: {db_path}")
-    A(f"- 窗口: {d0} ~ {d1} ({n_dates} 交易日), 股票数: {n_u}")
-    A("- 口径: 信号=后复权; cash：原始价成交(人民币)+现金分红单列, 股价增长=总盈亏-分红")
+    A(f"- 窗口: {d0[:10]} ~ {d1[:10]} ({n_dates} 交易日), 股票数: {n_u}")
+    A("- 口径: 信号按后复权价(hfq)判定；成交按原始价(人民币)，现金分红单列——"
+      "总盈亏 = 股价增长 + 分红余额；v7.0.36 起分红余额优先出资买股")
     A("- 偏差: 湖内无退市股（幸存者偏差）；--start 若晚于上市日则高点为窗口内高点")
     A("")
     A("## 触发")
     A(f"- 触发过建仓的股票: {n_t}/{n_u} ({n_t / n_u:.1%})" if n_u else "- 触发过建仓的股票: 0/0")
     if n_t:
         nb = np.array([int(r["n_buys"]) for r in triggered], dtype=float)
-        A(f"- 加仓次数分布: mean={nb.mean():.1f}, median={np.median(nb):.0f}, max={nb.max():.0f}")
+        A(f"- 买入次数分布: 平均={nb.mean():.1f}, 中位={np.median(nb):.0f}, 最多={nb.max():.0f}")
         nr = np.array([int(r["n_rounds"]) for r in triggered], dtype=float)
-        A(f"- 轮次: mean={nr.mean():.2f}, max={nr.max():.0f}")
+        A(f"- 轮次（一次再武装→下一次再武装=一轮）: 平均={nr.mean():.2f}, 最多={nr.max():.0f}")
     A("")
-    A("## 收益（触发过的股票，pnl_pct = 总盈亏/外部净投入；v7.0.36 分红余额优先出资）")
+    A("## 收益（仅触发过建仓的股票；收益率 = 总盈亏 ÷ 外部净投入）")
     if len(tp):
         A(f"- 股票数: {len(tp)}")
-        A(f"- 胜率(pnl>0): {(tp > 0).mean():.1%}")
-        A(f"- mean={tp.mean():.1%}, median={np.median(tp):.1%}")
-        for q in (1, 5, 25, 75, 95, 99):
-            A(f"- p{q}={np.quantile(tp, q / 100):.1%}")
+        A(f"- 胜率（总盈亏>0）: {(tp > 0).mean():.1%}")
+        A(f"- 收益率: 平均={tp.mean():.1%}, 中位={np.median(tp):.1%}")
+        A(f"- 分位（pN=第 N 百分位，比它低的股票占 N%）: "
+          + ", ".join(f"p{q}={np.quantile(tp, q / 100):.1%}" for q in (1, 5, 25, 75, 95, 99)))
         A(f"- 总投入(外部净): {sum(float(r['total_invested']) for r in triggered):,.0f}")
         A(f"- 最终资产: {sum(float(r['final_assets']) for r in triggered):,.0f}")
         tv = sum(float(r["total_pnl"]) for r in triggered)
@@ -109,7 +115,8 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
         else:
             A(f"- 其中分红余额: {td:,.0f}（总盈亏为负，拆分见个股）")
         mu = np.array([float(r["min_unreal_pct"]) for r in triggered])
-        A(f"- 最差浮亏(min_unreal_pct): p1={np.quantile(mu, 0.01):.1%}, min={mu.min():.1%}")
+        A(f"- 最差浮亏（持仓期间最低 浮亏/投入）: p1={np.quantile(mu, 0.01):.1%}（最深 1% 的股票低于此值）, "
+          f"最深={mu.min():.1%}")
     A("")
     A("## 组合账本（每日累计，equity_curve.csv）")
     if curve_last is not None:
@@ -119,11 +126,11 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
     if curve_worst is not None:
         A(f"- 账本最差浮亏日: {curve_worst[0]} ({curve_worst[1]:.1%})")
     A("")
-    A("## 基准对照（各股窗口内 hfq 首末收益，等权平均，买持）")
+    A("## 基准对照（各股窗口内 后复权首末收益，等权平均，买入持有——同窗口不做策略、直接持有的参照）")
     if bench_rets:
         br = np.array(bench_rets)
-        A(f"- mean={br.mean():.1%}, median={np.median(br):.1%}, "
-          f"p1={np.quantile(br, 0.01):.1%}, p99={np.quantile(br, 0.99):.1%}")
+        A(f"- 平均={br.mean():.1%}, 中位={np.median(br):.1%}, "
+          f"p1={np.quantile(br, 0.01):.1%}（最差 1%）, p99={np.quantile(br, 0.99):.1%}（最好 1%）")
     A("")
     if n_t and n_u <= 20:
         A("## 个股明细")
@@ -142,7 +149,7 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                   f"({float(r['price_pnl']) / float(r['total_pnl']):.1%})"
                   f" + 分红余额 {pool:+,.0f} "
                   f"({pool / float(r['total_pnl']):.1%})")
-            A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {r['last_status']}, "
+            A(f"- 轮次 {r['n_rounds']}, 买入 {r['n_buys']} 次, 状态 {_STATUS_CN.get(r['last_status'], r['last_status'])}, "
               f"最差浮亏 {float(r['min_unreal_pct']):.1%}")
             # v7.0.35：年度汇总替代买入时间表（Joel 2026-11-10：回测结果区已有
             # 买入时间表 buys 表/buys.csv，明细不重复；列 = 投入(外部/分红)/
@@ -164,13 +171,13 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                       f"{a['price_pnl']:+,.0f} | {a['end_assets']:,.0f} |")
                 A("")
     else:
-        A("## Top / Bottom 10（按 pnl_pct，仅触发过的股票）")
+        A("## 前 10 / 后 10（按收益率排序，仅触发过建仓的股票）")
         if len(tp):
-            for label, sub in (("Top", _sort_per_stock(triggered)[:10]),
-                               ("Bottom", list(reversed(_sort_per_stock(triggered)))[:10])):
+            for label, sub in (("前 10", _sort_per_stock(triggered)[:10]),
+                               ("后 10", list(reversed(_sort_per_stock(triggered)))[:10])):
                 A(f"### {label}")
                 A("")
-                A("| code | name | buys | invested | pnl | pnl% | 分红/上涨 | status |")
+                A("| 代码 | 名称 | 买入次数 | 总投入 | 总盈亏 | 收益率 | 分红/上涨占比 | 状态 |")
                 A("|---|---|---|---|---|---|---|---|")
                 for r in sub:
                     tp = float(r["total_pnl"])
@@ -183,8 +190,21 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                         split = "—"
                     A(f"| {r['ts_code']} | {r['name']} | {r['n_buys']} | "
                       f"{float(r['total_invested']):,.0f} | {float(r['total_pnl']):,.0f} | "
-                      f"{float(r['pnl_pct']):.1%} | {split} | {r['last_status']} |")
+                      f"{float(r['pnl_pct']):.1%} | {split} | {_STATUS_CN.get(r['last_status'], r['last_status'])} |")
                 A("")
+    A("")
+    A("## 术语表")
+    A("- 首仓：一轮里的第一次买入（固定 首仓手数）；加仓：后续逐档买入，每档加 加仓手数步长 手，"
+      "触发线比上一档再低 加仓价格步长")
+    A("- 档位线：第 k 档 = 本轮高点 × (1 − 首仓回撤线 − k × 加仓价格步长)")
+    A("- 再武装（rearm）：一轮买满后，价格从低点反弹 再武装幅度（或创出新高，视模式）→ "
+      "状态机复位，刷新本轮高点，重新起新一轮的档位线")
+    A("- 轮次：一次再武装到下一次再武装之间为一轮")
+    A("- 收益率 = 总盈亏 ÷ 外部净投入；总盈亏 = 最终资产 − 总投入（最终资产含分红余额）")
+    A("- 分红余额：收到但尚未再投入买股的现金分红（v7.0.36 起余额优先出资，未投出部分留在余额）")
+    A("- 最差浮亏：持仓期间 浮亏÷投入 的最低点（不卖出的账面最大回撤）")
+    A("- 分位 pN：第 N 百分位——有 N% 的股票比它差")
+    A("- 后复权(hfq)：分红/送转折算进价格的复权方式，信号判定用它避免除权假信号")
     A(f"耗时 {time.time() - t0:.1f}s")
     return lines
 
