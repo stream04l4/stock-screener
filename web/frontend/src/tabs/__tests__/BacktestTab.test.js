@@ -121,10 +121,17 @@ afterEach(() => {
 });
 
 describe("BacktestTab · 表单与触发", () => {
-  it("渲染：参数表单（start/end/标的 radio，pool 默认选中）+ 触发按钮", async () => {
+  it("渲染：参数表单（start/end/标的 radio，pool 默认选中）+ 触发按钮；结束日默认今天 + 近 20/10/5 年快捷", async () => {
+    vi.setSystemTime(new Date("2026-11-13T08:00:00+08:00"));
     const w = mk();
     await flushPromises();
-    expect(w.find('input[type="date"]').exists()).toBe(true);
+    const dates = w.findAll('input[type="date"]');
+    expect(dates.length).toBe(2);
+    // v8.2.0 补（Joel 2026-11-13 定案）：结束日默认 = 今天；起始日留空
+    expect(dates[0].element.value).toBe("");
+    expect(dates[1].element.value).toBe("2026-11-13");
+    const quick = w.findAll(".bt-quick");
+    expect(quick.map((b) => b.text())).toEqual(["近 20 年", "近 10 年", "近 5 年"]);
     const radios = w.findAll('input[type="radio"]');
     // v8.0.13：静态池 / 动态池 / 指定标的 三选
     expect(radios.length).toBe(3);
@@ -136,17 +143,47 @@ describe("BacktestTab · 表单与触发", () => {
     w.unmount();
   });
 
-  it("pool 模式触发 → POST /api/bt/runs {pool:true}（start/end 留空不带）+ 状态 running", async () => {
+  it("pool 模式触发 → POST /api/bt/runs {pool:true, end:今天}（起始留空不带）+ 状态 running", async () => {
+    vi.setSystemTime(new Date("2026-11-13T08:00:00+08:00"));
     const w = mk();
     await flushPromises();
     await w.find("#btn-bt-run").trigger("click");
     await flushPromises();
     const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
     expect(call).toBeTruthy();
-    expect(JSON.parse(call[1].body)).toEqual({ pool: true });
+    expect(JSON.parse(call[1].body)).toEqual({ pool: true, end: "2026-11-13" });
     const store = useTaskStore(appPinia);
     expect(store.state).toBe("running");
     expect(sse.url).toBe("/api/bt/runs/bt_t1/events");
+    w.unmount();
+  });
+
+  it("快捷「近 20/10/5 年」→ start = 今天−N 年、end = 今天；触发 POST 带当前窗口", async () => {
+    vi.setSystemTime(new Date("2026-11-13T08:00:00+08:00"));
+    const w = mk();
+    await flushPromises();
+    // 依次点三个快捷（未触发 run 前按钮始终可用），只核表单
+    await w.findAll(".bt-quick")[0].trigger("click");
+    await flushPromises();
+    let d = w.findAll('input[type="date"]');
+    expect(d[0].element.value).toBe("2006-11-13");
+    expect(d[1].element.value).toBe("2026-11-13");
+    await w.findAll(".bt-quick")[1].trigger("click");
+    await flushPromises();
+    d = w.findAll('input[type="date"]');
+    expect(d[0].element.value).toBe("2016-11-13");
+    await w.findAll(".bt-quick")[2].trigger("click");
+    await flushPromises();
+    d = w.findAll('input[type="date"]');
+    expect(d[0].element.value).toBe("2021-11-13");
+    expect(d[1].element.value).toBe("2026-11-13");
+    // 触发 → POST 带最后选定的窗口
+    await w.find("#btn-bt-run").trigger("click");
+    await flushPromises();
+    const call = apiMock.mock.calls.find(([p, o]) => p === "/api/bt/runs" && o.method === "POST");
+    expect(JSON.parse(call[1].body)).toEqual({
+      pool: true, start: "2021-11-13", end: "2026-11-13",
+    });
     w.unmount();
   });
 

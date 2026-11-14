@@ -18,8 +18,21 @@ const store = useTaskStore();
 
 // ---------------------------------------------------------------------------
 // 参数表单
+// 结束日默认 = 今天（Joel 2026-11-13 定案）；快捷「近 20/10/5 年」一键设窗口
+// （start = 今天−N 年，end = 今天）；start/end 均留空 = 各股数据起点 → 数据
+// 终点（旧语义保留，手动清空即回退）。
 // ---------------------------------------------------------------------------
-const form = ref({ start: "", end: "", mode: "pool", codes: "" });
+function _pad2(x) { return String(x).padStart(2, "0"); }
+function _dateStr(d) {
+  return `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pad2(d.getDate())}`;
+}
+function quickWindow(years) {
+  const s = new Date();
+  s.setFullYear(s.getFullYear() - years);
+  form.value.start = _dateStr(s);
+  form.value.end = _dateStr(new Date());
+}
+const form = ref({ start: "", end: _dateStr(new Date()), mode: "pool", codes: "" });
 const starting = ref(false);
 
 // ---------------------------------------------------------------------------
@@ -350,7 +363,9 @@ onMounted(loadHistory);
     <div class="card bt-form">
       <h3>🧪 按需回测</h3>
       <p class="muted small">
-        窗口留空 = 各股数据起点 → 数据终点；标的默认全股票池（5 条件全链）。回测为异步子进程，进度经 SSE 实时推送。
+        结束日默认今天；「近 20/10/5 年」一键设窗口（起始 = 今天 − N 年）。
+        起止均留空 = 各股数据起点 → 数据终点。标的默认全股票池（5 条件全链）。
+        回测为异步子进程，进度经 SSE 实时推送。
       </p>
       <div class="bt-form-grid">
         <label class="f-row">
@@ -361,6 +376,12 @@ onMounted(loadHistory);
           <span>结束日</span>
           <input type="date" v-model="form.end" :disabled="starting || store.state === 'running'">
         </label>
+        <div class="f-row f-quick">
+          <span>快捷</span>
+          <button type="button" class="bt-quick" :disabled="starting || store.state === 'running'" @click="quickWindow(20)">近 20 年</button>
+          <button type="button" class="bt-quick" :disabled="starting || store.state === 'running'" @click="quickWindow(10)">近 10 年</button>
+          <button type="button" class="bt-quick" :disabled="starting || store.state === 'running'" @click="quickWindow(5)">近 5 年</button>
+        </div>
         <div class="f-row f-scope">
           <span>标的</span>
           <label class="radio"><input type="radio" value="pool" v-model="form.mode" :disabled="starting || store.state === 'running'"> 静态股票池（默认，当前池固定回测）</label>
@@ -455,6 +476,13 @@ onMounted(loadHistory);
 </template>
 
 <style scoped>
+/* v8.2.0 补（Joel 2026-11-13）：回测窗口快捷按钮（近 20/10/5 年） */
+.bt-quick {
+  padding: 3px 10px; font-size: 12px; border: 1px solid #c7cdd8; border-radius: 6px;
+  background: #fff; color: #374151; cursor: pointer; white-space: nowrap;
+}
+.bt-quick:hover:not(:disabled) { border-color: #7c8aa5; background: var(--bg-soft, #eef0f8); }
+.bt-quick:disabled { opacity: .5; cursor: default; }
 /* v8.0.9：指定标的代码模糊搜索下拉（与手动池录入条同款） */
 .bt-codes-wrap { position: relative; display: inline-block; }
 .bt-codes-wrap input { width: 320px; }
