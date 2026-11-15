@@ -1243,6 +1243,7 @@ def run_t5_incremental(con, db_path: str, codes: Optional[List[str]],
         log.info("T5 增量：probe=%s，%d 股全部齐 → 跳过（零网络）", p_star, len(codes))
         return stats
 
+    _t5_live_view(con, runner, p_star, len(codes), 0)   # 开始即上屏（locked 态 /status 可见）
     processed = not_reported = 0
     errors: List[str] = []
     t0 = time.monotonic()
@@ -1267,14 +1268,49 @@ def run_t5_incremental(con, db_path: str, codes: Optional[List[str]],
             processed += 1
         except Exception as exc:  # noqa: BLE001 - 单股失败不中断整队（同 run_t5 纪律）
             errors.append(f"{c}: {exc}")
+        if (i + 1) % 200 == 0:
+            _t5_live_view(con, runner, p_star, len(codes), processed)
     stats.update(processed=processed, not_reported=not_reported,
                  errors=errors[:50], elapsed_s=round(time.monotonic() - t0, 1))
-    # 终刷 done 集合（mark_done 按 _MARK_FLUSH_BATCH=200 批量落盘——裸 save_progress
+    # 收尾实时视图（running→由 run_incremental 收尾的 _refresh 归位终态）+ 终刷
+    # done 集合（mark_done 按 _MARK_FLUSH_BATCH=200 批量落盘——裸 save_progress
     # 不刷 progress["done"]，末批残留会丢簿记键；run() 收尾同样走本终刷）
+    _t5_live_view(con, runner, p_star, len(codes), processed)
     runner._flush_done_marks()
     log.info("T5 增量完成：probe=%s needed=%d processed=%d not_reported=%d errors=%d (%.0fs)",
              p_star, len(needed), processed, not_reported, len(errors), stats["elapsed_s"])
     return stats
+
+
+def _t5_live_view(con, runner, p_star: str, total: int, processed: int) -> None:
+    """T5 增量实时进度视图（v7.0.32，Joel 2026-11-15 实锤："页面上没有补数提示"）。
+
+    locked 态 /status 降级读 progress 文件的 tasks（DuckDB 连不上、JSON 可读）——
+    灌数期间不更新该条目，Web 只见陈旧快照（5215/5223）。本函数在 T5 循环开始/
+    每 200 只/收尾调用：state=running + done=**湖内已达 p_star 的股数**（真实
+    "已至最新期"口径，与收尾视图一致）+ note 带 probe 与本轮处理数。
+    """
+    from lake.backfill import save_progress
+
+    e = next((t for t in runner.progress.get("tasks", [])
+              if t.get("table") == "fundamentals_quarterly"), None)
+    if e is None:
+        e = {"table": "fundamentals_quarterly", "tier": "P2", "total": total, "done": 0,
+             "quota_used_today": runner.quota_used_today(),
+             "quota_budget": runner.budget_per_day,
+             "state": "pending", "eta_min": None, "last_error": ""}
+        runner.progress.setdefault("tasks", []).append(e)
+    e["total"] = total
+    try:
+        done_n = con.execute(
+            "SELECT COUNT(DISTINCT ts_code) FROM fundamentals_quarterly WHERE period=?",
+            [p_star]).fetchone()[0]
+    except Exception:  # noqa: BLE001 - 视图计数失败不阻断灌数（退本轮已处理数）
+        done_n = processed
+    e["done"] = min(int(done_n), total)
+    e["state"] = "running"
+    e["note"] = f"季度增量中（probe={p_star}；本轮已处理 {processed}/{total}）"
+    save_progress(runner.progress, runner.progress_path)
 
 
 

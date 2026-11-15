@@ -338,3 +338,55 @@ def test_view_t5_empty_table_pending(monkeypatch, tmp_path):
     drv._refresh_incremental_task_view(r, con, "2026-11-14")
     e5 = next(t for t in r.progress["tasks"] if t.get("table") == "fundamentals_quarterly")
     assert e5["total"] == 0 and e5["done"] == 0 and e5["state"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# 实时视图（locked 态 /status 读 progress tasks——Joel 2026-11-15 实锤缺提示）
+# ---------------------------------------------------------------------------
+
+def test_live_view_updated_during_and_after_run(monkeypatch, tmp_path):
+    """T5 循环开始+收尾各刷一次实时视图（<200 只无周期刷）；done=湖内已达 P* 股数。"""
+    import lake_backfill as drv
+
+    con = _make_con([("sh.601000", "2026Q2", "2026-07-30")])
+    fake = FakeAdapter({
+        "sh.600519": [_rec("2026Q3", "2026-10-25")],
+        "sh.600000": [_rec("2026Q3", "2026-10-28")],
+        "sh.601000": [_rec("2026Q3", "2026-11-02"), _rec("2026Q2", "2026-07-30")],
+    })
+    _patch_adapter(monkeypatch, fake)
+    r = _runner(tmp_path)
+
+    calls = []
+    orig = drv._t5_live_view
+
+    def spy(*a, **kw):
+        calls.append(a)
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(drv, "_t5_live_view", spy)
+    drv.run_t5_incremental(con, ":memory:", ["sh.601000"], r)
+
+    # 3 只 < 200 → 仅开始(0) + 收尾(processed) 两次
+    assert [c[-1] for c in calls] == [0, 1]
+    e5 = next(t for t in r.progress["tasks"] if t.get("table") == "fundamentals_quarterly")
+    assert e5["state"] == "running"
+    assert e5["done"] == 1 and e5["total"] == 1
+    assert "2026Q3" in e5["note"] and "季度增量中" in e5["note"]
+
+
+def test_live_view_fallback_on_sql_error(monkeypatch, tmp_path):
+    """视图湖查询失败 → 退本轮 processed 计数，不抛错、不阻断。"""
+    import lake_backfill as drv
+
+    con = _make_con([])
+
+    class _DeadCon:
+        def execute(self, *a, **kw):
+            raise RuntimeError("fake lake error")
+
+    e = {"table": "fundamentals_quarterly"}
+    r = _runner(tmp_path)
+    r.progress.setdefault("tasks", []).append(e)
+    drv._t5_live_view(_DeadCon(), r, "2026Q3", total=10, processed=7)
+    assert e["done"] == 7 and e["state"] == "running"
