@@ -487,6 +487,63 @@ def test_batch_call_quota_penalty_fails_fast(monkeypatch):
     assert sleeps == [], f"不得退避等待: {sleeps}"
 
 
+def test_batch_call_hourly_limit_waits_62min_then_recovers(monkeypatch):
+    """"N 次/小时"限频=可等待（2026-11-15 实锤：adj_factor 免费档 1 次/小时）
+    → 等 62min 重试一次；恢复即成功，不触发 legacy 回退。"""
+    import pandas as pd
+    import lake.ingest.tushare_ingest as ti
+
+    calls = {"n": 0}
+    sleeps = []
+
+    class FakePro:
+        def adj_factor(self, trade_date):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception("抱歉，您访问接口(adj_factor)频率超限(1次/小时)，"
+                                "具体频次详情：https://tushare.pro/document/1?doc_id=108")
+            return pd.DataFrame([
+                {"ts_code": "601398.SH", "trade_date": "20260918",
+                 "adj_factor": 1.25},
+            ])
+
+    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
+    import time as _real_time
+
+    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
+    rows = ti.fetch_adj_factor_batch("2026-09-18")
+    assert calls["n"] == 2, f"限频后应重试一次: {calls}"
+    assert sleeps == [62 * 60], f"应等 62min: {sleeps}"
+    assert rows == {"sh.601398": {"2026-09-18": 1.25}}, rows
+
+
+def test_batch_call_hourly_limit_persistent_fails_after_wait(monkeypatch):
+    """等 62min 后二次命中小时限频 → 判配额耗尽抛错（交上层回退 legacy），
+    不无限等待。"""
+    import lake.ingest.tushare_ingest as ti
+
+    calls = {"n": 0}
+    sleeps = []
+
+    class FakePro:
+        def adj_factor(self, trade_date):
+            calls["n"] += 1
+            raise Exception("抱歉，您访问接口(adj_factor)频率超限(1次/小时)，"
+                            "具体频次详情：https://tushare.pro/document/1?doc_id=108")
+
+    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
+    import time as _real_time
+
+    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
+    try:
+        ti.fetch_adj_factor_batch("2026-09-18")
+        raise AssertionError("持续限频应判配额耗尽")
+    except RuntimeError as exc:
+        assert "配额耗尽" in str(exc), str(exc)
+    assert calls["n"] == 2, f"应恰好重试一次: {calls}"
+    assert sleeps == [62 * 60], f"只应等一次 62min: {sleeps}"
+
+
 # ---------------------------------------------------------------------------
 # v7.0.9：表级完整性预检（"不需要更新的数据就不要更新"）
 # ---------------------------------------------------------------------------

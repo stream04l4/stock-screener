@@ -118,7 +118,7 @@ def _to_lake_code(ts_code: str) -> Optional[str]:
 
 def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
                 max_retries: int = 6) -> List[Dict[str, Any]]:
-    """全市场单日批量调用（1 次/分钟限频 → 超限等 62s 重试）。
+    """全市场单日批量调用（限频退避重试）。
 
     :return: list[dict]（ts_code 已转湖格式；非 sh/sz 行丢弃）。
     """
@@ -127,18 +127,29 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
     td = trade_date.replace("-", "")
     last: Optional[Exception] = None
     df = None
+    hour_waited = False
     for i in range(max_retries):
         try:
             df = getattr(pro, fn_name)(trade_date=td)
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
-            # 配额耗尽（实测免费 120 分：adj_factor/daily_basic = 5 次/天，
-            # 超限后惩罚 1 次/小时、重置口径未确认）→ 重试无意义（最多 1 次/时），
-            # 立即中止批量 → 回退逐只 legacy（不白等 8 轮退避 ~25min）。
-            # 每日批量每端点只用 1 次，正常不会触发。
+            # 限频/配额（免费 120 分档实测口径，2026-11-15 实锤修正旧注释：
+            # adj_factor = **1 次/小时**，非"5 次/天"）：
+            # - "N 次/小时"：可等待限频。正常每日 cron 每端点仅 1 次不触发；
+            #   触发场景=同日第二次批量（手动重跑/双跑，2026-11-15 事故：
+            #   当时误判为配额耗尽 → 回退逐只 legacy 9-10h）。等 62 分钟
+            #   重试一次；二次命中才判配额耗尽 → 回退逐只 legacy。
+            # - "N 次/天"：当日配额用尽 → 重试无意义，立即中止回退。
+            if "次/小时" in msg and not hour_waited:
+                last = exc
+                hour_waited = True
+                log.warning("tushare %s 触 N 次/小时限频 → 等 62min 重试一次: %s",
+                            fn_name, msg[:80])
+                _time.sleep(62 * 60)
+                continue
             if "次/小时" in msg or "次/天" in msg:
                 raise RuntimeError(
-                    f"tushare {fn_name} 配额耗尽（惩罚态，今日重试无意义）: {msg[:80]}"
+                    f"tushare {fn_name} 配额耗尽（已等 62min 仍超限）: {msg[:80]}"
                     " → 批量中止") from exc
             last = exc
             if "频率超限" in msg:
