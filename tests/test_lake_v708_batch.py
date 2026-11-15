@@ -83,6 +83,13 @@ def _isolate(tmp_path, monkeypatch):
     _reg = dict(_sp._adapter_registry())
     _reg["adata_f10"] = _AdataDown()
     monkeypatch.setattr(_sp, "_REGISTRY", _reg)
+    # v7.0.33：本文件验证 **tushare 备源** 路径 → EM 主通道恒离线（fail → 备源）
+    import lake.ingest.em_batch_ingest as _emb
+
+    def _emb_offline(allow_sg=True):
+        raise _emb.EmBatchError("test: EM offline（验证 tushare 备源路径）")
+
+    monkeypatch.setattr(_emb, "fetch_clist_snapshot", _emb_offline)
     yield
 
 
@@ -121,14 +128,23 @@ def _seed(db_path: str, codes, last_date: str = "2026-09-17") -> None:
     con.close()
 
 
-def _fake_tencent(monkeypatch, snap):
-    """fake 腾讯（零网络）：K线恒空（T7 指数不写库）；快照按 snap 返回。"""
+def _fake_tencent(monkeypatch, snap, idx_up_to=None):
+    """fake 腾讯（零网络）：股票 K线恒空；指数 sh000001=工作日 bar 至 idx_up_to
+    （缺省=运行日）——v7.0.33 批量通道以指数最新 bar 为日期锚。快照按 snap 返回。"""
     import lake.ingest.tencent_ingest as ti
 
     counter = {"kline": 0, "snapshot": 0}
 
     def fake_kline(client, ts_code, n):
         counter["kline"] += 1
+        if ts_code == "sh000001":
+            end = idx_up_to or drv._today_beijing()
+            out, d = [], dt.date.fromisoformat(end)
+            while len(out) < n:
+                if d.weekday() < 5:
+                    out.append({"date": d.isoformat(), "close": 1.0})
+                d -= dt.timedelta(days=1)
+            return list(reversed(out))[-n:]
         return []
 
     def fake_snapshot(client, ts_codes):
@@ -254,7 +270,8 @@ def test_batch_no_trade_day_marks_done_without_write(tmp_path, monkeypatch):
     # 节假日：腾讯快照仍是"当前时点"旧值（非空）→ legacy T3 照写（既有行为）
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in codes}
-    tc = _fake_tencent(monkeypatch, snap)
+    # v7.0.33：指数最新 bar=09-17（运行日 09-18 无 bar）→ ①.5 no_trade 短路
+    tc = _fake_tencent(monkeypatch, snap, idx_up_to="2026-09-17")
     # 批量：daily 空；af 空；daily_basic 也空 → 但 no_trade 判定只看 daily+指数
     bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
     r = drv.run_incremental(con, db, codes, days=3)
@@ -262,7 +279,9 @@ def test_batch_no_trade_day_marks_done_without_write(tmp_path, monkeypatch):
     # 无新 K线（不写）；也不逐只 legacy（腾讯 K线只被 T7 指数调用，非股票）
     assert con.execute(
         "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-18'").fetchone()[0] == 0
-    assert r["t2"]["processed"] == 2
+    # v7.0.33：no_trade 携指数 bar 日期 → data_date=09-17 → 表级预检判定 T2 已齐
+    # → 连逐只任务都不建（比旧版逐只 no-op 更强；processed=0 即无空转）
+    assert r["t2"]["processed"] == 0
     con.close()
 
 
@@ -756,4 +775,166 @@ def test_incremental_t9_fetch_failure_nonblocking(tmp_path, monkeypatch):
     assert "t9_error" not in r, r                          # 不阻断
     # 增量主体不受 T9 故障影响
     assert r["t3"]["processed"] == 1
+    con.close()
+
+
+# ---------------------------------------------------------------------------
+# v7.0.33：EM 主通道（东财 clist 批量取代 tushare 主轴）
+# ---------------------------------------------------------------------------
+
+def _em_snap_row(ts_code="sh.600001"):
+    """fetch_clist_snapshot 契约行（字段映射后口径）。"""
+    return {"ts_code": ts_code, "name": "测试股", "close": 10.25,
+            "pct_chg": 2.5, "open": 10.1, "high": 10.3, "low": 10.0,
+            "preclose": 10.0, "volume": 123456, "amount": 1000000.0,
+            "turnover": 1.0, "total_mv_yi": 100.0, "float_mv_yi": 80.0,
+            "list_date": "2000-01-01", "industry": "测试行业",
+            "pe_ttm": 5.0, "pb": 0.8}
+
+
+def test_em_batch_primary_channel_zero_tushare(tmp_path, monkeypatch):
+    """EM 主通道命中 → 行落库 source=em_batch + af 本地推导 + tushare 零调用。"""
+    import lake.ingest.em_batch_ingest as emb
+
+    db = str(tmp_path / "em1.duckdb")
+    codes = ["sh.600001"]
+    _seed(db, codes)   # 缺口 = 09-18 单日；kline 止 09-17（af=1.0 已播种）
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    tc = _fake_tencent(monkeypatch, snap)   # 指数 bar 至运行日 → EM 触发
+    # 收盘后（非盘中 guard）
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 18, 21, 30))
+    # EM 在线：快照 1 行 + 1 条除权事件（现金 0.2 元/股，无送转）
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: [_em_snap_row()])
+    monkeypatch.setattr(emb, "fetch_ex_events",
+                        lambda d: [{"ts_code": "sh.600001", "ex_date": d,
+                                    "cash": 0.2, "bonus": 0.0,
+                                    "has_allot": False}])
+    bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
+    r = drv.run_incremental(con, db, codes, days=3)
+
+    # 批量走 EM：channel=em、tushare 三接口零调用
+    assert r["batch"]["channel"] == "em", r.get("batch")
+    assert bs == {"daily": 0, "af": 0, "basic": 0}, bs
+    assert r["batch"]["n_events"] == 1
+    # T2：em_batch 行落库
+    row = con.execute(
+        'SELECT "close", volume, amount, pct_chg, preclose, source '
+        "FROM kline_daily WHERE ts_code='sh.600001' AND date='2026-09-18'"
+    ).fetchone()
+    assert row == (10.25, 123456, 1000000.0, 2.5, 10.0, "em_batch"), row
+    # af：本地推导（除权参考价步长，c0=09-17 close，prev af=1.0）
+    c0 = con.execute(
+        "SELECT \"close\" FROM kline_daily WHERE ts_code='sh.600001' "
+        "AND date='2026-09-17'").fetchone()[0]
+    af = con.execute(
+        "SELECT adj_factor FROM kline_daily WHERE ts_code='sh.600001' "
+        "AND date='2026-09-18'").fetchone()[0]
+    assert af == pytest.approx(1.0 * c0 * 1.0 / (c0 - 0.2), rel=1e-9), af
+    # T3：em_batch 落库（date=批量日，非运行日）
+    vrow = con.execute(
+        "SELECT total_mv, source FROM valuation_daily "
+        "WHERE ts_code='sh.600001' AND date='2026-09-18'").fetchone()
+    assert vrow == (100.0, "em_batch"), vrow
+    # T2/T3 全命中批量 → 腾讯快照零调用
+    assert tc["snapshot"] == 0
+    con.close()
+
+
+def test_refetch_batch_cannot_cover_pre_batch_trading_gap(tmp_path, monkeypatch):
+    """v7.0.33 修复：refetch 批量（批量日=指数最新交易日）不得覆盖批量日**之前**
+    的缺失交易日。
+
+    2026-11-15 实锤：5215 只 11-13 缺口被 done 键毒化（空窗误标完成）→ 周一批量日
+    =11-16，若按旧判定（区间内无其他交易日即覆盖）批量 11-16 行落库后标 done
+    → 11-13 永久空洞。修复：start 本身是批量日前交易日（在指数 bar 中）→ 批量不
+    覆盖 → 逐只窗口取数补齐。
+    """
+    import lake.ingest.em_batch_ingest as emb
+
+    db = str(tmp_path / "em3.duckdb")
+    codes = ["sh.600001"]
+    monkeypatch.setattr(drv, "_today_beijing", lambda: "2026-09-21")  # 周一
+    _seed(db, codes, last_date="2026-09-17")   # start=09-18（周五，缺失）
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    # 指数 bar：09-17/09-18/09-21（09-18 在 bar 中=缺失的交易日）；股票 K线=
+    # 09-18+09-21 两根（逐只窗口取数可补齐）
+    import lake.ingest.tencent_ingest as tix
+
+    def fake_kline(client, ts_code, n):
+        if ts_code == "sh000001":
+            return [{"date": d, "open": 1, "high": 1, "low": 1, "close": 1,
+                     "volume": 1} for d in ("2026-09-17", "2026-09-18",
+                                            "2026-09-21")]
+        return [{"date": "2026-09-18", "open": 10.1, "high": 10.3, "low": 10.0,
+                 "close": 10.2, "volume": 1000},
+                {"date": "2026-09-21", "open": 10.3, "high": 10.5, "low": 10.1,
+                 "close": 10.4, "volume": 2000}]
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv", fake_kline)
+    monkeypatch.setattr(tix, "fetch_snapshot",
+                        lambda client, ts_codes: {c: dict(snap[c])
+                                                  for c in ts_codes if c in snap})
+    from lake.ingest import source_pool as sp
+    ad = sp.get_adapter("tdx")
+    if ad is not None:
+        monkeypatch.setattr(ad, "available", lambda: False)
+    # EM 在线：快照行（批量日=09-21，refetch）
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 21, 21, 0))
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: [_em_snap_row()])
+    monkeypatch.setattr(emb, "fetch_ex_events", lambda d: [])
+    bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
+    r = drv.run_incremental(con, db, codes, days=3)
+
+    assert r["batch"]["channel"] == "em" and r["batch"]["date"] == "2026-09-21"
+    assert r["batch"].get("refetch") is True
+    # 09-18（批量日前缺失交易日）必须由逐只窗口取数补齐——不得被 EM 09-21 行替代
+    rows = con.execute(
+        "SELECT date, source FROM kline_daily WHERE ts_code='sh.600001' "
+        "AND date >= '2026-09-18' ORDER BY date").fetchall()
+    assert [str(x[0]) for x in rows] == ["2026-09-18", "2026-09-21"], rows
+    assert all(x[1] != "em_batch" for x in rows), rows  # 走逐只（tencent），非批量行
+    con.close()
+
+
+def test_em_intraday_guard_skips_batch(tmp_path, monkeypatch):
+    """盘中（北京<15:05 且快照=今日）→ EM 拒用 → 回退 tushare（备源）。"""
+    import lake.ingest.em_batch_ingest as emb
+
+    db = str(tmp_path / "em2.duckdb")
+    codes = ["sh.600001"]
+    _seed(db, codes)
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    _fake_tencent(monkeypatch, snap)
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 18, 10, 30))  # 盘中
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: (_ for _ in ()).throw(
+                            AssertionError("盘中不应取 EM 快照")))
+    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
+                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
+                "preclose": 10.0, "pct_chg": 2.5,
+                "volume": 123456, "amount": 1000000.0}]
+    bs = _fake_batch(monkeypatch, t2_rows=t2_rows,
+                     af_map={"sh.600001": {"2026-09-18": 1.5}},
+                     t3_rows=[{"ts_code": "sh.600001", "date": "2026-09-18",
+                               "total_mv_yi": 100.0, "float_mv_yi": 80.0,
+                               "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0,
+                               "ttm_yield_pct": 3.2}])
+    r = drv.run_incremental(con, db, codes, days=3)
+    # EM 盘中拒用（batch failed 记痕含 em:）→ tushare 备源接管
+    assert r["batch"]["channel"] == "tushare", r.get("batch")
+    assert bs["daily"] == 1
+    assert con.execute(
+        "SELECT source FROM kline_daily WHERE ts_code='sh.600001' "
+        "AND date='2026-09-18'").fetchone()[0] == "tushare"
     con.close()
