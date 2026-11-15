@@ -1557,6 +1557,23 @@ def _kline_gap_start(con, code: str, fallback_days: int) -> str:
     return (dmax + _dt.timedelta(days=1)).isoformat()
 
 
+def _sweep_stale_running(runner) -> int:
+    """清扫陈旧 state=running 条目（v7.0.32 补，Joel 2026-11-15 页面实锤）。
+
+    新进程启动即意味着上一个进程必已死亡（崩溃/被杀；CLI 入口有 pgrep 双跑
+    保护，两进程不会并存）→ progress 文件里任何 state=running 都是上次未
+    优雅退出的 run 的陈旧标记（表数据其实已齐 5223 却仍显示"运行中"）。
+    归一为 stopped_by_signal（前端渲染"已停止"灰色，与 SIGTERM 优雅停止同
+    语义）；本轮真实终态由收尾 _refresh 写入。:return: 清扫条数。
+    """
+    n = 0
+    for t in runner.progress.get("tasks", []):
+        if t.get("state") == "running":
+            t["state"] = "stopped_by_signal"
+            n += 1
+    return n
+
+
 def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     days: int) -> Dict[str, Any]:
     """P3 每日增量（v6.1.4 O2，brief 逐字）：
@@ -1606,6 +1623,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
 
     codes = codes or _universe_codes(con)
     runner = BackfillRunner(db_path=db_path)
+    # 陈旧 running 清扫（新进程=旧进程已死，running 必为陈旧标记；详见
+    # _sweep_stale_running 注释）。不单独 save_progress——本轮首个视图刷新
+    # 会整体落盘（避免与运行中进程的文件写竞争语义混乱）。
+    _sweeped = _sweep_stale_running(runner)
+    if _sweeped:
+        log.info("incremental: 清扫陈旧 running 条目 %d 个（上一 run 未优雅退出）", _sweeped)
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes), "as_of": today_s}
 

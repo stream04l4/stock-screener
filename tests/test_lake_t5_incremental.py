@@ -390,3 +390,22 @@ def test_live_view_fallback_on_sql_error(monkeypatch, tmp_path):
     r.progress.setdefault("tasks", []).append(e)
     drv._t5_live_view(_DeadCon(), r, "2026Q3", total=10, processed=7)
     assert e["done"] == 7 and e["state"] == "running"
+
+
+def test_sweep_stale_running_only_flips_running(tmp_path):
+    """新 run 启动时 state=running 必为陈旧标记（旧进程已死）→ 归一
+    stopped_by_signal（前端渲染"已停止"）；done/pending 等其他状态不动。"""
+    import lake_backfill as drv
+
+    r = _runner(tmp_path)
+    r.progress["tasks"] = [
+        {"table": "kline_daily", "state": "running", "done": 5223, "total": 5223},
+        {"table": "fundamentals_quarterly", "state": "done", "done": 5, "total": 5},
+        {"table": "index_daily", "state": "pending", "done": 0, "total": 4},
+    ]
+    n = drv._sweep_stale_running(r)
+    assert n == 1
+    states = [t["state"] for t in r.progress["tasks"]]
+    assert states == ["stopped_by_signal", "done", "pending"]
+    # done/total 数值不动（页面仍显示真实湖口径 5223/5223）
+    assert r.progress["tasks"][0]["done"] == 5223
