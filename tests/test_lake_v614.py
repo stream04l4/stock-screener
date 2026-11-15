@@ -96,6 +96,23 @@ def _v614_isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(wapi, "_run_sg_batch", lambda names: {
         n: {"available": False, "probed_at": "2026-09-17 08:05:00",
             "latency_ms": None, "detail": "offline-test"} for n in names})
+    # v7.0.32 T5 季度增量隔离：注册表注入 adata_f10 离线 mock（available()=False →
+    # T5 抛错记痕、不阻断增量——同 T8/T9 纪律；零网络。T5 自身语义由
+    # tests/test_lake_t5_incremental.py 的 FakeAdapter 覆盖。）
+    import lake.ingest.source_pool as _sp
+
+    class _AdataDown:
+        name = "adata_f10"
+
+        def available(self):
+            return False
+
+        def fetch_f10(self, ts_code):
+            raise AssertionError("T5 离线测试：不应取数")
+
+    _reg = dict(_sp._adapter_registry())
+    _reg["adata_f10"] = _AdataDown()
+    monkeypatch.setattr(_sp, "_REGISTRY", _reg)
     yield
 
 
@@ -425,7 +442,8 @@ def _seed_stuck_history_progress(codes) -> None:
 
 def test_o3_refresh_marks_kline_history_done_and_adds_t5_t6(tmp_path):
     """incremental 收尾刷新：kline_history running→done（不依赖已死进程自报）；
-    T5 fundamentals_quarterly 加 pending 条目（备注 history --t5）；
+    T5 fundamentals_quarterly 加条目（v7.0.32 起 note=季度增量、湖驱动 done 计数；
+    离线 mock 下 done=0 → pending）；
     T6 holders_snapshot v6.1.7 起为真实任务（total=universe、tier=P2、pending）。"""
     db = str(tmp_path / "o3.duckdb")
     codes = ["sh.600001", "sz.000002"]
@@ -448,7 +466,8 @@ def test_o3_refresh_marks_kline_history_done_and_adds_t5_t6(tmp_path):
     e5 = _task_entry(prog, "fundamentals_quarterly")
     assert e5 is not None and e5["state"] == "pending" and e5["total"] == 2, \
         f"T5 应加 pending 条目: {e5}"
-    assert "--t5" in (e5.get("note") or "")
+    # v7.0.32：note 改季度增量口径（湖驱动 done 计数；离线 mock 下 done=0 亦 pending）
+    assert "季度增量" in (e5.get("note") or "")
     e6 = _task_entry(prog, "holders_snapshot")
     assert e6 is not None and e6["state"] == "pending", \
         f"T6 应为真实任务 pending（v6.1.7）: {e6}"

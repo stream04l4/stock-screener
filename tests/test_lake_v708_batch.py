@@ -67,6 +67,22 @@ def _isolate(tmp_path, monkeypatch):
                                      "source": "tradingeconomics"}))
     monkeypatch.setattr(_lci, "load_macro_rf",
                         lambda con, cache_dir, source="te_local": 7)
+    # v7.0.32 T5 季度增量隔离：注册表注入 adata_f10 离线 mock（available()=False →
+    # T5 抛错记痕、不阻断增量；零网络。T5 语义见 tests/test_lake_t5_incremental.py。）
+    import lake.ingest.source_pool as _sp
+
+    class _AdataDown:
+        name = "adata_f10"
+
+        def available(self):
+            return False
+
+        def fetch_f10(self, ts_code):
+            raise AssertionError("T5 离线测试：不应取数")
+
+    _reg = dict(_sp._adapter_registry())
+    _reg["adata_f10"] = _AdataDown()
+    monkeypatch.setattr(_sp, "_REGISTRY", _reg)
     yield
 
 

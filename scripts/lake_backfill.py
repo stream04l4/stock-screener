@@ -1164,6 +1164,119 @@ def run_t5(con, db_path: str, codes: Optional[List[str]], runner) -> Dict[str, A
     return {"table": "fundamentals_quarterly", **stats}
 
 
+# ---------------------------------------------------------------------------
+# T5 季度增量（v7.0.32：每日增量跟进新季度；Joel 2026-11-14 拍板）
+# ---------------------------------------------------------------------------
+# 背景（2026-11-14 排查实锤）：run_t5 全量用一次性 ``f10_full`` done 键（每股一次抓
+# 全部历史报告期，标 done 后永不重取），而每日增量只覆盖 T2/T3/T7 →
+# fundamentals_quarterly 冻结在最后一次全量 backfill 的报告期（生产：2026Q3=0 行，
+# 股票全景卡"暂无数据（后台补齐中）"、Web 进度停在 5215/5223 陈旧快照）。
+# 修复：每日增量按报告期跟进——探测源上最新报告期 → 逐股缺口判定 → 补齐。
+T5_PROBE_CODES = ("sh.600519", "sh.600000")   # 茅台/浦发——披露最及时的两只（探测标的）
+
+
+def _t5_probe_latest_period(ad) -> str:
+    """探测数据源当前最新报告期（探测标的的 max period）。
+
+    - 探测标的 ``T5_PROBE_CODES``（2 只、1-2 次 adata 调用）——茅台/浦发恒按时披露，
+      其最新期 ≈ 全市场最新期（季报披露截止日前个别滞后股由逐股 not_reported 重试覆盖）。
+    - 全空/全错 → 抛 RuntimeError（T5 本轮整体失败、不标 done、下轮重试——语义同
+      run_t5 的 adata 不可用分支；单只探测失败容忍，另一只仍可出 P*）。
+    """
+    best: Optional[str] = None
+    errs: List[str] = []
+    for c in T5_PROBE_CODES:
+        try:
+            recs = ad.fetch_f10(c)
+        except Exception as exc:  # noqa: BLE001 - 单只探测失败容忍，全灭才抛
+            errs.append(f"{c}: {exc}")
+            continue
+        for r in recs or []:
+            if r.get("period") and (best is None or r["period"] > best):
+                best = r["period"]
+    if best is None:
+        raise RuntimeError("T5 增量探测失败（探测标的全空/全错，adata 不可达？）: "
+                           + "; ".join(errs))
+    return best
+
+
+def run_t5_incremental(con, db_path: str, codes: Optional[List[str]],
+                       runner) -> Dict[str, Any]:
+    """T5 季度增量（v7.0.32：补 run_t5 一次性 f10_full done 键的"无后续季度"缺陷）。
+
+    算法（湖驱动、kill-safe，逐股即时落盘）：
+    1. **探测** P* = 数据源最新报告期（探测标的，1-2 次调用；全灭抛错）；
+    2. **缺口判定** 用湖内每股 MAX(period)（单条 SQL）：无行（次新股）或 < P* → 待补；
+       ≥ P* → 跳过（零网络）。判定以**湖**为准（非 done 键）——崩溃/中断后下轮从湖
+       重算缺口续跑，无脏数据、无重复取数副作用（upsert PK 幂等）；
+    3. 逐股 fetch_f10（全报告期）→ load_t5 upsert（PK (ts_code, period)，DuckDB
+       语句级自动提交 → 每股落盘，进程中途被杀下轮自动续）；
+    4. done 键 ``(fundamentals_quarterly, code, "q:<本轮返回的实际最大期>")``——仅作
+       进度簿记/续跑加速，**不是判定依据**（防"本轮未披露 P* 却标 q:P* → 该股被永久
+       跳过、漏后披露行"的键毒化）；
+    5. 失败语义：adata 不可用/探测失败 → 抛错（不标 done，下轮重试）；单股取空/
+       取错 → 记痕继续、该股不标 done（下轮自动重试）；"P* 尚未披露"（actual < P*，
+       季报披露季 ~1 个月窗口内的滞后股）→ 已披露部分照常 upsert + 按实际期标 done，
+       下轮自动重试，窗口结束自愈。
+
+    :return: {table, probe, needed, processed, not_reported, errors(截 50), elapsed_s}
+    """
+    from lake.backfill import Task
+    from lake.config import lake_cfg
+    from lake.ingest import source_pool as sp
+    from lake.ingest.adata_f10_adapter import load_t5
+
+    ad = sp.get_adapter("adata_f10")
+    if ad is None or not lake_cfg().get("adata_f10_enabled", True) or not ad.available():
+        raise RuntimeError("T5 adata F10 不可用（增量，不标 done，下轮重试）")
+
+    p_star = _t5_probe_latest_period(ad)
+    codes = codes or _universe_codes(con)
+    lake_max = dict(con.execute(
+        "SELECT ts_code, MAX(period) FROM fundamentals_quarterly GROUP BY ts_code"
+    ).fetchall())
+    needed = [c for c in codes if lake_max.get(c) is None or lake_max[c] < p_star]
+    stats: Dict[str, Any] = {"table": "fundamentals_quarterly", "probe": p_star,
+                             "needed": len(needed)}
+    if not needed:
+        stats["skipped"] = "全部股票已至最新报告期"
+        log.info("T5 增量：probe=%s，%d 股全部齐 → 跳过（零网络）", p_star, len(codes))
+        return stats
+
+    processed = not_reported = 0
+    errors: List[str] = []
+    t0 = time.monotonic()
+    for i, c in enumerate(needed):
+        # 优雅停止（sync_control SIGTERM）——逐股已提交，下轮从湖续（safe）
+        if getattr(runner, "_stop_requested", False):
+            stats["stopped"] = True
+            log.info("T5 增量：停止信号 → %d/%d 已处理，下轮续", i, len(needed))
+            break
+        try:
+            recs = ad.fetch_f10(c)
+            if not recs:
+                errors.append(f"{c}: adata F10 取空（不标 done，下轮重试）")
+                continue
+            load_t5(con, c, recs, source="adata_f10", conflict_src=None)
+            actual = max(r["period"] for r in recs)
+            if actual < p_star:
+                not_reported += 1   # 该股尚未披露 P*（披露季窗口）→ 下轮自动重试
+            # done 键 = 实际最大期（非固定 q:P*）：未披露 P* 不能标 q:P*（防键毒化）
+            runner.mark_done(Task(priority=2, table="fundamentals_quarterly", ts_code=c,
+                                  period_or_date=f"q:{actual}", tier="P2"))
+            processed += 1
+        except Exception as exc:  # noqa: BLE001 - 单股失败不中断整队（同 run_t5 纪律）
+            errors.append(f"{c}: {exc}")
+    stats.update(processed=processed, not_reported=not_reported,
+                 errors=errors[:50], elapsed_s=round(time.monotonic() - t0, 1))
+    # 终刷 done 集合（mark_done 按 _MARK_FLUSH_BATCH=200 批量落盘——裸 save_progress
+    # 不刷 progress["done"]，末批残留会丢簿记键；run() 收尾同样走本终刷）
+    runner._flush_done_marks()
+    log.info("T5 增量完成：probe=%s needed=%d processed=%d not_reported=%d errors=%d (%.0fs)",
+             p_star, len(needed), processed, not_reported, len(errors), stats["elapsed_s"])
+    return stats
+
+
 
 # ---------------------------------------------------------------------------
 # T6 holders_snapshot（v6.1.7：full 模式第 4 阶段——SinaClient.fetch_holders → load_t6）
@@ -1421,6 +1534,11 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
       "当前时点"数据，滞后多少补多少 = 每次覆盖写最新值）。取空前置一批探测
       （全空=网络故障 → 抛错不标 done；个别缺失=停牌/批次失败 → 跳过该只）。
     - **index_daily**：四指数腾讯主源近 N 日 upsert（同 run_t7 取数，done 键换新周期）。
+    - **fundamentals_quarterly（T5 季度增量，v7.0.32）**：探测源上最新报告期 P*
+      （探测标的 2 只）→ 湖内逐股 MAX(period) 缺口判定（无行/低于 P* 才取）→
+      fetch_f10 + load_t5 upsert 补齐。补旧缺陷：T5 全量一次性 f10_full done 键 +
+      增量不碰 T5 → 季度表永久停在末次全量的报告期（2026Q3=0 行"一直滞后"）。
+      失败不阻断增量（同 T8/T9 单阶段纪律，stats 记痕下轮重试）。
 
     **幂等**：done 键 per-table+code+**运行日**（``inc:YYYY-MM-DD`` / T3=日期本身）——
     同日重跑跳过已灌；次日新键自动重取。全源失败 → worker 抛错**不 mark_done**
@@ -1885,6 +2003,19 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         log.error("T9 macro_rf 跟进失败（增量不阻断）: %s", exc)
         stats["t9_error"] = str(exc)
 
+    # ---- T5 fundamentals_quarterly 季度跟进（v7.0.32，Joel 2026-11-14 拍板）----
+    # 旧缺陷实锤（2026-11-14 排查）：T5 全量一次性 f10_full done 键 + 每日增量不碰
+    # T5 → 季度基本面永久停在最后一次全量的报告期（生产 2026Q3=0 行、"一直滞后"）。
+    # 此处跟进：探测最新报告期 → 湖内逐股缺口判定 → 补齐。首轮全市场追 2026Q3 +
+    # 次新股（~2h，限速内）；此后常规轮零网络（全齐→跳过）；季报披露季 ~1 个月
+    # 窗口内滞后股逐股重试（not_reported 自愈，窗口结束归零）。
+    # 纪律（同 T8/T9 单阶段异常）：失败不阻断增量（stats 记痕 + 日志，下轮自动重试）。
+    try:
+        stats["t5"] = run_t5_incremental(con, db_path, codes, runner)
+    except Exception as exc:  # noqa: BLE001 - T5 失败不阻断增量（同 T8/T9 纪律）
+        log.error("T5 季度跟进失败（增量不阻断）: %s", exc)
+        stats["t5_error"] = str(exc)
+
     # O2/O3：tasks 占位条目刷成真实 total/done + kline_history 完成态 + T5/T6 条目
     _refresh_incremental_task_view(runner, con, today_s)
     # v7.0.9：预检判"已齐"的表按 done 键计数为 0 → _refresh 会误显 0/total pending，
@@ -2022,13 +2153,26 @@ def _refresh_incremental_task_view(runner, con, today_s: str) -> None:
         # v6.3.1 R1 纵深防御：done<total 的陈旧 "done" 同样降级 pending。
         eh["state"] = "pending"
 
-    # T5 fundamentals_quarterly：加进 tasks（pending；已灌的按 f10_full done 键计）
+    # T5 fundamentals_quarterly：v7.0.32 季度增量——done = 湖内期数已达**全库最新
+    # 报告期**的 universe 股数（湖驱动口径，取代旧 f10_full 固定键计数）。旧 f10_full
+    # done 键留在 done 集合里无害（判定以湖为准）；首轮全量追平后 done=total→done。
     e5 = _entry("fundamentals_quarterly", tier="P2")
-    done5 = len(_done_codes("fundamentals_quarterly"))   # 固定键 f10_full
+    _pmax5 = con.execute("SELECT MAX(period) FROM fundamentals_quarterly").fetchone()[0]
+    if _pmax5:
+        done5 = con.execute(
+            "SELECT COUNT(DISTINCT ts_code) FROM fundamentals_quarterly WHERE period=?",
+            [str(_pmax5)]).fetchone()[0]
+    else:
+        done5 = 0
     e5["total"] = universe_n
-    e5["done"] = done5
-    e5["state"] = "done" if (universe_n > 0 and done5 >= universe_n) else "pending"
-    e5["note"] = "history --t5 或增量均可灌（adata F10 主源）"
+    e5["done"] = min(int(done5), universe_n)
+    if universe_n > 0 and e5["done"] >= universe_n:
+        e5["state"] = "done"
+    elif e5.get("state") in ("running", "stopping", "done"):
+        # v6.3.1 R1 纵深防御（同 T2/T3）：收尾态无活跃 writer，非 done 归位 pending
+        e5["state"] = "pending"
+    e5["note"] = (f"季度增量（v7.0.32 每日跟进；最新报告期={str(_pmax5) if _pmax5 else '—'}；"
+                  "adata F10 主源）")
 
     # T6 holders_snapshot：v6.1.7 起有源（SinaClient.fetch_holders → load_t6，full 阶段 4）
     # ——由 v6.1.4 O3 的 no_source/total=0 占位升级为**真实任务**（brief §A 逐字：
