@@ -40,7 +40,7 @@ async function doLogin(target) {
       <p class="login-sub">A股深回撤金字塔加仓 · 加密深回撤网格 + 10x 止盈 · 同一账号密码，选择要进入的系统</p>
       <label class="login-field">
         <span>用户名</span>
-        <input v-model="form.username" autocomplete="username" placeholder="admin" />
+        <input v-model="form.username" autocomplete="username" placeholder="请输入用户名" />
       </label>
       <label class="login-field">
         <span>密码</span>
