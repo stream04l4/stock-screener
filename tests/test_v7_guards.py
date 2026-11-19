@@ -51,7 +51,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # web_api.py SG 双通道探测（Gate 1 并行任务），lake/ 有意变更，基线前移。
 # review 断档修复（530284c，2026-11-10）：source_pool.py tushare 卡补 T2 每日
 # 增量主源登记（能力表=展示元数据，有意变更），基线前移。
-BASELINE = "4c4adf8"
+# v8.2.0 补（138baf6，2026-11-19）：T3 息率质量门（baidu_valuation_adapter
+# derive_yield_for_date + lake_backfill _t3_yield_gate），lake/ 有意变更，
+# 基线前移。
+BASELINE = "138baf6"
 
 
 def _git(*args) -> str:
