@@ -51,7 +51,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # web_api.py SG 双通道探测（Gate 1 并行任务），lake/ 有意变更，基线前移。
 # review 断档修复（530284c，2026-11-10）：source_pool.py tushare 卡补 T2 每日
 # 增量主源登记（能力表=展示元数据，有意变更），基线前移。
-BASELINE = "530284c"
+BASELINE = "4c4adf8"
 
 
 def _git(*args) -> str:
@@ -102,7 +102,7 @@ def test_no_stale_multifactor_references_in_tracked_files():
 # ---------------------------------------------------------------------------
 
 def test_crontab_only_lake_sync_business_line():
-    """stock-screener 的 crontab 业务行恰为 5 条（v1.1 Gate 1 起，2026-11-10）：
+    """stock-screener 的 crontab 业务行恰为 7 条（v1.1 Gate 1 起，2026-11-10）：
     lake-sync 每日增量（1-5 11:30 UTC）+ t1-delist 周频退市档（周日 11:30 UTC，
     tushare stock_basic D 单调用）+ t6 季度全市场重抓（9/11/5 月 5 日 11:30 UTC，
     tester DEF-4：季度报告期披露截止日后补新期）+ signal-touch 盘中触碰落盘
@@ -110,16 +110,20 @@ def test_crontab_only_lake_sync_business_line():
     data/alerts/signal_touch_state.json，v7.0.20
     Joel 定案「盘中达成信号保留到当日、次日移入历史」）+ **Gate 1 观察期延时
     复测**（1-5 01:35/04:05/06:35 UTC 盘中 3 时点，push2delay vs 腾讯 tick 延时，
-    设计稿 §5/§6，Gate 0 已批——备源定位判据 >3min 降兜底）。
+    设计稿 §5/§6，Gate 0 已批——备源定位判据 >3min 降兜底）+ **signal-touch
+    补跑槽**（1-5 23:30 UTC = 北京 07:30，v8.2.0 补：20:05 主跑在行情/湖
+    双故障日失败后次日开盘前补记，(代码,行情日) 键幂等，11-17/18 实锤
+    后 Joel 拍板）。
     团队基础设施行——hermes memory-backup/pipeline-watchdog——不属本项目，按路径过滤。
     （v7.0.20–v1.1 前为 4 条；Gate 1 观察期批准后才加第 5 条；v7.0.43 双系统定案
-    后加第 6 条 crypto-sync——加密货币系统独立湖每小时增量，docs/crypto_design §6。）"""
+    后加第 6 条 crypto-sync——加密货币系统独立湖每小时增量，docs/crypto_design §6；
+    v8.2.0 补加第 7 条 signal-touch 补跑槽。）"""
     r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("无 crontab 条目（非部署环境）")
     proj = [l for l in r.stdout.splitlines()
             if l.strip() and not l.strip().startswith("#") and "stock-screener" in l]
-    assert len(proj) == 6, f"stock-screener crontab 业务行应恰为 6（lake-sync + t1-delist + t6-quarterly + signal-touch + gate1-latency + crypto-sync），实际 {len(proj)}: {proj}"
+    assert len(proj) == 7, f"stock-screener crontab 业务行应恰为 7（lake-sync + t1-delist + t6-quarterly + signal-touch + signal-touch-makeup + gate1-latency + crypto-sync），实际 {len(proj)}: {proj}"
     assert any("run_lake_sync_daily.sh" in l for l in proj)
     assert any("run_t1_delist_weekly.sh" in l for l in proj)
     assert any("run_t6_quarterly.sh" in l for l in proj)

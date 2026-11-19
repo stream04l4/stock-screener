@@ -1581,6 +1581,81 @@ def _sweep_stale_running(runner) -> int:
     return n
 
 
+def _t3_yield_gate(con, date) -> Dict[str, Any]:
+    """T3 息率质量门（v8.2.0 补，2026-11-19 Joel 拍板；2026-11-17 实锤）。
+
+    背景：EM 批量源（clist 快照）无 dv_ttm 字段 → 该通道日 T3 的
+    ttm_yield_pct 全 NULL；若逐只腾讯快照同日也失败（WAF/降级），整日息率
+    缺口落库 → G8 息率门槛 fail-closed（息率缺失不入选）→ **候选池归零**
+    （11-17 池 0 只、11-18 全天推送无池内标的实锤）。
+
+    口径（2026-11-19 实测定标）：tushare dv_ttm 与腾讯 idx64 的「TTM」
+    均宽于严格 365 天 ex_date 窗口（华润新阳 sh.601825：严格 2.0% vs
+    商业 4.5%，两商业源相互一致）→ 本地严格派生会系统性偏低 ~2 倍，
+    直接补会让池子在「商业源日 / EM 源日」之间跳变。故补齐序：
+      ① **前 ≤10 日最近有值日结转（价格调整）**：dps_est = 前日息率% ÷100
+         × 前日 close → 当日息率 = dps_est ÷ 当日 close ×100（分红 DPS
+         日际不变，价格调整消除日内漂移）——与商业源口径一致；
+      ② 前 10 日无商业值（新上市/长缺口）→ 严格 TTM 兜底（TTM 现金
+         DPS ÷ 当日 close，derive_yield_for_date 同公式）；
+      ③ 无当日 close（停牌）或真无息 → 保持 NULL，G8 fail-closed 不变。
+    触发条件：当日 ttm_yield_pct NULL 率 > 50%（可配 t3_yield_null_max；
+    正常日 tushare ~33% / tencent 0% 不触发）。零网络，幂等。
+    :return: 记痕 dict（进 stats["t3_yield_gate"]）。
+    """
+    from lake.config import lake_cfg
+    from lake.ingest.baidu_valuation_adapter import derive_yield_for_date
+
+    null_max = float(lake_cfg().get("t3_yield_null_max", 0.5) or 0.5)
+    row = con.execute(
+        "SELECT COUNT(*), COUNT(ttm_yield_pct) FROM valuation_daily WHERE date=?",
+        [date]).fetchone()
+    total, non_null = int(row[0]), int(row[1])
+    if total == 0:
+        return {"date": str(date), "rows": 0, "ok": True}
+    # 触发条件=严格 NULL 率 > null_max（与文档口径一致；2026-11-19 修：
+    # 原写法 1.0-null_max 边界上恰好 50% 会误触发）
+    if non_null / total >= (1.0 - null_max):
+        return {"date": str(date), "rows": total, "null": total - non_null,
+                "ok": True}
+    log.warning("T3 息率质量门触发: %s NULL %d/%d（%.0f%%）→ 结转+派生补齐",
+                date, total - non_null, total, (total - non_null) / total * 100)
+    # ① 前 ≤10 日最近有值日结转（价格调整）——只填仍 NULL 的行
+    #    （SET 内标量子查询；子查询 0 行 → NULL → 行保持 NULL）
+    con.execute("""
+        UPDATE valuation_daily v SET ttm_yield_pct =
+            (SELECT py.y * pc.c / kf.c
+             FROM (SELECT close AS c FROM kline_daily
+                   WHERE ts_code = v.ts_code AND date = v.date) kf,
+                  (SELECT v2.ttm_yield_pct AS y FROM valuation_daily v2
+                   WHERE v2.ts_code = v.ts_code AND v2.date < v.date
+                     AND v2.date >= v.date - INTERVAL 10 DAY
+                     AND v2.ttm_yield_pct IS NOT NULL
+                   ORDER BY v2.date DESC LIMIT 1) py,
+                  (SELECT k2.close AS c FROM kline_daily k2
+                   WHERE k2.ts_code = v.ts_code AND k2.date =
+                     (SELECT MAX(v3.date) FROM valuation_daily v3
+                      WHERE v3.ts_code = v.ts_code AND v3.date < v.date
+                        AND v3.date >= v.date - INTERVAL 10 DAY
+                        AND v3.ttm_yield_pct IS NOT NULL)) pc
+             WHERE kf.c IS NOT NULL AND py.y IS NOT NULL AND pc.c IS NOT NULL)
+        WHERE v.date = ? AND v.ttm_yield_pct IS NULL
+    """, [date])
+    con.commit()
+    # ② 严格 TTM 兜底（前 10 日无商业值的缺口行）
+    derived = derive_yield_for_date(con, date)
+    con.commit()
+    total2, non_null2 = con.execute(
+        "SELECT COUNT(*), COUNT(ttm_yield_pct) FROM valuation_daily WHERE date=?",
+        [date]).fetchone()
+    log.warning("T3 息率质量门完成: 结转+派生后 %d/%d 有值，剩余 NULL %d"
+                "（停牌/无 TTM 商业值且无分红）",
+                int(non_null2), int(total2), int(total2) - int(non_null2))
+    return {"date": str(date), "rows": int(total2),
+            "null_before": total - non_null, "derived": int(derived),
+            "null_after": int(total2) - int(non_null2), "ok": True}
+
+
 def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     days: int) -> Dict[str, Any]:
     """P3 每日增量（v6.1.4 O2，brief 逐字）：
@@ -2043,6 +2118,17 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     t3_tasks = [Task(priority=3, table="valuation_daily", ts_code=c,
                      period_or_date=today_s, tier="P3") for c in t3_codes]
     stats["t3"] = runner.run(t3_tasks, t3_worker)
+
+    # ---- v8.2.0 补 T3 息率质量门（2026-11-17 em_batch 息率全 NULL → 池归零）----
+    # 在 selection/timing 重算之前收口（它们读预计算表，而预计算/池 G8 读
+    # valuation_daily 最新行）；失败不阻断增量（记痕，下轮重跑幂等重试）。
+    _gate_date = batch.get("date") or data_date
+    if _gate_date:
+        try:
+            stats["t3_yield_gate"] = _t3_yield_gate(con, _gate_date)
+        except Exception as exc:  # noqa: BLE001 - 质量门失败不阻断（记痕，不静默）
+            log.error("T3 息率质量门失败（不阻断）: %s", exc)
+            stats["t3_yield_gate_error"] = str(exc)
 
     # ---- T7 index_daily：四指数腾讯主源近 N 日 upsert（同 run_t7 取数口径）----
     def t7_worker(task: Task) -> None:

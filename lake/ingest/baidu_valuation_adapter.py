@@ -160,6 +160,37 @@ def derive_yield_for_rows(con, ts_codes: Optional[List[str]] = None) -> int:
     # 前后 COUNT 差（rowcount 不可靠）。
     pre_sql = (f"SELECT COUNT(*) FROM valuation_daily v WHERE v.source=? AND v.ttm_yield_pct IS NOT NULL {code_f}")
     before = con.execute(pre_sql, args).fetchone()[0]
+    n = _derive_yield(con, "v.source = ?" + code_f, args)
+    after = con.execute(pre_sql, args).fetchone()[0]
+    return int(after - before)
+
+
+def derive_yield_for_date(con, date, ts_codes: Optional[List[str]] = None) -> int:
+    """v8.2.0 补：derive_yield_for_rows 的按日通用版（不限 source，按 date 圈定）。
+
+    用途：① 每日 T3 息率质量门（em_batch 源无 dv_ttm → 当日息率全 NULL，
+    本地派生补齐；无 TTM 分红/无当日 close 的股保持 NULL——G8 fail-closed
+    语义不变）；② 历史缺口手动补数（如 2026-11-17）。
+    公式与 derive_yield_for_rows 相同：TTM 现金 DPS（dividend_events
+    ex_date ∈ (date-365, date]）÷ 当日 close × 100。零网络，幂等。
+    **只填 NULL 行**（AND ttm_yield_pct IS NULL）：作为质量门 ② 兜底时
+    不得覆盖 ① 结转值（2026-11-19 实锤：无保护时严格 TTM=NULL 的股把
+    结转值冲成 NULL，46 行实损）。:return: 派生成功行数（前后非 NULL
+    计数差）。
+    """
+    code_f = " AND v.ts_code IN ({})".format(",".join("?" * len(ts_codes))) if ts_codes else ""
+    args: List[Any] = [date]
+    if ts_codes:
+        args.extend(ts_codes)
+    pre_sql = (f"SELECT COUNT(*) FROM valuation_daily v WHERE v.date=? AND v.ttm_yield_pct IS NOT NULL {code_f}")
+    before = con.execute(pre_sql, args).fetchone()[0]
+    n = _derive_yield(con, "v.date = ? AND v.ttm_yield_pct IS NULL" + code_f, args)
+    after = con.execute(pre_sql, args).fetchone()[0]
+    return int(after - before)
+
+
+def _derive_yield(con, where: str, args: List[Any]) -> None:
+    """派生 UPDATE 核心（两函数共用，保证口径一致）。"""
     sql = f"""
     UPDATE valuation_daily v SET ttm_yield_pct = (
         SELECT dps.s / k.close * 100
@@ -171,8 +202,6 @@ def derive_yield_for_rows(con, ts_codes: Optional[List[str]] = None) -> int:
               WHERE kk.ts_code = v.ts_code AND kk.date = v.date) k
         WHERE dps.s IS NOT NULL AND dps.s > 0 AND k.close IS NOT NULL
     )
-    WHERE v.source = ? {code_f}
+    WHERE {where}
     """
     con.execute(sql, args)
-    after = con.execute(pre_sql, args).fetchone()[0]
-    return int(after - before)
