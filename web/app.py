@@ -1414,6 +1414,13 @@ def get_my_positions() -> Dict[str, Any]:
                                       and (s.get("round_anchor") or 0.0) > 0.0)
                            else "first")
                           if s.get("next_add_price_raw") is not None else None),
+            # v8.2.0 补（Joel 2026-11-20 拍板）：首仓线双条件展示的组成线——
+            # first_price_line_raw=条件①价线（本轮高点×(1−回撤)）、
+            # timing_line_raw=条件②时机线（5 年≤40% 分位翻线价，引擎翻线价
+            # 同口径）；"first" 行的 next_add_price_raw 取两者较低（下方覆写），
+            # "add" 行/无数据 → None（页面不显）。
+            "first_price_line_raw": None,
+            "timing_line_raw": None,
             "next_add_price": s.get("next_add_price"),
             "next_rearm_price": (s.get("next_rearm_price")
                                  if (shares_since or 0) > 0 else None),
@@ -1478,6 +1485,37 @@ def get_my_positions() -> Dict[str, Any]:
                   or (rows.get(c) or {}).get("last_price"))
             timing_map[c] = _held_first_timing(c, _tmap, _p)[0]
     signals = build_signals(positions, _sp, timing_map=timing_map)
+    # v8.2.0 补（Joel 2026-11-20 拍板：「首仓线应该按照双条件，不应该只判定
+    # 一个条件」）：「first」行的下一触发价 = min(条件①价线 L1, 条件②时机线
+    # P*)——策略真实建仓需两条件同时满足（COFCO 糖业实案：① 11.0 已破 13.59
+    # 但 5 年分位 74.8% > 40% → 理论 0 手，只显 13.59 误导）。P* 与引擎时机门
+    # 翻线价同口径（timing.first_timing_price_map，live 秩口径）；「add」行
+    # 无时机门（11-13 定案 k≥1 纯价格）不动。湖锁/缺失/数据不足 → P*=None，
+    # 回退 L1 照显（与改动前一致）。signals 已在覆写前构建 → 推送判定口径
+    # 零变化（其首仓条件本就另查 timing_map 双条件）。
+    _fcodes = [p["ts_code"] for p in positions
+               if p["line_kind"] == "first" and p["next_add_price_raw"] is not None]
+    if _fcodes and not lake_locked:
+        try:
+            from martingale.config import load_config as _mload
+            from martingale.data import connect_readonly
+            from martingale.timing import first_timing_price_map
+            _s2, _u2, _tp2 = _mload(str(CONFIG_PATH))
+            tcon = connect_readonly(None)
+            try:
+                _pmap = first_timing_price_map(tcon, _fcodes, _tp2)
+            finally:
+                tcon.close()
+        except Exception:  # noqa: BLE001 - 湖锁/缺表/配置异常 → 展示回退 L1
+            _pmap = {}
+        for p in positions:
+            if p["line_kind"] != "first" or p["next_add_price_raw"] is None:
+                continue
+            _tl = _pmap.get(p["ts_code"])
+            p["first_price_line_raw"] = p["next_add_price_raw"]
+            p["timing_line_raw"] = _tl
+            if _tl is not None:
+                p["next_add_price_raw"] = min(p["next_add_price_raw"], _tl)
     return {
         "as_of": max((r["end_date"] for r in positions if r["end_date"]), default=None),
         "lake_locked": lake_locked,

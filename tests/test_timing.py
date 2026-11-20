@@ -241,3 +241,29 @@ def test_live_pctile_missing_price_and_empty():
     assert out2 == {"a.1": None}
     assert tm.live_pctile_map(con, [], {}, tp) == {}
     con.close()
+
+
+def test_first_timing_price_map():
+    """v8.2.0 补：时机线 = 分位门翻线价（与 live 秩口径逐位一致）。
+
+    W=120、pct=40 → P*_qfq = sorted[ceil(0.4×120)−1] = sorted[47] = 48.0
+    （raw==qfq 因子 1 → 48.0）；短窗口 <60 bar / 无 qfq 序列 → None
+    （fail-closed，与引擎 first_ok_series min_bars=60 同门槛）；空 codes → {}。
+    一致性：翻线价处 live 分位恰好 = 40%、低 0.01 → <40% → 显示线即引擎
+    翻线价，不漂移。
+    """
+    closes = [float(i) for i in range(1, 121)]
+    con = make_lake({"e.1": closes,
+                     "short": [float(i) for i in range(1, 10)]},
+                    price_only=["f.3"])
+    tp = make_tp(price_window_years=1, price_pctile_max=40.0)
+    out = tm.first_timing_price_map(con, ["e.1", "short", "f.3"], tp)
+    assert abs(out["e.1"] - 48.0) < 1e-9
+    assert out["short"] is None        # 9 bar < 60 fail-closed
+    assert out["f.3"] is None          # 无 qfq 序列 fail-closed
+    assert tm.first_timing_price_map(con, [], tp) == {}
+    p_at = tm.live_pctile_map(con, ["e.1"], {"e.1": 48.0}, tp)
+    assert abs(p_at["e.1"] - 40.0) < 1e-9
+    p_below = tm.live_pctile_map(con, ["e.1"], {"e.1": 47.99}, tp)
+    assert p_below["e.1"] < 40.0
+    con.close()

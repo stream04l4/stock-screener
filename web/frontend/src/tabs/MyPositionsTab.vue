@@ -329,6 +329,30 @@ async function addNew() {
 // 更新股数/成本统一走顶部「添加/更新持仓」录入条（Joel 2026-11-13：弹层不重复编辑）
 // ---------------------------------------------------------------------------
 const modalRow = ref(null);
+// v8.2.0 补（Joel 2026-11-20 拍板：首仓线按双条件）：「first」行弹层展开
+// 组成线——下一触发价 = min(① 价线=本轮高点×(1−回撤), ② 时机线=5 年
+// ≤40% 分位翻线价)，后端已取较低覆写 next_add_price_raw；时机线可得时
+// 两条组成线照显，「add」行（k≥1 无时机门）/ 时机线缺失 → 原标签。
+const modalFieldRows = computed(() => {
+  const r = modalRow.value;
+  if (!r) return [];
+  const rows = [
+    ["ts_code", "代码"], ["in_pos", "策略持仓中"], ["strat_shares", "策略模拟股数"],
+    ["since_date", "建仓日（顶部录入条填）"], ["strat_shares_since", "建仓日起策略股数"],
+    ["theory_lots", "策略理论(手)"], ["actual_lots", "实际(手)"], ["gap_lots", "差值(手)"],
+    ["k_level", "当前档位 k"],
+  ];
+  if (r.line_kind === "first" && r.timing_line_raw != null) {
+    rows.push(["first_price_line_raw", "① 价线（本轮高点×(1−回撤)）"]);
+    rows.push(["timing_line_raw", "② 时机线（5 年≤40% 分位翻线价）"]);
+    rows.push(["next_add_price_raw", "下一触发价（双条件·取较低）"]);
+  } else {
+    rows.push(["next_add_price_raw", "下一触发价（首仓/加仓）"]);
+  }
+  rows.push(["next_rearm_price_raw", "再武装触发价（策略零买入不显示）"]);
+  rows.push(["last_price", "最新价"], ["end_date", "数据截至"]);
+  return rows;
+});
 const saveMsg = ref("");
 const saveErr = ref("");
 
@@ -519,8 +543,10 @@ function pnlColor(v) {
       <p class="muted small">
         录入你实际持有的股票（代码 + 股数 + 成本价）；<b>首次建仓时填建仓日</b>
         （之后自动锚定，无需再动），同一代码再次保存即更新持仓。
-        策略参考列来自状态机模拟——「下次触发价」即该跌到的触发价位
-        （首仓线标「首仓」= 策略下一次建仓价；加仓线标「加仓」）；
+        策略参考列来自状态机模拟——「下次触发价」即该跌到的触发价位：
+        首仓线按<b>双条件</b>判定（① 价破价线 且 ② 5 年分位≤40%），
+        显示两条件线的较低者（标「首仓」，点行看两条组成线）；
+        加仓线（标「加仓」）= 纯价格条件；
         「理论上不持有」的持仓股（建仓日起策略零买入）再武装价不显示。
       </p>
       <div class="add-bar">
@@ -649,14 +675,7 @@ function pnlColor(v) {
            @close="modalRow = null">
       <div v-if="modalRow">
         <div class="detail-grid">
-          <div v-for="[k, label] in [
-            ['ts_code', '代码'], ['in_pos', '策略持仓中'], ['strat_shares', '策略模拟股数'],
-            ['since_date', '建仓日（顶部录入条填）'], ['strat_shares_since', '建仓日起策略股数'],
-            ['theory_lots', '策略理论(手)'], ['actual_lots', '实际(手)'], ['gap_lots', '差值(手)'],
-            ['k_level', '当前档位 k'],
-            ['next_add_price_raw', '下一触发价（首仓/加仓）'], ['next_rearm_price_raw', '再武装触发价（策略零买入不显示）'],
-            ['last_price', '最新价'], ['end_date', '数据截至'],
-          ]" :key="k" class="d-row">
+          <div v-for="[k, label] in modalFieldRows" :key="k" class="d-row">
             <span class="d-key">{{ label }}</span>
             <span class="d-val">{{ modalRow[k] ?? "—" }}</span>
           </div>

@@ -379,6 +379,45 @@ describe("MyPositionsTab · 渲染", () => {
     w.unmount();
   });
 
+  it("v8.2.0 补：首仓线双条件——列显两条件线较低者，弹层展开组成线", async () => {
+    const FIX = {
+      ...JSON.parse(JSON.stringify(MY)),
+      n: 1,
+      positions: [{
+        ts_code: "sh.600737", name: "中粮糖业", shares: 400, cost_price: 11.0,
+        last_price: 11.0, market_value: 4400, pnl: 0, pnl_pct: 0,
+        updated_at: "2026-10-23T01:00:00Z", since_date: "2026-10-23",
+        buys: [], in_pos: true, strat_shares: 55968.96,
+        strat_shares_since: 0, theory_lots: 0, actual_lots: 4, gap_lots: 0,
+        k_level: 0, line_kind: "first",
+        // 双条件：① 价线 13.5913 ∧ ② 时机线 8.6142 → 有效线 = 较低 8.6142
+        // （后端已 min 覆写 next_add_price_raw）
+        first_price_line_raw: 13.5913, timing_line_raw: 8.6142,
+        next_add_price: 113.05, next_rearm_price: null,
+        next_add_price_raw: 8.6142, next_rearm_price_raw: null,
+        end_date: "2026-11-18",
+      }],
+      signals: [],
+      totals: { market_value: 4400, cost: 4400, pnl: 0, pnl_pct: 0 },
+    };
+    mockApi(FIX);
+    const w = mk();
+    await flushPromises();
+    // 列显双条件有效线（较低者）+「首仓」标签
+    expect(w.text()).toContain("8.6142 首仓");
+    // 单条件价线 13.5913 不再作为触发价展示（仅在弹层组成线出现）
+    const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.600737"));
+    expect(row.text()).not.toContain("13.5913");
+    // 弹层：点击行 → 展开两条组成线 + 双条件标签
+    await row.trigger("click");
+    await flushPromises();
+    expect(w.text()).toContain("① 价线（本轮高点×(1−回撤)）");
+    expect(w.text()).toContain("13.5913");
+    expect(w.text()).toContain("② 时机线（5 年≤40% 分位翻线价）");
+    expect(w.text()).toContain("下一触发价（双条件·取较低）");
+    w.unmount();
+  });
+
   it("lake_locked（灌数持锁降级）→ 琥珀提示条 + 账本仍列出", async () => {
     const locked = {
       ...JSON.parse(JSON.stringify(MY)),

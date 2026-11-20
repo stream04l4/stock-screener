@@ -164,35 +164,19 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
     return out
 
 
-def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
-                    tp, now=None) -> Dict[str, Optional[float]]:
-    """实时分位（v7.0.31）：当前价（前复权折算）在 5 年前复权收盘分布中的秩
-    = #{窗口收盘 ≤ 当前价} / 窗口长度 ×100（v8.1.3 审计 F1：docstring 原
-    「替换窗口末值」为不精确表述——实现是标准秩口径，参考分布不含被检点，
-    下行日较「替换末值」语义低 1/W，仅微信推送通道，量级 ~0.08pp@W≈1250）。
+def _qfq_window_and_factor(con, codes: List[str], tp, now=None):
+    """实时分位/时机线共享加载（v8.2.0 补抽离）：近 N 年 qfq 收盘窗口 +
+    各股自身末 bar raw→qfq 因子 + pending 除权修正因子。
 
-    微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
-    收盘快照滞后一天——「价格破线 + 分位破 40%」同日达成时，快照只在当晚
-    刷新、推送窗口（15:05 止）早已关闭 → 结构性漏推（山煤国际 2026-11-10
-    实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）。窗口与
-    refresh_timing 同一口径（kline_daily_qfq、近 N 年、截至湖最新 bar）；
-    现价（原始价）按该股**自身末 bar** 因子折前复权（qfq_now = price ×
-    last_qfq/last_raw；非事件日该因子=末 bar 当日 raw→qfq 换算，误差 ~bp 级）。
-    v7.0.32 除权日修正（now=参照日）：除权日盘中末 bar 是事件前 K 线，
-    前复权窗口停在事件前口径，现价（事件后）须乘 pending 除权累计复权比
-    （engine.pending_exrights_factor，与触发价修正同一因子）对齐窗口口径，
-    否则分位被除权缺口系统性压低（假"时机成熟"）。now=None → 零修正。
-
-    :param prices: {code: 当前原始价（spot；无行情时传湖最后收盘）}；
-      缺/None/≤0 → 该股 None。
-    :return: {code: 分位(0-100) | None}；无 qfq 序列/bar 不足/无因子 →
-      None（fail-closed，调用方按「时机未过」处理）。
+    :return: (series {code: [qfq 收盘...]}, fac {code: last_qfq/last_raw},
+             rebase {code: pending 除权复权比}, latest 湖最新 bar 日期)；
+             无代码/湖空 → 空 dict/None（调用方 fail-closed）。
     """
     if not codes:
-        return {}
+        return {}, {}, {}, None
     latest = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
     if latest is None:
-        return {c: None for c in codes}
+        return {}, {}, {}, None
     start = str(_years_ago(latest, tp.price_window_years))
     fmt = ", ".join(["?"] * len(codes))
     con.execute(
@@ -220,6 +204,34 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
     # v7.0.32 除权日修正：现价 × pending 事件累计复权比（对齐事件前窗口口径）
     from .engine import pending_exrights_factor
     rebase = pending_exrights_factor(con, codes, now) if now is not None else {}
+    return series, fac, rebase, latest
+
+
+def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
+                    tp, now=None) -> Dict[str, Optional[float]]:
+    """实时分位（v7.0.31）：当前价（前复权折算）在 5 年前复权收盘分布中的秩
+    = #{窗口收盘 ≤ 当前价} / 窗口长度 ×100（v8.1.3 审计 F1：docstring 原
+    「替换窗口末值」为不精确表述——实现是标准秩口径，参考分布不含被检点，
+    下行日较「替换末值」语义低 1/W，仅微信推送通道，量级 ~0.08pp@W≈1250）。
+
+    微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
+    收盘快照滞后一天——「价格破线 + 分位破 40%」同日达成时，快照只在当晚
+    刷新、推送窗口（15:05 止）早已关闭 → 结构性漏推（山煤国际 2026-11-10
+    实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）。窗口与
+    refresh_timing 同一口径（kline_daily_qfq、近 N 年、截至湖最新 bar）；
+    现价（原始价）按该股**自身末 bar** 因子折前复权（qfq_now = price ×
+    last_qfq/last_raw；非事件日该因子=末 bar 当日 raw→qfq 换算，误差 ~bp 级）。
+    v7.0.32 除权日修正（now=参照日）：除权日盘中末 bar 是事件前 K 线，
+    前复权窗口停在事件前口径，现价（事件后）须乘 pending 除权累计复权比
+    （engine.pending_exrights_factor，与触发价修正同一因子）对齐窗口口径，
+    否则分位被除权缺口系统性压低（假"时机成熟"）。now=None → 零修正。
+
+    :param prices: {code: 当前原始价（spot；无行情时传湖最后收盘）}；
+      缺/None/≤0 → 该股 None。
+    :return: {code: 分位(0-100) | None}；无 qfq 序列/bar 不足/无因子 →
+      None（fail-closed，调用方按「时机未过」处理）。
+    """
+    series, fac, rebase, _latest = _qfq_window_and_factor(con, codes, tp, now)
     out: Dict[str, Optional[float]] = {}
     for c in codes:
         ks = series.get(str(c))
@@ -230,6 +242,38 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
             continue
         cur = float(p) * f * rebase.get(str(c), 1.0)
         out[c] = sum(1 for x in ks if x <= cur) / len(ks) * 100.0
+    return out
+
+
+def first_timing_price_map(con, codes: List[str], tp, now=None) -> Dict[str, Optional[float]]:
+    """时机线价（v8.2.0 补，Joel 2026-11-20 拍板）：首仓双条件②「5 年分位 ≤
+    price_pctile_max%」对应的 **RAW 价格线**——低于该价②成立、高于则不成立，
+    即引擎时机门的翻线价。首仓实际触发 = ①价破首仓线 AND ②价 ≤ 本线 →
+    有效触发价 = min(首仓线, 时机线)。
+
+    口径与 live_pctile_map 逐位一致（同一窗口加载 _qfq_window_and_factor：
+    标准秩 #{窗口 qfq 收盘 ≤ 被检价}/W×100、窗口=近 N 年 qfq 截至湖最新 bar、
+    因子=各股自身末 bar raw→qfq、除权日 pending 因子）→ 页面显示的时机线
+    即引擎分位恰好 = price_pctile_max% 的那个价，翻线不漂移。
+
+    P* = sorted(窗口)[ceil(pct_max×W)−1]（满足秩 ≥ pct_max 的最小价；
+    重复值取低侧，与「≤ 被检价」秩口径一致）。W < 60 → None（与引擎
+    first_ok_series min_bars=60 fail-closed 同门槛）；无因子 → None。
+    """
+    out: Dict[str, Optional[float]] = {c: None for c in codes}
+    if not codes:
+        return {}
+    import math
+    series, fac, rebase, _latest = _qfq_window_and_factor(con, codes, tp, now)
+    k = float(tp.price_pctile_max) / 100.0
+    for c in codes:
+        ks = series.get(str(c))
+        f = fac.get(str(c))
+        if not ks or len(ks) < 60 or not f:
+            continue
+        idx = max(0, math.ceil(k * len(ks)) - 1)
+        p_qfq = sorted(ks)[idx]
+        out[c] = p_qfq / (f * rebase.get(str(c), 1.0))
     return out
 
 

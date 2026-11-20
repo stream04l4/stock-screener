@@ -548,6 +548,12 @@ def test_my_positions_line_kind_and_rearm_hide(tmp_positions_file, monkeypatch):
                                      "tmap": {c: {"push_eligible": True}
                                               for c in fake_rows}})
     monkeypatch.setattr(wapp, "_fetch_spot_cached", lambda codes: {})
+    # 零湖：时机线查询路径（connect_readonly）→ 湖锁异常 → 回退 L1 照显
+    import martingale.data as mdata
+    monkeypatch.setattr(
+        mdata, "connect_readonly",
+        lambda *a, **k: (_ for _ in ()).throw(
+            mdata.LakeLocked("test", 0)))
 
     got = wapp.get_my_positions()
     by = {p["ts_code"]: p for p in got["positions"]}
@@ -559,6 +565,94 @@ def test_my_positions_line_kind_and_rearm_hide(tmp_positions_file, monkeypatch):
     p1 = by["sh.601006"]
     assert p1["line_kind"] == "add"
     assert p1["next_rearm_price_raw"] == 5.6925    # 策略有轮次 → 照显
+
+
+def test_my_positions_first_line_dual_condition(tmp_positions_file, tmp_path,
+                                                monkeypatch):
+    """v8.2.0 补（Joel 2026-11-20 拍板）：首仓线按双条件展示。
+
+    「first」行的下一触发价 = min(条件①价线 L1, 条件②时机线 P*)；P* =
+    5 年≤40% 分位翻线价（= 窗口排序 [ceil(0.4W)−1]，live 秩口径，与引擎
+    时机门逐位一致）。验证：
+    - e.1 首仓行：L1=60 > P*=48 → 有效线 48.0（组成线两字段照给）；
+    - e.2 加仓行（k=1 锚点>0）：无时机门 → 照显 40.0、时机线 None；
+    - e.3 首仓行但窗口 <60 bar：fail-closed → 回退 L1=20.0、时机线 None。
+    零湖零网络：_state_projection fake + connect_readonly 指向合成小湖。
+    """
+    import duckdb as _duck
+    from martingale.config import load_config
+
+    _sp, _up, _tp = load_config(str(PROJECT_ROOT / "config" / "strategy.yaml"))
+    for c, sh in (("sh.600001", 100), ("sh.600002", 100), ("sh.600003", 100)):
+        wapp.put_my_positions({"ts_code": c, "shares": sh,
+                               "cost_price": 10.0, "since_date": "2026-11-01"})
+    # 合成小湖：e.1 120 bar raw==qfq（fac=1）、e.2 120 bar qfq=2×raw（fac=2）、
+    # e.3 30 bar（<60 fail-closed）。窗口值 1..120 → P*_qfq = 48.0。
+    lake_f = tmp_path / "lake_dual.duckdb"
+    con = _duck.connect(str(lake_f))
+    con.execute("CREATE TABLE kline_daily (ts_code VARCHAR, date DATE, close DOUBLE)")
+    con.execute("CREATE TABLE kline_daily_qfq (ts_code VARCHAR, date DATE, close DOUBLE)")
+    from datetime import date as _date, timedelta as _td
+    d0 = _date(2026, 1, 5)
+    for i in range(1, 121):
+        d = str(d0 + _td(days=i - 1))
+        con.execute("INSERT INTO kline_daily VALUES ('sh.600001', ?, ?)", [d, float(i)])
+        con.execute("INSERT INTO kline_daily_qfq VALUES ('sh.600001', ?, ?)", [d, float(i)])
+        con.execute("INSERT INTO kline_daily VALUES ('sh.600002', ?, ?)", [d, float(i)])
+        con.execute("INSERT INTO kline_daily_qfq VALUES ('sh.600002', ?, ?)", [d, float(i) * 2.0])
+    for i in range(1, 31):
+        d = str(d0 + _td(days=i - 1))
+        con.execute("INSERT INTO kline_daily VALUES ('sh.600003', ?, ?)", [d, float(i)])
+        con.execute("INSERT INTO kline_daily_qfq VALUES ('sh.600003', ?, ?)", [d, float(i)])
+    con.close()
+    import martingale.data as mdata
+    monkeypatch.setattr(
+        mdata, "connect_readonly",
+        lambda *a, **k: _duck.connect(str(lake_f), read_only=True))
+
+    fake_rows = {
+        "sh.600001": {"name": "首仓股", "in_pos": True, "k_level": 0, "round_anchor": 0.0,
+                "next_add_price": 60.0, "next_add_price_raw": 60.0,
+                "next_rearm_price": None, "next_rearm_price_raw": None,
+                "shares_since": 0.0, "shares": 0.0, "last_price": 55.0,
+                "end_date": "2026-11-18"},
+        "sh.600002": {"name": "加仓股", "in_pos": True, "k_level": 1, "round_anchor": 10.0,
+                "next_add_price": 40.0, "next_add_price_raw": 40.0,
+                "next_rearm_price": 44.0, "next_rearm_price_raw": 44.0,
+                "shares_since": 100.0, "shares": 200.0, "last_price": 41.0,
+                "end_date": "2026-11-18"},
+        "sh.600003": {"name": "数据不足股", "in_pos": True, "k_level": 0, "round_anchor": 0.0,
+                "next_add_price": 20.0, "next_add_price_raw": 20.0,
+                "next_rearm_price": None, "next_rearm_price_raw": None,
+                "shares_since": 0.0, "shares": 0.0, "last_price": 19.0,
+                "end_date": "2026-11-18"},
+    }
+    monkeypatch.setattr(wapp, "_state_projection",
+                        lambda **k: {"lake_locked": False,
+                                     "rows_since": fake_rows,
+                                     "rows": fake_rows, "sp": _sp,
+                                     "tmap": {c: {"push_eligible": True}
+                                              for c in fake_rows}})
+    monkeypatch.setattr(wapp, "_fetch_spot_cached", lambda codes: {})
+
+    got = wapp.get_my_positions()
+    by = {p["ts_code"]: p for p in got["positions"]}
+    p1 = by["sh.600001"]
+    assert p1["line_kind"] == "first"
+    # 双条件有效线 = min(60.0 价线, 48.0 时机线)
+    assert p1["next_add_price_raw"] == 48.0
+    assert p1["first_price_line_raw"] == 60.0
+    assert p1["timing_line_raw"] == 48.0
+    p2 = by["sh.600002"]
+    assert p2["line_kind"] == "add"
+    assert p2["next_add_price_raw"] == 40.0      # 加仓行无时机门 → 不动
+    assert p2["first_price_line_raw"] is None
+    assert p2["timing_line_raw"] is None
+    p3 = by["sh.600003"]
+    assert p3["line_kind"] == "first"
+    assert p3["next_add_price_raw"] == 20.0      # <60 bar fail-closed → 回退 L1
+    assert p3["timing_line_raw"] is None
+    assert p3["first_price_line_raw"] == 20.0
 
 
 def test_my_positions_line_kind_no_line_none(tmp_positions_file, monkeypatch):
