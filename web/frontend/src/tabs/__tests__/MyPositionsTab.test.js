@@ -339,6 +339,46 @@ describe("MyPositionsTab · 渲染", () => {
     w.unmount();
   });
 
+  it("v8.2.0 补：触发线首仓/加仓标签 + 策略零买入再武装隐藏", async () => {
+    const FIX = {
+      ...JSON.parse(JSON.stringify(MY)),
+      n: 2,
+      positions: [
+        { ts_code: "sh.600737", name: "中粮糖业", shares: 400, cost_price: 11.0,
+          last_price: 11.0, market_value: 4400, pnl: 0, pnl_pct: 0,
+          updated_at: "2026-10-23T01:00:00Z", since_date: "2026-10-23",
+          buys: [], in_pos: true, strat_shares: 55968.96,
+          strat_shares_since: 0, theory_lots: 0, actual_lots: 4, gap_lots: 0,
+          k_level: 0, line_kind: "first",
+          next_add_price: 172.7193, next_rearm_price: null,
+          next_add_price_raw: 13.5913, next_rearm_price_raw: null,
+          end_date: "2026-11-18" },
+        { ts_code: "sh.601006", name: "大秦铁路", shares: 100, cost_price: 5.0,
+          last_price: 5.0, market_value: 500, pnl: 0, pnl_pct: 0,
+          updated_at: "2026-11-01T01:00:00Z", since_date: "2026-11-01",
+          buys: [], in_pos: true, strat_shares: 12000,
+          strat_shares_since: 1000, theory_lots: 10, actual_lots: 1, gap_lots: 9,
+          k_level: 5, line_kind: "add",
+          next_add_price: 12.8782, next_rearm_price: 15.7489,
+          next_add_price_raw: 4.6549, next_rearm_price_raw: 5.6925,
+          end_date: "2026-11-18" },
+      ],
+      signals: [],
+      totals: { market_value: 4900, cost: 4900, pnl: 0, pnl_pct: 0 },
+    };
+    mockApi(FIX);
+    const w = mk();
+    await flushPromises();
+    // 首仓线标「首仓」、加仓线标「加仓」
+    expect(w.text()).toContain("13.5913 首仓");
+    expect(w.text()).toContain("4.6549 加仓");
+    // 策略零买入（shares_since=0）→ 再武装价隐藏（null → 「—」占位，无 13.0755）
+    expect(w.text()).not.toContain("13.0755");
+    // 策略有轮次 → 再武装价照显
+    expect(w.text()).toContain("5.6925");
+    w.unmount();
+  });
+
   it("lake_locked（灌数持锁降级）→ 琥珀提示条 + 账本仍列出", async () => {
     const locked = {
       ...JSON.parse(JSON.stringify(MY)),
@@ -524,7 +564,7 @@ describe("MyPositionsTab · 行点击弹层（策略参考 + 交易登记 + 删�
     expect(row).toBeTruthy();
     await row.trigger("click");
     await flushPromises();
-    expect(w.text()).toContain("下一加仓触发价");
+    expect(w.text()).toContain("下一触发价（首仓/加仓）");
     expect(w.text()).toContain("42.07"); // 弹层展示原始口径（与最新价同单位）
     expect(w.find(".d-row").exists()).toBe(true);
     expect(w.text()).toContain("再武装触发价");

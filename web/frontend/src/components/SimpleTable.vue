@@ -55,7 +55,8 @@ function cell(r, key) {
   const col = props.cols.find((c) => c[0] === key);
   if (col && typeof col[3] === "function") {
     try {
-      const s = col[3](v);
+      // v8.2.0 补：fmt 可取 (v, row) 二参（行级上下文，如 line_kind 标签）
+      const s = col[3](v, r);
       if (s !== null && s !== undefined) return String(s);
     } catch (e) { /* fmt 异常 → 回退原样展示 */ }
   }

@@ -505,6 +505,85 @@ def test_my_positions_put_get_roundtrip(tmp_positions_file, bt_copy):
     json.dumps(got)  # 无 numpy 泄漏
 
 
+def test_my_positions_line_kind_and_rearm_hide(tmp_positions_file, monkeypatch):
+    """v8.2.0 补（Joel 2026-11-19）：触发线语义标注 + 再武装显隐。
+
+    - line_kind：k≥1 且本轮首仓锚点已建立 → "add"（加仓线）；否则 →
+      "first"（首仓线）；无触发线 → None。
+    - 建仓日起策略零买入（shares_since=0，「理论上不持有」）→ 再武装价
+      置 None（页面「—」）；shares_since>0 → 照显。
+    零湖零网络：_state_projection 全量 fake。
+    """
+    from martingale.config import load_config
+
+    _sp, _up, _tp = load_config(str(PROJECT_ROOT / "config" / "strategy.yaml"))
+    wapp.put_my_positions({"ts_code": "sh.600737", "shares": 400,
+                           "cost_price": 11.0, "since_date": "2026-10-23"})
+    wapp.put_my_positions({"ts_code": "sh.601006", "shares": 100,
+                           "cost_price": 5.0, "since_date": "2026-11-01"})
+    fake_rows = {
+        # 理论上不持有：shares_since=0，k=0 首仓线，再武装应隐藏
+        "sh.600737": {
+            "name": "中粮糖业", "in_pos": True, "k_level": 0,
+            "round_anchor": 0.0,
+            "next_add_price": 172.7193, "next_add_price_raw": 13.5913,
+            "next_rearm_price": 166.164, "next_rearm_price_raw": 13.0755,
+            "shares_since": 0.0, "shares": 55968.96, "last_price": 11.37,
+            "end_date": "2026-11-18",
+        },
+        # 策略有跟上：shares_since>0，k=5 加仓档，再武装照显
+        "sh.601006": {
+            "name": "大秦铁路", "in_pos": True, "k_level": 5,
+            "round_anchor": 17.1709,
+            "next_add_price": 12.8782, "next_add_price_raw": 4.6549,
+            "next_rearm_price": 15.7489, "next_rearm_price_raw": 5.6925,
+            "shares_since": 1000.0, "shares": 12000.0, "last_price": 4.98,
+            "end_date": "2026-11-18",
+        },
+    }
+    monkeypatch.setattr(wapp, "_state_projection",
+                        lambda **k: {"lake_locked": False,
+                                     "rows_since": fake_rows,
+                                     "rows": fake_rows, "sp": _sp,
+                                     "tmap": {c: {"push_eligible": True}
+                                              for c in fake_rows}})
+    monkeypatch.setattr(wapp, "_fetch_spot_cached", lambda codes: {})
+
+    got = wapp.get_my_positions()
+    by = {p["ts_code"]: p for p in got["positions"]}
+    p0 = by["sh.600737"]
+    assert p0["line_kind"] == "first"
+    assert p0["next_add_price_raw"] == 13.5913     # 触发线照显（= 首仓价）
+    assert p0["next_rearm_price_raw"] is None      # 零买入 → 再武装隐藏
+    assert p0["next_rearm_price"] is None
+    p1 = by["sh.601006"]
+    assert p1["line_kind"] == "add"
+    assert p1["next_rearm_price_raw"] == 5.6925    # 策略有轮次 → 照显
+
+
+def test_my_positions_line_kind_no_line_none(tmp_positions_file, monkeypatch):
+    """湖中无触发线（next_add_price_raw=None）→ line_kind=None、再武装隐藏。"""
+    wapp.put_my_positions({"ts_code": "sh.600000", "shares": 100,
+                           "cost_price": 10.0, "since_date": "2026-11-01"})
+    monkeypatch.setattr(
+        wapp, "_state_projection",
+        lambda **k: {"lake_locked": False,
+                     "rows_since": {"sh.600000": {
+                         "name": "浦发银行", "in_pos": False, "k_level": 0,
+                         "round_anchor": 0.0,
+                         "next_add_price": None, "next_add_price_raw": None,
+                         "next_rearm_price": None,
+                         "next_rearm_price_raw": None,
+                         "shares_since": None, "shares": 0.0,
+                         "last_price": 10.0, "end_date": "2026-11-18"}},
+                     "rows": {}, "sp": None,
+                     "tmap": {"sh.600000": {"push_eligible": False}}})
+    monkeypatch.setattr(wapp, "_fetch_spot_cached", lambda codes: {})
+    p0 = wapp.get_my_positions()["positions"][0]
+    assert p0["line_kind"] is None
+    assert p0["next_rearm_price_raw"] is None
+
+
 def test_my_positions_update_and_delete(tmp_positions_file, bt_copy):
     wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
     out = wapp.put_my_positions({"ts_code": "sh.600036", "shares": 800, "cost_price": 12.0})

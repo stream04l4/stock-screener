@@ -1349,6 +1349,9 @@ def get_my_positions() -> Dict[str, Any]:
       现价 = 腾讯实时行情（price_source="spot"）；行情失败回退湖最后价
       （price_source="lake"，只漏报不误报）。状态机「触线即买」→ 湖最后 bar 处
       湖价恒高于触发价，故必须用实时价判定。
+    - v8.2.0 补（Joel 2026-11-19）：行内 line_kind 标注触发线语义
+      （"add"=加仓线 / "first"=首仓线 / None=无线）；建仓日起策略零买入
+      （shares_since=0，理论上不持有）→ 再武装价置 None（页面不显示）。
     """
     user = _up_read()
     if not user:
@@ -1401,10 +1404,22 @@ def get_my_positions() -> Dict[str, Any]:
             "actual_lots": actual_lots,
             "gap_lots": gap_lots,
             "k_level": s.get("k_level"),
+            # v8.2.0 补（Joel 2026-11-19 拍板）：触发线语义标注 + 再武装显隐。
+            # 状态机行是全历史模拟：k≥1 且本轮首仓锚点已建立 → 加仓线；
+            # 否则（k=0/锚点 0）→ 首仓线。建仓日起策略零买入（shares_since=0，
+            # 「理论上不持有」的心血来潮/高位仓）→ 轮次对用户无意义：再武装价
+            # 隐藏（None → 页面「—」）；触发线照显（= 首仓价，策略下一次
+            # 建仓的价位）。展示层修正，引擎口径不动。
+            "line_kind": (("add" if ((s.get("k_level") or 0) >= 1
+                                      and (s.get("round_anchor") or 0.0) > 0.0)
+                           else "first")
+                          if s.get("next_add_price_raw") is not None else None),
             "next_add_price": s.get("next_add_price"),
-            "next_rearm_price": s.get("next_rearm_price"),
+            "next_rearm_price": (s.get("next_rearm_price")
+                                 if (shares_since or 0) > 0 else None),
             "next_add_price_raw": s.get("next_add_price_raw"),
-            "next_rearm_price_raw": s.get("next_rearm_price_raw"),
+            "next_rearm_price_raw": (s.get("next_rearm_price_raw")
+                                     if (shares_since or 0) > 0 else None),
             "end_date": s.get("end_date"),
         })
         tot_cost += shares * cost

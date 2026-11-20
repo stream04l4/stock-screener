@@ -197,7 +197,12 @@ const MY_COLS = [
   ["gap_lots", "差值(手)", true],
   ["market_value", "持仓市值", true], ["pnl", "浮动盈亏", true], ["pnl_pct", "盈亏%", true],
   ["k_level", "策略档", true],
-  ["next_add_price_raw", "下次加仓价", true], ["next_rearm_price_raw", "再武装价", true],
+  // v8.2.0 补（Joel 2026-11-19）：触发线语义标签——k≥1 加仓线标「加仓」、
+  // k=0 首仓线标「首仓」（策略下一次建仓价）；「理论上不持有」的持仓股
+  // （建仓日起策略零买入）再武装价由后端置空 → 「—」。
+  ["next_add_price_raw", "下次触发价", true,
+   (v, r) => (r.line_kind === "add" ? v + " 加仓" : v + " 首仓")],
+  ["next_rearm_price_raw", "再武装价", true],
   ["signal", "信号"],
   ["end_date", "数据截至"],
 ];
@@ -514,7 +519,9 @@ function pnlColor(v) {
       <p class="muted small">
         录入你实际持有的股票（代码 + 股数 + 成本价）；<b>首次建仓时填建仓日</b>
         （之后自动锚定，无需再动），同一代码再次保存即更新持仓。
-        策略参考列来自状态机模拟——「下次加仓价 / 再武装价」即该跌到的触发价位。
+        策略参考列来自状态机模拟——「下次触发价」即该跌到的触发价位
+        （首仓线标「首仓」= 策略下一次建仓价；加仓线标「加仓」）；
+        「理论上不持有」的持仓股（建仓日起策略零买入）再武装价不显示。
       </p>
       <div class="add-bar">
         <div class="code-sug-wrap">
@@ -647,7 +654,7 @@ function pnlColor(v) {
             ['since_date', '建仓日（顶部录入条填）'], ['strat_shares_since', '建仓日起策略股数'],
             ['theory_lots', '策略理论(手)'], ['actual_lots', '实际(手)'], ['gap_lots', '差值(手)'],
             ['k_level', '当前档位 k'],
-            ['next_add_price_raw', '下一加仓触发价'], ['next_rearm_price_raw', '再武装触发价'],
+            ['next_add_price_raw', '下一触发价（首仓/加仓）'], ['next_rearm_price_raw', '再武装触发价（策略零买入不显示）'],
             ['last_price', '最新价'], ['end_date', '数据截至'],
           ]" :key="k" class="d-row">
             <span class="d-key">{{ label }}</span>
