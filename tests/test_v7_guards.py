@@ -58,7 +58,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Joel 拍板）——common.py no_anchor_af_range 无锚点填充 + forward_fill_af
 # {d:None} 重置 + tencent/em_batch 加固 + lake_backfill 9 处接入（他源推导
 # 值禁写湖、NULL 洞禁写），lake/ 有意变更，基线前移。
-BASELINE = "3b2cd6e"
+BASELINE = "167c653"   # v7.0.35: driver 启动探测覆盖 3 展示源（lake/web_api.py 注释同步）
 
 
 def _git(*args) -> str:
