@@ -167,6 +167,11 @@ def test_d33_p0_multisource_no_production_pollution(tmp_path, monkeypatch):
         "adj_factor": {"2026-09-14": 2.5}})
     _set_registry(monkeypatch, {"sina": sina, "tdx": tdx})
     monkeypatch.delenv("LAKE_MULTISOURCE", raising=False)   # 多源开启
+    # v7.0.35：展示源探测 mock（测试零网络纪律）
+    import lake.web_api as wapi
+    monkeypatch.setattr(wapi, "_probe_tushare", lambda: (True, "fake（未调 API）"))
+    monkeypatch.setattr(wapi, "_probe_eastmoney", lambda: (False, "fake 请求失败"))
+    monkeypatch.setattr(wapi, "_probe_fuyao", lambda: (True, "fake 龙虎榜 OK"))
 
     rc = drv.main(["--db", db, "p0", "--days", "40", "--skip-t1",
                    "--codes", "sh.601398", "--t4-codes", "sh.601398"])
@@ -181,7 +186,9 @@ def test_d33_p0_multisource_no_production_pollution(tmp_path, monkeypatch):
     hp = tmp_path / "source_health.json"
     assert hp.exists(), f"tmp 目录应出现 source_health.json: {sorted(os.listdir(tmp_path))}"
     data = json.loads(hp.read_text(encoding="utf-8"))
-    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10"}  # v7.0.18：4 源（baostock 移除）
+    # v7.0.35：4 池源 + 3 展示源（tushare/eastmoney/fuyao 随灌数启动同探）
+    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10",
+                                "tushare", "eastmoney", "fuyao"}
     assert data["sina"]["available"] is True      # mock 注册表：sina 存活
     assert data["adata_f10"]["available"] is False  # 未注册 → false（不猜 null）
     # progress 同目录（patch 生效，两者一致落 tmp）

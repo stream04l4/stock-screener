@@ -316,15 +316,24 @@ def test_probe_all_adapters_writes_health_file(tmp_path, monkeypatch):
         return fakes.get(name)   # tdx 未注册 → None → false
 
     monkeypatch.setattr(sp, "get_adapter", fake_get_adapter)
+    # v7.0.35：展示源探测也 mock（测试零网络纪律——web_api 三探测分支真触网）
+    import lake.web_api as wapi
+    monkeypatch.setattr(wapi, "_probe_tushare", lambda: (True, "fake（未调 API）"))
+    monkeypatch.setattr(wapi, "_probe_eastmoney", lambda: (False, "fake 请求失败"))
+    monkeypatch.setattr(wapi, "_probe_fuyao", lambda: (True, "fake 龙虎榜 OK"))
     db = str(tmp_path / "custom.duckdb")
     res = drv._probe_all_adapters(db)
     assert res["enabled"] is True
     hp = tmp_path / "source_health.json"     # B-2：自定义 --db → 库目录
     assert res["path"] == str(hp) and hp.exists(), f"应落 {hp}: {res}"
     data = json.loads(hp.read_text(encoding="utf-8"))
-    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10"}
+    # v7.0.35：4 池源 + tushare/eastmoney/fuyao 3 展示源（每日自动刷新本机态）
+    assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10",
+                                "tushare", "eastmoney", "fuyao"}
     assert data["sina"]["available"] is True and isinstance(data["sina"]["latency_ms"], int)
     assert data["tdx"]["available"] is False   # 未注册 → false（不猜 null）
+    assert data["tushare"]["available"] is True   # 展示源=mock 值透传
+    assert data["eastmoney"]["available"] is False
     for a in data.values():
         assert a["probed_at"], "每个探测源必须有 probed_at"
 
