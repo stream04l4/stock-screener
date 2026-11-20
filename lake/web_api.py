@@ -884,8 +884,8 @@ def _read_source_health():
 #
 # 设计纪律：
 # - **独立文件 source_health_sg.json**：灌数 driver 每次启动全量覆盖
-#   source_health.json（只含 4 池源），若把 sg 记进取会被每日冲掉 → 分文件、
-#   仅 Web 探测写入，天然不受灌数影响。
+#   source_health.json（v7.0.35 起含 4 池源 + tushare/eastmoney/fuyao 3 展示源），
+#   若把 sg 记进取会被每日冲掉 → 分文件、仅 Web 探测写入，天然不受灌数影响。
 # - **一次 ssh 批量**：ssh oci 'python3 -s -' 跑 scripts/lake_probe_sg.py（SG 侧
 #   并行探活、纯 stdlib、无凭据、整体墙钟 25s）→ TSV 回传。不逐源开 7 条 ssh。
 # - **通道语义**：fuyao/tushare 在 SG 侧只做可达性（不附 key、不调配额 API）——

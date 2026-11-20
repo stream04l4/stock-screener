@@ -172,7 +172,9 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
 
     - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 跳过，零网络（与 _run_bs_probe /
       resolve_source 同口径；conftest autouse 默认置位 → 离线单测不触网）。
-    - 探测对象 = AUTHORITY 的外部源（v7.0.18 后=sina/tencent/tdx/adata_f10）；
+    - 探测对象 = AUTHORITY 的外部源（v7.0.18 后=sina/tencent/tdx/adata_f10）+
+      展示源 tushare/eastmoney/fuyao（v7.0.35，Joel 指出：本机态每日自动刷新；
+      实现单点=lake/web_api 轻量探测分支，tushare 不调 API 零额度）；
       ``local`` 是本地推导（静态 csv/factors 派生），无网络可达性概念，不进健康度。
     - 各 adapter ``available()`` 记 latency_ms：首次调用触发 EU 自检（网络探测），
       失败→False 自动跳过该源（不 crash、不阻塞灌数启动——单源异常只记 false）。
@@ -217,6 +219,27 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
             log.warning("adapter %s available() 探测异常 → 记 false: %s", name, exc)
             adapters[name] = {"available": False, "probed_at": now_s,
                               "latency_ms": int((time.monotonic() - t0) * 1000)}
+
+    # v7.0.35（2026-11-20 Joel 指出）：展示源 tushare/eastmoney/fuyao 随灌数启动
+    # 同探——此前 source_health.json 只含 4 池源，三源本机态恒显「未探测」，
+    # 只有手动点【探测】才刷新。实现单点=lake/web_api 的三个轻量探测分支：
+    # tushare **不调 API**（import+token 在场，零额度消耗）、eastmoney/fuyao
+    # 各 1 次免费轻量调用（push2his 1 根 / 龙虎榜 1 次），异常→false 不阻断灌数。
+    try:
+        from lake.web_api import _probe_eastmoney, _probe_fuyao, _probe_tushare
+        for name, fn in (("tushare", _probe_tushare),
+                         ("eastmoney", _probe_eastmoney),
+                         ("fuyao", _probe_fuyao)):
+            t0 = time.monotonic()
+            try:
+                ok, detail = fn()
+            except Exception as exc:  # noqa: BLE001 - 单源异常→false（不阻断）
+                ok, detail = False, f"probe error: {exc}"
+            adapters[name] = {"available": ok, "probed_at": now_s,
+                              "latency_ms": int((time.monotonic() - t0) * 1000),
+                              "detail": detail}
+    except ImportError:
+        pass   # 最小环境无 web_api → 展示源保持未探测（不阻断灌数）
 
     # 落点：progress 同目录（B-2 派生纪律；缺省库→生产 data/lake/）。
     # **DEFECT-D3-3**：fallback 统一经 ``lb._progress_path()``（lake.backfill），**不再**

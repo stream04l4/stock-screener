@@ -384,3 +384,84 @@ def test_build_sources_no_db_no_adapter_import(tmp_path, monkeypatch):
     assert all(s["quota"] is None for s in out)
     # provides 来自常量（不依赖 adapter 实例）
     assert out[0]["provides"] == SOURCE_CAPABILITIES["sina"]
+
+
+# ===========================================================================
+# v7.0.35（2026-11-20 Joel 指出）：灌数 driver 启动探测覆盖 3 展示源
+# （tushare/eastmoney/fuyao 本机态每日自动刷新，不再恒「未探测」）
+# ===========================================================================
+class _FakeAdapter:
+    def available(self) -> bool:
+        return True
+
+    def reset_available_for_test(self) -> None:  # noqa: D401 - 与真 adapter 同型
+        pass
+
+
+def test_driver_probe_includes_display_sources(tmp_path, monkeypatch):
+    """driver _probe_all_adapters 探测对象 = 4 池源 + tushare/eastmoney/fuyao。
+
+    - 实现单点=lake.web_api 三个轻量探测分支（monkeypatch 验调用+值透传）；
+    - tushare 探测从不调 API（零额度，见 web_api._probe_tushare 规格）；
+    - source_health.json 落 7 源（B-2 派生→tmp 库目录，不触生产 data/lake/）。"""
+    import lake.ingest.source_pool as sp
+    import os as _os
+    _scripts = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    import lake_backfill as drv
+
+    monkeypatch.delenv("LAKE_MULTISOURCE", raising=False)
+    monkeypatch.setattr(sp, "get_adapter", lambda name: _FakeAdapter())
+
+    calls = []
+    monkeypatch.setattr(wapi, "_probe_tushare",
+                        lambda: calls.append("tushare") or (True, "tok 在场（未调 API）"))
+    monkeypatch.setattr(wapi, "_probe_eastmoney",
+                        lambda: calls.append("eastmoney") or (False, "请求失败：rc=202（WAF）"))
+    monkeypatch.setattr(wapi, "_probe_fuyao",
+                        lambda: calls.append("fuyao") or (True, "龙虎榜 2 股"))
+
+    db = str(tmp_path / "test.duckdb")  # 仅派生 health 落点（函数不连库）
+    res = drv._probe_all_adapters(db)
+    assert res["enabled"] is True
+
+    assert calls == ["tushare", "eastmoney", "fuyao"], f"展示源探测调用序: {calls}"
+
+    data = json.load(open(tmp_path / "source_health.json", encoding="utf-8"))
+    assert set(data.keys()) == set(ALL_SOURCES), f"7 源齐全: {sorted(data.keys())}"
+    assert data["tushare"]["available"] is True
+    assert "未调 API" in data["tushare"]["detail"]
+    assert data["eastmoney"]["available"] is False
+    assert "WAF" in data["eastmoney"]["detail"]
+    assert data["fuyao"]["available"] is True
+    for n in ALL_SOURCES:
+        assert data[n]["probed_at"], f"{n} 应有 probed_at"
+
+
+def test_driver_display_probe_failure_not_blocking(tmp_path, monkeypatch):
+    """展示源探测函数抛异常 → 记 false 带 detail，灌数探测整体不炸（不阻断）。"""
+    import lake.ingest.source_pool as sp
+    import os as _os
+    _scripts = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    import lake_backfill as drv
+
+    monkeypatch.delenv("LAKE_MULTISOURCE", raising=False)
+    monkeypatch.setattr(sp, "get_adapter", lambda name: _FakeAdapter())
+
+    def _boom():
+        raise RuntimeError("probe down")
+    monkeypatch.setattr(wapi, "_probe_tushare", _boom)
+    monkeypatch.setattr(wapi, "_probe_eastmoney", lambda: (True, "ok"))
+    monkeypatch.setattr(wapi, "_probe_fuyao", lambda: (True, "ok"))
+
+    db = str(tmp_path / "test.duckdb")  # 仅派生 health 落点（函数不连库）
+    res = drv._probe_all_adapters(db)
+    assert res["enabled"] is True
+    data = json.load(open(tmp_path / "source_health.json", encoding="utf-8"))
+    assert data["tushare"]["available"] is False
+    assert "probe error" in data["tushare"]["detail"]
+    assert data["eastmoney"]["available"] is True
+    assert data["fuyao"]["available"] is True
