@@ -122,29 +122,29 @@ function fmt(v, suffix = "") {
 </template>
 
 <style scoped>
-.ts { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line, #d8d8e0); }
+.ts { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .ts-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .ts-title { font-size: 14px; font-weight: 600; }
-.ts-muted { color: #999; font-size: 12px; }
-.ts-note { color: #888; font-size: 12px; margin: 4px 0 8px; }
-.ts-err { color: #b42318; font-size: 13px; margin: 6px 0; }
+.ts-muted { color: var(--muted); font-size: 12px; }
+.ts-note { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+.ts-err { color: var(--bad); font-size: 13px; margin: 6px 0; }
 .ts-push { background: rgba(20, 120, 60, 0.07); }
 .ts-badge {
   display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 11px;
-  color: #fff; background: #14783c; border-radius: 8px; vertical-align: 1px;
+  color: #fff; background: var(--good); border-radius: 8px; vertical-align: 1px;
 }
-.ts-reasons { font-size: 12px; color: #555; min-width: 0; overflow-wrap: anywhere; }
+.ts-reasons { font-size: 12px; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
 .ts-op { min-width: 0; overflow-wrap: anywhere; }
 .ts-btn {
-  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line, #d8d8e0);
-  border-radius: 6px; background: #fff; cursor: pointer; white-space: nowrap;
+  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); cursor: pointer; white-space: nowrap;
 }
-.ts-btn:hover:not(:disabled) { border-color: #14783c; color: #14783c; }
+.ts-btn:hover:not(:disabled) { border-color: var(--good); color: var(--good); }
 .ts-btn:disabled { opacity: 0.6; cursor: default; }
-.ts-add-row td { background: #fafafa; }
-.ts-add-label { font-size: 12px; color: #555; margin-right: 8px; }
+.ts-add-row td { background: var(--bg); }
+.ts-add-label { font-size: 12px; color: var(--ink); margin-right: 8px; }
 .ts-inp { width: 110px; margin-right: 6px; }
 .ts-msg { font-size: 12px; margin-left: 8px; }
-.ts-msg-ok { color: #14783c; }
-.ts-msg-err { color: #b42318; }
+.ts-msg-ok { color: var(--good); }
+.ts-msg-err { color: var(--bad); }
 </style>

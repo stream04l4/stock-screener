@@ -70,7 +70,7 @@ const blocks = computed(() => {
       <h3 v-else-if="b.type === 'h3'" v-html="b.html"></h3>
       <h4 v-else-if="b.type === 'h4'" v-html="b.html"></h4>
       <ul v-else-if="b.type === 'ul'"><li v-for="(x, xi) in b.items" :key="xi" v-html="x"></li></ul>
-      <blockquote v-else-if="b.type === 'quote'" style="color:#6b7487;border-left:3px solid #e3e8f0;margin:6px 0;padding-left:10px" v-html="b.html"></blockquote>
+      <blockquote v-else-if="b.type === 'quote'" style="color:var(--muted);border-left:3px solid var(--line);margin:6px 0;padding-left:10px" v-html="b.html"></blockquote>
       <p v-else v-html="b.html"></p>
     </template>
   </div>

@@ -23,9 +23,10 @@ const fmt2 = (v) => {
   const n = typeof v === "number" ? v : parseFloat(v);
   return isNaN(n) ? String(v) : n.toFixed(2);
 };
+// v8.2.0 补（Joel 2026-11-20 全局格式统一）：百分比 1 位小数
 const fmtPct2 = (v) => {
   const n = typeof v === "number" ? v : parseFloat(v);
-  return isNaN(n) ? String(v) : n.toFixed(2) + "%";
+  return isNaN(n) ? String(v) : n.toFixed(1) + "%";
 };
 
 const funnelLine = computed(() => {
@@ -80,11 +81,11 @@ const COLS = [
 </template>
 
 <style scoped>
-.pm { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line, #d8d8e0); }
+.pm { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .pm-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .pm-title { font-size: 14px; font-weight: 600; }
-.pm-muted { color: #999; font-size: 12px; }
-.pm-funnel { color: #777; font-size: 12px; }
-.pm-note { color: #888; font-size: 12px; margin: 4px 0 8px; }
-.pm-err { color: #b42318; font-size: 13px; margin: 6px 0; }
+.pm-muted { color: var(--muted); font-size: 12px; }
+.pm-funnel { color: var(--muted); font-size: 12px; }
+.pm-note { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+.pm-err { color: var(--bad); font-size: 13px; margin: 6px 0; }
 </style>

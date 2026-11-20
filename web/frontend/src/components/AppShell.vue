@@ -66,16 +66,16 @@ async function doLogout() {
 
 <style scoped>
 .topbar-jump {
-  margin-left: auto; font-size: 13px; color: #9a6b00; text-decoration: none;
-  padding: 4px 12px; border: 1px solid #e0cf9a; border-radius: 8px; background: #fff;
+  margin-left: auto; font-size: 13px; color: var(--gold); text-decoration: none;
+  padding: 4px 12px; border: 1px solid var(--gold-line); border-radius: 8px; background: var(--panel);
   white-space: nowrap;
 }
-.topbar-jump:hover { background: #fbf6e8; }
+.topbar-jump:hover { background: var(--gold-soft); }
 .topbar-auth { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
-.topbar-user { font-size: 12px; color: #666; }
+.topbar-user { font-size: 12px; color: var(--muted); }
 .topbar-logout {
-  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line, #d8d8e0);
-  border-radius: 6px; background: #fff; color: #555; cursor: pointer;
+  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer;
 }
-.topbar-logout:hover { border-color: #b42318; color: #b42318; }
+.topbar-logout:hover { border-color: var(--bad); color: var(--bad); }
 </style>

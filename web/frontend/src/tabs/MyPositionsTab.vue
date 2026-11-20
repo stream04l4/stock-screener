@@ -13,6 +13,7 @@ import { inTradingWindow } from "../live/tradingWindow.js";
 import { useTaskStore } from "../stores/taskStore.js";
 import SimpleTable from "../components/SimpleTable.vue";
 import Modal from "../components/Modal.vue";
+import { fmtPrice, fmtPct, fmtInt, fmtMoney } from "../utils/fmt.js";
 
 const store = useTaskStore();
 
@@ -166,7 +167,7 @@ const sigShown = computed(() => {
 });
 const SIG_ACTIVE_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
-  ["price", "现价", true], ["next_add_price_raw", "触发价", true],
+  ["price", "现价", true, fmtPrice], ["next_add_price_raw", "触发价", true, fmtPrice],
   ["day_low_s", "日内低", true],
   ["action_label", "动作"], ["level_label", "档位"], ["lots_s", "建议手数"],
   ["amount_w", "参考金额(万)", true],
@@ -174,13 +175,13 @@ const SIG_ACTIVE_COLS = [
 ];
 const SIG_APPROACH_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
-  ["price", "现价", true], ["next_add_price_raw", "触发价", true],
+  ["price", "现价", true, fmtPrice], ["next_add_price_raw", "触发价", true, fmtPrice],
   ["distance_s", "距触发", true], ["level_label", "档位"],
   ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_HISTORY_COLS = [
   ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
-  ["level_label", "档位"], ["price", "触发价", true],
+  ["level_label", "档位"], ["price", "触发价", true, fmtPrice],
   ["lots_s", "手数"], ["amount_w", "金额(万)", true],
   ["pushed_s", "微信推送"],
 ];
@@ -190,19 +191,20 @@ const SIG_HISTORY_COLS = [
 // ---------------------------------------------------------------------------
 const MY_COLS = [
   ["ts_code", "代码"], ["name", "名称"],
-  ["shares", "股数", true], ["cost_price", "成本价", true], ["last_price", "最新价", true],
+  // v8.2.0 补（Joel 2026-11-20 全局格式统一）：价格 2 位 / 百分比 1 位 / 股数手数整数
+  ["shares", "股数", true, fmtInt], ["cost_price", "成本价", true, fmtPrice], ["last_price", "最新价", true, fmtPrice],
   // v8.2.0 累计差值口径（Joel 2026-11-13）：理论=状态机累计手数、实际=账本手数、
   // 差值=max(0,理论−实际)；湖中无数据的股为 "—"。实时新档触发的补差见顶部信号条。
-  ["theory_lots", "策略理论(手)", true], ["actual_lots", "实际(手)", true],
-  ["gap_lots", "差值(手)", true],
-  ["market_value", "持仓市值", true], ["pnl", "浮动盈亏", true], ["pnl_pct", "盈亏%", true],
+  ["theory_lots", "策略理论(手)", true, fmtInt], ["actual_lots", "实际(手)", true, fmtInt],
+  ["gap_lots", "差值(手)", true, fmtInt],
+  ["market_value", "持仓市值", true, fmtMoney], ["pnl", "浮动盈亏", true, fmtMoney], ["pnl_pct", "盈亏%", true, fmtPct],
   ["k_level", "策略档", true],
   // v8.2.0 补（Joel 2026-11-19）：触发线语义标签——k≥1 加仓线标「加仓」、
   // k=0 首仓线标「首仓」（策略下一次建仓价）；「理论上不持有」的持仓股
   // （建仓日起策略零买入）再武装价由后端置空 → 「—」。
   ["next_add_price_raw", "下次触发价", true,
-   (v, r) => (r.line_kind === "add" ? v + " 加仓" : v + " 首仓")],
-  ["next_rearm_price_raw", "再武装价", true],
+   (v, r) => (v == null ? "—" : fmtPrice(v) + (r.line_kind === "add" ? " 加仓" : " 首仓"))],
+  ["next_rearm_price_raw", "再武装价", true, fmtPrice],
   ["signal", "信号"],
   ["end_date", "数据截至"],
 ];
@@ -356,6 +358,19 @@ const modalFieldRows = computed(() => {
 const saveMsg = ref("");
 const saveErr = ref("");
 
+// v8.2.0 补（Joel 2026-11-20 全局格式统一）：弹层字段按类型格式化
+// （价格 2 位 / 股数手数整数；文本字段原样）
+const D_PRICE_KEYS = new Set(["first_price_line_raw", "timing_line_raw", "next_add_price_raw",
+  "next_rearm_price_raw", "last_price"]);
+const D_INT_KEYS = new Set(["strat_shares", "strat_shares_since", "theory_lots",
+  "actual_lots", "gap_lots", "k_level"]);
+function fmtField(k, v) {
+  if (v === null || v === undefined || v === "") return "—";
+  if (D_PRICE_KEYS.has(k)) return fmtPrice(v);
+  if (D_INT_KEYS.has(k)) return fmtInt(v);
+  return v;
+}
+
 function onRow(r) {
   modalRow.value = r;
   saveMsg.value = "";
@@ -420,8 +435,8 @@ const buyPreview = computed(() => {
   if (ns > 0) {
     const newShares = oldShares + ns;
     const newCost = (oldShares * oldCost + ns * np) / newShares;
-    return `当前 ${oldShares} 股 @ ${oldCost} ＋ 本次 ${ns} 股 @ ${np}` +
-      ` → ${newShares} 股 @ ${newCost.toFixed(3)}（本次金额 ¥${(ns * np).toLocaleString()}）`;
+    return `当前 ${fmtInt(oldShares)} 股 @ ${fmtPrice(oldCost)} ＋ 本次 ${fmtInt(ns)} 股 @ ${fmtPrice(np)}` +
+      ` → ${fmtInt(newShares)} 股 @ ${fmtPrice(newCost)}（本次金额 ¥${fmtMoney(ns * np)}）`;
   }
   const nSell = -ns;
   if (nSell > oldShares) return `⚠ 卖出不能超过持仓：当前 ${oldShares} 股`;
@@ -461,8 +476,8 @@ async function recordTrade() {
       buyMsg.value = `已登记卖出 ${-ns} 股 @ ${np}，清仓移除`;
     } else {
       buyMsg.value = ns > 0
-        ? `已登记买入 ${ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`
-        : `已登记卖出 ${-ns} 股 @ ${np} → ${pos.shares} 股 @ ${Number(pos.cost_price).toFixed(3)}`;
+        ? `已登记买入 ${fmtInt(ns)} 股 @ ${fmtPrice(np)} → ${fmtInt(pos.shares)} 股 @ ${fmtPrice(pos.cost_price)}`
+        : `已登记卖出 ${fmtInt(-ns)} 股 @ ${fmtPrice(np)} → ${fmtInt(pos.shares)} 股 @ ${fmtPrice(pos.cost_price)}`;
       // 弹层内同步：账本快照字段（策略档位列刷新后重开弹层可见新值）
       Object.assign(r, { shares: pos.shares, cost_price: pos.cost_price });
     }
@@ -507,7 +522,7 @@ const modalBuys = computed(() => {
 
 const BUYS_COLS = [
   ["ts_code", "代码"], ["seq", "序", true], ["date", "日期"],
-  ["price", "成交价", true], ["amount", "金额", true],
+  ["price", "成交价", true, fmtPrice], ["amount", "金额", true, fmtMoney],
 ];
 
 // ---------------------------------------------------------------------------
@@ -519,13 +534,10 @@ function fmtW(v) {
   if (v === null || v === undefined) return "—";
   return "¥" + (v / 10000).toFixed(1) + "万";
 }
-function fmtPct(v) {
-  if (v === null || v === undefined) return "—";
-  return v.toFixed(2) + "%";
-}
+// v8.2.0 补：本地 fmtPct 已并入 utils/fmt.js 单点（百分比 1 位小数，import 同名）
 function pnlColor(v) {
   if (v === null || v === undefined) return "inherit";
-  return v > 0 ? "#c62828" : v < 0 ? "#2e7d32" : "inherit";
+  return v > 0 ? "var(--lake-up)" : v < 0 ? "var(--lake-down)" : "inherit";
 }
 </script>
 
@@ -585,14 +597,14 @@ function pnlColor(v) {
           {{ s.new_round ? (s.in_pos ? "二次建仓" : "建仓") : (s.action === "buy" ? "买入·首仓" : "加仓") }}
         </span>
         <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
-        <span>现价 {{ s.price }} ≤ 触发价 {{ s.next_add_price }}</span>
+        <span>现价 {{ fmtPrice(s.price) }} ≤ 触发价 {{ fmtPrice(s.next_add_price) }}</span>
         <span>{{ s.new_round ? (s.in_pos ? "再武装·首仓（第 1 档）" : "首仓（第 1 档）")
           : (s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档`) }}</span>
         <span v-if="s.suggested_lots != null">
           建议{{ s.new_round ? "建仓" : (s.action === "buy" ? "买入" : "补") }}
-          <b>{{ s.suggested_lots }} 手</b>
+          <b>{{ fmtInt(s.suggested_lots) }} 手</b>
           <span v-if="s.theory_lots != null" class="muted small">
-            （理论累计 {{ s.theory_lots }} 手 / 现持 {{ s.actual_lots }} 手）
+            （理论累计 {{ fmtInt(s.theory_lots) }} 手 / 现持 {{ fmtInt(s.actual_lots) }} 手）
           </span>
           <span v-if="s.price" class="muted small">≈ ¥{{ ((s.suggested_lots * 100 * s.price) / 10000).toFixed(1) }}万</span>
         </span>
@@ -677,7 +689,7 @@ function pnlColor(v) {
         <div class="detail-grid">
           <div v-for="[k, label] in modalFieldRows" :key="k" class="d-row">
             <span class="d-key">{{ label }}</span>
-            <span class="d-val">{{ modalRow[k] ?? "—" }}</span>
+            <span class="d-val">{{ fmtField(k, modalRow[k]) }}</span>
           </div>
         </div>
         <!-- v8.2.0 手动加仓时间线（自动记录，时间锚定计算依据） -->
@@ -688,8 +700,8 @@ function pnlColor(v) {
             <tbody>
               <tr v-for="(b, i) in modalRow.buys" :key="i">
                 <td>{{ b.date }}</td>
-                <td class="num">{{ b.shares }}</td>
-                <td class="num">{{ b.price }}</td>
+                <td class="num">{{ fmtInt(b.shares) }}</td>
+                <td class="num">{{ fmtPrice(b.price) }}</td>
               </tr>
             </tbody>
           </table>
@@ -735,11 +747,11 @@ function pnlColor(v) {
               <tr v-for="t in tradeHist" :key="t.id">
                 <td>{{ t.date }}</td>
                 <td><span :class="t.direction === 'buy' ? 'tag-buy' : 'tag-sell'">{{ t.direction === 'buy' ? '买' : '卖' }}</span></td>
-                <td class="num">{{ t.shares }}</td>
-                <td class="num">{{ t.price }}</td>
-                <td class="num">{{ t.amount }}</td>
+                <td class="num">{{ fmtInt(t.shares) }}</td>
+                <td class="num">{{ fmtPrice(t.price) }}</td>
+                <td class="num">{{ fmtMoney(t.amount) }}</td>
                 <td class="num" :style="t.realized_pnl == null ? '' : { color: pnlColor(t.realized_pnl) }">
-                  {{ t.realized_pnl == null ? "—" : (t.realized_pnl >= 0 ? "+" : "") + t.realized_pnl }}
+                  {{ t.realized_pnl == null ? "—" : (t.realized_pnl >= 0 ? "+" : "") + fmtMoney(t.realized_pnl) }}
                 </td>
                 <td class="num"><button class="ghost-btn tiny" title="删除这条记录" @click="deleteTrade(t.id)">🗑</button></td>
               </tr>

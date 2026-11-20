@@ -369,13 +369,13 @@ describe("MyPositionsTab · 渲染", () => {
     mockApi(FIX);
     const w = mk();
     await flushPromises();
-    // 首仓线标「首仓」、加仓线标「加仓」
-    expect(w.text()).toContain("13.5913 首仓");
-    expect(w.text()).toContain("4.6549 加仓");
+    // 首仓线标「首仓」、加仓线标「加仓」（价格 2 位小数，全局格式统一）
+    expect(w.text()).toContain("13.59 首仓");
+    expect(w.text()).toContain("4.65 加仓");
     // 策略零买入（shares_since=0）→ 再武装价隐藏（null → 「—」占位，无 13.0755）
     expect(w.text()).not.toContain("13.0755");
-    // 策略有轮次 → 再武装价照显
-    expect(w.text()).toContain("5.6925");
+    // 策略有轮次 → 再武装价照显（价格 2 位小数，全局格式统一）
+    expect(w.text()).toContain("5.69");
     w.unmount();
   });
 
@@ -404,15 +404,16 @@ describe("MyPositionsTab · 渲染", () => {
     const w = mk();
     await flushPromises();
     // 列显双条件有效线（较低者）+「首仓」标签
-    expect(w.text()).toContain("8.6142 首仓");
+    // v8.2.0 补（全局格式统一）：价格 2 位小数
+    expect(w.text()).toContain("8.61 首仓");
     // 单条件价线 13.5913 不再作为触发价展示（仅在弹层组成线出现）
     const row = w.findAll("tbody tr").find((r) => r.text().includes("sh.600737"));
     expect(row.text()).not.toContain("13.5913");
-    // 弹层：点击行 → 展开两条组成线 + 双条件标签
+    // 弹层：点击行 → 展开两条组成线 + 双条件标签（价格 2 位）
     await row.trigger("click");
     await flushPromises();
     expect(w.text()).toContain("① 价线（本轮高点×(1−回撤)）");
-    expect(w.text()).toContain("13.5913");
+    expect(w.text()).toContain("13.59");
     expect(w.text()).toContain("② 时机线（5 年≤40% 分位翻线价）");
     expect(w.text()).toContain("下一触发价（双条件·取较低）");
     w.unmount();
@@ -722,14 +723,14 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     const ins = buyInputs(w);
     await ins[0].setValue("200");
     await ins[1].setValue("30");
-    // 预览：(1200×25 + 200×30) / 1400 = 25.714
-    expect(w.find(".buy-preview").text()).toContain("1400 股 @ 25.714");
+    // 预览：(1200×25 + 200×30) / 1400 = 25.714… → 价格 2 位（全局格式统一）
+    expect(w.find(".buy-preview").text()).toContain("1400 股 @ 25.71");
     await buyBtn(w).trigger("click");
     await flushPromises();
     expect(posts()).toHaveLength(1);
     expect(JSON.parse(posts()[0][1].body)).toEqual(
       { ts_code: "sh.601088", shares: 200, price: 30, date: "", name: "中国神华" });
-    expect(w.text()).toContain("已登记买入 200 股 @ 30 → 1400 股 @ 25.714");
+    expect(w.text()).toContain("已登记买入 200 股 @ 30.00 → 1400 股 @ 25.71");
     // 交易历史即时出现新记录（登记后 loadTrades 刷新）
     expect(w.find(".trade-hist").exists()).toBe(true);
     expect(w.text()).toContain("已登记买入");
@@ -751,7 +752,7 @@ describe("MyPositionsTab · 弹层交易登记（v7.0.17，买 + 卖）", () => 
     await flushPromises();
     expect(posts()).toHaveLength(1);
     expect(JSON.parse(posts()[0][1].body).shares).toBe(-200);
-    expect(w.text()).toContain("已登记卖出 200 股 @ 30 → 1000 股 @ 25.000");
+    expect(w.text()).toContain("已登记卖出 200 股 @ 30.00 → 1000 股 @ 25.00");
     w.unmount();
   });
 

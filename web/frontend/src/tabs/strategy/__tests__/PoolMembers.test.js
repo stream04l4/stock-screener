@@ -69,16 +69,16 @@ describe("PoolMembers · 分红占比/上涨占比 + 小数收敛（v8.0.11）",
                      "价差盈亏", "股息率%", "最新价", "总市值(亿)"]) {
       expect(t).toContain(h);
     }
-    // 神华：占比 22.49% / 77.51%；金额 2 位
-    expect(t).toContain("22.49%");
-    expect(t).toContain("77.51%");
+    // 神华：占比 22.5% / 77.5%（百分比 1 位小数，全局格式统一）；金额 2 位
+    expect(t).toContain("22.5%");
+    expect(t).toContain("77.5%");
     expect(t).toContain("17101.02");
     expect(t).toContain("58924.06");
     expect(t).toContain("96239.78");   // v8.0.12 累计分红
     expect(t).not.toContain("96239.777");
-    // 回测/股息率 百分数显示
-    expect(t).toContain("311.89%");
-    expect(t).toContain("7.75%");
+    // 回测/股息率 百分数显示（1 位小数）
+    expect(t).toContain("311.9%");
+    expect(t).toContain("7.8%");
     // 总市值 2165.50348228 → 2165.50（全精度长小数不得出现）
     expect(t).toContain("2165.50");
     expect(t).not.toContain("2165.50348228");

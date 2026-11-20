@@ -61,30 +61,30 @@ async function doLogin(target) {
 <style scoped>
 .login-wrap {
   min-height: 100vh; display: flex; align-items: center; justify-content: center;
-  padding: 16px; background: #f5f6fa;
+  padding: 16px; background: var(--bg);
 }
 .login-card {
   width: 100%; max-width: 340px; box-sizing: border-box;
-  background: #fff; border: 1px solid var(--line, #d8d8e0); border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 28px 24px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
 }
 .login-title { font-size: 18px; margin: 0 0 4px; }
-.login-sub { color: #888; font-size: 12px; margin: 0 0 20px; }
-.login-field { display: block; font-size: 13px; color: #555; margin-bottom: 14px; }
+.login-sub { color: var(--muted); font-size: 12px; margin: 0 0 20px; }
+.login-field { display: block; font-size: 13px; color: var(--ink); margin-bottom: 14px; }
 .login-field input {
   display: block; width: 100%; box-sizing: border-box; margin-top: 6px;
   padding: 8px 10px; font-size: 14px;
-  border: 1px solid var(--line, #d8d8e0); border-radius: 8px;
+  border: 1px solid var(--line); border-radius: 8px;
 }
-.login-err { color: #b42318; font-size: 13px; margin: 0 0 10px; }
+.login-err { color: var(--bad); font-size: 13px; margin: 0 0 10px; }
 .login-btn {
   width: 100%; padding: 9px 0; font-size: 14px; letter-spacing: 2px;
   border: none; border-radius: 8px; color: #fff; cursor: pointer;
 }
 .login-btn + .login-btn { margin-top: 8px; }
-.login-btn-stock { background: #14783c; }
-.login-btn-stock:hover:not(:disabled) { background: #0f5c2e; }
-.login-btn-crypto { background: #9a6b00; }
-.login-btn-crypto:hover:not(:disabled) { background: #7a5500; }
+.login-btn-stock { background: var(--good); }
+.login-btn-stock:hover:not(:disabled) { background: var(--good-deep); }
+.login-btn-crypto { background: var(--gold); }
+.login-btn-crypto:hover:not(:disabled) { background: var(--gold-deep); }
 .login-btn:disabled { opacity: 0.6; cursor: default; }
 </style>

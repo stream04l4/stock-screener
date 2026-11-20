@@ -177,34 +177,34 @@ const entries = computed(() => {
 <style scoped>
 .mpb {
   margin-top: 12px; padding: 10px 12px;
-  border-top: 1px dashed var(--line, #d8d8e0);
+  border-top: 1px dashed var(--line);
 }
-.mpb-head { font-size: 13px; color: #444; margin-bottom: 8px; }
-.mpb-muted { color: #999; font-size: 12px; }
+.mpb-head { font-size: 13px; color: var(--ink); margin-bottom: 8px; }
+.mpb-muted { color: var(--muted); font-size: 12px; }
 .mpb-row { display: flex; align-items: center; gap: 8px; }
 .mpb-wrap { position: relative; }
 .mpb-input { width: 300px; }
 .mpb-sug {
   position: absolute; top: 100%; left: 0; right: 0; z-index: 30;
   margin: 2px 0 0; padding: 4px 0; list-style: none;
-  background: var(--bg, #fff); border: 1px solid var(--line, #d8d8e0);
+  background: var(--panel); border: 1px solid var(--line);
   border-radius: 8px; box-shadow: 0 6px 18px rgba(20, 20, 40, .12);
   max-height: 240px; overflow: auto;
 }
 .mpb-sug li { padding: 6px 12px; font-size: 13px; cursor: pointer; }
-.mpb-sug li.hi, .mpb-sug li:hover { background: var(--bg-soft, #eef0f8); }
-.mpb-ind { color: #888; margin-left: 8px; font-size: 12px; }
+.mpb-sug li.hi, .mpb-sug li:hover { background: var(--bg-soft); }
+.mpb-ind { color: var(--muted); margin-left: 8px; font-size: 12px; }
 .mpb-btn { padding: 4px 14px; }
 .mpb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .mpb-list li {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 2px 8px; border: 1px solid var(--line, #d8d8e0); border-radius: 999px;
-  font-size: 12px; background: var(--bg-soft, #f6f6fa);
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+  font-size: 12px; background: var(--bg-soft);
 }
-.mpb-code { font-family: ui-monospace, monospace; }
-.mpb-name { color: #444; }
+.mpb-code { font-family: var(--mono); }
+.mpb-name { color: var(--ink); }
 .mpb-x {
-  border: none; background: none; cursor: pointer; color: #b42318;
+  border: none; background: none; cursor: pointer; color: var(--bad);
   font-size: 14px; line-height: 1; padding: 0 2px;
 }
 </style>

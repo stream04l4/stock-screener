@@ -487,10 +487,10 @@ onMounted(loadHistory);
 <style scoped>
 /* v8.2.0 补（Joel 2026-11-13）：回测窗口快捷按钮（近 20/10/5 年） */
 .bt-quick {
-  padding: 3px 10px; font-size: 12px; border: 1px solid #c7cdd8; border-radius: 6px;
-  background: #fff; color: #374151; cursor: pointer; white-space: nowrap;
+  padding: 3px 10px; font-size: 12px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); color: var(--ink); cursor: pointer; white-space: nowrap;
 }
-.bt-quick:hover:not(:disabled) { border-color: #7c8aa5; background: var(--bg-soft, #eef0f8); }
+.bt-quick:hover:not(:disabled) { border-color: var(--muted); background: var(--bg-soft); }
 .bt-quick:disabled { opacity: .5; cursor: default; }
 /* v8.0.9：指定标的代码模糊搜索下拉（与手动池录入条同款） */
 .bt-codes-wrap { position: relative; display: inline-block; }
@@ -498,11 +498,11 @@ onMounted(loadHistory);
 .bt-codes-sug {
   position: absolute; top: 100%; left: 0; right: 0; z-index: 30;
   margin: 2px 0 0; padding: 4px 0; list-style: none;
-  background: var(--bg, #fff); border: 1px solid var(--line, #d8d8e0);
+  background: var(--panel); border: 1px solid var(--line);
   border-radius: 8px; box-shadow: 0 6px 18px rgba(20, 20, 40, .12);
   max-height: 240px; overflow: auto;
 }
 .bt-codes-sug li { padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
-.bt-codes-sug li.hi, .bt-codes-sug li:hover { background: var(--bg-soft, #eef0f8); }
-.bt-codes-ind { color: #888; margin-left: 8px; font-size: 12px; }
+.bt-codes-sug li.hi, .bt-codes-sug li:hover { background: var(--bg-soft); }
+.bt-codes-ind { color: var(--muted); margin-left: 8px; font-size: 12px; }
 </style>

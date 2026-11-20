@@ -43,6 +43,6 @@ watch(() => auth.user, (u) => {
 <style>
 .auth-loading {
   min-height: 100vh; display: flex; align-items: center; justify-content: center;
-  color: #999; font-size: 14px; background: #f5f6fa;
+  color: var(--muted); font-size: 14px; background: var(--bg);
 }
 </style>
