@@ -148,6 +148,11 @@ def find_spurious_jumps(con, since_date: Optional[str] = None,
     """全市场扫描假基准跳变（SQL 取相邻对 + 同一判定函数，纯湖内零网络）。
 
     :param since_date: 只报告 date>=since_date 的跳变对（None=全史）。
+
+    **NULL 盲点修复（2026-11-20 山煤国际事故）**：先在 af>0 行内做 LAG——
+    af=NULL 的行（批量 af 失败日，如 2026-11-13 全市场 NULL）不参与配对，
+    否则 d0→d1 的假跳变被 NULL 行隔断后对检测器不可见（LAG 只看到
+    NULL 邻居 → 整对过滤），rebase_recent 日增护栏静默失效。
     """
     where, params = "", []
     if since_date is not None:
@@ -159,12 +164,10 @@ def find_spurious_jumps(con, since_date: Optional[str] = None,
                      close c1, LAG(close)     OVER w c0,
                      adj_factor af1, LAG(adj_factor) OVER w af0
               FROM kline_daily
+              WHERE adj_factor IS NOT NULL AND adj_factor > 0
+                AND close IS NOT NULL AND close > 0
               WINDOW w AS (PARTITION BY ts_code ORDER BY date)) t
         WHERE t.d0 IS NOT NULL
-          AND t.af1 IS NOT NULL AND t.af1 > 0
-          AND t.af0 IS NOT NULL AND t.af0 > 0
-          AND t.c1 IS NOT NULL AND t.c1 > 0
-          AND t.c0 IS NOT NULL AND t.c0 > 0
           {where}
         LIMIT {int(max_pairs)}
     """, params).fetchall()

@@ -938,3 +938,70 @@ def test_em_intraday_guard_skips_batch(tmp_path, monkeypatch):
         "SELECT source FROM kline_daily WHERE ts_code='sh.600001' "
         "AND date='2026-09-18'").fetchone()[0] == "tushare"
     con.close()
+
+
+# ---------------------------------------------------------------------------
+# v7.0.34 af 铁律（2026-11-20 山煤国际事故）：同一参数同一源
+# ---------------------------------------------------------------------------
+def test_batch_hit_af_missing_no_anchor_fill(tmp_path, monkeypatch):
+    """批量命中但 af 批量空返回（限频/空 df）→ 无锚点填充沿用湖内 level，
+    绝不写 NULL 洞（NULL 行隔断 af_rebase 检测对 → 护栏失明，山煤事故实锤）。"""
+    db = str(tmp_path / "b6.duckdb")
+    codes = ["sh.600001"]
+    _seed(db, codes)   # 历史 af 恒 1.0
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    tc = _fake_tencent(monkeypatch, snap)
+    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
+                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
+                "preclose": 10.0, "pct_chg": 2.5,
+                "volume": 123456, "amount": 1000000.0}]
+    _fake_batch(monkeypatch, t2_rows=t2_rows, af_map={},   # af 批量空返回
+                t3_rows=[{"ts_code": c, "date": "2026-09-18",
+                          "total_mv_yi": 100.0, "float_mv_yi": 80.0,
+                          "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0,
+                          "ttm_yield_pct": 3.2} for c in codes])
+    r = drv.run_incremental(con, db, codes, days=3)
+    assert r["batch"]["date"] == FIXED_TODAY
+    row = con.execute(
+        "SELECT adj_factor, source FROM kline_daily "
+        "WHERE ts_code='sh.600001' AND date='2026-09-18'").fetchone()
+    # af = 湖内 level 1.0（无锚点填充），非 NULL
+    assert row == (1.0, "tushare"), row
+    con.close()
+
+
+def test_per_ticker_sina_derived_af_not_written(tmp_path, monkeypatch):
+    """逐只 fallback：sina 源私有推导 af（hfq÷raw 任意常数）不落库——
+    写湖=无锚点填充沿用湖内 level（2026-10-26 sh.600018 / 2026-11-20
+    山煤国际事故同根因：源私有归一化混写 → 换源日假断崖）。"""
+    monkeypatch.delenv("LAKE_MULTISOURCE", raising=False)  # 多源开启（conftest 默认 0）
+    db = str(tmp_path / "b7.duckdb")
+    codes = ["sh.600001"]
+    _seed(db, codes)   # 历史 af 恒 1.0
+    con = lconn.open(db)
+    snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
+                "pb": 0.8, "turnover": 1.0} for c in codes}
+    _fake_tencent(monkeypatch, snap)
+    _fake_batch(monkeypatch, t2_exc=RuntimeError("频率超限 x8"))  # 批量失败→逐只
+    import lake.ingest.source_pool as sp
+    sina = sp.get_adapter("sina")
+
+    def fake_sina_kline(code, start=None, end=None):
+        # 源私有锚点 9.99（与湖内 1.0 相差 9.9 倍——旧逻辑会原样落库造假断崖）
+        return {"ohlcv": [{"date": "2026-09-18", "open": 10.1, "high": 10.3,
+                           "low": 10.0, "close": 10.25,
+                           "volume": 12345, "amount": 100000.0}],
+                "adj_factor": {"2026-09-18": 9.99}}
+
+    monkeypatch.setattr(sina, "available", lambda: True)
+    monkeypatch.setattr(sina, "fetch_kline", fake_sina_kline)
+    r = drv.run_incremental(con, db, codes, days=3)
+    row = con.execute(
+        "SELECT adj_factor, source FROM kline_daily "
+        "WHERE ts_code='sh.600001' AND date='2026-09-18'").fetchone()
+    # af = 湖内 level 1.0（无锚点填充），绝不=sina 私有推导 9.99
+    assert row == (1.0, "sina"), row
+    assert r["t2"]["processed"] == 1
+    con.close()

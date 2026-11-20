@@ -548,11 +548,15 @@ def to_float(v: Any) -> Optional[float]:
     return None if f != f else f  # NaN → None
 
 
-def forward_fill_af(dates: Sequence[str], adj_map: Dict[str, float]) -> Dict[str, Optional[float]]:
+def forward_fill_af(dates: Sequence[str],
+                    adj_map: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
     """adj_factor 前向填充（Q4：BaoStock 仅除权日有行 → 标准做法是事件值前向填充）。
 
     :param dates: 交易日序列（升序，ISO）。
-    :param adj_map: {除权日: af}——事件日的复权因子。
+    :param adj_map: {除权日: af}——事件日的复权因子。**{d: None} = fail-closed
+        标记（2026-11-20 铁律）：自 d 起 level 显式重置为 NULL**（事件步长不可判，
+        绝不沿用旧 level，留待 tushare 官方 af 批量覆盖）；旧调用方只传
+        {事件日: af>0}，语义不变。
     :return: {date: af}——每个交易日的有效 af = 该日或之前最近一个除权日的 af；
         首个除权日之前 → None（无历史 af，hfq/qfq view 该段 NULL，属预期）。
 
@@ -561,8 +565,9 @@ def forward_fill_af(dates: Sequence[str], adj_map: Dict[str, float]) -> Dict[str
     """
     if not dates:
         return {}
-    # 事件日排序（只保留落在 dates 范围内的；范围外的事件不影响本窗口填充）
-    events = sorted((d, af) for d, af in adj_map.items() if af is not None)
+    # 事件日排序（只保留落在 dates 范围内的；范围外的事件不影响本窗口填充）。
+    # None 值保留=显式 fail-closed 重置标记（见上）。
+    events = sorted((d, af) for d, af in adj_map.items())
     out: Dict[str, Optional[float]] = {}
     cur: Optional[float] = None
     ei = 0
@@ -573,6 +578,89 @@ def forward_fill_af(dates: Sequence[str], adj_map: Dict[str, float]) -> Dict[str
             cur = events[ei][1]
             ei += 1
         out[d] = cur
+    return out
+
+
+def no_anchor_af_range(con, ts_code: str, start: str, end: str,
+                       dates: Optional[Sequence[str]] = None) -> Dict[str, Optional[float]]:
+    """af **无锚点**填充（铁律 2026-11-20：同一参数同一源）。
+
+    背景：kline_daily.adj_factor 只允许一个规范锚点源（tushare 官方 af）。
+    批量 af 失败/缺失时（限频、空返回），**绝不**引入其它源的私有归一化
+    （sina hfq÷raw / tencent qfq 各自带任意常数 → 换源日假断崖，
+    2026-10-26 sh.600018 与 2026-11-20 山煤国际两次事故同根因），
+    也**绝不**写 NULL 洞（NULL 行曾隔断 af_rebase 的 LAG 检测对 → 护栏失明）。
+    唯一允许的兜底=**沿用湖内现有 level**（同锚点族，非新锚点）+ 已知除权
+    事件的官方除权参考价步长。
+
+    :param con: lake 连接（只读 SQL，零网络）。
+    :param start, end: 填充窗口（ISO 日期，含端点）。
+    :param dates: 要填充的目标日期（如待写 K 线行的日期——缺口日尚不在湖中，
+        不能只依赖湖内已有行）；缺省=窗口内湖内已有 K 线行日期。
+    :return: {date: af|None}——每个目标日期的有效 af；None = fail-closed
+        （无历史 level / 事件步长不可判），由下次 tushare 官方 af 批量覆盖。
+    """
+    rows = con.execute(
+        "SELECT date, close, adj_factor FROM kline_daily "
+        "WHERE ts_code=? AND date<=? ORDER BY date", [ts_code, end]).fetchall()
+    if not rows:
+        return {}
+    # 事件窗口下界放宽到 start-10d：start 当日除权事件（ex_date==start）必须
+    # 纳入——早于 base_date 的事件由推演循环的跳过守卫防重复应用
+    # （已含在湖内现值里）。
+    events = con.execute(
+        "SELECT ex_date, cash_dps, stk_div FROM dividend_events "
+        "WHERE ts_code=? AND ex_date<=? "
+        "AND ex_date > (CAST(? AS DATE) - INTERVAL 10 DAY) ORDER BY ex_date",
+        [ts_code, end, start]).fetchall()
+    if dates is None:
+        dates = [str(d)[:10] for (d, _c, _a) in rows if start <= str(d)[:10] <= end]
+    else:
+        dates = sorted({str(d)[:10] for d in dates if start <= str(d)[:10] <= end})
+    if not dates:
+        return {}
+    lake_af = {str(d)[:10]: float(a) for (d, _c, a) in rows
+               if a is not None and a > 0}
+    out: Dict[str, Optional[float]] = {}
+    cur: Optional[float] = None
+    base_date = ""
+    for (d0, _c0, a0) in rows:
+        d0s = str(d0)[:10]
+        if d0s < dates[0] and a0 is not None and a0 > 0:
+            cur, base_date = float(a0), d0s   # 窗口前最近 level
+    ev_idx = 0
+    target = set(dates)
+    # 目标日 + 窗口内湖内已有 af 锚点日，统一升序推演（锚点续接防重复应用事件）
+    for ds in sorted(target | {d for d in lake_af if dates[0] <= d <= end}):
+        # 已有 af 的行：湖内现值权威（单 level 契约）→ 锚点续接，不再推演
+        if ds in lake_af:
+            cur, base_date = lake_af[ds], ds
+            if ds in target:
+                out[ds] = cur
+            continue
+        # 跳过已含在湖内现值里的事件（ex <= base_date）
+        while ev_idx < len(events) and str(events[ev_idx][0])[:10] <= base_date:
+            ev_idx += 1
+        # 应用 (base_date, d] 内的全部已知事件（官方除权参考价步长）
+        while ev_idx < len(events) and str(events[ev_idx][0])[:10] <= ds:
+            ex, cash, bonus = events[ev_idx]
+            cash = float(cash) if cash is not None else 0.0
+            bonus = float(bonus) if bonus is not None else 0.0
+            if cash == 0.0 and bonus == 0.0:
+                cur = None   # 事件但金额/送股均缺 → 步长不可判，fail-closed
+            else:
+                ex_s = str(ex)[:10]
+                c0 = next((c for (dd, c, _a) in reversed(rows)
+                           if str(dd)[:10] < ex_s and c is not None and c > 0),
+                          None)
+                if cur is None or c0 is None or c0 - cash <= 0:
+                    cur = None   # 无 level / 无事件前 close / 分母非正 → fail-closed
+                else:
+                    cur = cur * c0 * (1.0 + bonus) / (c0 - cash)
+            ev_idx += 1
+            base_date = str(events[ev_idx - 1][0])[:10]
+        if ds in target:
+            out[ds] = cur
     return out
 
 

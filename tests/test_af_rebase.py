@@ -65,7 +65,8 @@ def assert_hfq_continuous(con, ts_code, max_step=0.02):
         "SELECT date, close, LAG(close) OVER (ORDER BY date) "
         "FROM kline_daily WHERE ts_code=? ORDER BY date", [ts_code]).fetchall()
     for (d, h, hp), (_, r, rp) in zip(rows, raw):
-        if hp is None or rp is None or not hp or not rp:
+        # hfq 行 NULL（af 未填日）无连续性可言 → 跳过（修复后由无锚点填充补齐）
+        if h is None or hp is None or rp is None or not hp or not rp:
             continue
         step_h, step_r = h / hp, r / rp
         if str(d)[:10] in events or step_r < 1.0 / LARGE_DROP_RATIO:
@@ -217,3 +218,35 @@ def test_qfq_view_continuity_600018_replica(con):
     after = qfq()
     assert abs(after[1] / after[0] - 5.46 / 5.47) < 1e-9
     assert all(a > 5.0 for a in after), after
+
+
+# ---------------------------------------------------------------------------
+# 9. NULL 盲点（2026-11-20 山煤国际事故）：af=NULL 行隔断 LAG 配对
+# ---------------------------------------------------------------------------
+def test_null_day_blindspot_jump_detected_and_rebased(con):
+    """批量 af 失败日（整列 NULL）夹在两段之间：旧检测器的 LAG 只看到 NULL
+    邻居 → 假跳变不可见，rebase_recent 日增护栏静默失效。修复后：
+    11-12(af=7.5) → 11-13(af=NULL) → 11-16(af=11.8564, 无事件) 必须被
+    find_spurious_jumps 捕获并 rebase 回最早段基准。"""
+    from af_rebase import find_spurious_jumps, rebase_stock_af
+    add_rows(con, "sh.600546", [
+        ("2026-11-10", 11.01, 7.5),
+        ("2026-11-12", 10.90, 7.5),
+        ("2026-11-13", 10.90, None),       # 批量 af 失败日（NULL 洞）
+        ("2026-11-16", 11.05, 11.8564),    # 新段（无除权事件）
+        ("2026-11-18", 10.96, 11.8564),
+    ])
+    jumps = find_spurious_jumps(con)
+    assert [j["ts_code"] for j in jumps] == ["sh.600546"], jumps
+    assert jumps[0]["date"] == "2026-11-16" and jumps[0]["kind"] == "no_event"
+    res = rebase_stock_af(con, "sh.600546")
+    assert len(res["jumps"]) == 1 and res["jumps"][0]["date"] == "2026-11-16"
+    # 对齐后 11-16/11-18 回到最早段基准 7.5（NULL 行保持 NULL，由无锚点填充补）
+    afs = dict(con.execute(
+        "SELECT CAST(date AS VARCHAR), adj_factor FROM kline_daily "
+        "WHERE ts_code='sh.600546'").fetchall())
+    assert abs(afs["2026-11-16"] - 7.5) < 1e-9 and afs["2026-11-13"] is None
+    # hfq 连续（断步消除）
+    assert_hfq_continuous(con, "sh.600546")
+    # 幂等：重扫零跳变
+    assert find_spurious_jumps(con) == []

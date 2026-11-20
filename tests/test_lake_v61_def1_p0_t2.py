@@ -326,8 +326,10 @@ def test_p0_t2_all_sources_down_not_done(tmp_path, monkeypatch):
 # 4) legacy 回退：LAKE_MULTISOURCE=0 → p0 T2 走腾讯单源（v6.0.x 行为，零回归）
 # ===========================================================================
 def test_p0_t2_legacy_fallback_zero_regression(tmp_path, monkeypatch):
-    """池空（LAKE_MULTISOURCE=0）→ 既有腾讯直连路径逐字节不变：
-    fetch_kline_ohlcv(n=days+30) + load_t2(adj_map=None) → source=tencent、amount=NULL。"""
+    """池空（LAKE_MULTISOURCE=0）→ 既有腾讯直连路径零回归：
+    fetch_kline_ohlcv(n=days+30) + source=tencent、amount=NULL。
+    af=铁律无锚点填充（2026-11-20）：湖内已有 level 沿用（09-14 锚点
+    2.5 权威续写 + 09-15 level 沿用），不再留 NULL 洞。"""
     db = str(tmp_path / "def1_legacy.duckdb")
     from lake import conn as lconn
 
@@ -359,11 +361,14 @@ def test_p0_t2_legacy_fallback_zero_regression(tmp_path, monkeypatch):
         rows = {str(r[0]): r for r in con.execute(
             "SELECT date, close, volume, amount, adj_factor, source FROM kline_daily "
             "WHERE ts_code='sh.601398' ORDER BY date").fetchall()}
-        # v6.0.x 行为：source=tencent、amount=NULL、adj_factor=NULL（本步留 NULL）
+        # v6.0.x 行为：source=tencent、amount=NULL
         assert rows["2026-09-14"][5] == "tencent" and rows["2026-09-15"][5] == "tencent"
         assert rows["2026-09-14"][3] is None and rows["2026-09-15"][3] is None, \
             f"legacy 腾讯不提供 amount → NULL: {rows}"
-        assert rows["2026-09-14"][4] is None, f"legacy adj_map=None → NULL: {rows}"
+        # af 铁律（2026-11-20）：无锚点填充——09-14 湖内现值 2.5 权威，
+        # 09-15 沿用同 level（不再 NULL 洞）
+        assert rows["2026-09-14"][4] == 2.5 and rows["2026-09-15"][4] == 2.5, \
+            f"无锚点填充沿用湖内 level: {rows}"
         # volume 手→股 ×100（Q8 既有行为）
         assert rows["2026-09-14"][2] == 1_000_000 and rows["2026-09-15"][2] == 1_020_000
     finally:

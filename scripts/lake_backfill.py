@@ -63,7 +63,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 # 仓库根入 sys.path（scripts/ 下直接 python 运行）
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -593,7 +593,7 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
     from lake.backfill import Task
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
-    from lake.ingest.common import EmptyWindowError
+    from lake.ingest.common import EmptyWindowError, no_anchor_af_range
     from lake.ingest.tencent_ingest import fetch_kline_ohlcv, load_t2
     from screener.data.tencent import TencentClient
 
@@ -618,14 +618,19 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
             # ---- legacy 路径（池全不可用：离线单测/新源全降级）——v6.0.x 行为逐字节不变 ----
             kl = fetch_kline_ohlcv(tclient, code, n=days + 30)
             if kl:
-                load_t2(con, code, kl, adj_map=None)
+                # af 铁律（2026-11-20）：无锚点填充（无 level→None，同旧行为）
+                load_t2(con, code, kl,
+                        adj_map=no_anchor_af_range(
+                            con, code, window_start, _today_beijing(),
+                            dates=[str(r["date"])[:10] for r in kl]) or None)
             time.sleep(0.3)  # brief 限速红线：≥0.3s/股
             return
 
         # ---- v6.1 DEF-1 多源路径（镜像 run_history，窗口化）----
         kl: Optional[List[Dict[str, Any]]] = None
         source = "tencent"
-        adj_map: Optional[Dict[str, float]] = None
+        adj_derived: Optional[Dict[str, float]] = None   # 仅交叉校验用，不落库（af 铁律）
+        adj_map: Optional[Dict[str, Optional[float]]] = None
         _any_hard_err = False   # v6.3.5：真实失败 vs 窗口合法空
         for ad in ohlcv_srcs:
             try:
@@ -639,7 +644,8 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
             if res and res.get("ohlcv"):
                 kl = res["ohlcv"]
                 source = ad.name
-                adj_map = res.get("adj_factor")
+                # af 铁律（2026-11-20）：源私有推导值仅留作交叉校验，不写湖
+                adj_derived = res.get("adj_factor")
                 break
         if not kl:
             # v6.3.5：全源窗口合法空（该股窗口内无新数据，源可达）→ 视为完成；
@@ -653,17 +659,11 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
         if not kl:
             raise RuntimeError(f"T2 增量 K线窗口内无数据 {code}（不标 done，下轮重试）")
 
-        # adj_factor：主源自带推导值优先；否则按 adj 优先级补取（同 history）
-        if not adj_map:
-            for ad in adj_srcs:
-                try:
-                    m = ad.fetch_adj_factor(code, window_start, _today_beijing())
-                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
-                    log.warning("T2 %s adj source=%s 失败，回退下一源: %s", code, ad.name, exc)
-                    continue
-                if m:
-                    adj_map = m
-                    break
+        # adj_factor 铁律（2026-11-20）：写湖=无锚点填充（湖内 level 沿用+官方
+        # 除权步长）；源私有推导值（adj_derived）只进 tdx 交叉校验，不落库。
+        adj_map = no_anchor_af_range(
+            con, code, window_start, _today_beijing(),
+            dates=[str(r["date"])[:10] for r in kl]) or None
 
         # cross_check：采用 sina 主源 → tdx 最近窗口轻量验证（close/amount/末因子）
         conflict_src: Optional[str] = None
@@ -679,9 +679,11 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
                                 kl, "sina", vrows, "tdx",
                                 close_pct=t2_close_pct, amount_pct=t2_amount_pct)
                             # 末因子交叉校验（af 误差累积进 hfq/qfq view，阈值从严）
-                            if adj_map and (vres or {}).get("adj_factor"):
+                            # 铁律（2026-11-20）：校验对象=源私有推导值（仅审计，不落库）
+                            if adj_derived and (vres or {}).get("adj_factor"):
                                 af_conf = sp.cross_check_adj_factor(
-                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
+                                    adj_derived, "sina", vres["adj_factor"], "tdx",
+                                    pct=t2_af_pct)
                                 conflict_src = _merge_conflict(conflict_src, af_conf)
                 except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
                     log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
@@ -967,7 +969,8 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
     from lake.backfill import BackfillRunner, Task, save_progress, stop_requested as _bk_stop
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
-    from lake.ingest.common import HangWatchdogError, ProgressWatchdog
+    from lake.ingest.common import (HangWatchdogError, ProgressWatchdog,
+                                    no_anchor_af_range)
     from lake.ingest.tencent_ingest import load_t2
     from screener.data.tencent import TencentClient
 
@@ -1023,14 +1026,20 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                 # 防御：fetch_kline_full_history 契约上取空即抛错，这里双保险——
                 # 绝不在无数据时 mark_done（旧 done 键毒化根因）
                 raise RuntimeError(f"腾讯K线全史为空 {code}（不标 done，下轮重试）")
-            load_t2(con, code, kl, adj_map=None)
+            # af 铁律（2026-11-20）：湖内已有 level→无锚点填充；无 level→None
+            # （同旧行为：af 列留 NULL，多源池恢复后补齐）
+            load_t2(con, code, kl,
+                    adj_map=no_anchor_af_range(
+                        con, code, start_date, end_date,
+                        dates=[str(r["date"])[:10] for r in kl]) or None)
             time.sleep(0.3)
             return
 
         # ---- v6.1 多源路径：按 Q1 优先级取第一个成功源（break）----
         kl: Optional[List[Dict[str, Any]]] = None
         source = "tencent"
-        adj_map: Optional[Dict[str, float]] = None
+        adj_derived: Optional[Dict[str, float]] = None   # 仅交叉校验用，不落库（af 铁律）
+        adj_map: Optional[Dict[str, Optional[float]]] = None
         for ad in ohlcv_srcs:
             try:
                 res = ad.fetch_kline(code)  # 全史（start/end=None）
@@ -1040,13 +1049,19 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
             if res and res.get("ohlcv"):
                 kl = res["ohlcv"]
                 source = ad.name
-                adj_map = res.get("adj_factor")
+                # af 铁律（2026-11-20）：源私有推导值仅留作交叉校验，不写湖
+                adj_derived = res.get("adj_factor")
                 break
         if not kl:
             raise RuntimeError(f"T2 全史 K线所有源均失败 {code}（不标 done，下轮重试）")
 
-        # adj_factor：主源自带推导值（sina/tdx hfq÷raw）优先；否则按 adj 优先级补取
-        if not adj_map:
+        # adj_factor 铁律（2026-11-20）：源私有推导值（sina/tdx hfq÷raw）只留作
+        # 交叉校验——写湖分两档：
+        # - 湖内已有 af level（重取场景）→ 无锚点填充（沿用现有锚点，绝不混入
+        #   源私有归一化 → 防换锚假断崖，2026-10-26/2026-11-20 两次事故同根因）；
+        # - 无 level（新股首次全史 bootstrap）→ 源推导值作为唯一全史锚点
+        #   （单次抓取内自洽；此后日增永不引入新锚点，漂移由 af_rebase 对齐）。
+        if adj_derived is None:
             for ad in adj_srcs:
                 try:
                     m = ad.fetch_adj_factor(code, start_date, end_date)
@@ -1054,8 +1069,20 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                     log.warning("T2 %s adj source=%s 失败，回退下一源: %s", code, ad.name, exc)
                     continue
                 if m:
-                    adj_map = m
+                    adj_derived = m
                     break
+        _has_level = con.execute(
+            "SELECT 1 FROM kline_daily WHERE ts_code=? "
+            "AND adj_factor IS NOT NULL AND adj_factor > 0 LIMIT 1",
+            [code]).fetchone()
+        if _has_level:
+            adj_map = no_anchor_af_range(
+                con, code, start_date, end_date,
+                dates=[str(r["date"])[:10] for r in kl]) or None
+        else:
+            # 全史 bootstrap：源推导值作唯一锚点（{事件日: af}，load_t2 前向填充）
+            adj_map = cast("Optional[Dict[str, Optional[float]]]",
+                           dict(adj_derived) if adj_derived else None)
 
         # cross_check（≥2源时）：采用新浪主源 → tdx 最近窗口轻量验证（close/amount/末因子）
         conflict_src: Optional[str] = None
@@ -1071,9 +1098,11 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                                 kl, "sina", vrows, "tdx",
                                 close_pct=t2_close_pct, amount_pct=t2_amount_pct)
                             # 末因子交叉校验（af 误差累积进 hfq/qfq view，阈值从严）
-                            if adj_map and (vres or {}).get("adj_factor"):
+                            # 铁律（2026-11-20）：校验对象=源私有推导值（仅审计，不落库）
+                            if adj_derived and (vres or {}).get("adj_factor"):
                                 af_conf = sp.cross_check_adj_factor(
-                                    adj_map, "sina", vres["adj_factor"], "tdx", pct=t2_af_pct)
+                                    adj_derived, "sina", vres["adj_factor"], "tdx",
+                                    pct=t2_af_pct)
                                 conflict_src = _merge_conflict(conflict_src, af_conf)
                 except Exception as exc:  # noqa: BLE001 - 验证失败不阻断（conflict=NULL）
                     log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
@@ -1691,7 +1720,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     from lake.backfill import BackfillRunner, Task
     from lake.config import crosscheck_threshold, lake_cfg
     from lake.ingest import source_pool as sp
-    from lake.ingest.common import EmptyWindowError
+    from lake.ingest.common import EmptyWindowError, no_anchor_af_range
     from lake.ingest.tencent_ingest import (INDEX_CODES, fetch_kline_ohlcv,
                                             fetch_snapshot, load_t2, load_t3, load_t7)
     from screener.data.tencent import TencentClient
@@ -1983,8 +2012,17 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
             if _gap_ok:
                 _brow = batch.get("t2", {}).get(code)
                 if _brow:
+                    adj_map = batch.get("af", {}).get(code)
+                    if not adj_map:
+                        # af 铁律（2026-11-20）：批量 af 缺失（tushare 批量限频/
+                        # 空返回）→ 无锚点填充（湖内 level 沿用+官方事件步长）；
+                        # 不写 NULL 洞（NULL 行隔断 af_rebase LAG 检测对致护栏
+                        # 失明，山煤国际事故实锤），不引入他源新锚点。
+                        adj_map = no_anchor_af_range(
+                            con, code, start, _bdate,
+                            dates=[str(_brow["date"])[:10]]) or None
                     load_t2(con, code, [_brow],
-                            adj_map=batch.get("af", {}).get(code),
+                            adj_map=adj_map,
                             # 来源标签随批量通道（v7.0.33 EM 主源；备源期 tushare）
                             source="em_batch" if batch.get("channel") == "em"
                             else "tushare",
@@ -1998,13 +2036,17 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
             kl = [r for r in kl if str(r["date"]) >= start]
             if not kl:
                 return   # 缺口内无新数据（节假日/未收盘）→ 视为完成（不写库）
-            load_t2(con, code, kl, adj_map=None)
+            # af 铁律（2026-11-20）：无锚点填充（同逐只 fallback 口径）
+            load_t2(con, code, kl,
+                    adj_map=no_anchor_af_range(
+                        con, code, start, today_s,
+                        dates=[str(r["date"])[:10] for r in kl]) or None)
             time.sleep(0.3)
             return
 
         kl: Optional[List[Dict[str, Any]]] = None
         source = "tencent"
-        adj_map: Optional[Dict[str, float]] = None
+        adj_map: Optional[Dict[str, Optional[float]]] = None
         _any_hard_err = False   # v6.3.5：是否有"真实失败"（区别于窗口合法空）
         for ad in ohlcv_srcs:
             try:
@@ -2019,7 +2061,11 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
             if res and res.get("ohlcv"):
                 kl = res["ohlcv"]
                 source = ad.name
-                adj_map = res.get("adj_factor")
+                # af 铁律（2026-11-20）：适配器自带推导 af（sina/tdx hfq÷raw）
+                # 是源私有归一化（窗口首日比值为任意常数）→ 写湖即埋换源日
+                # 假断崖（2026-10-26 sh.600018 / 2026-11-20 山煤国际事故同根因）
+                # → 一律不落库；af 统一走下方无锚点填充。
+                adj_map = None
                 break
         if kl is None:
             if not _any_hard_err and ohlcv_srcs:
@@ -2035,18 +2081,13 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         if not kl:
             return   # 源正常但缺口内无新数据（节假日/未收盘）→ 视为完成
 
-        # adj_factor：主源自带推导值优先；否则按 adj 优先级补取（同 run_t2）
-        if not adj_map:
-            for ad in adj_srcs:
-                try:
-                    m = ad.fetch_adj_factor(code, start, today_s)
-                except Exception as exc:  # noqa: BLE001 - 该源失败 → 下一源
-                    log.warning("incremental T2 %s adj source=%s 失败，回退下一源: %s",
-                                code, ad.name, exc)
-                    continue
-                if m:
-                    adj_map = m
-                    break
+        # adj_factor 铁律（2026-11-20）：湖内唯一新锚点源=tushare 官方 af
+        # （批量通道命中分支已写入）。逐只 fallback **不再取任何源私有推导值**
+        # （sina/tdx hfq÷raw=源私有归一化，写湖即换源假断崖）——统一无锚点填充：
+        # 沿用湖内现有 level+官方除权步长；无 level→None（下次 tushare 批量补）。
+        adj_map = no_anchor_af_range(
+            con, code, start, today_s,
+            dates=[str(r["date"])[:10] for r in kl]) or None
 
         # v6.3.5（Joel 拍板）：incremental **不做** tdx 交叉验证——此前每只 sina
         # 主源股多 1 次 tdx 窗口取数 ~4s（×5112 ≈ 5.7h），只为写 conflict_src

@@ -233,7 +233,7 @@ def fetch_snapshot(client, ts_codes: Sequence[str]) -> Dict[str, Dict[str, Any]]
 # load（→ DuckDB，零网络）
 # ---------------------------------------------------------------------------
 def load_t2(con, ts_code: str, kline_rows: Sequence[Dict[str, Any]],
-            adj_map: Optional[Dict[str, float]] = None,
+            adj_map: Optional[Dict[str, Optional[float]]] = None,
             is_st: int = 0, source: str = "tencent",
             conflict_src: Optional[str] = None,
             volume_is_shares: bool = False) -> int:

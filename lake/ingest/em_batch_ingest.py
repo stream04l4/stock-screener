@@ -341,12 +341,17 @@ def derive_af_batch(con, trade_date: str,
             f"东财 af 推导遇配股事件 {len(_allot)} 条（无配股价字段，fail-closed）："
             + ", ".join(f"{e['ts_code']}({e.get('plan','')})" for e in _allot[:3]))
 
-    # 1) 全市场前一日 af level（本地 SQL；(ts_code,date) 二级索引，~1-2s）
+    # 1) 全市场前一日 af level（本地 SQL；(ts_code,date) 二级索引，~1-2s）。
+    # 铁律（2026-11-20）：取**最近非 NULL** af 行（而非 MAX(date) 行）——最新行
+    # af=NULL（批量 af 失败日）时，若以 1.0 起步即为引入新锚点（假断崖隐患）。
     levels: Dict[str, Optional[float]] = {}
     for ts, af in con.execute(
             "SELECT ts_code, adj_factor FROM kline_daily "
             "WHERE (ts_code, date) IN "
-            "(SELECT ts_code, MAX(date) FROM kline_daily GROUP BY ts_code)").fetchall():
+            "(SELECT ts_code, MAX(date) FROM kline_daily "
+            " WHERE adj_factor IS NOT NULL AND adj_factor > 0 "
+            " GROUP BY ts_code) "
+            "AND adj_factor IS NOT NULL").fetchall():
         levels[ts] = af
     # 2) 事件股的 c0（D 前最近 close；只查事件股 ≤20 只/日）
     ev_codes = sorted({e["ts_code"] for e in events})
