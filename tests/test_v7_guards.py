@@ -54,7 +54,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # v8.2.0 补（138baf6，2026-11-19）：T3 息率质量门（baidu_valuation_adapter
 # derive_yield_for_date + lake_backfill _t3_yield_gate），lake/ 有意变更，
 # 基线前移。
-BASELINE = "138baf6"
+# lake v7.0.34（3b2cd6e，2026-11-20）：adj_factor 单源铁律（山煤国际事故，
+# Joel 拍板）——common.py no_anchor_af_range 无锚点填充 + forward_fill_af
+# {d:None} 重置 + tencent/em_batch 加固 + lake_backfill 9 处接入（他源推导
+# 值禁写湖、NULL 洞禁写），lake/ 有意变更，基线前移。
+BASELINE = "3b2cd6e"
 
 
 def _git(*args) -> str:
