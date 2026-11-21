@@ -202,6 +202,8 @@ def test_production_pool_scale_and_f6_members():
         con.close()
     f = res.funnel
     assert f["total"] >= f["whitelist"] >= f["soe"] >= f["mv"] >= f["listing"] >= f["div"] >= f["final"]
-    assert f["final"] >= 90, f"池规模异常: {f}"
+    # 2026-11-21 池基线更新：外部审计 e088705（最大国有股东规则+3 子公司链 token）
+    # 后生产池 final=80 量级（原 111），阈值放宽到 75 留季度快照漂移容差
+    assert f["final"] >= 75, f"池规模异常: {f}"
     missing = [c for c in F6_IN_POOL if c not in set(res.codes)]
     assert not missing, f"f6 白名单行业内四股不在池: {missing}"

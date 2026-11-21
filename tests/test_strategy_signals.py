@@ -449,6 +449,14 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
     wapp._STATE_CACHE["value"] = None
     wapp._SPOT_CACHE["ts"] = 0.0
     wapp._SPOT_CACHE["data"] = {}
+    # 审查修复（2026-11-21, e088705 跟进）：k=0 时机门改实时分位优先后，
+    # fixture 用真实上市代码（sh.600004=三一重工等）会读真湖算实时分位 →
+    # 环境耦合（无真湖静默全绿 / 真湖下与 fixture 价脱钩误 fail）。统一短路
+    # 实时路径为空 → 回退 tmap 快照语义（本文件断言的原口径）；实时路径本身
+    # 由 test_held_first_timing_pool_outside_live 离线 mock 单独覆盖。
+    wapp._HELD_PCT_CACHE.clear()
+    monkeypatch.setattr(wapp, "_live_pctile_cached",
+                        lambda codes, price_map, tp: {})
     monkeypatch.setattr(wapp, "_up_read", lambda: dict(user))
     monkeypatch.setattr(timing_mod, "load_timing_map", lambda con: dict(tmap))
     monkeypatch.setattr(sel_mod, "load_backtest_map", lambda con: dict(bmap))
