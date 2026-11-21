@@ -58,19 +58,16 @@ def _bs_to_tcode(ts_code: str) -> str:
 # ---------------------------------------------------------------------------
 # fetch（网络）
 # ---------------------------------------------------------------------------
-def fetch_kline_ohlcv(client, ts_code: str, n: int) -> List[Dict[str, Any]]:
-    """腾讯 raw 日K完整 OHLCV 行（升序，末行=最新交易日）。
-
-    :param client: TencentClient（复用其 session/超时/重试语义；本函数用 session.get）。
-    :return: [{date, open, high, low, close, volume}]；失败/无数据 → []。
-        volume 单位=手（调用方 ×100 转股）；amount 不提供（→NULL）。
-    """
+def _fetch_kline_ohlcv_impl(client, ts_code: str, n: int,
+                            raise_on_error: bool = False) -> List[Dict[str, Any]]:
+    """腾讯 raw 日K完整 OHLCV 行内部实现（支持 raise_on_error 区分网络故障与合法空窗口）。"""
     import requests
 
     tcode = _bs_to_tcode(ts_code)
     url = _KLINE_URL.format(tcode=tcode, n=n, fq="")
     timeout = float(getattr(client, "timeout", 15))
     max_attempts = int(getattr(client, "max_attempts", 3))
+    last_err: Optional[str] = None
     for attempt in range(1, max_attempts + 1):
         # v6.0.10：收到停止信号 → 提前中断（抛错不标 done，下轮续传；不返回 []——
         # p0 worker 对空结果仍 mark_done，会把未取数误标完成）
@@ -79,12 +76,16 @@ def fetch_kline_ohlcv(client, ts_code: str, n: int) -> List[Dict[str, Any]]:
         try:
             resp = client.session.get(url, timeout=timeout)
             if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}"
                 log.warning("腾讯K线 HTTP %s %s (attempt %d)", resp.status_code, ts_code, attempt)
-                break
+                continue
             body = json.loads(resp.content.decode("utf-8", errors="replace"))
             data = body.get("data")
             if not isinstance(data, dict):
-                log.warning("腾讯K线响应异常 data=%r %s: %s", type(data).__name__, ts_code, body.get("msg", ""))
+                last_err = f"响应异常 data={type(data).__name__}: {body.get('msg', '')}"
+                log.warning("腾讯K线%s %s", last_err, ts_code)
+                if raise_on_error:
+                    raise RuntimeError(f"腾讯K线 {ts_code} {last_err}")
                 return []
             node = data.get(tcode, {})
             rows = node.get("day") or []
@@ -106,8 +107,16 @@ def fetch_kline_ohlcv(client, ts_code: str, n: int) -> List[Dict[str, Any]]:
                     continue
             return out
         except (requests.RequestException, ValueError) as exc:
+            last_err = str(exc)
             log.warning("腾讯K线请求失败 %s (attempt %d): %s", ts_code, attempt, exc)
+    if raise_on_error:
+        raise RuntimeError(f"腾讯K线请求失败 {ts_code}: {last_err or 'unknown'}")
     return []
+
+
+def fetch_kline_ohlcv(client, ts_code: str, n: int) -> List[Dict[str, Any]]:
+    """腾讯 raw 日K完整 OHLCV 行（升序，末行=最新交易日；保持原 3 参数公开签名）。"""
+    return _fetch_kline_ohlcv_impl(client, ts_code, n, raise_on_error=False)
 
 
 def _kline_page_url(tcode: str, start: Optional[str], end: Optional[str],
@@ -299,18 +308,23 @@ def load_t3(con, ts_code: str, snap: Dict[str, Any], date: str,
 
 
 def load_t7(con, index_code: str, kline_rows: Sequence[Dict[str, Any]],
-            source: str = "tencent", conflict_src: Optional[str] = None) -> int:
+            source: str = "tencent", conflict_src: Optional[str] = None,
+            volume_is_shares: bool = False) -> int:
     """T7 upsert：指数日K（amount 行提供则写、缺→NULL）。
 
     :param conflict_src: v6.1 跨源分歧摘要（close 腾讯 vs tdx >0.3%；None=NULL）。
+    :param volume_is_shares: True=行内 volume 已为股（source_pool adapter 统一口径，不重复 ×100）；
+        False=腾讯直连原始手数（×100 转股）。
     """
     rows = []
     for r in kline_rows:
-        vol_hand = r.get("volume")
+        vol = r.get("volume")
+        if vol is not None:
+            vol = int(vol) if volume_is_shares else int(vol * 100)
         rows.append([
             index_code, r["date"],
             r.get("open"), r.get("high"), r.get("low"), r.get("close"),
-            int(vol_hand * 100) if vol_hand is not None else None,
+            vol,
             r.get("amount"),  # amount：行提供则写（tdx 补缺口）；缺→NULL（不硬造）
             source, now_ts(), DATA_VERSION,
         ])

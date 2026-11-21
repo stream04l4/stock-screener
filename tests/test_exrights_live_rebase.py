@@ -120,8 +120,8 @@ def test_no_pending_event_past(lake):
 
 
 def test_cash_and_stk_div(lake):
-    """现金+送转：p_ex = (100−5)/(1+10/10) = 47.5 → r = 100/47.5。"""
-    _add_event(lake, TODAY, CASH, 10.0)
+    """现金+送转（每股口径 stk_div=1.0 即 10 送 10）：p_ex = (100−5)/(1+1.0) = 47.5 → r = 100/47.5。"""
+    _add_event(lake, TODAY, CASH, 1.0)
     con = _conn(lake)
     out = engine.pending_exrights_factor(con, [CODE], TODAY)
     assert out[CODE] == pytest.approx(100.0 / 47.5)
@@ -129,10 +129,10 @@ def test_cash_and_stk_div(lake):
 
 
 def test_multi_events_sequential(lake):
-    """多事件顺序模拟（罕见兜底）：11-10 分红 5 → 95；11-11 10 送 10 → 47.5。
+    """多事件顺序模拟（每股口径）：11-10 分红 5 → 95；11-11 10 送 10（stk_div=1.0）→ 47.5。
     r_cum = (100/95) × (95/47.5) = 100/47.5。"""
     _add_event(lake, "2026-11-10", CASH, 0.0)
-    _add_event(lake, "2026-11-11", 0.0, 10.0)
+    _add_event(lake, "2026-11-11", 0.0, 1.0)
     con = _conn(lake)
     out = engine.pending_exrights_factor(con, [CODE], "2026-11-11")
     assert out[CODE] == pytest.approx(100.0 / 47.5)
@@ -265,8 +265,8 @@ def test_live_pctile_exrights_fix(lake):
     tp = SimpleNamespace(price_window_years=5)
     prices = {CODE: 95.0}
     con = _conn(lake)
-    old = timing.live_pctile_map(con, [CODE], prices, tp)
-    new = timing.live_pctile_map(con, [CODE], prices, tp, now=TODAY)
+    old = timing.live_pctile_map(con, [CODE], prices, tp, min_bars=2)
+    new = timing.live_pctile_map(con, [CODE], prices, tp, min_bars=2, now=TODAY)
     con.close()
     assert old[CODE] == pytest.approx(25.0)
     assert new[CODE] == pytest.approx(37.5)
@@ -276,7 +276,7 @@ def test_live_pctile_no_event_unchanged(lake):
     tp = SimpleNamespace(price_window_years=5)
     prices = {CODE: 103.0}
     con = _conn(lake)
-    old = timing.live_pctile_map(con, [CODE], prices, tp)
-    new = timing.live_pctile_map(con, [CODE], prices, tp, now=TODAY)
+    old = timing.live_pctile_map(con, [CODE], prices, tp, min_bars=2)
+    new = timing.live_pctile_map(con, [CODE], prices, tp, min_bars=2, now=TODAY)
     con.close()
     assert old == new  # 无事件 → 零修正

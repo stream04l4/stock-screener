@@ -154,15 +154,18 @@ def test_funnel_central_only_excludes_local(tmp_path):
     db = tmp_path / "f.duckdb"
     _mk_db(db)
     con = duckdb.connect(str(db), read_only=True)
-    res_off = build_pool(con, _up(), run_year=RUN_YEAR)
-    res_on = build_pool(con, _up(central_only=True), run_year=RUN_YEAR)
+    # 关央企门（min_soe_ratio_pct=8.0 单边生效 + 海油O豁免）：A/B/D/宇通L/海油O 过，
+    # C（国网 5% < 8%）在控股强度门即被剔除（修复原 sum=0 OR 短路漏洞）
+    up_base = _up(soe_control_overrides=("sh.600938",))
+    res_off = build_pool(con, up_base, run_year=RUN_YEAR)
+    res_on = build_pool(con, _up(central_only=True, soe_control_overrides=("sh.600938",)),
+                        run_year=RUN_YEAR)
     con.close()
-    # 关：SOE 门过 A/B/C/D/海油O/宇通L（E 民营排）；sum=0 → 合计档恒过 → 全进
     assert set(res_off.codes) == {
-        "sh.600101", "sh.600102", "sh.600103", "sh.600104", "sh.600938", "sh.600066",
+        "sh.600101", "sh.600102", "sh.600104", "sh.600938", "sh.600066",
     }
-    # 开：再剔 B（深铁=地方国资）+ C（央企但 5% < 8% 控股门槛）
-    #     + 宇通L（郑州国资=地方国企）；海油O 保留（CENTRAL_OVERRIDE_CODES 央企豁免）
+    # 开央企门：再剔 B（深铁=地方国资）+ 宇通L（郑州国资=地方国企）；
+    # 海油O 保留（CENTRAL_OVERRIDE_CODES 央企豁免）
     assert set(res_on.codes) == {"sh.600101", "sh.600104", "sh.600938"}
 
 

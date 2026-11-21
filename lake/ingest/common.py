@@ -36,10 +36,10 @@ def to_ts_code(code6_or_bs: str) -> str:
     if "." in c:
         return c
     c = c.zfill(6)
-    if c[0] in ("5", "6", "9"):      # 沪市（含科创板 688、基金 5）
-        return f"sh.{c}"
-    if c[0] in ("4", "8") or c.startswith("92"):  # 北交所
+    if c.startswith("92") or c[0] in ("4", "8"):  # 北交所（含 920xxx 新号段，须先于沪市 9）
         return f"bj.{c}"
+    if c[0] in ("5", "6", "9"):      # 沪市（含科创板 688、基金 5、B 股 900）
+        return f"sh.{c}"
     return f"sz.{c}"                  # 深市（含创业板 300）
 
 
@@ -111,14 +111,23 @@ class _DaemonFetchPool:
 
     _SENTINEL = object()
 
-    def __init__(self, max_workers: int = 8) -> None:
+    def __init__(self, max_workers: int = 8, max_cap: int = 32) -> None:
         import queue as _queue
 
         self._q: "_queue.Queue" = _queue.Queue()
-        for i in range(max(1, int(max_workers))):
-            t = threading.Thread(target=self._worker, name=f"lake-fetch-{i}",
-                                 daemon=True)   # ← R2 关键：daemon，退出时不 join
-            t.start()
+        self._lock = threading.Lock()
+        self._busy = 0
+        self._workers = 0
+        self._max_cap = max(max_workers, int(max_cap))
+        for _ in range(max(1, int(max_workers))):
+            self._spawn_worker()
+
+    def _spawn_worker(self) -> None:
+        idx = self._workers
+        self._workers += 1
+        t = threading.Thread(target=self._worker, name=f"lake-fetch-{idx}",
+                             daemon=True)   # ← R2 关键：daemon，退出时不 join
+        t.start()
 
     def _worker(self) -> None:
         while True:
@@ -126,14 +135,23 @@ class _DaemonFetchPool:
             if item is self._SENTINEL:
                 return
             fn, args, kwargs, fut = item
+            with self._lock:
+                self._busy += 1
             try:
                 fut.set_result(fn(*args, **kwargs))
             except BaseException as exc:   # noqa: BLE001 - 异常经 Future 传回主线程
                 if not fut.set_exception(exc):
                     pass   # Future 已被取消（超时放弃）→ 丢弃，不刷错
+            finally:
+                with self._lock:
+                    self._busy = max(0, self._busy - 1)
 
     def submit(self, fn, *args, **kwargs) -> "concurrent.futures.Future":
         fut: concurrent.futures.Future = concurrent.futures.Future()
+        with self._lock:
+            # 弱网/黑洞导致旧线程卡死在 socket recv 时，按需动态补线程（封顶防无限增长）
+            if self._busy >= self._workers and self._workers < self._max_cap:
+                self._spawn_worker()
         self._q.put((fn, args, kwargs, fut))
         return fut
 
@@ -518,6 +536,31 @@ def delete_where(con, table: str, col: str, val: Any) -> None:
     con.execute(f'DELETE FROM {table} WHERE "{col}" = ?', [val])
 
 
+def replace_where(con, table: str, where_sql: str, where_params: Sequence[Any],
+                  columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> int:
+    """无 PK 表事务原子「先删后插」：避免 DELETE 后崩溃导致该股全史数据丢失。"""
+    rows_list = [list(r) for r in rows]
+    in_tx = False
+    try:
+        con.execute("BEGIN TRANSACTION")
+        in_tx = True
+    except Exception:  # noqa: BLE001 - 已在外部事务内
+        in_tx = False
+    try:
+        con.execute(f"DELETE FROM {table} WHERE {where_sql}", list(where_params))
+        written = insert_many(con, table, columns, rows_list)
+        if in_tx:
+            con.execute("COMMIT")
+        return written
+    except Exception:
+        if in_tx:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+
+
 def clean_date(v: Any) -> Optional[str]:
     """'YYYY-MM-DD ...'/8位/YYYYMMDD → ISO；非法/空 → None。"""
     if v is None:
@@ -582,7 +625,8 @@ def forward_fill_af(dates: Sequence[str],
 
 
 def no_anchor_af_range(con, ts_code: str, start: str, end: str,
-                       dates: Optional[Sequence[str]] = None) -> Dict[str, Optional[float]]:
+                       dates: Optional[Sequence[str]] = None,
+                       close_map: Optional[Dict[str, float]] = None) -> Dict[str, Optional[float]]:
     """af **无锚点**填充（铁律 2026-11-20：同一参数同一源）。
 
     背景：kline_daily.adj_factor 只允许一个规范锚点源（tushare 官方 af）。
@@ -591,12 +635,13 @@ def no_anchor_af_range(con, ts_code: str, start: str, end: str,
     2026-10-26 sh.600018 与 2026-11-20 山煤国际两次事故同根因），
     也**绝不**写 NULL 洞（NULL 行曾隔断 af_rebase 的 LAG 检测对 → 护栏失明）。
     唯一允许的兜底=**沿用湖内现有 level**（同锚点族，非新锚点）+ 已知除权
-    事件的官方除权参考价步长。
+    事件的官方除权参考价步长（stk_div 为每股送转股数，同日多事件先聚合求和）。
 
     :param con: lake 连接（只读 SQL，零网络）。
     :param start, end: 填充窗口（ISO 日期，含端点）。
     :param dates: 要填充的目标日期（如待写 K 线行的日期——缺口日尚不在湖中，
         不能只依赖湖内已有行）；缺省=窗口内湖内已有 K 线行日期。
+    :param close_map: 可选本次待写行的 `{date: close}`，补充多日缺口下的 `c0`。
     :return: {date: af|None}——每个目标日期的有效 af；None = fail-closed
         （无历史 level / 事件步长不可判），由下次 tushare 官方 af 批量覆盖。
     """
@@ -605,14 +650,6 @@ def no_anchor_af_range(con, ts_code: str, start: str, end: str,
         "WHERE ts_code=? AND date<=? ORDER BY date", [ts_code, end]).fetchall()
     if not rows:
         return {}
-    # 事件窗口下界放宽到 start-10d：start 当日除权事件（ex_date==start）必须
-    # 纳入——早于 base_date 的事件由推演循环的跳过守卫防重复应用
-    # （已含在湖内现值里）。
-    events = con.execute(
-        "SELECT ex_date, cash_dps, stk_div FROM dividend_events "
-        "WHERE ts_code=? AND ex_date<=? "
-        "AND ex_date > (CAST(? AS DATE) - INTERVAL 10 DAY) ORDER BY ex_date",
-        [ts_code, end, start]).fetchall()
     if dates is None:
         dates = [str(d)[:10] for (d, _c, _a) in rows if start <= str(d)[:10] <= end]
     else:
@@ -628,6 +665,33 @@ def no_anchor_af_range(con, ts_code: str, start: str, end: str,
         d0s = str(d0)[:10]
         if d0s < dates[0] and a0 is not None and a0 > 0:
             cur, base_date = float(a0), d0s   # 窗口前最近 level
+
+    # 事件窗口下界 = base_date（覆盖长停牌 >10 天除权）；同日多事件先聚合求和
+    if base_date:
+        events = con.execute(
+            "SELECT ex_date, SUM(COALESCE(cash_dps, 0)), SUM(COALESCE(stk_div, 0)) "
+            "FROM dividend_events "
+            "WHERE ts_code=? AND ex_date > ? AND ex_date <= ? "
+            "GROUP BY ex_date ORDER BY ex_date",
+            [ts_code, base_date, end]).fetchall()
+    else:
+        events = con.execute(
+            "SELECT ex_date, SUM(COALESCE(cash_dps, 0)), SUM(COALESCE(stk_div, 0)) "
+            "FROM dividend_events "
+            "WHERE ts_code=? AND ex_date >= ? AND ex_date <= ? "
+            "GROUP BY ex_date ORDER BY ex_date",
+            [ts_code, start, end]).fetchall()
+
+    merged_close: Dict[str, float] = {}
+    for (dd, c, _a) in rows:
+        if c is not None and float(c) > 0:
+            merged_close[str(dd)[:10]] = float(c)
+    if close_map:
+        for dd, c in close_map.items():
+            if c is not None and float(c) > 0:
+                merged_close[str(dd)[:10]] = float(c)
+    sorted_close_dates = sorted(merged_close.keys())
+
     ev_idx = 0
     target = set(dates)
     # 目标日 + 窗口内湖内已有 af 锚点日，统一升序推演（锚点续接防重复应用事件）
@@ -641,7 +705,7 @@ def no_anchor_af_range(con, ts_code: str, start: str, end: str,
         # 跳过已含在湖内现值里的事件（ex <= base_date）
         while ev_idx < len(events) and str(events[ev_idx][0])[:10] <= base_date:
             ev_idx += 1
-        # 应用 (base_date, d] 内的全部已知事件（官方除权参考价步长）
+        # 应用 (base_date, d] 内的全部已知事件（官方除权参考价步长，已按日聚合）
         while ev_idx < len(events) and str(events[ev_idx][0])[:10] <= ds:
             ex, cash, bonus = events[ev_idx]
             cash = float(cash) if cash is not None else 0.0
@@ -650,9 +714,11 @@ def no_anchor_af_range(con, ts_code: str, start: str, end: str,
                 cur = None   # 事件但金额/送股均缺 → 步长不可判，fail-closed
             else:
                 ex_s = str(ex)[:10]
-                c0 = next((c for (dd, c, _a) in reversed(rows)
-                           if str(dd)[:10] < ex_s and c is not None and c > 0),
-                          None)
+                c0 = None
+                for dd in reversed(sorted_close_dates):
+                    if dd < ex_s:
+                        c0 = merged_close[dd]
+                        break
                 if cur is None or c0 is None or c0 - cash <= 0:
                     cur = None   # 无 level / 无事件前 close / 分母非正 → fail-closed
                 else:

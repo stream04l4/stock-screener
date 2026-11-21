@@ -13,9 +13,16 @@
 # 若 5 号恰逢周末 cron 跳过 → 数据多滞后数天，状态面板"缺 X 报告期"徽章如实标注。
 # 重试 10 次×60s：启动时与 web 短连接撞锁则等下一轮（web 请求 <2s）。
 cd /home/ubuntu/stock-screener
+# 仅首轮尝试带 --reset-nodata 清旧季度 done 键；后续重试保留断点续传进度，
+# 防止中途遇新浪 WAF 失败后清空进度从头重抓。
 for i in 1 2 3 4 5 6 7 8 9 10; do
     echo "=== $(date -u '+%F %T') attempt $i ==="
-    if .venv/bin/python scripts/lake_backfill.py t6 --reset-nodata; then
+    if [ "$i" -eq 1 ]; then
+        CMD=(.venv/bin/python scripts/lake_backfill.py t6 --reset-nodata)
+    else
+        CMD=(.venv/bin/python scripts/lake_backfill.py t6)
+    fi
+    if "${CMD[@]}"; then
         echo "T6_QUARTERLY_OK"
         exit 0
     fi

@@ -532,7 +532,7 @@ def test_batch_call_hourly_limit_waits_62min_then_recovers(monkeypatch):
     monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
     rows = ti.fetch_adj_factor_batch("2026-09-18")
     assert calls["n"] == 2, f"限频后应重试一次: {calls}"
-    assert sleeps == [62 * 60], f"应等 62min: {sleeps}"
+    assert sum(sleeps) == 62 * 60 and all(0 < s <= 5 for s in sleeps), f"应分段等满 62min: {sleeps[:5]}"
     assert rows == {"sh.601398": {"2026-09-18": 1.25}}, rows
 
 
@@ -560,7 +560,7 @@ def test_batch_call_hourly_limit_persistent_fails_after_wait(monkeypatch):
     except RuntimeError as exc:
         assert "配额耗尽" in str(exc), str(exc)
     assert calls["n"] == 2, f"应恰好重试一次: {calls}"
-    assert sleeps == [62 * 60], f"只应等一次 62min: {sleeps}"
+    assert sum(sleeps) == 62 * 60 and all(0 < s <= 5 for s in sleeps), f"只应分段等一次 62min: {sleeps[:5]}"
 
 
 # ---------------------------------------------------------------------------

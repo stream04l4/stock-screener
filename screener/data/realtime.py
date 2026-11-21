@@ -64,6 +64,25 @@ def _bs_to_secid(code: str) -> Optional[str]:
     return f"{market}.{num}"
 
 
+def _to_float_or_none(v) -> Optional[float]:
+    """东财 push2delay 停牌/无行情常返回 '-' 或空串 → 统一转为 None 防下游 TypeError。"""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        import math
+        f = float(v)
+        return f if math.isfinite(f) else None
+    s = str(v).strip()
+    if not s or s == "-":
+        return None
+    try:
+        import math
+        f = float(s)
+        return f if math.isfinite(f) else None
+    except ValueError:
+        return None
+
+
 def _em_parse(diff: List[dict]) -> Dict[str, Dict]:
     """ulist diff 列表 → {bs_code: {...}}（与 TencentClient.parse 同形状）。"""
     out: Dict[str, Dict] = {}
@@ -85,11 +104,11 @@ def _em_parse(diff: List[dict]) -> Dict[str, Dict]:
                 "%Y%m%d%H%M%S")
         out[bs] = {
             "name": it.get("f14"),
-            "price": it.get("f2"),
-            "high": it.get("f15"),
-            "low": it.get("f16"),
+            "price": _to_float_or_none(it.get("f2")),
+            "high": _to_float_or_none(it.get("f15")),
+            "low": _to_float_or_none(it.get("f16")),
             "timestamp": timestamp,
-            "pct_chg": it.get("f3"),
+            "pct_chg": _to_float_or_none(it.get("f3")),
             # 备源无对应字段 → None 显式降级（原则 5）：
             "turnover": None, "pe_ttm": None, "float_mv_yi": None,
             "total_mv_yi": None, "pb": None, "ttm_yield_pct": None,

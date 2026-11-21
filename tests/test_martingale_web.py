@@ -130,7 +130,7 @@ def test_put_strategy_rejects_bad_payload(tmp_config):
         wapp.put_strategy(p)
     assert e4.value.status_code == 400
     # 文件未被任何非法写破坏
-    assert wapp.get_strategy()["json"] == {**base, **{k: v for k, v in base.items()}} or True
+    assert wapp.get_strategy()["json"] == base
 
 
 def test_put_strategy_valid_change_persists(tmp_config):
@@ -1174,7 +1174,7 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert len(out["signals"]) == 1
     s = out["signals"][0]
     assert s["ts_code"] == "sh.601088" and s["name"] == "中国神华"
-    assert s["action"] == "add"
+    assert s["action"] == "buy"  # k=0 首仓/二次建仓统一为 "buy"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
     # v8.2.0 补（「不受约束」定案）：k=0（本轮未启动）且 shares_since=0
@@ -1320,15 +1320,15 @@ def test_state_projection_cache_shared_and_invalidation(tmp_positions_file, monk
     wapp.get_my_positions()
     wapp.get_my_positions()
     wapp.get_strategy_signals()
-    # 3 请求：rows（无 since）+ rows_since（带 since）各算一次，ctx 一次
-    assert calls["rows"] == 2 and calls["ctx"] == 1
+    # 3 请求：rows 与 rows_since 已合并为单次状态机计算（速度翻倍），ctx 一次
+    assert calls["rows"] == 1 and calls["ctx"] == 1
 
-    # 账本变更（内容哈希变）→ 键变 → 重算（双变体）
+    # 账本变更（内容哈希变）→ 键变 → 重算（单次）
     tmp_positions_file.write_text(_json.dumps({"updated_at": "y", "positions": {
         "sh.600000": {"shares": 200.0, "cost_price": 10.0, "updated_at": "y"}}}),
         encoding="utf-8")
     wapp.get_my_positions()
-    assert calls["rows"] == 4
+    assert calls["rows"] == 2
 
     # 湖锁定（lake-sync 灌数持锁 → 账本/湖内容变 → 键变）→ 降级但不入缓存：
     # 连续请求每次都重试（fail-fast），灌数完成后内容再变 → 自动恢复

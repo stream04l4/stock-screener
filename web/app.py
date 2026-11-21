@@ -23,6 +23,7 @@ import asyncio
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -85,18 +86,32 @@ from web.auth import (COOKIE_NAME, TOKEN_TTL_S, check_credentials,  # noqa: E402
                       parse_token, record_fail, record_ok)
 
 _AUTH_PUBLIC_PATHS = {"/api/login", "/api/logout", "/api/health"}
+_AUTH_PROTECTED_EXTRA = {"/docs", "/redoc", "/openapi.json"}
 
-# 测试钩子：lake HTTP 契约测试以子进程起**真实** web.app（uvicorn），子进程内置
-# WEB_TEST_NO_AUTH=1 跳过登录门禁（那些用例测的是 lake 同步语义，不是登录；
-# 登录门禁本身由 tests/test_web_auth.py 用 TestClient 全量覆盖）。
-# 生产 systemd 环境不设该变量，钩子恒关。
 _AUTH_DISABLED = os.environ.get("WEB_TEST_NO_AUTH") == "1"
+
+
+def _client_ip(request: Request) -> str:
+    """反代后安全解析客户端真实 IP：仅当直连来源是回环（nginx）时才信任 X-Real-IP。"""
+    host = request.client.host if request.client else "unknown"
+    if host in ("127.0.0.1", "::1"):
+        xrip = (request.headers.get("X-Real-IP") or "").strip()
+        if xrip:
+            return xrip
+        xff = (request.headers.get("X-Forwarded-For") or "").strip()
+        if xff:
+            return xff.split(",")[0].strip() or host
+    return host
 
 
 @app.middleware("http")
 async def _auth_gate(request: Request, call_next):
     path = request.url.path
-    if path.startswith("/api/") and not _AUTH_DISABLED and path not in _AUTH_PUBLIC_PATHS:
+    need_auth = (
+        (path.startswith("/api/") and path not in _AUTH_PUBLIC_PATHS)
+        or path in _AUTH_PROTECTED_EXTRA
+    )
+    if need_auth and not _AUTH_DISABLED:
         _u, _p, secret = load_auth_config()
         if parse_token(request.cookies.get(COOKIE_NAME), secret) is None:
             return JSONResponse({"detail": "未登录或会话已过期，请先登录"}, status_code=401)
@@ -113,23 +128,22 @@ class _LoginBody(BaseModel):
 
 @app.post("/api/login")
 def login(body: _LoginBody, request: Request, response: Response) -> Dict[str, Any]:
-    """登录成功则写签名 cookie（HttpOnly / SameSite=Lax / 7 天）。
-
-    失败 401；连续 5 次失败锁 120s 返回 429；凭据未配置 500 显式失败（不静默放行）。
-    """
+    """登录成功则写签名 cookie（HttpOnly / SameSite=Lax / HTTPS 自动 Secure / 7 天）。"""
     admin_user, admin_pass, secret = load_auth_config()
     if not admin_user or not admin_pass:
         raise HTTPException(status_code=500,
                             detail="登录凭据未配置（.env WEB_ADMIN_USER/WEB_ADMIN_PASS）")
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     if lock_status(ip):
         raise HTTPException(status_code=429, detail="失败次数过多，请 2 分钟后再试")
     if not check_credentials(body.username, body.password, admin_user, admin_pass):
         record_fail(ip)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     record_ok(ip)
+    is_https = (request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+                or request.url.scheme == "https")
     response.set_cookie(COOKIE_NAME, make_token(admin_user, secret), max_age=TOKEN_TTL_S,
-                        httponly=True, samesite="lax", path="/")
+                        httponly=True, samesite="lax", secure=is_https, path="/")
     return {"ok": True, "user": admin_user}
 
 
@@ -479,6 +493,7 @@ class TaskManager:
     def __init__(self) -> None:
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self._lock_path = LOGS_DIR / ".web_bt_run.lock"
+        self._mu = threading.Lock()
 
     # -- pidfile 辅助 --
     def _write_lock(self, task_id: str, pid: int) -> None:
@@ -503,17 +518,35 @@ class TaskManager:
     def _pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
         except OSError:
             return False
+        # 检查 /proc/<pid>/stat 排除僵尸进程（'Z' 态）
+        try:
+            stat_txt = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            rparen = stat_txt.rfind(")")
+            if rparen != -1:
+                fields = stat_txt[rparen + 1:].split()
+                if fields and fields[0] == "Z":
+                    return False
+        except OSError:
+            pass
+        return True
+
+    def _prune_tasks(self) -> None:
+        if len(self.tasks) <= 50:
+            return
+        finished = [tid for tid, t in self.tasks.items()
+                    if t.get("popen") is not None and t["popen"].poll() is not None]
+        for tid in finished[:-20]:
+            self.tasks.pop(tid, None)
 
     def active_task_id(self) -> Optional[str]:
         """返回当前正在运行的 task_id（内存优先，其次 pidfile）。"""
-        for tid, t in self.tasks.items():
+        for tid, t in list(self.tasks.items()):
             p = t.get("popen")
             if p is not None and p.poll() is None:
                 return tid
@@ -526,43 +559,39 @@ class TaskManager:
 
     def start(self, cmd: List[str], meta: Dict[str, Any],
               done_markers: List[str], task_id: Optional[str] = None) -> Dict[str, Any]:
-        """启动一个后台任务（cmd = 完整 argv；meta 存任务上下文）。
+        """启动一个后台任务（加锁防并发绕过 409 单任务锁，Popen 后立即关父进程 logf）。"""
+        with self._mu:
+            self._prune_tasks()
+            existing = self.active_task_id()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"已有回测任务在进行中: {existing}",
+                )
 
-        :param task_id: 调用方可预生成（Web 回测需要 task_id 拼产物目录）；
-            缺省则自动生成。
-        """
-        existing = self.active_task_id()
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"已有回测任务在进行中: {existing}",
+            task_id = task_id or (
+                "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
             )
+            log_path = LOGS_DIR / f"web_bt_{task_id}.log"
+            with open(log_path, "ab") as logf:
+                logf.write(
+                    f"\n===== 启动 {datetime.now(timezone.utc).isoformat()} cmd={' '.join(cmd)} =====\n".encode()
+                )
+                logf.flush()
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(PROJECT_ROOT),
+                        stdout=logf,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise HTTPException(status_code=500, detail=f"启动子进程失败: {exc}")
 
-        task_id = task_id or (
-            "bt_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
-        )
-        log_path = LOGS_DIR / f"web_bt_{task_id}.log"
-        logf = open(log_path, "ab")
-        logf.write(
-            f"\n===== 启动 {datetime.now(timezone.utc).isoformat()} cmd={' '.join(cmd)} =====\n".encode()
-        )
-        logf.flush()
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logf.close()
-            raise HTTPException(status_code=500, detail=f"启动子进程失败: {exc}")
-
-        self.tasks[task_id] = {
-            "pid": proc.pid,
+            self.tasks[task_id] = {
+                "pid": proc.pid,
             "popen": proc,
             "meta": meta,
             "done_markers": done_markers,
@@ -858,8 +887,8 @@ def bt_results(task_id: str) -> Dict[str, Any]:
 def _classify_log_line(line: str, done_markers: List[str]) -> Dict[str, Any]:
     """把一行运行日志分类为 SSE 事件。
 
-    - [PROGRESS] stage=... done=N total=M → progress（结构化进度标记）
-    - 完成标记（"回测完成"）→ done；"错误:"/Traceback → error；其余 → log。
+    - [PROGRESS] stage=... done=N total=M → progress
+    - 完成标记（"回测完成"）→ done；Traceback / "错误:" / 顶层异常行 → error；其余 → log。
     """
     m = re.search(r"\[PROGRESS\]\s+stage=(\S+)\s+done=(\d+)\s+total=(\d+)", line)
     if m:
@@ -867,18 +896,36 @@ def _classify_log_line(line: str, done_markers: List[str]) -> Dict[str, Any]:
                 "done": int(m.group(2)), "total": int(m.group(3))}
     if any(mk in line for mk in done_markers):
         return {"type": "done"}
-    if "Traceback" in line or "错误:" in line or re.search(r"\bError\b", line):
+    if ("Traceback (most recent call last)" in line
+            or line.lstrip().startswith("错误:")
+            or re.match(r"^\s*[A-Za-z_]*Error:", line)):
         return {"type": "error"}
     return {"type": "log", "text": line}
 
 
+def _read_log_chunk_lines(path: Path, offset: int) -> Tuple[List[str], int, int]:
+    """按完整换行边界读取新增字节，避免截断半行或 UTF-8 多字节字符。"""
+    size = path.stat().st_size
+    if offset > size:
+        offset = size
+    if size <= offset:
+        return [], offset, size
+    with open(path, "rb") as f:
+        f.seek(offset)
+        raw = f.read(size - offset)
+    nl = raw.rfind(b"\n")
+    if nl == -1:
+        # 尚未出现换行：仅在进程可能已退出时由上层兜底刷出
+        return [], offset, size
+    complete = raw[: nl + 1]
+    new_offset = offset + len(complete)
+    lines = complete.decode("utf-8", errors="replace").splitlines()
+    return lines, new_offset, size
+
+
 @app.get("/api/bt/runs/{task_id}/events")
 async def bt_run_events(task_id: str, request: Request) -> StreamingResponse:
-    """SSE 事件流：log / progress / done / error + ~15s 心跳。
-
-    - `id: <offset>` = 已推送到该字节偏移；断线重连带 Last-Event-ID 从该偏移续读。
-    - 子进程结束且日志读完 → 发送终态事件后关闭流（前端据此停止轮询兜底）。
-    """
+    """SSE 事件流：log / progress / done / error + ~15s 心跳（异步读盘 + 进程退出感知）。"""
     if not re.fullmatch(r"bt_[A-Za-z0-9_]+", task_id):
         raise HTTPException(status_code=400, detail="非法 task_id")
     log_path = LOGS_DIR / f"web_bt_{task_id}.log"
@@ -891,7 +938,7 @@ async def bt_run_events(task_id: str, request: Request) -> StreamingResponse:
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id")
     try:
-        start_offset = int(last_event_id) if last_event_id else 0
+        start_offset = max(0, int(last_event_id)) if last_event_id else 0
     except (TypeError, ValueError):
         start_offset = 0
 
@@ -903,15 +950,13 @@ async def bt_run_events(task_id: str, request: Request) -> StreamingResponse:
             if await request.is_disconnected():
                 break
             try:
-                size = log_path.stat().st_size
+                lines, new_offset, size = await asyncio.to_thread(
+                    _read_log_chunk_lines, log_path, offset)
             except OSError:
                 break
-            if size > offset:
-                with open(log_path, "rb") as f:
-                    f.seek(offset)
-                    chunk = f.read(size - offset)
-                    offset = size
-                for line in chunk.decode("utf-8", errors="replace").splitlines():
+            if new_offset > offset:
+                offset = new_offset
+                for line in lines:
                     if not line.strip():
                         continue
                     ev = _classify_log_line(line, markers)
@@ -920,10 +965,38 @@ async def bt_run_events(task_id: str, request: Request) -> StreamingResponse:
                 idle_ticks = 0
             else:
                 idle_ticks += 1
-                if idle_ticks % 15 == 0:  # ~15s 心跳（poll=1s）
-                    yield "data: {\"type\":\"heartbeat\"}\n\n"
+                # 检测真实子进程终态：防止 OOM/SIGKILL 导致无完成标记时 SSE 永久挂死
+                proc_status = None
+                try:
+                    proc_status = tm.status(task_id).get("status")
+                except Exception:  # noqa: BLE001
+                    proc_status = None
+                if proc_status in ("done", "failed"):
+                    # 进程已结束：把尾部未带换行的残余字节也读完
+                    if size > offset:
+                        try:
+                            def _read_rem(p: Path, off: int):
+                                with open(p, "rb") as f:
+                                    f.seek(off)
+                                    return f.read()
+                            rem = await asyncio.to_thread(_read_rem, log_path, offset)
+                            offset += len(rem)
+                            for line in rem.decode("utf-8", errors="replace").splitlines():
+                                if not line.strip():
+                                    continue
+                                ev = _classify_log_line(line, markers)
+                                sent_terminal = sent_terminal or ev["type"] in ("done", "error")
+                                yield f"id: {offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        except OSError:
+                            pass
+                    if not sent_terminal:
+                        term_ev = {"type": "done" if proc_status == "done" else "error"}
+                        yield f"id: {offset}\ndata: {json.dumps(term_ev, ensure_ascii=False)}\n\n"
+                    break
                 if sent_terminal and offset >= size:
                     break
+                if idle_ticks % 15 == 0:  # ~15s 心跳（poll=1s）
+                    yield "data: {\"type\":\"heartbeat\"}\n\n"
                 await asyncio.sleep(1)
 
     return StreamingResponse(
@@ -1172,6 +1245,24 @@ def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 我的持仓（用户实际持仓账本 + 策略状态机参考）
 # ---------------------------------------------------------------------------
+_LEDGER_LOCK = threading.Lock()
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _up_read() -> Dict[str, Any]:
     """读用户持仓账本 → {code: {shares, cost_price, updated_at}}；缺省/损坏 → {}。"""
     if not USER_POSITIONS_PATH.exists():
@@ -1186,41 +1277,19 @@ def _up_read() -> Dict[str, Any]:
 
 def _up_write(positions: Dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    USER_POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"updated_at": now, "positions": positions}
-    tmp = USER_POSITIONS_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, USER_POSITIONS_PATH)  # 原子替换，防半截账本
+    _atomic_write_json(USER_POSITIONS_PATH, {"updated_at": now, "positions": positions})
 
 
-# ---------------------------------------------------------------------------
-# v8.2.0 补 页面刷新提速（Joel 2026-11-13：我的持仓每次刷新十几秒）
-# 我的持仓页每 30s 轮询 /api/my_positions + /api/strategy_signals，原先每次
-# 请求都重跑 候选池构建(~1s) + 全历史状态机投影(池∪持仓 ~3.5s) + 实时行情
-# 网络取价(1~10s)。两处进程内缓存，不新增配置键：
-# 1) 状态机投影缓存：键 = 湖/策略配置/持仓账本/手动池 的 mtime+size + 北京日期。
-#    数据不变 → 零重算；lake-sync 灌数 / 改配置 / 改账本 → mtime 变 → 自动重算。
-#    两接口共享同一投影（include_buys + since_map 一次算齐，strategy_signals
-#    多出的 shares_since 字段无害；tmap/bmap 快照同缓存）。
-# 2) 实时行情 TTL 15s 缓存：页面 30s 轮询 → 多数轮次命中；取价失败不写缓存
-#    （有空缓存则 best-effort 返回，比回退湖价新鲜）。
-# ---------------------------------------------------------------------------
 _STATE_CACHE: Dict[str, Any] = {"key": None, "value": None}
-_SPOT_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
+# 兼顾逐股 TTL（ts_map）与旧测试读取/修改 _SPOT_CACHE["ts"]/["data"] 的兼容性
+_SPOT_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}, "ts_map": {}}
 _STATE_LOCK = threading.Lock()
 _SPOT_LOCK = threading.Lock()
-# TTL 35s > 页面轮询 30s：隔轮共享一次取价（两接口共享同一缓存），
-# 价格至多滞后 ~35s（30s 轮询页面上不可感知）；盘中每轮平均网络 ≈ 1 次。
 _SPOT_TTL_S = 35.0
 
 
-def _state_cache_key() -> tuple:
-    """投影缓存键：湖(mtime+size) + 小文件内容哈希 + 北京日期。
-
-    本机文件系统 mtime 量化粗（实测 10ms 内两次写同 mtime）→ 小文件（策略
-    配置/持仓账本/手动池，KB 级）直接内容哈希，任何改动即失效；湖是大文件
-    （仅 lake-sync 日写），mtime+size 足够。
-    """
+def _state_cache_key(user: Optional[Dict[str, Any]] = None) -> tuple:
+    """投影缓存键：湖(mtime+size) + 小文件内容哈希 + 内存态 user 哈希 + 北京日期。"""
     from martingale.data import default_db_path
     try:
         st = Path(default_db_path()).stat()
@@ -1234,30 +1303,31 @@ def _state_cache_key() -> tuple:
         except OSError:
             return None
 
-    return (lake_sig, _sig(CONFIG_PATH), _sig(USER_POSITIONS_PATH),
+    if user is not None:
+        up_sig = hashlib.sha1(
+            json.dumps(user, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+    else:
+        up_sig = _sig(USER_POSITIONS_PATH)
+    return (lake_sig, _sig(CONFIG_PATH), up_sig,
             _sig(Path(PROJECT_ROOT) / "data" / "manual_pool.json"),
             str(_beijing_today()))
 
 
 def _state_projection(need_since: bool = False) -> Dict[str, Any]:
-    """候选池 + 状态机投影（池∪持仓，include_buys）共享缓存。
+    """候选池 + 状态机投影（池∪持仓，include_buys + since_map 一次算齐）共享缓存。
 
-    两份投影共享同一数据键（各自每数据键至多算一次，惰性）：
-    - rows（无 since_map）→ /api/strategy_signals（与 v8.2.0 前调用签名一致）；
-    - rows_since（带 since_map，v8.2.0 建仓日锚定）→ /api/my_positions 持仓判断路径。
-    慢路径持锁（并发轮询串行化）；湖锁定/缺失 → 降级值**不入缓存**（瞬态，
-    fail-fast 重试）；HTTPException（配置 400 / 池构建 500）原样上抛不缓存。
+    - 在 _STATE_LOCK 内读取账本并基于同一份对象计算缓存键，消除 TOCTOU 缓存投毒；
+    - 合并 rows 与 rows_since 为单次状态机计算（仅相差 shares_since 字段），速度翻倍。
     """
-    user = _up_read()
-    key = _state_cache_key()
     _today = str(_beijing_today())[:10]
     with _STATE_LOCK:
+        user = _up_read()
+        key = _state_cache_key(user)
         entry = _STATE_CACHE["value"] if _STATE_CACHE["key"] == key else None
-        if entry is not None and entry.get("rows") is not None and (
-                not need_since or entry.get("rows_since") is not None):
+        if entry is not None and entry.get("rows") is not None:
             return entry
         from martingale.data import LakeInvalidFile, LakeLocked, LakeMissing
-        # v8.2.0：用户建仓日锚定（缺省=今天）；仅账本股携带
         since_map: Dict[str, str] = {}
         for c, u in user.items():
             u = u if isinstance(u, dict) else {}
@@ -1265,30 +1335,23 @@ def _state_projection(need_since: bool = False) -> Dict[str, Any]:
         try:
             _sp, _up, con, pool = _load_pool_ctx()
         except (LakeLocked, LakeMissing, LakeInvalidFile):
-            # 湖锁定/缺失 → 降级值**不入缓存**：锁定是瞬态的（lake-sync 灌数
-            # 持锁数分钟），缓存会让降级卡到 mtime 变化；每次请求 fail-fast
-            # 重试（连接层即失败，代价 <1s）。
             return {"sp": None, "pool_codes": [],
                     "universe": sorted(user.keys()), "rows": {}, "rows_since": {},
                     "tmap": {}, "bmap": {}, "lake_locked": True}
         try:
-            if entry is None:
-                universe = sorted(set(pool.codes) | set(user.keys()))
-                entry = {"sp": _sp, "pool_codes": list(pool.codes),
-                         "universe": universe, "rows": None, "rows_since": None,
-                         "tmap": None, "bmap": None, "lake_locked": False}
-            if entry["rows"] is None:
-                entry["rows"] = _strategy_state_rows(
-                    _sp, con, entry["universe"], include_buys=True, now=_today)
-            if need_since and entry["rows_since"] is None:
-                entry["rows_since"] = _strategy_state_rows(
-                    _sp, con, entry["universe"], include_buys=True, now=_today,
-                    since_map=since_map)
-            if entry["tmap"] is None:
-                from martingale.selection import load_backtest_map
-                from martingale.timing import load_timing_map
-                entry["tmap"] = load_timing_map(con)
-                entry["bmap"] = load_backtest_map(con)
+            universe = sorted(set(pool.codes) | set(user.keys()))
+            rows_all = _strategy_state_rows(
+                _sp, con, universe, include_buys=True, now=_today,
+                since_map=since_map)
+            from martingale.selection import load_backtest_map
+            from martingale.timing import load_timing_map
+            tmap = load_timing_map(con)
+            bmap = load_backtest_map(con)
+            entry = {
+                "sp": _sp, "pool_codes": list(pool.codes),
+                "universe": universe, "rows": rows_all, "rows_since": rows_all,
+                "tmap": tmap, "bmap": bmap, "lake_locked": False,
+            }
         finally:
             con.close()
         _STATE_CACHE["key"] = key
@@ -1297,38 +1360,45 @@ def _state_projection(need_since: bool = False) -> Dict[str, Any]:
 
 
 def _fetch_spot_cached(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """fetch_spot + 15s TTL 缓存（v8.2.0 补）。
-
-    命中（TTL 内且已有价）→ 零网络；未命中取缺失集合并合并回缓存；
-    取价失败/空 → 返回仍可用的缓存价（含过期，best-effort 比回退湖价新鲜）；
-    首取失败且无缓存 → {}（调用方回退湖价，与旧语义一致）。
-    """
+    """fetch_spot + 逐股 TTL 缓存（避免补拉单股把旧股价格无限续期）。"""
     if not codes:
         return {}
-    need = list(dict.fromkeys(codes))  # 去重保序
+    need = list(dict.fromkeys(codes))
+    now_m = time.monotonic()
     with _SPOT_LOCK:
-        ts = _SPOT_CACHE["ts"]
-        cached = dict(_SPOT_CACHE["data"])
-    missing = [c for c in need
-               if time.monotonic() - ts >= _SPOT_TTL_S
-               or (cached.get(c) or {}).get("price") is None]
+        data_map = _SPOT_CACHE.setdefault("data", {})
+        ts_map = _SPOT_CACHE.setdefault("ts_map", {})
+        global_ts = float(_SPOT_CACHE.get("ts") or 0.0)
+        if not data_map:
+            ts_map.clear()
+        snap_data = {c: data_map[c] for c in need if c in data_map}
+        snap_ts = {c: min(float(ts_map.get(c, global_ts)), global_ts) for c in snap_data}
+    missing = [
+        c for c in need
+        if c not in snap_data
+        or (now_m - snap_ts[c]) >= _SPOT_TTL_S
+        or (snap_data[c] or {}).get("price") is None
+    ]
     if not missing:
-        return {c: cached[c] for c in need}
+        return snap_data
     try:
         from screener.data.realtime import fetch_spot
         fresh, _ = fetch_spot(missing, timeout=5.0, max_attempts=1)
     except Exception:  # noqa: BLE001 - 行情失败不阻塞页面
         fresh = {}
     if fresh:
+        now_w = time.monotonic()
         with _SPOT_LOCK:
-            merged = dict(_SPOT_CACHE["data"])
-            merged.update(fresh)
-            _SPOT_CACHE["data"] = merged
-            _SPOT_CACHE["ts"] = time.monotonic()
-        out = {c: cached[c] for c in need if c in cached and c not in fresh}
+            data_map = _SPOT_CACHE.setdefault("data", {})
+            ts_map = _SPOT_CACHE.setdefault("ts_map", {})
+            for c, q in fresh.items():
+                data_map[c] = q
+                ts_map[c] = now_w
+            _SPOT_CACHE["ts"] = now_w
+        out = {c: snap_data[c] for c in need if c in snap_data and c not in fresh}
         out.update(fresh)
     else:
-        out = {c: cached[c] for c in need if c in cached}
+        out = {c: snap_data[c] for c in need if c in snap_data}
     return out
 
 
@@ -1503,7 +1573,7 @@ def get_my_positions() -> Dict[str, Any]:
             _s2, _u2, _tp2 = _mload(str(CONFIG_PATH))
             tcon = connect_readonly(None)
             try:
-                _pmap = first_timing_price_map(tcon, _fcodes, _tp2)
+                _pmap = first_timing_price_map(tcon, _fcodes, _tp2, now=_beijing_today())
             finally:
                 tcon.close()
         except Exception:  # noqa: BLE001 - 湖锁/缺表/配置异常 → 展示回退 L1
@@ -1560,52 +1630,74 @@ def _timing_breakdown(trow: Optional[Dict[str, Any]], tp) -> str:
     return " · ".join(parts)
 
 
+def _live_pctile_cached(codes: List[str], price_map: Dict[str, Optional[float]],
+                        tp) -> Dict[str, Optional[float]]:
+    """统一实时分位计算（带 60s 按股内存缓存，与微信 position_alert.py 同口径）。
+
+    - 缓存键按 (ts_code, price_2dp, window_years, min_bars) 校验，避免同轮内重复开湖；
+    - 传入 now=_beijing_today() 保证除权日盘中实时价与历史收盘同口径折算；
+    - 湖锁定/缺表/异常时静默返回已有缓存，不阻断主流程（由调用方回退 tmap 或 fail-closed）。
+    """
+    if not codes:
+        return {}
+    now_ts = time.time()
+    out: Dict[str, Optional[float]] = {}
+    need: List[str] = []
+    win_y = int(getattr(tp, "price_window_years", 5))
+    for c in codes:
+        p = price_map.get(c)
+        p_key = round(float(p), 2) if (p is not None and p > 0) else None
+        hit = _HELD_PCT_CACHE.get(c)
+        if (hit is not None and now_ts - hit[0] < 60.0
+                and hit[1] == p_key and hit[2] == win_y):
+            out[c] = hit[3]
+        else:
+            need.append(c)
+    if not need:
+        return out
+    try:
+        from martingale.data import connect_readonly
+        from martingale.timing import live_pctile_map
+        con = connect_readonly(None)
+        try:
+            sub_pm = {c: price_map.get(c) for c in need if price_map.get(c) is not None}
+            pcts = live_pctile_map(con, need, sub_pm, tp, now=_beijing_today())
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001
+        return out
+    for c in need:
+        pct = pcts.get(c)
+        p = price_map.get(c)
+        p_key = round(float(p), 2) if (p is not None and p > 0) else None
+        if pct is not None:
+            _HELD_PCT_CACHE[c] = (now_ts, p_key, win_y, pct)
+            out[c] = pct
+    return out
+
+
 def _held_first_timing(c: str, tmap: Dict[str, Dict[str, Any]],
                        price: Optional[float]):
-    """v8.2.0 补（Joel 2026-11-13 二次定案）：持仓股首档（k=0 = 再武装后新一轮
-    「二次建仓」/ 模拟从未持仓轮次的首仓）的时机判定——策略中心与我的持仓
-    共用（单一定义点，与微信 position_alert 通道同口径对齐）。
+    """持仓股首档（k=0 = 再武装后新一轮「二次建仓」/ 首仓）的时机判定。
 
-    池内（tmap 有行）= 预计算快照 push_eligible（O(1)，与非持仓时机门同源）；
-    池外/无行（自选持仓股，如中粮糖业）→ 现算**实时分位**（与微信持仓通道的
-    live_pctile_map 同一口径：现价替换窗口末值重算 5 年分位 ≤ 40%）——否则
-    池外持仓股 fail-closed 恒不过门，微信能推而页面不显示，两处不一致。
-    失败/湖占用/无数据 → (False, None, 原因)（fail-closed：未过）。
-
+    统一优先使用实时分位（_live_pctile_cached，与微信 position_alert 通道完全同口径）；
+    若湖占用或实时计算不可得，则回退预计算快照 tmap（池内）；仍无数据则 fail-closed。
     :return: (ok, pctile, reasons)
     """
+    tp = tp_obj_global()
+    pm: Dict[str, Optional[float]] = {c: price} if (price is not None and price > 0) else {}
+    live_map = _live_pctile_cached([c], pm, tp)
+    pct = live_map.get(c)
+    if pct is not None:
+        ok = pct <= tp.price_pctile_max
+        src_note = "实时" if c in tmap else "池外现算"
+        return ok, round(pct, 1), (f"{'✓' if ok else '✗'} {tp.price_window_years}年分位 "
+                                   f"{pct:.1f}%（{src_note}，需≤{tp.price_pctile_max:g}%）")
     trow = tmap.get(c)
     if trow is not None:
         return (bool(trow.get("push_eligible")),
-                trow.get("pctile_window"), _timing_breakdown(trow, tp_obj_global()))
-    # 无时机行（池外持仓）→ 现算实时分位（微信同口径，fail-closed）
-    # 300s TTL 进程内缓存：页面 30s 轮询不每次开湖（5 年分位对现价变动不敏感，
-    # 边界抖动与微信实时通道同量级）
-    now_ts = time.time()
-    hit = _HELD_PCT_CACHE.get(c)
-    if hit is not None and now_ts - hit[0] < 300.0:
-        pct = hit[1]
-    else:
-        try:
-            from martingale.data import connect_readonly
-            from martingale.timing import live_pctile_map
-            con = connect_readonly(None)
-            try:
-                pm: Dict[str, Optional[float]] = {c: price} if price is not None else {}
-                pcts = live_pctile_map(con, [c], pm, tp_obj_global())
-            finally:
-                con.close()
-            pct = pcts.get(c)
-        except Exception:  # noqa: BLE001 - 湖占用/结构异常 → fail-closed（不缓存）
-            return False, None, "无时机数据（fail-closed）"
-        if pct is not None:
-            _HELD_PCT_CACHE[c] = (now_ts, pct)
-    if pct is None:
-        return False, None, "无时机数据（fail-closed）"
-    tp = tp_obj_global()
-    ok = pct <= tp.price_pctile_max
-    return ok, round(pct, 1), (f"实时 {tp.price_window_years}年分位 {pct:.1f}%"
-                               f"（需≤{tp.price_pctile_max:g}%，池外现算）")
+                trow.get("pctile_window"), _timing_breakdown(trow, tp))
+    return False, None, "无时机数据（fail-closed）"
 
 
 def tp_obj_global():
@@ -1740,9 +1832,16 @@ def get_strategy_signals() -> Dict[str, Any]:
                 continue  # 湖中无数据 → no_data，无触发价，不必取行情
             trig = _touches.trigger_price(r, held=False)
             last = r.get("last_price")
-            if trig is None or last is None:
+            if trig is None or last is None or trig <= 0:
                 continue
-            if (last - trig) / trig * 100.0 <= tp_obj.spot_preselect_pct:
+            # 除权日盘中：trig 已除 exrights_rebase 折算到除权后，last 须同步除 r_cum
+            # 才能同口径比较；双创/北交宽幅涨跌幅板自动放大预筛带，主板严格按 spot_preselect_pct
+            r_cum = float(r.get("exrights_rebase") or 1.0)
+            last_adj = last / r_cum if r_cum > 1.0 else last
+            is_wide_limit = (c.startswith("bj.") or c.startswith("sz.30")
+                             or c.startswith("sh.688"))
+            eff_preselect = max(float(tp_obj.spot_preselect_pct), 20.0) if is_wide_limit else float(tp_obj.spot_preselect_pct)
+            if (last_adj - trig) / trig * 100.0 <= eff_preselect:
                 fetch_codes.append(c)
     # 实时价（与 /api/my_positions 同口径：spot 优先，失败回退湖最后价——
     # 只漏报不误报）。v1.1（Gate 3，设计 §5）：一主一备统一入口
@@ -1776,6 +1875,17 @@ def get_strategy_signals() -> Dict[str, Any]:
         hist_cutoff = (datetime.fromisoformat(as_of).date()
                        - timedelta(days=SIG_HISTORY_WINDOW_DAYS)).isoformat()
 
+    # 统一实时分位批量计算（与微信 position_alert.py 同口径，带 60s 缓存；失败自动回退 tmap 快照）
+    live_pmap: Dict[str, Optional[float]] = {}
+    if not lake_locked:
+        for c in universe:
+            p_cur = (spot.get(c) or {}).get("price")
+            if p_cur is None or p_cur <= 0:
+                p_cur = (rows.get(c) or {}).get("last_price")
+            if p_cur is not None and p_cur > 0:
+                live_pmap[c] = p_cur
+    live_pct_map = _live_pctile_cached(list(live_pmap.keys()), live_pmap, tp_obj) if live_pmap else {}
+
     stocks: List[Dict[str, Any]] = []
     history: List[Dict[str, Any]] = []
     n_active = n_appr = n_idle = n_nodata = n_act_held = n_act_unheld = n_touched = 0
@@ -1783,61 +1893,45 @@ def get_strategy_signals() -> Dict[str, Any]:
         held = c in user
         r = rows.get(c)
         price = (spot.get(c) or {}).get("price")
-        if price is None and r is not None:
+        if (price is None or price <= 0) and r is not None:
             price = r.get("last_price")
-        # 触发价口径（v7.0.23 定案，Joel 2026-11-09：「非持仓首仓 = 时机成熟
-        # 且已距高点回撤到位，双条件」）：
-        # - 持仓股：in_pos → 模拟 next 档（加仓线）；未 in_pos → 首仓线（不变，
-        #   持仓策略加仓不受时机限制）；
-        # - 非持仓股：**恒用首仓线**（first_level_raw）——价跌破首仓线（距轮高
-        #   回撤 first_drawdown）= 「已距高点下跌到位」；时机门（timing_ok）=
-        #   「时机成熟」；两者都过才有买入·首仓信号。时机门同时兜住老股幽灵
-        #   信号（锚高老轮首仓线远低于市价 → 价条件恒真，靠分位>40% 拦住）。
-        #   建仓后由用户记入持仓账本 → 转持仓策略加仓档。
         in_pos = bool((r or {}).get("in_pos"))
         trigger = _touches.trigger_price(r or {}, held=held)
         k = (r.get("k_level") or 0) if r else 0
-        # 非持仓的动作/金额按首仓口径（buy/initial）——simulate in_pos 仅持仓
-        # 股影响档位语义
         cls = classify_signal(price, trigger, in_pos if held else False, k, sp_obj,
                               approach_pct=tp_obj.approach_pct)
-        # 盘中触碰（v7.0.20，Joel 2026-11-08：「盘中达成信号又涨回出区的，保留
-        # 到当日，第二天移入历史信号」）：最新行情日最低价已触线、现价回出信号区
-        # → 信号今日已发生，保留在当前段（status=touched）；行情日滚动后自动
-        # 移出（收盘 job 已把事件落盘 → 次日在历史段可见）
         q = spot.get(c) or {}
         day_low = q.get("low")
-        touched = (trigger is not None and day_low is not None
+        touched = (trigger is not None and trigger > 0
+                   and day_low is not None and day_low > 0
+                   and ref_quote_date is not None
                    and _touches.quote_date_of(q.get("timestamp")) == ref_quote_date
                    and day_low <= trigger and cls["status"] != "active")
-        # 时机门（v7.0.24 定案：① 价格分位单条件；v7.0.26：②③ 彻底删除）：非持仓股
-        # 的买入信号须先过策略选股时机提醒口径（5年分位≤40%；selection_timing
-        # 预计算快照，O(1)）——到买入时机才给买入信号；持仓股不受时机限制
-        # （持仓策略负责加仓档）。无时机行（timing 未跑/池外）→ fail-closed
-        # 不给买入信号，只展示价格状态与原因。
         timing_ok: Optional[bool] = None
         timing_reasons: Optional[str] = None
+        unheld_pctile: Optional[float] = None
         if not held:
-            trow = tmap.get(c)
-            timing_ok = bool((trow or {}).get("push_eligible"))
-            # 逐条件 ✓/✗ 明细（含数值+阈值）：整体过/未过都列明哪条达成哪条未达
-            # （Joel 2026-11-08 定案；前端不再叠加总判定前缀，防 ✗✗ 误读）
-            timing_reasons = _timing_breakdown(trow, tp_obj)
+            lp = live_pct_map.get(c)
+            if lp is not None:
+                timing_ok = bool(lp <= tp_obj.price_pctile_max)
+                unheld_pctile = round(lp, 2)
+                timing_reasons = (f"{'✓' if timing_ok else '✗'} {tp_obj.price_window_years}年分位 "
+                                  f"{lp:.1f}%（实时，需≤{tp_obj.price_pctile_max:g}%）")
+            else:
+                trow = tmap.get(c)
+                timing_ok = bool((trow or {}).get("push_eligible"))
+                unheld_pctile = (trow or {}).get("pctile_window")
+                timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
         suggested = cls["suggested_lots"]
         if touched and action is None and sp_obj is not None:
-            # 已触回（现价已高于触发线 → cls 无动作）：信号今日已发生，动作/
-            # 手数按 active 同口径补齐（持仓股 in_pos=加仓 first+k×step 手；
-            # 非持仓/未 in_pos=首仓 first_lots 手，v7.0.23/v7.0.28 手数口径）
-            if in_pos and held:
+            if in_pos and held and k > 0:
                 action = "add"
                 suggested = int(sp_obj.first_lots + k * sp_obj.add_lots_step)
             else:
                 action = "buy"
                 suggested = int(sp_obj.first_lots)
         if not held:
-            # 非持仓股的动作统一为「买入」（next 档对非持仓用户是加入策略的
-            # 买入位，不是加仓）；时机门未过 → 无动作（价格状态照展示）
             if action is not None:
                 action = "buy"
             if timing_ok is not True:
@@ -1846,24 +1940,13 @@ def get_strategy_signals() -> Dict[str, Any]:
         held_first = held and action is not None and k == 0
         held_first_pctile: Optional[float] = None
         if held_first:
-            # v8.2.0 补（Joel 2026-11-13 二次定案「二次建仓也要符合时机门
-            # 才能提示」）：持仓股首档（k=0）触线 = 再武装后新一轮的建仓
-            # （二次建仓，提醒应为「建仓 N 手」而非「加仓」）→ 须过**当前**
-            # 时机门才提醒（「不受约束」只豁免轮内加仓档 k≥1）；未过 → 无动作
-            # （前端标「时机未过」，价格状态照展示）；池外持仓无时机行 →
-            # 现算实时分位（微信同口径），无数据 → fail-closed
             timing_ok, held_first_pctile, timing_reasons = _held_first_timing(
                 c, tmap, price)
             if timing_ok is not True:
                 action, suggested = None, None
         held_extra: Optional[Dict[str, float]] = None
+        held_sufficient = False
         if held and action is not None and sp_obj is not None:
-            # v8.2.0 补（Joel 2026-11-13：两处信号一致）：持仓股遵循建仓日锚定
-            # 判定逻辑（与 /api/my_positions、微信 position_alert 同一口径，
-            # judge_held_lots 单一定义点）——有策略跟上的仓位（shares_since>0）：
-            # 理论（建仓日起策略买入累计 + 本档）≤ 实际 → 不产动作（持仓已够）；
-            # 差值 >0 → 建议补差值手数；建仓日起策略零买入（心血来潮/高位建仓）
-            # 或数据缺失 → 正常信号（本档手数，照常提醒）。非持仓股不受影响。
             adj, held_extra, judged = judge_held_lots(
                 sp_obj, k, in_pos, suggested,
                 (rows_since.get(c) or {}).get("shares_since"),
@@ -1871,6 +1954,7 @@ def get_strategy_signals() -> Dict[str, Any]:
             if judged:
                 if adj is None:
                     action, suggested = None, None  # 持仓已够 → 不提醒
+                    held_sufficient = True
                 else:
                     suggested = int(adj)
         status = "touched" if touched else cls["status"]
@@ -1890,23 +1974,15 @@ def get_strategy_signals() -> Dict[str, Any]:
             "distance_pct": cls["distance_pct"],
             "action": action,
             "suggested_lots": suggested,
-            # v8.2.0 补：持仓股首档触线（再武装后新一轮 = 二次建仓）且动作在
-            # → 前端标「二次建仓」而非「加仓」
+            "held_sufficient": held_sufficient,
             "new_round": bool(held_first and action is not None),
-            # v8.2.0 补：持仓股差值判定明细（与我的持仓页同口径；非持仓/未判定 → None）
             "theory_lots": (held_extra or {}).get("theory_lots"),
             "actual_lots": (held_extra or {}).get("actual_lots"),
             "gap_lots": (held_extra or {}).get("gap_lots"),
             "timing_ok": timing_ok,
-            # v7.0.31（C 案，Joel 定案）：5 年分位数值——前端「即将进入」段
-            # 对非持仓股按 ≤50% 展示（timing 40% 门未过但价格临区 = 最有提前
-            # 量价值的信号；持仓股轮内加仓档不受时机限制 → None，但首档
-            # 二次建仓须过时机门 → 展示分位明细：池内=快照，池外=实时现算）
             "timing_pctile": (held_first_pctile if held_first else
-                              ((tmap.get(c) or {}).get("pctile_window")
-                               if not held else None)),
+                              (unheld_pctile if not held else None)),
             "timing_reasons": timing_reasons,
-            # 十年回测参考（推荐买入时展示；池外/无回测 → None）
             "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)
                            if bt.get("pnl_pct") is not None else None),
             "bt_n_buys": bt.get("n_buys"),
@@ -1940,12 +2016,11 @@ def get_strategy_signals() -> Dict[str, Any]:
                 "pushed": f"{c}|{baction}|{b['level']}|" in pushed_pfx,
                 "_seq": i,
             })
-    # 盘中触碰事件（v7.0.20）：收盘 job（12:05 UTC）落盘快照 → 并入历史信号
-    # （90 天窗口同口径；同 代码|日期|档 与回放 buys 去重——收盘过线那天的
-    # 触碰回放已记，buy 优先不重复展示；_seq 大值保证同日 buy 行在前）
+    # 盘中触碰事件：兼容新键 "ts_code|date" 与旧裸键 "ts_code"
     tseq = 0
-    for tc in sorted(touch_state, key=lambda x: str(touch_state[x].get("date") or "")):
-        ev = touch_state[tc]
+    for tk in sorted(touch_state, key=lambda x: str(touch_state[x].get("date") or "")):
+        ev = touch_state[tk]
+        tc = ev.get("ts_code") or (tk.split("|", 1)[0] if "|" in tk else tk)
         d = ev.get("date")
         if not d or tc not in universe or (hist_cutoff is not None and d < hist_cutoff):
             continue
@@ -1953,14 +2028,13 @@ def get_strategy_signals() -> Dict[str, Any]:
         history.append({
             "ts_code": tc, "name": ev.get("name") or tc, "held": tc in user,
             "date": d, "price": ev.get("level_price"), "amount": ev.get("amount"),
-            "lots": ev.get("lots"),   # v7.0.28 手数（旧快照无此键 → None）
+            "lots": ev.get("lots"),
             "level": ev.get("level"), "first_of_round": bool(ev.get("first_of_round")),
             "pushed": f"{tc}|{ev_action}|{ev.get('level')}|" in pushed_pfx,
             "source": "touch", "_seq": 10 ** 6 + tseq,
         })
         tseq += 1
     history = _touches.dedupe_buys(history)
-    # 日期降序；稳定排序保留同日同股「档位先后」（先首仓后加仓）
     history.sort(key=lambda h: (h["ts_code"], h["_seq"]))
     history.sort(key=lambda h: h["date"], reverse=True)
     for h in history:
@@ -1968,6 +2042,7 @@ def get_strategy_signals() -> Dict[str, Any]:
     return {
         "as_of": as_of,
         "strategy": "current",
+        "price_pctile_max": tp_obj.price_pctile_max,
         "lake_locked": lake_locked,
         "approach_pct": tp_obj.approach_pct,
         "spot_preselect_pct": tp_obj.spot_preselect_pct,
@@ -2045,34 +2120,39 @@ def put_my_positions(payload: Dict[str, Any]) -> Dict[str, Any]:
         cost_f = float(cost) if cost is not None else 0.0
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="shares/cost_price 应为数字")
+    if not (math.isfinite(shares_f) and math.isfinite(cost_f)):
+        raise HTTPException(status_code=400, detail="shares/cost_price 必须是有限数值")
     if shares_f < 0 or cost_f < 0:
         raise HTTPException(status_code=400, detail="shares/cost_price 不能为负")
     since_raw = str(payload.get("since_date") or "").strip()[:10]
-    if since_raw and not _DATE_RE.fullmatch(since_raw):
-        raise HTTPException(status_code=400, detail="since_date 应为 YYYY-MM-DD")
-    positions = _up_read()
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if shares_f == 0:
-        positions.pop(code, None)
-    else:
-        old = positions.get(code) or {}
-        # v8.2.0：加仓自动记录（Joel 2026-11-13）——股数增加 → buys 时间线
-        # 追加一笔（日期=建仓日输入，未填=今天）；旧条目首次填建仓日 →
-        # 按「自该日起持有当前股数」回填一笔（不造虚假增量）。
-        old_buys = list(old.get("buys") or [])
-        buy_event = None
-        if since_raw and not old_buys and not old.get("since_date_manual"):
-            buy_event = {"date": since_raw, "shares": round(shares_f, 2),
-                         "price": cost_f}
-        elif shares_f > float(old.get("shares") or 0):
-            buy_event = {"date": since_raw or str(_beijing_today())[:10],
-                         "shares": round(shares_f - float(old.get("shares") or 0), 2),
-                         "price": cost_f}
-        positions[code] = _up_entry(old, shares_f, cost_f, now,
-                                    buy_event=buy_event,
-                                    since_override=since_raw or None)
-    _up_write(positions)
-    return {"ok": True, "ts_code": code, "n": len(positions)}
+    if since_raw:
+        if not _DATE_RE.fullmatch(since_raw):
+            raise HTTPException(status_code=400, detail="since_date 应为 YYYY-MM-DD")
+        try:
+            date.fromisoformat(since_raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"since_date 日期非法: {since_raw}")
+    with _LEDGER_LOCK:
+        positions = _up_read()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if shares_f == 0:
+            positions.pop(code, None)
+        else:
+            old = positions.get(code) or {}
+            old_buys = list(old.get("buys") or [])
+            buy_event = None
+            if since_raw and not old_buys and not old.get("since_date_manual"):
+                buy_event = {"date": since_raw, "shares": round(shares_f, 2),
+                             "price": cost_f}
+            elif shares_f > float(old.get("shares") or 0):
+                buy_event = {"date": since_raw or str(_beijing_today())[:10],
+                             "shares": round(shares_f - float(old.get("shares") or 0), 2),
+                             "price": cost_f}
+            positions[code] = _up_entry(old, shares_f, cost_f, now,
+                                        buy_event=buy_event,
+                                        since_override=since_raw or None)
+        _up_write(positions)
+        return {"ok": True, "ts_code": code, "n": len(positions)}
 
 
 # ---------------------------------------------------------------------------
@@ -2097,31 +2177,26 @@ def _trades_read() -> List[Dict[str, Any]]:
 
 def _trades_write(trades: List[Dict[str, Any]]) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    USER_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"updated_at": now, "trades": trades}
-    tmp = USER_TRADES_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, USER_TRADES_PATH)  # 原子替换，防半截账本
+    _atomic_write_json(USER_TRADES_PATH, {"updated_at": now, "trades": trades})
 
 
 @app.post("/api/my_trades")
 def record_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """登记一笔实盘交易：shares 正=买入（整手）、负=卖出。
-
-    原子更新当前持仓 + 追加 data/my_trades.json；卖出记录含已实现盈亏
-    （=（卖价−登记时成本）×股数，快照值，供历史回看）。
-    """
+    """登记一笔实盘交易：shares 正=买入（整手）、负=卖出（加 _LEDGER_LOCK 串行保护）。"""
     code = str(payload.get("ts_code", "")).strip()
     if not _TS_CODE_RE.fullmatch(code):
         raise HTTPException(status_code=400, detail="ts_code 应为 sh.600000 / sz.000001 形式")
     shares = payload.get("shares")
     price = payload.get("price")
     try:
-        shares_i = int(shares)
+        shares_f = float(shares)
         price_f = float(price)
+        if not (math.isfinite(shares_f) and math.isfinite(price_f)):
+            raise ValueError("non-finite")
+        shares_i = int(shares_f)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="shares/price 应为数字")
-    if float(shares_i) != float(shares):  # 拒非整数股数（1.5 手之类）
+        raise HTTPException(status_code=400, detail="shares/price 应为有限数字")
+    if float(shares_i) != shares_f:  # 拒非整数股数（1.5 手之类）
         raise HTTPException(status_code=400, detail="shares 必须为整数")
     if shares_i == 0:
         raise HTTPException(status_code=400, detail="shares 不能为 0（正=买入，负=卖出）")
@@ -2130,60 +2205,65 @@ def record_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
     date_s = str(payload.get("date") or "").strip()
     if not date_s:
         date_s = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-    elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_s):
-        raise HTTPException(status_code=400, detail="date 应为 YYYY-MM-DD")
+    else:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_s):
+            raise HTTPException(status_code=400, detail="date 应为 YYYY-MM-DD")
+        try:
+            date.fromisoformat(date_s)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"date 日期非法: {date_s}")
     name = str(payload.get("name") or "").strip()[:32]
 
-    positions = _up_read()
-    cur = positions.get(code) or {}
-    old_shares = float(cur.get("shares") or 0)
-    old_cost = float(cur.get("cost_price") or 0)
-    realized_pnl: Optional[float] = None
-    if shares_i > 0:
-        if shares_i % 100 != 0:
-            raise HTTPException(status_code=400, detail="A 股买入按整手（100 股倍数）")
-        new_shares = old_shares + shares_i
-        new_cost = round((old_shares * old_cost + shares_i * price_f) / new_shares, 3)
-    else:
-        n_sell = -shares_i
-        if old_shares <= 0:
-            raise HTTPException(status_code=400, detail="未持有该股，不能卖出（先登记持仓）")
-        if n_sell > old_shares:
-            raise HTTPException(
-                status_code=400,
-                detail=f"卖出不能超过持仓：当前 {old_shares:.0f} 股，拟卖 {n_sell} 股")
-        new_shares = old_shares - n_sell
-        new_cost = old_cost  # 卖出后剩余持仓均价不变（券商口径）
-        realized_pnl = round((price_f - old_cost) * n_sell, 2)
+    with _LEDGER_LOCK:
+        positions = _up_read()
+        cur = positions.get(code) or {}
+        old_shares = float(cur.get("shares") or 0)
+        old_cost = float(cur.get("cost_price") or 0)
+        realized_pnl: Optional[float] = None
+        if shares_i > 0:
+            if shares_i % 100 != 0:
+                raise HTTPException(status_code=400, detail="A 股买入按整手（100 股倍数）")
+            new_shares = old_shares + shares_i
+            new_cost = round((old_shares * old_cost + shares_i * price_f) / new_shares, 3)
+        else:
+            n_sell = -shares_i
+            if old_shares <= 0:
+                raise HTTPException(status_code=400, detail="未持有该股，不能卖出（先登记持仓）")
+            if n_sell > old_shares:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"卖出不能超过持仓：当前 {old_shares:.0f} 股，拟卖 {n_sell} 股")
+            new_shares = old_shares - n_sell
+            new_cost = old_cost  # 卖出后剩余持仓均价不变（券商口径）
+            realized_pnl = round((price_f - old_cost) * n_sell, 2)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if new_shares <= 0:
-        positions.pop(code, None)
-    else:
-        # v8.2.0：登记买入 → 加仓时间线自动记录（日期=登记日，支持回填）
-        _bev = ({"date": date_s, "shares": float(shares_i), "price": price_f}
-                if shares_i > 0 else None)
-        positions[code] = _up_entry(positions.get(code), new_shares, new_cost, now,
-                                    buy_event=_bev)
-    _up_write(positions)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if new_shares <= 0:
+            positions.pop(code, None)
+        else:
+            _bev = ({"date": date_s, "shares": float(shares_i), "price": price_f}
+                    if shares_i > 0 else None)
+            positions[code] = _up_entry(positions.get(code), new_shares, new_cost, now,
+                                        buy_event=_bev)
+        _up_write(positions)
 
-    trades = _trades_read()
-    tid = "t" + str(int(datetime.now(timezone.utc).timestamp() * 1000))
-    while any(t.get("id") == tid for t in trades):  # 同毫秒连笔 → 加后缀保唯一
-        tid += "x"
-    trade = {
-        "id": tid, "ts_code": code, "name": name,
-        "direction": "buy" if shares_i > 0 else "sell",
-        "shares": abs(shares_i), "price": price_f,
-        "amount": round(abs(shares_i) * price_f, 2),
-        "date": date_s, "realized_pnl": realized_pnl, "created_at": now,
-    }
-    trades.append(trade)
-    _trades_write(trades)
-    return {"ok": True, "trade": trade,
-            "position": {"ts_code": code, "shares": max(new_shares, 0.0),
-                         "cost_price": new_cost if new_shares > 0 else None,
-                         "removed": new_shares <= 0}}
+        trades = _trades_read()
+        tid = "t" + str(int(datetime.now(timezone.utc).timestamp() * 1000))
+        while any(t.get("id") == tid for t in trades):
+            tid += "x"
+        trade = {
+            "id": tid, "ts_code": code, "name": name,
+            "direction": "buy" if shares_i > 0 else "sell",
+            "shares": abs(shares_i), "price": price_f,
+            "amount": round(abs(shares_i) * price_f, 2),
+            "date": date_s, "realized_pnl": realized_pnl, "created_at": now,
+        }
+        trades.append(trade)
+        _trades_write(trades)
+        return {"ok": True, "trade": trade,
+                "position": {"ts_code": code, "shares": max(new_shares, 0.0),
+                             "cost_price": new_cost if new_shares > 0 else None,
+                             "removed": new_shares <= 0}}
 
 
 @app.get("/api/my_trades")
@@ -2201,13 +2281,14 @@ def list_trades(ts_code: Optional[str] = None) -> Dict[str, Any]:
 @app.delete("/api/my_trades/{trade_id}")
 def delete_trade(trade_id: str) -> Dict[str, Any]:
     """删除一条历史记录。仅移除日志，**不回改当前持仓**（持仓是唯一状态源）。"""
-    trades = _trades_read()
-    for i, t in enumerate(trades):
-        if t.get("id") == trade_id:
-            removed = trades.pop(i)
-            _trades_write(trades)
-            return {"ok": True, "ts_code": removed.get("ts_code"), "n": len(trades)}
-    raise HTTPException(status_code=404, detail="记录不存在")
+    with _LEDGER_LOCK:
+        trades = _trades_read()
+        for i, t in enumerate(trades):
+            if t.get("id") == trade_id:
+                removed = trades.pop(i)
+                _trades_write(trades)
+                return {"ok": True, "ts_code": removed.get("ts_code"), "n": len(trades)}
+        raise HTTPException(status_code=404, detail="记录不存在")
 
 
 # ---------------------------------------------------------------------------
@@ -2369,7 +2450,19 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"errors": ["strategy 顶层必须是 JSON 对象(mapping)"]})
 
-    errors = _validate_strategy(payload)
+    # 强制服务端保留既有 lake / datasource 段，防止导入缺段抹除生产同步配置或注入 datasource.rf.url
+    safe_payload = dict(payload)
+    if CONFIG_PATH.exists():
+        try:
+            existing_cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            if isinstance(existing_cfg, dict):
+                for _prot in ("lake", "datasource"):
+                    if _prot in existing_cfg:
+                        safe_payload[_prot] = existing_cfg[_prot]
+        except Exception:  # noqa: BLE001
+            pass
+
+    errors = _validate_strategy(safe_payload)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
 
@@ -2378,7 +2471,7 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
         from martingale import config as mcfg
         fd, tmp = tempfile.mkstemp(suffix=".yaml")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+            yaml.safe_dump(safe_payload, f, allow_unicode=True, sort_keys=False)
         try:
             mcfg.load_config(tmp)
         finally:
@@ -2391,20 +2484,45 @@ def _apply_strategy_write(payload: Any) -> Tuple[str, List[str]]:
     if CONFIG_PATH.exists():
         shutil.copy2(CONFIG_PATH, bak_path)
 
-    _write_strategy_preserving_comments(payload)
-    return str(bak_path), list(payload.keys())
+    _write_strategy_preserving_comments(safe_payload)
+    return str(bak_path), list(safe_payload.keys())
+
+
+def _is_duckdb_connect_real(duckdb_mod) -> bool:
+    """判断 duckdb.connect 是否为真实 C 扩展函数（测试 monkeypatch 时走进程内桩）。"""
+    return getattr(duckdb_mod.connect, "__module__", "") in ("_duckdb", "duckdb")
+
+
+def _rescan_via_subprocess(sub: str, timeout_s: int = 120) -> Dict[str, Any]:
+    """在独立子进程中执行 martingale selection/timing（持 flock 写锁），
+    确保 Web 主进程永远只持 read_only DuckDB 连接，杜绝同进程 RO/RW 冲突。"""
+    py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+    env = dict(os.environ)
+    env["MARTINGALE_CONFIG"] = str(CONFIG_PATH)
+    proc = subprocess.run(
+        [py, "-m", "martingale", sub],
+        cwd=str(PROJECT_ROOT), env=env,
+        capture_output=True, text=True, timeout=timeout_s)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"refreshed": False, "reason": (err[-1] if err else f"rc={proc.returncode}")[:200]}
+    out_txt = proc.stdout or ""
+    m_asof = re.search(r"as_of=(\d{4}-\d{2}-\d{2})", out_txt)
+    res: Dict[str, Any] = {"refreshed": True, "as_of": m_asof.group(1) if m_asof else None}
+    if sub == "selection":
+        m_w = re.search(r"写入\s+(\d+)/(\d+)", out_txt)
+        if m_w:
+            res["n_written"] = int(m_w.group(1))
+            res["n_codes"] = int(m_w.group(2))
+    elif sub == "timing":
+        m_wl = re.search(r"今日选股\s+(\d+)", out_txt)
+        if m_wl:
+            res["n_watchlist"] = int(m_wl.group(1))
+    return res
 
 
 def _rescan_selection_after_save() -> Dict[str, Any]:
-    """v7.0.41：策略配置写盘成功后立即重算候选池十年回测表（selection_backtest_10y）。
-
-    G7 十年回测门槛按「当前生产策略参数」回放预计算（v7.0.40 前仅 11:30 UTC
-    lake-sync 刷新）——改策略参数（回撤%/手数等）不重算，G7 停在旧参数快照
-    直到次日（Joel 2026-11-11「改策略是应该触发重算」）。
-    重算 ~2s（102 股×十年回放实测 2.2s）；失败（如 11:30 同步窗口湖被锁）
-    不影响保存结果 → 降级 refreshed=false，新参数于下次 11:30 刷新自动生效。
-    须在时机表重算**之前**执行：时机表按候选池算，而候选池 G7 读本表。
-    """
+    """策略配置写盘成功后重算候选池十年回测表（生产走子进程隔离写锁，防 RO/RW 冲突）。"""
     try:
         import duckdb
 
@@ -2412,11 +2530,13 @@ def _rescan_selection_after_save() -> Dict[str, Any]:
         from martingale.data import default_db_path
         from martingale.selection import refresh_selection
 
-        _sp, up, _tp = load_config(str(CONFIG_PATH))
         p = default_db_path()
-        if not os.path.exists(p):
+        if _is_duckdb_connect_real(duckdb) and os.path.exists(p):
+            return _rescan_via_subprocess("selection", timeout_s=180)
+        _sp, up, _tp = load_config(str(CONFIG_PATH))
+        if not os.path.exists(p) and _is_duckdb_connect_real(duckdb):
             return {"refreshed": False, "reason": "数据湖不存在（新值下次同步生效）"}
-        con = duckdb.connect(p)  # 写连接：湖被锁时立即失败（已实测不挂起）
+        con = duckdb.connect(p)
         try:
             out = refresh_selection(con, _sp, up, tp=_tp)
         finally:
@@ -2428,28 +2548,27 @@ def _rescan_selection_after_save() -> Dict[str, Any]:
 
 
 def _rescan_timing_after_save() -> Dict[str, Any]:
-    """v7.0.27：策略配置写盘成功后立即重算选股时机表（selection_timing）。
-
-    时机门 / 今日选股读的是预计算表（历史仅 11:30 UTC lake-sync 刷新）——
-    编辑模式改了 timing 参数（分位上限/窗口/首仓建仓回撤）不重算，新值要
-    次日才生效（Joel 2026-11-09 反馈「编辑改动后没有生效重新扫描」）。
-    重算 ~1s；失败（如 11:30 同步窗口湖被锁，DuckDB 写连接立即报锁冲突）
-    不影响保存结果 → 降级 refreshed=false，新值于下次 11:30 刷新自动生效。
-    """
+    """策略配置写盘成功后重算选股时机表（生产走子进程隔离写锁，防 RO/RW 冲突）。"""
     try:
         import duckdb
 
         from martingale.config import load_config
         from martingale.data import default_db_path
+        from martingale.selection import load_manual_pool
         from martingale.timing import refresh_timing
 
-        _sp, up, tp = load_config(str(CONFIG_PATH))
         p = default_db_path()
-        if not os.path.exists(p):
+        if _is_duckdb_connect_real(duckdb) and os.path.exists(p):
+            return _rescan_via_subprocess("timing", timeout_s=120)
+        _sp, up, tp = load_config(str(CONFIG_PATH))
+        if not os.path.exists(p) and _is_duckdb_connect_real(duckdb):
             return {"refreshed": False, "reason": "数据湖不存在（新值下次同步生效）"}
-        con = duckdb.connect(p)  # 写连接：湖被锁时立即失败（已实测不挂起）
+        con = duckdb.connect(p)
         try:
-            out = refresh_timing(con, up, tp)
+            try:
+                out = refresh_timing(con, up, tp, manual=load_manual_pool())
+            except TypeError:
+                out = refresh_timing(con, up, tp)
         finally:
             con.close()
         return {"refreshed": True, "as_of": out.get("as_of"),
@@ -2468,7 +2587,9 @@ def put_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/strategy/import")
 def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
-    """加载策略文件——body={raw}（yaml 文本），复用 PUT 同一套校验。"""
+    """加载策略文件——body={raw}（限制 ≤64KB 防 YAML 炸弹，复用 PUT 同一套校验）。"""
+    if len(req.raw or "") > 65536:
+        raise HTTPException(status_code=400, detail={"errors": ["YAML 体积超出 64KB 上限"]})
     try:
         data = yaml.safe_load(req.raw)
     except Exception as exc:  # noqa: BLE001 - yaml 语法错误 → 400（不写盘）
@@ -2480,7 +2601,7 @@ def import_strategy(req: ImportStrategyRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 健康检查
+# 健康检查（不泄露服务器绝对路径）
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
@@ -2488,7 +2609,6 @@ def health() -> Dict[str, Any]:
         "ok": True,
         "version": "7.0.0",
         "time": datetime.now(timezone.utc).isoformat(),
-        "project_root": str(PROJECT_ROOT),
         "active_task": tm.active_task_id(),
     }
 
@@ -2536,4 +2656,4 @@ if DIST_DIR.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9090)
+    uvicorn.run(app, host="127.0.0.1", port=9090)

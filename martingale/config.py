@@ -35,7 +35,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -81,16 +81,22 @@ class StrategyParams:
     stamp: float = field(default=STAMP_BPS / 1e4, compare=False)
 
     def level_price(self, entry_high: float, k: int) -> float:
-        """第 k 档买入线：H×(1−first_drawdown−k×add_step)（k=0 为首建仓位）。"""
+        """首仓线（k=0）：H×(1−first_drawdown)；兼容旧 k≥1 调用。"""
         return entry_high * (1.0 - self.first_drawdown - k * self.add_step)
 
-    def next_add_price(self, entry_high: float, k_level: int) -> float:
-        """当前状态下的**下一个**触发价位 = 下一档（k_level 尚未触发的那档）。
+    def next_add_price(self, entry_high: float, k_level: int,
+                       round_anchor: float = 0.0) -> Optional[float]:
+        """当前状态下的下一个触发价位（v8.1.0 口径）。
 
-        引擎里 k_level = 当前周期已买入档数（每买一档 +1）→ 下一档下标 = k_level。
-        等价于 brief 的 H×(1−dd−(k+1)×step)（k = 已买档序号，0 起）。
+        - k_level == 0：首仓线 H×(1−first_drawdown)；
+        - k_level >= 1 且提供 round_anchor > 0：P0×(1−k×add_step)（≤0 时返回 None）；
+        - 兼容旧 2 参调用（round_anchor=0）：回退 level_price(entry_high, k_level)。
         """
-        return self.level_price(entry_high, k_level)
+        if k_level >= 1 and round_anchor > 0.0:
+            mult = 1.0 - k_level * self.add_step
+            return round_anchor * mult if mult > 0.0 else None
+        val = self.level_price(entry_high, k_level)
+        return val if val > 0.0 else None
 
     def next_rearm_price(self, low_since_high: float) -> float:
         """bounce 模式下再武装触发价：L×(1+rearm_pct)（newhigh 模式无此语义）。"""

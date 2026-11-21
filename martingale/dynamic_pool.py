@@ -34,8 +34,9 @@ from .engine import aggregate_into, extend_start, first_ok_series, load, run_sto
 from .report import write_outputs
 from .universe import build_pool_asof
 
-# 滚动回测门 G7 的窗口长度（与 selection 十年滚动口径一致）
-ROLLING_DAYS = 3650
+# 滚动回测门 G7 的窗口长度：None 表示精确按 up.backtest_window_years 日历年回溯（无闰年漂移）；
+# 若显式设为整数天数（如单测 monkeypatch），按天回溯。
+ROLLING_DAYS: Optional[int] = None
 # 仓库根（子进程 cwd + -m martingale 可导入）
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 月度重算子进程并发数（子进程峰值 RSS ~1.3GB，本机 11GB 留 3 路余量）
@@ -52,32 +53,29 @@ def month_starts(dates: np.ndarray) -> np.ndarray:
 
 
 def _rolling_g7(con, sp, codes: List[str], end_d: str,
-                min_return_pct: float,
+                window_years: int = 10,
                 tp: Optional[TimingParams] = None) -> Dict[str, dict]:
-    """滚动十年策略回测（窗口 [end-3650d, end]），返回 {code: stat}。
-
-    G7 过滤在调用方做（与 selection.build_candidate_pool 同语义：
-    n_buys≥1 且 pnl_pct×100 ≥ 门槛）。verbose=False 避免 400 股×120 次
-    的日志洪水；进度由上层按重算日期粒度打 [PROGRESS]。
-    tp=v8.1.0 首仓双条件②（timing 段）——G7 回测与生产同口径（PIT）；
-    None = ②关闭（仅单元测试兼容）。
-    """
-    start10 = str(np.datetime64(end_d, "D") - np.timedelta64(ROLLING_DAYS, "D"))[:10]
-    # v8.1.0：分位窗口 → load 起点前移 N 年，算完切回原窗口
-    ext_start = (extend_start(start10, tp.price_window_years)
-                 if tp is not None else start10)
+    """滚动 N 年策略回测（日历年回溯，与 selection.py::_years_ago 同口径），返回 {code: stat}。"""
+    start_win = extend_start(end_d, int(window_years))
+    ext_start = (extend_start(start_win, tp.price_window_years)
+                 if tp is not None else start_win)
     _names, data, divs = load(con, codes=codes, start=ext_start, end=end_d)
     out: Dict[str, dict] = {}
     for c in codes:
-        d, s, e = data[c]
+        series = data.get(c)
+        if not series:
+            continue
+        d, s, e = series
         if len(d) < 2:
             continue
         ok = None
         if tp is not None:
             ok = first_ok_series(d, s, tp.price_window_years,
                                  tp.price_pctile_max)
-            i0 = int(np.searchsorted(d, np.datetime64(start10)))
+            i0 = int(np.searchsorted(d, np.datetime64(start_win)))
             d, s, e, ok = d[i0:], s[i0:], e[i0:], ok[i0:]
+            if len(d) < 2:
+                continue
         stat, _state, _v, _cc, _fl, _buys = run_stock(
             c, d, s, e, divs.get(c), sp, verbose=False, first_ok=ok)
         out[c] = stat
@@ -89,10 +87,10 @@ def _month_pool(con, sp, up, rd: str,
     """单月全漏斗（PIT）：基础 6 门 ∩ G7 滚动十年 ∩ G8 TTM ∩ G9 价格区间。"""
     base = build_pool_asof(con, up, rd)
     members = base.members
-    # G7（滚动十年策略回测；up.backtest_positive=False 时关闭 = 基础池直通）
+    # G7（滚动 N 年策略回测；up.backtest_positive=False 时关闭 = 基础池直通）
     if up.backtest_positive and members:
         g7 = _rolling_g7(con, sp, [m.ts_code for m in members], rd,
-                         up.backtest_min_return_pct, tp=tp)
+                         window_years=up.backtest_window_years, tp=tp)
         codes_g7 = [
             m.ts_code for m in members
             if (b := g7.get(m.ts_code)) is not None
@@ -134,7 +132,9 @@ def compute_month_pool(as_of: str, config_path: Optional[str] = None) -> List[st
     from .config import load_config
     from .data import connect_readonly
     # v8.1.0：G7 回测首仓双条件② → 子进程同样取 timing 段（生产同口径）
-    sp, up, tp = load_config(config_path or os.path.join(_ROOT, "config", "strategy.yaml"))
+    cfg_path = (config_path or os.environ.get("MARTINGALE_CONFIG")
+                or os.path.join(_ROOT, "config", "strategy.yaml"))
+    sp, up, tp = load_config(cfg_path)
     con = connect_readonly(None)
     try:
         con.execute("SET memory_limit='2GB'")
@@ -246,9 +246,15 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
     # 且 2016 前 SOE/分红 PIT 数据稀疏、池无意义；Joel 定案口径 = 十年动态池）
     if end is None or start is None:
         hi = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()[0]
+        if hi is None:
+            print("无交易日数据（湖中 kline_daily 为空）")
+            return 0
         end = end or str(hi)[:10]
     if start is None:
-        start = str(np.datetime64(end, "D") - np.timedelta64(ROLLING_DAYS, "D"))[:10]
+        if ROLLING_DAYS is not None:
+            start = str(np.datetime64(end, "D") - np.timedelta64(int(ROLLING_DAYS), "D"))
+        else:
+            start = extend_start(end, int(up.backtest_window_years))
     schedule = pool_schedule(con, sp, up, start, end,
                              progress=lambda s, d, t: print(
                                  f"[PROGRESS] stage={s} done={d} total={t}",
@@ -277,14 +283,20 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
     names, data, divs = load(con, codes=union, start=ext_start, end=end)
     prepared: Dict[str, tuple] = {}
     for c in union:
-        d, s, e = data[c]
+        series = data.get(c)
+        if not series:
+            continue
+        d, s, e = series
         if len(d) < 2:
             continue
         ok = (first_ok_series(d, s, tp.price_window_years,
                               tp.price_pctile_max)
               if tp is not None else None)
         i0 = int(np.searchsorted(d, np.datetime64(start)))
-        prepared[c] = (d[i0:], s[i0:], e[i0:], ok[i0:] if ok is not None else None)
+        d2, s2, e2 = d[i0:], s[i0:], e[i0:]
+        if len(d2) < 2:
+            continue
+        prepared[c] = (d2, s2, e2, ok[i0:] if ok is not None else None)
     codes = [c for c in union if c in prepared]
     if not codes:
         print("no data")

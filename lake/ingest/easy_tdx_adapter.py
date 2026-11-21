@@ -185,12 +185,13 @@ class EasyTdxAdapter:
                     client.get_stock_kline, market, code6, Period.DAILY,
                     start=0, count=_FULL_HISTORY_COUNT)
             else:
-                # 窗口：按自然日估算交易日数 + 缓冲，取最近 N 根后过滤
+                # 窗口：tdx start=0 从最新倒数，须按 (today - d0) 估算覆盖 start 至今
                 import datetime as _dt
 
                 d0 = _dt.date.fromisoformat(start or "1990-01-01")
-                d1 = _dt.date.fromisoformat(end or _dt.date.today().isoformat())
-                n = max(30, int((d1 - d0).days * 0.72) + 60)
+                today_d = _dt.date.today()
+                n = max(30, min(_FULL_HISTORY_COUNT,
+                                int(max(0, (today_d - d0).days) * 0.72) + 60))
                 raw_df = fetch_with_timeout(
                     client.get_stock_kline, market, code6, Period.DAILY,
                     start=0, count=n)

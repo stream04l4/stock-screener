@@ -89,7 +89,10 @@ export const useTaskStore = defineStore("task", {
       this._sse = _useSSEImpl(
         `/api/bt/runs/${taskId}/events`,
         (ev) => this.handleSSEEvent(ev),
-        { onDowngrade: () => this.downgradeToPolling(taskId) }
+        {
+          onOpen: () => { this.sseAlive = true; },
+          onDowngrade: () => this.downgradeToPolling(taskId),
+        }
       );
     },
 
@@ -130,7 +133,7 @@ export const useTaskStore = defineStore("task", {
           if (s.status === "done") this.finish("done");
           else if (s.status === "failed") this.finish("failed");
         } catch (e) {
-          if (e.status === 404) this.stopMonitors(); // 服务重启且任务未知 → 停止
+          if (e.status === 404 || e.status === 401) this.stopMonitors(); // 任务未知或未登录 → 停止
         }
       };
       tick();

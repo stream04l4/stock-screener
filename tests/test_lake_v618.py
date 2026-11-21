@@ -453,8 +453,8 @@ def test_t1_single_l_call_preserves_delist_and_coarse_industry(tmp_path, monkeyp
     row = con.execute(
         "SELECT industry_name, industry_csric2, CAST(delist_date AS VARCHAR), source "
         "FROM stock_master WHERE ts_code='sz.000002'").fetchone()
-    assert row == ("农林牧渔", None, "2026-09-01", "tushare"), \
-        f"csric2 应 NULL、delist_date 应沿用旧值: {row}"
+    assert row == ("农林牧渔", "J66", "2026-09-01", "tushare"), \
+        f"csric2 与 delist_date 均应沿用既有值（防 T1 同步清空证监会行业代码）: {row}"
     n_bj = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code='bj.920001'").fetchone()[0]
     assert n_bj == 0, "北交所不得入 universe"
     con.close()

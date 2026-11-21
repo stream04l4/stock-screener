@@ -218,14 +218,16 @@ def test_live_pctile_replaces_last_bar_and_factors():
                 ["f.3", str(start + timedelta(days=N - 1)), 10.0])
     tp = make_tp(price_window_years=1, price_pctile_max=40.0)
     out = tm.live_pctile_map(con, ["e.1", "e.2", "f.3"],
-                             {"e.1": 4.0, "e.2": 8.0, "f.3": 9.9}, tp)
+                             {"e.1": 4.0, "e.2": 8.0, "f.3": 9.9}, tp, min_bars=2)
     # e.1 @4.0：10 个 bar 里 4 个 ≤4 → 40%
     assert abs(out["e.1"] - 4.0 / N * 100) < 1e-9
     # e.2 @raw 8.0：×因子 0.5 → cur=4.0 → 同样 40%
     assert abs(out["e.2"] - 4.0 / N * 100) < 1e-9
     # e.2 现价高于末 bar raw（20）→ cur=10 → 100%
-    out2 = tm.live_pctile_map(con, ["e.2"], {"e.2": 20.0}, tp)
+    out2 = tm.live_pctile_map(con, ["e.2"], {"e.2": 20.0}, tp, min_bars=2)
     assert abs(out2["e.2"] - 100.0) < 1e-9
+    # 默认 min_bars=60：短样本 10 bar → None（fail-closed）
+    assert tm.live_pctile_map(con, ["e.1"], {"e.1": 4.0}, tp)["e.1"] is None
     # f.3 无 qfq 序列 → None（fail-closed）
     assert out["f.3"] is None
     con.close()

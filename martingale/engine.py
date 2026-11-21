@@ -105,8 +105,11 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
         div_where += f" AND ts_code IN ({fmt})"
         div_params.extend(codes)
     con.execute(f"""
-        SELECT ts_code, ex_date, COALESCE(cash_dps, 0) cash_dps, COALESCE(stk_div, 0) stk_div
+        SELECT ts_code, ex_date,
+               SUM(COALESCE(cash_dps, 0)) AS cash_dps,
+               SUM(COALESCE(stk_div, 0)) AS stk_div
         FROM dividend_events WHERE {div_where}
+        GROUP BY ts_code, ex_date
     """, div_params)
     divs: Dict[str, Dict] = {}
     for c, d, cd, sd in con.fetchall():
@@ -256,6 +259,23 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
       lots = 本笔手数（v7.0.28）。消费方 report.py / state_rows 已同步解包。）
     """
     n = len(sig)
+    if n == 0:
+        empty_stat = {
+            "ts_code": ts_code, "n_bars": 0, "n_rounds": 0, "n_rearms": 0,
+            "n_buys": 0, "total_invested": 0.0, "realized_pnl": 0.0,
+            "final_assets": 0.0, "dividends": 0.0, "div_pool": 0.0,
+            "price_pnl": 0.0, "total_pnl": 0.0, "pnl_pct": np.nan,
+            "min_unreal_pct": 0.0, "first_buy_date": "", "last_buy_date": "",
+            "last_status": "never", "end_date": "", "annual": [],
+        }
+        empty_state = {
+            "ts_code": ts_code, "in_pos": False, "shares": 0.0,
+            "open_cost": 0.0, "avg_cost": 0.0, "last_price": 0.0,
+            "market_value": 0.0, "cash_div": 0.0, "unreal_pct": 0.0,
+            "entry_high": 0.0, "low_since_high": 0.0, "k_level": 0,
+            "round_anchor": 0.0, "next_add_price": None, "next_rearm_price": None,
+        }
+        return empty_stat, empty_state, np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8), []
     comm = p.commission  # 3bps 买入佣金（引擎常量）
 
     in_pos = False
@@ -287,63 +307,62 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     cd_arr = np.zeros(n)   # v7.0.35：逐 bar 累计收到分红（仅年汇总报告用）
     du_arr = np.zeros(n)   # v7.0.36：逐 bar 累计分红出资（仅年汇总报告用）
 
-    # —— 隐含除权还原（参考 L154-202 逐行移植）——
-    # 湖内 stk_div 多数为空 → 从 hfq 因子跳变推导除权事件：
-    # 因子倍率 = (1+送转) × (1+现金分红)；判定规则（勿改，f6 数字含其贡献）：
-    #   - 因子步长落在相邻两根 bar 之间（停牌期除权在复牌日归属）
-    #   - 当日有现金分红事件：送转比例接近整数(±8%)才记送转，否则视为因子舍入残差
-    #   - 当日无事件：送转比例接近整数或 ≥1 → 记送转；<1 的非整数组 → 判为漏记现金分红
-    #   - 原始价缺口必须与因子跳变匹配（容差 5pp+30%相对），否则视为因子源 glitch，忽略
-    if exmap is not None:
-        exmap = dict(exmap)
-        # 停牌期除权事件 → 顺延到复牌日（首个存在的 bar）收取
-        for k in list(exmap):
-            i = int(np.searchsorted(dates, k))
-            if i >= n or dates[i] != k:
-                if i >= n:
-                    del exmap[k]  # 数据终点之后的除权日，不计
-                    continue
-                c0, s0 = exmap.get(dates[i], (0.0, 0.0))
-                c1, s1 = exmap[k]
-                exmap[dates[i]] = (c0 + c1, s0 + s1)
-                del exmap[k]
-        for i in range(1, n):
-            if sig[i] > 0 and sig[i - 1] > 0 and exec_c[i] > 0 and exec_c[i - 1] > 0:
-                af_ratio = (sig[i] / exec_c[i]) / (sig[i - 1] / exec_c[i - 1])
-                if af_ratio <= 1.001:
-                    continue
-                d = exmap.get(dates[i], (0.0, 0.0))[0]
-                pc = exec_c[i - 1]
-                cash_mult = pc / (pc - d) if 0 < d < pc else 1.0
-                x10 = (af_ratio / cash_mult - 1.0) * 10.0
-                if x10 < 0.1:
-                    continue
-                expected = (pc - d) / (pc * (1.0 + x10 / 10.0))  # 原始价应得比率
-                actual = exec_c[i] / pc
-                if abs(actual - expected) > 0.05 + 0.3 * abs(expected - 1.0):
-                    continue  # 因子跳变与原始价缺口不符 → 因子数据错误，忽略
-                near_int = any(abs(x10 - k) <= 0.08 * k for k in range(1, 11))
-                cash0, stk0 = exmap.get(dates[i], (0.0, 0.0))
-                if d > 0:
-                    if x10 >= 1.0 and near_int:
-                        exmap[dates[i]] = (cash0, stk0 + x10)
-                        if verbose:
-                            print(f"[除权推导] {str(dates[i])[:10]} 10送{x10:.2f} (当日分红{d:.3f})")
-                    # 其余：与已记事件一致的舍入残差，忽略（防重复计）
-                elif x10 >= 1.0 or near_int:
-                    exmap[dates[i]] = (cash0, stk0 + x10)
+    # —— 隐含除权还原（统一 stk_div 为每股送转股数口径，与 lake/ingest 同单位）——
+    # 即使 dividend_events 暂无该股记录（exmap is None），仍执行隐含除权推导兜底。
+    exmap = dict(exmap) if exmap is not None else {}
+    # 窗口前历史事件丢弃；停牌期除权事件 → 顺延到复牌日（首个存在的 bar）收取
+    for k in list(exmap):
+        if k < dates[0]:
+            del exmap[k]
+            continue
+        i = int(np.searchsorted(dates, k))
+        if i >= n or dates[i] != k:
+            if i >= n:
+                del exmap[k]  # 数据终点之后的除权日，不计
+                continue
+            c0, s0 = exmap.get(dates[i], (0.0, 0.0))
+            c1, s1 = exmap[k]
+            exmap[dates[i]] = (c0 + c1, s0 + s1)
+            del exmap[k]
+    for i in range(1, n):
+        if sig[i] > 0 and sig[i - 1] > 0 and exec_c[i] > 0 and exec_c[i - 1] > 0:
+            af_ratio = (sig[i] / exec_c[i]) / (sig[i - 1] / exec_c[i - 1])
+            if af_ratio <= 1.001:
+                continue
+            d, stk_existing = exmap.get(dates[i], (0.0, 0.0))
+            pc = exec_c[i - 1]
+            # 已知送转（每股口径）一并折入已解释倍率，避免重复推导
+            known_mult = (pc * (1.0 + stk_existing) / (pc - d)) if (0 <= d < pc) else 1.0
+            x10 = (af_ratio / known_mult - 1.0) * 10.0
+            if x10 < 0.1:
+                continue
+            total_stk = stk_existing + x10 / 10.0
+            expected = (pc - d) / (pc * (1.0 + total_stk))  # 原始价应得比率
+            actual = exec_c[i] / pc
+            if abs(actual - expected) > 0.05 + 0.3 * abs(expected - 1.0):
+                continue  # 因子跳变与原始价缺口不符 → 因子数据错误，忽略
+            near_int = any(abs(x10 - k) <= 0.08 * k for k in range(1, 11))
+            cash0, stk0 = exmap.get(dates[i], (0.0, 0.0))
+            if d > 0:
+                if x10 >= 1.0 and near_int:
+                    exmap[dates[i]] = (cash0, stk0 + x10 / 10.0)
                     if verbose:
-                        print(f"[除权推导] {str(dates[i])[:10]} 10送{x10:.2f} (无分红事件)")
-                else:
-                    exmap[dates[i]] = (cash0 + pc * (af_ratio / cash_mult - 1.0), stk0)
-                    if verbose:
-                        print(f"[除权推导] {str(dates[i])[:10]} "
-                              f"补记现金分红 {pc * (af_ratio / cash_mult - 1.0):.3f} 元/股")
+                        print(f"[除权推导] {str(dates[i])[:10]} 10送{x10:.2f} (当日分红{d:.3f})")
+            elif x10 >= 1.0 or near_int:
+                exmap[dates[i]] = (cash0, stk0 + x10 / 10.0)
+                if verbose:
+                    print(f"[除权推导] {str(dates[i])[:10]} 10送{x10:.2f} (无分红事件)")
+            else:
+                inferred_cash = pc * (1.0 - known_mult / af_ratio)
+                exmap[dates[i]] = (cash0 + inferred_cash, stk0)
+                if verbose:
+                    print(f"[除权推导] {str(dates[i])[:10]} "
+                          f"补记现金分红 {inferred_cash:.3f} 元/股")
 
     for i in range(n):
         sprice = float(sig[i])
         price = float(exec_c[i])
-        # 1) 除息/除权：前一日收持仓 → 收现金分红（送转同步加股）
+        # 1) 除息/除权：前一日收持仓 → 收现金分红（送转按每股口径同步加股）
         if exmap and shares > 0:
             ev = exmap.get(dates[i])
             if ev is not None:
@@ -352,7 +371,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                     cash_div += shares * cash
                     div_total += shares * cash
                 if stk:
-                    shares += shares * stk / 10.0
+                    shares += shares * stk
         # 2) 再武装：newhigh=创新高; bounce=较本周期低点反弹 rearm_pct
         #    （新高可低于旧高点；先更新 low_since_high 再判反弹 → 创新低当日不触发）
         if p.rearm_mode == "bounce":
@@ -486,13 +505,14 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         "k_level": int(k_level),
         # v8.1.0：本轮首仓价 P0（加仓锚点；0 = 本轮首仓未建立 → 下一触发线 = 首仓线）
         "round_anchor": float(round_anchor),
-        # 下一触发价位（状态机直接投影；brief §2 API 语义）
-        # v8.1.0：k=0 → 首仓线 H×(1−first_drawdown)（双条件①侧；②分位另行展示）；
-        # k≥1 → P0×(1−k×add_step)（加仓锚点 = 本轮首仓价）
-        "next_add_price": (float(round_anchor * (1.0 - k_level * p.add_step))
-                           if (k_level >= 1 and round_anchor > 0.0)
-                           else (float(entry_high * (1.0 - p.first_drawdown))
-                                 if entry_high > 0.0 else None)),
+        # 下一触发价位（状态机直接投影；k_level * add_step >= 1 时无正触发价 → None）
+        "next_add_price": (
+            (float(round_anchor * (1.0 - k_level * p.add_step))
+             if (1.0 - k_level * p.add_step) > 0.0 else None)
+            if (k_level >= 1 and round_anchor > 0.0)
+            else (float(entry_high * (1.0 - p.first_drawdown))
+                  if entry_high > 0.0 else None)
+        ),
         "next_rearm_price": (float(low_since_high * (1.0 + p.rearm_pct))
                              if (p.rearm_mode == "bounce" and low_since_high > 0) else None),
     }
@@ -502,62 +522,61 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
 def aggregate_into(gdates: np.ndarray, g_value: np.ndarray, g_cost: np.ndarray,
                    g_open: np.ndarray, dates: np.ndarray, v_arr: np.ndarray,
                    c_arr: np.ndarray, flag: np.ndarray) -> None:
-    """组合聚合（参考 L404-412 逐行移植）：scatter 到全局轴 + 末值向前结转
-    （停牌/数据截断后持仓不消失）。
+    """组合聚合：在全局日历轴 gdates 上对每只股票做完整前向结转（ffill）。
 
-    注意：结转切片 `g_value[gi[-1]:]` 从该股末 bar 当日开始（含当日）——
-    f6 基线即此行为，"修正"为 [gi[-1]+1:] 会改变 equity_curve 数值，禁止改动。
+    修复原实现两处会计缺陷：
+    1) 窗口中间停牌日持仓不再凭空归零（停牌期间沿用停牌前末值）；
+    2) 消除尾部结转 g_value[gi[-1]:] 对最后一个交易日的双倍重复计入。
     """
-    gi = np.searchsorted(gdates, dates)
-    g_value[gi] += v_arr
-    g_cost[gi] += c_arr
-    g_open[gi] += flag
-    n_dates = len(gdates)
-    if len(gi) and gi[-1] < n_dates - 1:
-        g_value[gi[-1]:] += v_arr[-1]
-        g_cost[gi[-1]:] += c_arr[-1]
-        g_open[gi[-1]:] += flag[-1]
+    if len(dates) == 0 or len(gdates) == 0:
+        return
+    idx = np.searchsorted(dates, gdates, side="right") - 1
+    valid = idx >= 0
+    if not np.any(valid):
+        return
+    vi = idx[valid]
+    g_value[valid] += v_arr[vi]
+    g_cost[valid] += c_arr[vi]
+    g_open[valid] += flag[vi]
 
 
-def pending_exrights_factor(con, codes, now) -> Dict[str, float]:
-    """除权日实时口径修正因子（v7.0.32，Joel 2026-11-10 定案修复）。
-
-    背景：实时价（原始口径）对比触发价（= 后复权档位价 ÷ 湖末 bar 因子）时，
-    **除权日盘中湖末 bar 还是昨日（事件前因子）**——除权缺口未被吸收，触发价
-    比真实除权后口径正好高一个分红幅度，与当日除权跌幅同幅 → 线近时分红一跌
-    即假触线（假买入/加仓信号；当晚 19:30 湖同步后自愈）。
+def pending_exrights_factor(con, codes, now, end: Optional[str] = None) -> Dict[str, float]:
+    """除权日实时口径修正因子（v7.0.32；统一 stk_div 为每股口径 + 支持历史回放上界）。
 
     对每股返回 r_cum = af_new/af_old：已生效（ex_date ≤ now）但 K 线尚未入湖
-    （ex_date > 该股末 bar）的除权事件累计复权比。单事件（现实场景）精确：
-    r = P_prev × (1 + stk_div/10) / (P_prev − cash_dps)，P_prev = 事件前末 bar
-    原始收盘；多事件（湖多日未同步，罕见）顺序模拟、忽略事件间真实价漂移
-    （近似，优于无修正）。无 pending 事件 / now=None / 无数据 → 1.0。
-
-    纯只读两查询（kline_daily 末 bar + dividend_events）；lake 与 martingale
-    零 import 约束不受影响（仅 duckdb API）。
+    （ex_date > 该股截至 end/now 的末 bar）的除权事件累计复权比。
+    公式：r = P_prev × (1 + stk_div) / (P_prev − cash_dps)（同日多事件先聚合求和）。
     """
     out: Dict[str, float] = {str(c): 1.0 for c in codes}
     if not codes or now is None:
         return out
     now_s = str(now)[:10]
+    cap_s = str(end)[:10] if end else now_s
     fmt = ", ".join(["?"] * len(codes))
-    # 每股末 bar（date + 原始收盘）
+    # 每股截至 cap_s 的末 bar（修复历史回放误读未来 MAX(date) 的问题）
     last_bar: Dict[str, tuple] = {}
     con.execute(f"""
         SELECT k.ts_code, CAST(k.date AS VARCHAR) AS d, k.close FROM kline_daily k
         JOIN (SELECT ts_code, MAX(date) AS md FROM kline_daily
-              WHERE ts_code IN ({fmt}) GROUP BY ts_code) m
+              WHERE ts_code IN ({fmt}) AND date <= ? GROUP BY ts_code) m
           ON m.ts_code = k.ts_code AND m.md = k.date
-        WHERE k.ts_code IN ({fmt}) AND k.close > 0""", list(codes) + list(codes))
+        WHERE k.ts_code IN ({fmt}) AND k.close > 0""", list(codes) + [cap_s] + list(codes))
     for c, d, cl in con.fetchall():
         last_bar[str(c)] = (str(d)[:10], float(cl))
-    con.execute(f"""
-        SELECT ts_code, ex_date, COALESCE(cash_dps, 0), COALESCE(stk_div, 0)
-        FROM dividend_events
-        WHERE ts_code IN ({fmt}) AND ex_date IS NOT NULL AND ex_date <= ?
-        ORDER BY ts_code, ex_date""", list(codes) + [now_s])
+    try:
+        con.execute(f"""
+            SELECT ts_code, ex_date,
+                   SUM(COALESCE(cash_dps, 0)) AS cash_dps,
+                   SUM(COALESCE(stk_div, 0)) AS stk_div
+            FROM dividend_events
+            WHERE ts_code IN ({fmt}) AND ex_date IS NOT NULL AND ex_date <= ?
+            GROUP BY ts_code, ex_date
+            ORDER BY ts_code, ex_date""", list(codes) + [now_s])
+        div_rows = con.fetchall()
+    except Exception:  # noqa: BLE001 - 极简合成库无 dividend_events 表 → 无待除权事件
+        return out
     ev: Dict[str, list] = {}
-    for c, d, cash, stk in con.fetchall():
+    for c, d, cash, stk in div_rows:
         ev.setdefault(str(c), []).append((str(d)[:10], float(cash or 0), float(stk or 0)))
     for c in codes:
         cs = str(c)
@@ -572,9 +591,9 @@ def pending_exrights_factor(con, codes, now) -> Dict[str, float]:
             if cur_price <= 0:
                 break
             denom = cur_price - cash
-            if denom <= 0:
-                continue  # cash_dps ≥ 价：数据异常，跳过该事件
-            p_ex = denom / (1.0 + stk / 10.0)
+            if denom <= 0 or (1.0 + stk) <= 0:
+                continue  # 数据异常，跳过该事件
+            p_ex = denom / (1.0 + stk)
             r_cum *= cur_price / p_ex
             cur_price = p_ex
         out[cs] = r_cum
@@ -608,7 +627,7 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
     names, data, divs = load(con, codes=list(codes), start=None, end=end)
     rows: Dict[str, Dict[str, Any]] = {}
     # 除权日实时口径修正（now=参照日；None → 回测/回放路径，零修正）
-    rebase = pending_exrights_factor(con, codes, now) if now is not None else None
+    rebase = pending_exrights_factor(con, codes, now, end=end) if now is not None else None
     for c in codes:
         series = data.get(c)
         if not series or len(series[0]) < 2:
@@ -661,13 +680,35 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
             rows[c]["next_rearm_price_raw"] = round(rows[c]["next_rearm_price"] / f, 4)
         else:
             rows[c]["next_rearm_price_raw"] = None
-        # v8.2.0：用户建仓日起的策略买入累计（仅持仓判断路径；since_map=None
-        # 时整段跳过——回测/新建仓/状态页零影响）
+        # v8.2.0：用户建仓日起的策略买入累计（含建仓日后送转股扩股 + 严格 YYYY-MM-DD 校验）
         if since_map is not None and c in since_map:
-            since = str(since_map[c])[:10]
-            shares_since = sum(b[5] * sp.lot_size for b in _buys
-                               if str(b[0])[:10] >= since)
-            rows[c]["shares_since"] = round(float(shares_since), 2)
+            raw_since = since_map[c]
+            import re as _re
+            if isinstance(raw_since, str) and _re.match(r"^\d{4}-\d{2}-\d{2}$", raw_since.strip()):
+                since = raw_since.strip()
+                # 按时间序重放 since 之后的买入与除权送转（保持与状态机 shares 一致）
+                c_divs = divs.get(c) or {}
+                stk_events = sorted(
+                    (str(d)[:10], float(sd))
+                    for d, (_cd, sd) in c_divs.items() if sd and float(sd) > 0
+                )
+                buy_events = sorted(
+                    (str(b[0])[:10], float(b[5] * sp.lot_size))
+                    for b in _buys if str(b[0])[:10] >= since
+                )
+                # 同日先除权再买入（与 run_stock 顺序一致）
+                ev_timeline = [(d, 0, s) for d, s in stk_events if d >= since] + [
+                    (d, 1, sh) for d, sh in buy_events
+                ]
+                ev_timeline.sort(key=lambda x: (x[0], x[1]))
+                shares_since = 0.0
+                for _d, kind_ev, val_ev in ev_timeline:
+                    if kind_ev == 0:
+                        if shares_since > 0:
+                            shares_since += shares_since * val_ev
+                    else:
+                        shares_since += val_ev
+                rows[c]["shares_since"] = round(float(shares_since), 2)
         if include_buys:
             # 历史触发逐笔（策略状态机口径；date 截到日；k=档下标 0 起，
             # first_of_round=本轮首笔 → 前端渲染「首仓/第 N 档」；

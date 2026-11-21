@@ -11,6 +11,18 @@
 //    立即触发刷新，无订阅者的只标记过期不发请求（旧值保留——重订阅时按 SWR 先返旧值再后台刷新）。
 
 const registry = new Map(); // key -> entry
+const MAX_ENTRIES = 120;
+
+function evictIfNeeded() {
+  if (registry.size <= MAX_ENTRIES) return;
+  for (const [k, entry] of registry) {
+    if (registry.size <= MAX_ENTRIES) break;
+    if (entry.refcount <= 0 && !entry.inFlight) {
+      if (entry.timer) clearInterval(entry.timer.id);
+      registry.delete(k);
+    }
+  }
+}
 
 function now() {
   return Date.now();
@@ -103,6 +115,11 @@ export function subscribe(key, fetcher, opts = {}) {
       lastError: null,
     };
     registry.set(key, entry);
+    evictIfNeeded();
+  } else {
+    // LRU 刷新：移到 Map 尾部
+    registry.delete(key);
+    registry.set(key, entry);
   }
   entry.refcount += 1;
   // 重复订阅（如 key 切换后切回）：更新 fetcher/opts，保证后续刷新用最新闭包
@@ -147,10 +164,16 @@ export function peek(key) {
   return entry ? entry.data : undefined;
 }
 
-// 测试专用：清空整个注册表（含定时器）。生产代码不得调用。
-export function __reset() {
+// 登出/401 会话清理：停所有定时器并清空会话缓存（防止切换账号或未登录态后台继续轮询）。
+export function clearAll() {
   for (const entry of registry.values()) {
     if (entry.timer) clearInterval(entry.timer.id);
+    entry.timer = null;
   }
   registry.clear();
+}
+
+// 测试专用：清空整个注册表（含定时器）。生产代码不得调用。
+export function __reset() {
+  clearAll();
 }

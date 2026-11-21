@@ -152,6 +152,8 @@ def test_d33_p0_multisource_no_production_pollution(tmp_path, monkeypatch):
     import lake.ingest.tencent_ingest as ti
 
     monkeypatch.setattr(ti, "fetch_snapshot", lambda client, ts_codes: {})
+    if not os.path.exists(os.path.join(drv._cache_dir(), "em_dividend_all.csv")):
+        monkeypatch.setattr(drv, "run_t4", lambda con, db_path, ts_codes=None: {"rows": 0, "skipped": True})
 
     # ---- 多源开启 + mock 注册表（get_adapter 零网络）----
     sina = MockAdapter("sina", 0, kline={

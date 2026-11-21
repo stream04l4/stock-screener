@@ -93,6 +93,7 @@ const errMsg = computed(() => (lake.lastError ? "数据湖不可用：" + lake.l
 // > 120s → 视为陈旧（浏览器后台标签 timer 节流，进程退出后快照冻结，本轮事故 Joel
 // 截图 14:44:19 仍显示 14:41:05 的旧 locked 快照）。仅 backfillView 存在时判。
 const staleSnapshot = computed(() => {
+  void lake._tick; // 每轮轮询 tick 触发重算 Date.now() 差值
   const v = lake.backfillView;
   if (!v || !v.updated_at) return false;
   const ts = String(v.updated_at).trim();

@@ -92,18 +92,24 @@ class TencentKlineAdapter:
 
             rows = fetch_with_timeout(_ti.fetch_kline_full_history, client, ts_code)
         else:
-            # 近 N 天窗口（end-start 自然日 → 交易日数估算 ×2/3 + 缓冲）
+            # 近 N 天窗口（按今天回溯 d0 估算交易日数；超 2000 根或历史窗口走分页防 param error）
             import datetime as _dt
-
-            d0 = _dt.date.fromisoformat(start or "1990-01-01")
-            d1 = _dt.date.fromisoformat(end or _dt.date.today().isoformat())
-            n = max(30, int((d1 - d0).days * 0.72) + 60)
             from .common import fetch_with_timeout
 
-            rows = fetch_with_timeout(_ti.fetch_kline_ohlcv, client, ts_code, n=n)
+            today_d = _dt.date.today()
+            d0 = _dt.date.fromisoformat(start or "1990-01-01")
+            n = max(30, int(max(0, (today_d - d0).days) * 0.72) + 60)
+            if n > 2000:
+                rows = fetch_with_timeout(_ti.fetch_kline_full_history, client, ts_code)
+            else:
+                rows = fetch_with_timeout(
+                    _ti._fetch_kline_ohlcv_impl, client, ts_code, n=n, raise_on_error=True)
+            if start:
+                rows = [r for r in rows if r["date"] >= start]
+            if end:
+                rows = [r for r in rows if r["date"] <= end]
             if not rows:
-                # v6.3.5：窗口模式区分"合法空"（停牌/节假日，源可达）与真实失败——
-                # 空窗口=EmptyWindowError（worker 视为完成），全史取空=RuntimeError。
+                # 仅在源可达（未抛 RuntimeError）且过滤后窗口真为空时判 EmptyWindowError
                 if start is not None:
                     raise EmptyWindowError(f"腾讯 K线窗口空 {ts_code} start={start}（停牌/节假日）")
                 raise RuntimeError(f"腾讯 K线取空 {ts_code}（回退下一源）")

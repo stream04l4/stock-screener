@@ -12,9 +12,12 @@ import AppShell from "./components/AppShell.vue";
 import LoginView from "./views/LoginView.vue";
 import { useAuthStore } from "./stores/authStore.js";
 import { useTaskStore } from "./stores/taskStore.js";
+import { useLakeStore } from "./stores/lakeStore.js";
+import { clearAll } from "./live/queryRegistry.js";
 
 const auth = useAuthStore();
 const task = useTaskStore();
+const lake = useLakeStore();
 
 function on401() {
   auth.onUnauthorized();
@@ -28,9 +31,15 @@ onBeforeUnmount(() => {
   window.removeEventListener("auth:401", on401);
 });
 
-// 登录（含刷新后 cookie 有效直进）→ 恢复活动回测任务监控
+// 登录（含刷新后 cookie 有效直进）→ 恢复活动回测任务监控；登出/401 → 停轮询清缓存
 watch(() => auth.user, (u) => {
-  if (u) task.restore();
+  if (u) {
+    task.restore();
+  } else {
+    task.stopMonitors();
+    lake.stopAll();
+    clearAll();
+  }
 });
 </script>
 

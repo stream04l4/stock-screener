@@ -143,9 +143,16 @@ def _batch_call(pro, fn_name: str, trade_date: str, cols: List[str],
             if "次/小时" in msg and not hour_waited:
                 last = exc
                 hour_waited = True
-                log.warning("tushare %s 触 N 次/小时限频 → 等 62min 重试一次: %s",
+                log.warning("tushare %s 触 N 次/小时限频 → 等 62min 重试一次（可响应停止信号）: %s",
                             fn_name, msg[:80])
-                _time.sleep(62 * 60)
+                from .common import _stop_requested
+                rem = 62 * 60
+                while rem > 0:
+                    if _stop_requested():
+                        raise RuntimeError(f"tushare {fn_name} 限频等待期间收到停止信号") from exc
+                    step = min(5, rem)
+                    _time.sleep(step)
+                    rem -= step
                 continue
             if "次/小时" in msg or "次/天" in msg:
                 raise RuntimeError(

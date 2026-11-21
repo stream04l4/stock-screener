@@ -114,13 +114,17 @@ def load_profit_history(con, cache_dir: str, ts_code: str,
         if not stat:
             continue
         period = f"{stat[:4]}Q{(int(stat[5:7]) - 1) // 3 + 1}"
+        gp_raw = to_float(d.get("gpMargin"))
+        # BaoStock gpMargin 为小数比率（如 0.25 表示 25%），对齐 adata 百分数口径
+        gp_pct = (gp_raw * 100.0 if (gp_raw is not None and abs(gp_raw) <= 1.5)
+                  else gp_raw)
         con.execute(
             "INSERT OR REPLACE INTO fundamentals_quarterly "
             "(ts_code, period, pub_date, roe_weighted, yoy_pni, npi, "
             " gross_margin, liability_pct, source, fetched_at, data_version) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             [ts_code, period, clean_date(d.get("pubDate")), None, None,
-             to_float(d.get("netProfit")), to_float(d.get("gpMargin")),
+             to_float(d.get("netProfit")), gp_pct,
              None, source, now_ts(), DATA_VERSION])
         n += 1
     return n

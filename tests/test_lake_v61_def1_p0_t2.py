@@ -119,6 +119,11 @@ def _make_fake_env(monkeypatch, tmp_path, prog_path):
 
     monkeypatch.setattr(ti, "fetch_snapshot", lambda client, ts_codes: {})
 
+    # 离线克隆环境无未入库的 cache/em_dividend_all.csv → 缺文件时 mock T4 避免环境依赖
+    import os as _os
+    if not _os.path.exists(_os.path.join(drv._cache_dir(), "em_dividend_all.csv")):
+        monkeypatch.setattr(drv, "run_t4", lambda con, db_path, ts_codes=None: {"rows": 0, "skipped": True})
+
 
 def _run_p0_t2(monkeypatch, tmp_path, db, days, codes, registry=None):
     """跑 p0 --skip-t1（进程内 main，同 CLI 代码路径）。

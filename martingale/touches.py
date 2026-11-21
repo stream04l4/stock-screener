@@ -90,19 +90,20 @@ def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, A
         trig = trigger_price(row, held=held)
         q = spot.get(c) or {}
         low = q.get("low")
-        if trig is None or low is None or trig <= 0 or low > trig:
+        if trig is None or low is None or trig <= 0 or low <= 0 or low > trig:
             continue
         d = quote_date_of(q.get("timestamp"))
         if d is None:
             continue
-        # 档位/首笔标注按「对该用户是否是加仓」：持仓股 in_pos → 第 k 档加仓；
-        # 非持仓（或持仓未 in_pos）→ 首仓（level=0, first_of_round=True）
-        in_pos_eff = bool(row.get("in_pos")) and held
+        # 档位/首笔标注：仅当持仓且处于轮内加仓档（k>0）才标加仓；
+        # k==0（含再武装后新一轮二次建仓）统一标 first_of_round=True
+        k_lv = row.get("k_level") or 0
+        in_pos_eff = bool(row.get("in_pos")) and held and k_lv > 0
         out.append({
             "ts_code": c,
             "name": row.get("name") or c,
             "date": d,
-            "level": (row.get("k_level") or 0) if in_pos_eff else 0,
+            "level": k_lv if in_pos_eff else 0,
             "first_of_round": not in_pos_eff,
             "level_price": trig,
             "lots": touch_lots(sp, row, held=held),
@@ -112,8 +113,22 @@ def compute_touches(rows: Dict[str, Dict[str, Any]], spot: Dict[str, Dict[str, A
     return out
 
 
+def latest_for_code(alerts: Dict[str, Dict[str, Any]], ts_code: str) -> Optional[Dict[str, Any]]:
+    """从 alerts（支持新键 ts_code|date 及旧裸键 ts_code）取指定股最新一条触碰记录。"""
+    best: Optional[Dict[str, Any]] = None
+    for k, ev in alerts.items():
+        if not isinstance(ev, dict):
+            continue
+        code = ev.get("ts_code") or (k.split("|", 1)[0] if "|" in k else k)
+        if code != ts_code:
+            continue
+        if best is None or str(ev.get("date") or "") > str(best.get("date") or ""):
+            best = ev
+    return best
+
+
 def load_state(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """读触碰事件状态 → {code: event}。缺失/损坏 → {}（fail-safe）。"""
+    """读触碰事件状态 → {key: event}。缺失/损坏 → {}（fail-safe）。"""
     p = path or default_state_path()
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -126,34 +141,52 @@ def load_state(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
 
 def save_state(path: Optional[str], alerts: Dict[str, Dict[str, Any]],
                updated_at: Optional[str] = None) -> None:
-    """原子写（tmp + os.replace，防半截状态，与 position_alert 同模式）。"""
+    """原子写（mkstemp + os.replace，防并发竞争同一 .tmp）。"""
+    import tempfile
     p = path or default_state_path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"updated_at": updated_at or _beijing_now_iso(),
-                   "alerts": alerts}, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(p)),
+                               prefix=".signal_touch.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"updated_at": updated_at or _beijing_now_iso(),
+                       "alerts": alerts}, f, ensure_ascii=False, indent=1, allow_nan=False)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def merge_events(existing: Dict[str, Dict[str, Any]],
                  new: List[Dict[str, Any]],
                  window_days: int = WINDOW_DAYS) -> Dict[str, Dict[str, Any]]:
-    """合并今日事件入历史：每 (代码,日期) 只留最新一条；窗口外的老事件清掉。
+    """合并今日事件入历史：每 (代码, 日期) 保留最新一条；窗口外老事件滚动清理。
 
-    - 同一代码当日重复跑（重跑/补跑）→ 覆盖（幂等）；
-    - 代码当日无新事件 → 保留既有历史条目（次日移入历史信号的数据来源）；
-    - 清理基准 = 全量最大日期 − window_days（文件整体老化，而非按运行日）。
+    键格式统一为 ``f"{ts_code}|{date}"``（同时兼容清理历史遗留裸 ts_code 键）。
     """
-    merged = dict(existing)
+    merged: Dict[str, Dict[str, Any]] = {}
+    for k, ev in existing.items():
+        if not isinstance(ev, dict):
+            continue
+        code = ev.get("ts_code") or (k.split("|", 1)[0] if "|" in k else k)
+        d = ev.get("date")
+        nk = f"{code}|{d}" if d else str(k)
+        merged[nk] = dict(ev)
     for ev in new:
         ev = dict(ev)
-        merged[ev["ts_code"]] = ev
+        d = ev.get("date")
+        nk = f"{ev['ts_code']}|{d}" if d else ev["ts_code"]
+        merged[nk] = ev
     if merged:
-        max_d = max(e["date"] for e in merged.values() if e.get("date"))
-        cutoff = (date.fromisoformat(max_d) - timedelta(days=window_days)).isoformat()
-        merged = {c: e for c, e in merged.items()
-                  if e.get("date") is None or e["date"] >= cutoff}
+        dates_present = [e["date"] for e in merged.values() if e.get("date")]
+        if dates_present:
+            max_d = max(dates_present)
+            cutoff = (date.fromisoformat(max_d) - timedelta(days=window_days)).isoformat()
+            merged = {k: e for k, e in merged.items()
+                      if e.get("date") is None or e["date"] >= cutoff}
     return merged
 
 

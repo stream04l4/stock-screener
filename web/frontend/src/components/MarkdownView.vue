@@ -1,7 +1,8 @@
+<script setup>
 // 极简 markdown 渲染（移植 app.js renderMarkdown/inlineMd，不引 marked——零新依赖零回归）。
 // 先转义再处理：表格 / #/##/### 标题 / - * 列表 / > 引用 / **加粗** / `code`。
-// 输出为结构化节点数组（Vue 渲染），不使用 v-html（安全 + 与旧渲染结果等价）。
-<script setup>
+// 先经 esc() HTML 转义，仅将 **加粗** 和 `code` 替换为受控粗体/代码标签，
+// 再通过块级节点渲染（无任意 HTML 注入风险）。
 import { computed } from "vue";
 
 const props = defineProps({ md: { type: String, default: "" } });

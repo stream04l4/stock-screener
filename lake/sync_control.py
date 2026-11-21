@@ -308,6 +308,7 @@ def start_sync(db_path: Optional[str] = None, sub: str = "history",
     # fail-open：迁移失败只降级为旧行为（随 web 生命周期），不影响 spawn 成功判定。
     _detach_to_own_cgroup(pid)
     deadline = time.monotonic() + 5.0
+    min_observe_until = time.monotonic() + 1.5
     confirmed = False
     reason: Optional[str] = None
     while time.monotonic() < deadline:
@@ -323,12 +324,13 @@ def start_sync(db_path: Optional[str] = None, sub: str = "history",
         if "Traceback (most recent call last)" in new_log:
             reason = f"traceback in log: {new_log.strip().splitlines()[-1][:200]}"
             break
-        # brief 确认条件：锁出现 或 pid 存活+日志无 traceback（此处 rc is None=存活）
+        # 锁出现立即确认；否则至少观察 1.5s 捕获早期导入/参数崩溃
         if lconn.duckdb_available() and lconn.probe_db_state(db) == "locked":
             confirmed = True
             break
-        confirmed = True   # pid 存活 + 无 traceback → 视为 running（driver 尚在启动期）
-        break
+        if time.monotonic() >= min_observe_until:
+            confirmed = True
+            break
     if not confirmed:
         return {"started": False, "pid": pid, "log_path": log_path, "reason": reason}
     return {"started": True, "pid": pid, "log_path": log_path}

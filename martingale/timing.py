@@ -84,15 +84,12 @@ def _years_ago(d: date, years: int) -> date:
 def refresh_timing(con, up: UniverseParams, tp: TimingParams,
                    manual: Optional[Dict[str, Dict[str, Any]]] = None,
                    members: Optional[List[Member]] = None,
-                   verbose: bool = False) -> Dict[str, Any]:
+                   verbose: bool = False,
+                   min_bars: int = 60) -> Dict[str, Any]:
     """候选池逐股算 ①（时机门唯一条件）→ 写入 selection_timing（整表刷新）。
 
-    v7.0.26：② 股息率 / ③ 250 日线计算与数据列一并删除（回测定案无用，
-    不留观察项）；分位 / 窗口回撤保留（页面展示 = 时机门本体）。
-
-    :param con: **写**连接（每日作业在湖增量后独占执行；勿在 Web 请求路径调用）。
-    :param members: 可注入（测试用）；缺省 build_candidate_pool(con, up, manual)。
-    返回 {as_of, n_codes, n_watchlist, n_push, elapsed_s}。
+    与引擎 first_ok_series 统一 min_bars=60 fail-closed 门槛（不足 60 bar
+    可展示参考分位，但 cond_price_low/in_watchlist/push_eligible 恒 False）。
     """
     t0 = time.time()
     ensure_table(con)
@@ -124,13 +121,16 @@ def refresh_timing(con, up: UniverseParams, tp: TimingParams,
     for c in codes:
         m = by_code[c]
         ks = series.get(c)
-        # ① 价格分位 / 窗口回撤（前复权窗口序列；数据不足 → fail-closed False）
+        # ① 价格分位 / 窗口回撤（前复权窗口序列；<min_bars → 决策口径 fail-closed False）
         pctile = dd = None
         if ks and len(ks) >= 2:
             cur_qfq = ks[-1]
             pctile = sum(1 for x in ks if x <= cur_qfq) / len(ks) * 100.0
             dd = (1.0 - cur_qfq / max(ks)) * 100.0
-        cond_price_low = (pctile is not None and pctile <= tp.price_pctile_max)
+        cond_price_low = (
+            ks is not None and len(ks) >= min_bars
+            and pctile is not None and pctile <= tp.price_pctile_max
+        )
         # v7.0.24：时机门 = ① 单条件（②③ 参考展示）；v7.0.26：②③ 彻底删除
         in_watch = bool(cond_price_low)
         push_ok = bool(cond_price_low)
@@ -208,28 +208,10 @@ def _qfq_window_and_factor(con, codes: List[str], tp, now=None):
 
 
 def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
-                    tp, now=None) -> Dict[str, Optional[float]]:
-    """实时分位（v7.0.31）：当前价（前复权折算）在 5 年前复权收盘分布中的秩
-    = #{窗口收盘 ≤ 当前价} / 窗口长度 ×100（v8.1.3 审计 F1：docstring 原
-    「替换窗口末值」为不精确表述——实现是标准秩口径，参考分布不含被检点，
-    下行日较「替换末值」语义低 1/W，仅微信推送通道，量级 ~0.08pp@W≈1250）。
+                    tp, now=None, min_bars: int = 60) -> Dict[str, Optional[float]]:
+    """实时分位（v7.0.31；统一 min_bars=60 fail-closed，与引擎 first_ok_series 一致）。
 
-    微信推送盘中判定用（Joel 2026-11-10 定案 A 案）：refresh_timing 的盘后
-    收盘快照滞后一天——「价格破线 + 分位破 40%」同日达成时，快照只在当晚
-    刷新、推送窗口（15:05 止）早已关闭 → 结构性漏推（山煤国际 2026-11-10
-    实案：前夜 42.00% → 当日 37.95%，价全天在首仓线下）。窗口与
-    refresh_timing 同一口径（kline_daily_qfq、近 N 年、截至湖最新 bar）；
-    现价（原始价）按该股**自身末 bar** 因子折前复权（qfq_now = price ×
-    last_qfq/last_raw；非事件日该因子=末 bar 当日 raw→qfq 换算，误差 ~bp 级）。
-    v7.0.32 除权日修正（now=参照日）：除权日盘中末 bar 是事件前 K 线，
-    前复权窗口停在事件前口径，现价（事件后）须乘 pending 除权累计复权比
-    （engine.pending_exrights_factor，与触发价修正同一因子）对齐窗口口径，
-    否则分位被除权缺口系统性压低（假"时机成熟"）。now=None → 零修正。
-
-    :param prices: {code: 当前原始价（spot；无行情时传湖最后收盘）}；
-      缺/None/≤0 → 该股 None。
-    :return: {code: 分位(0-100) | None}；无 qfq 序列/bar 不足/无因子 →
-      None（fail-closed，调用方按「时机未过」处理）。
+    :return: {code: 分位(0-100) | None}；窗口 bar 数 < min_bars 或缺因子/价 → None。
     """
     series, fac, rebase, _latest = _qfq_window_and_factor(con, codes, tp, now)
     out: Dict[str, Optional[float]] = {}
@@ -237,7 +219,7 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
         ks = series.get(str(c))
         p = prices.get(c)
         f = fac.get(str(c))
-        if not ks or len(ks) < 2 or p is None or p <= 0 or not f:
+        if not ks or len(ks) < min_bars or p is None or p <= 0 or not f:
             out[c] = None
             continue
         cur = float(p) * f * rebase.get(str(c), 1.0)
@@ -245,20 +227,15 @@ def live_pctile_map(con, codes: List[str], prices: Dict[str, Optional[float]],
     return out
 
 
-def first_timing_price_map(con, codes: List[str], tp, now=None) -> Dict[str, Optional[float]]:
-    """时机线价（v8.2.0 补，Joel 2026-11-20 拍板）：首仓双条件②「5 年分位 ≤
-    price_pctile_max%」对应的 **RAW 价格线**——低于该价②成立、高于则不成立，
-    即引擎时机门的翻线价。首仓实际触发 = ①价破首仓线 AND ②价 ≤ 本线 →
-    有效触发价 = min(首仓线, 时机线)。
+def first_timing_price_map(con, codes: List[str], tp, now=None,
+                           min_bars: int = 60) -> Dict[str, Optional[float]]:
+    """时机线价：首仓双条件②「5 年分位 ≤ price_pctile_max%」对应的最大有效 RAW 价格线。
 
-    口径与 live_pctile_map 逐位一致（同一窗口加载 _qfq_window_and_factor：
-    标准秩 #{窗口 qfq 收盘 ≤ 被检价}/W×100、窗口=近 N 年 qfq 截至湖最新 bar、
-    因子=各股自身末 bar raw→qfq、除权日 pending 因子）→ 页面显示的时机线
-    即引擎分位恰好 = price_pctile_max% 的那个价，翻线不漂移。
-
-    P* = sorted(窗口)[ceil(pct_max×W)−1]（满足秩 ≥ pct_max 的最小价；
-    重复值取低侧，与「≤ 被检价」秩口径一致）。W < 60 → None（与引擎
-    first_ok_series min_bars=60 fail-closed 同门槛）；无因子 → None。
+    严格满足 #{x ∈ 窗口 : x ≤ P*_qfq} / W ≤ k：
+    - m = floor(k * W)；若 m <= 0 → None（无解）；
+    - sk = sorted(ks)；若 m == W → P*_qfq = sk[-1]；
+    - 否则若边界存在重复值（sk[m] == sk[m - 1]），向左收缩至严格小于 sk[m] 的最大元素
+      （因为 <= 会把所有等于 sk[m] 的元素一并计入导致分位 > k；若全等无解 → None）。
     """
     out: Dict[str, Optional[float]] = {c: None for c in codes}
     if not codes:
@@ -269,10 +246,25 @@ def first_timing_price_map(con, codes: List[str], tp, now=None) -> Dict[str, Opt
     for c in codes:
         ks = series.get(str(c))
         f = fac.get(str(c))
-        if not ks or len(ks) < 60 or not f:
+        if not ks or len(ks) < min_bars or not f:
             continue
-        idx = max(0, math.ceil(k * len(ks)) - 1)
-        p_qfq = sorted(ks)[idx]
+        w = len(ks)
+        m = math.floor(k * w)
+        if m <= 0:
+            continue
+        sk = sorted(ks)
+        if m >= w:
+            p_qfq = sk[-1]
+        else:
+            idx = m - 1
+            if sk[m] == sk[idx]:
+                # 边界值与右侧相等 → 选该值会让计数 ≥ m+1 > k*W，向左找严格更小值
+                val = sk[m]
+                while idx >= 0 and sk[idx] == val:
+                    idx -= 1
+                if idx < 0:
+                    continue
+            p_qfq = sk[idx]
         out[c] = p_qfq / (f * rebase.get(str(c), 1.0))
     return out
 

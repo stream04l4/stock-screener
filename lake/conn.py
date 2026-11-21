@@ -112,18 +112,24 @@ def _check_invalid_db_file(db_path: str) -> None:
         raise LakeInvalidFile(db_path)
 
 
-def _connect_or_raise_invalid(duckdb, db_path: str):
+def _connect_or_raise_invalid(duckdb, db_path: str, read_only: bool = False):
     """duckdb.connect 的归一包装（v6.0.4 起同时覆盖"锁被持有"）：
 
+    - read_only=True 时：`:memory:` 不支持只读自动切 False；若同进程已以 RW
+      模式打开同一库（触发 DuckDB different configuration），安全回退 RW 避免假报错。
     - IO Error "Could not set lock … Conflicting lock is held (PID n)" →
-      :class:`LakeLocked`（**先判**——见 _LOCKED_DB_MARKERS 处注释；持锁 PID 尽力解析）。
-    - IO Error "not a valid DuckDB database file" → :class:`LakeInvalidFile`
-      （覆盖非 0 字节但内容损坏的文件）。
-    - 其余异常原样上抛。
+      :class:`LakeLocked`（**先判**——持锁 PID 尽力解析）。
+    - IO Error "not a valid DuckDB database file" → :class:`LakeInvalidFile`。
     """
+    ro = bool(read_only) and db_path != ":memory:"
     try:
-        return duckdb.connect(db_path)
-    except Exception as exc:  # noqa: BLE001 - 仅归一两类已知 IO Error，其余透传
+        return duckdb.connect(db_path, read_only=ro)
+    except Exception as exc:  # noqa: BLE001 - 仅归一已知 IO/Config Error，其余透传
+        if ro and "different configuration" in str(exc).lower():
+            try:
+                return duckdb.connect(db_path, read_only=False)
+            except Exception as exc2:  # noqa: BLE001
+                exc = exc2
         if _is_locked_db_error(exc):
             raise LakeLocked(db_path, parse_lock_holder_pid(str(exc))) from exc
         if _is_invalid_db_error(exc):
@@ -197,23 +203,12 @@ def get_conn():
     return _conn
 
 
-def connect_existing(db_path: Optional[str] = None):
-    """轻量只读短连接（Web 端点每请求专用）：仅 duckdb.connect，**不执行 init_schema**。
+def connect_existing(db_path: Optional[str] = None, read_only: Optional[bool] = None):
+    """轻量短连接（跳过 init_schema；对已存在的库文件默认 read_only=True）。
 
-    v6.0.1 D-4：lake.web_api 原用 get_conn() 进程级单例跨 FastAPI 线程池并发
-    execute → 结果集交错/500。改为每请求新开短连接（DuckDB 文件库支持多连接
-    并发读），用完即 close。
-
-    - **不走 :func:`open`**：open() 每次执行 init_schema 全量 DDL，每请求跑一遍
-      不可接受；Web 只读，schema 由 backfill（写路径）负责建立。
-    - 文件不存在/打不开 → duckdb 抛错，由调用方（web_api._con）转 503。
-    - **D-1（v6.0.3 rework）**：0 字节/无效库文件 → :class:`LakeInvalidFile`
-      （connect 前 size 探测 + connect IO Error 归一，双保险）。
-    - **v6.0.4**：库被另一进程独占写锁持有（灌数中）→ :class:`LakeLocked`
-      （connect IO Error 文案归一；持锁 PID 尽力解析进 holder_pid）。
-    - 不触碰进程级单例 ``_conn``——与写路径完全隔离。
-
-    :param db_path: 缺省 = default_db_path()；测试可传 tmp 库路径。
+    - 已存在的磁盘库默认以 read_only=True 打开（与 martingale.data 同口径），
+      彻底消除 DuckDB 1.5.5 同进程 RO/RW 混开触发的 different configuration 冲突；
+    - 不存在的文件或 `:memory:` 默认 read_only=False（保持创建空库不建 schema 契约）。
     """
     if not duckdb_available():
         raise LakeUnavailable("duckdb 未安装（uv sync --extra lake）")
@@ -221,7 +216,11 @@ def connect_existing(db_path: Optional[str] = None):
 
     p = db_path or default_db_path()
     _check_invalid_db_file(p)
-    return _connect_or_raise_invalid(duckdb, p)
+    if read_only is None:
+        ro = (p != ":memory:") and os.path.exists(p)
+    else:
+        ro = bool(read_only)
+    return _connect_or_raise_invalid(duckdb, p, read_only=ro)
 
 
 def probe_db_state(db_path: Optional[str] = None) -> str:
@@ -253,7 +252,7 @@ def probe_db_state(db_path: Optional[str] = None) -> str:
         return "unavailable"
     try:
         _check_invalid_db_file(p)  # size==0 → LakeInvalidFile → unavailable
-        con = _connect_or_raise_invalid(duckdb, p)
+        con = _connect_or_raise_invalid(duckdb, p, read_only=True)
     except LakeLocked:
         return "locked"
     except Exception:  # noqa: BLE001 - LakeInvalidFile / 其它 IO Error → unavailable
@@ -309,23 +308,27 @@ class LakeLock:
 # Parquet 导出（Q5：按 date hive 分区 + zstd）
 # ---------------------------------------------------------------------------
 def export_parquet(table: str, out_dir: Optional[str] = None, con=None) -> str:
-    """COPY table → out_dir/<table>/date=YYYY-MM-DD/*.parquet（zstd）。返回目录。
+    """COPY table → out_dir/<table>/（有 date 列按 date hive 分区 + zstd）。返回目录。
 
     :param con: 可选显式连接（测试用 tmp 库）；缺省用单例 get_conn()。
     """
     con = con or get_conn()
-    out_dir = out_dir or os.path.join(
-        _project_root(), "data", "lake", "parquet", table)
-    os.makedirs(out_dir, exist_ok=True)
-    target = os.path.join(out_dir, table)
-    # hive 分区：PARTITION_BY(date)；zstd 压缩（Q5）。
-    # OVERWRITE：目标目录非空时先清空再写——v6.0.1 D-2 修复：无此选项时
-    # 对同一目标二次导出必抛 "Directory ... is not empty! Enable OVERWRITE"，
-    # 破坏 P2 快照"同目录重导 = 幂等覆盖"的语义。
-    con.execute(
-        f"COPY (SELECT * FROM {table}) TO '{target}' "
-        "(FORMAT PARQUET, PARTITION_BY (date), COMPRESSION zstd, OVERWRITE)"
-    )
+    base = out_dir or os.path.join(_project_root(), "data", "lake", "parquet")
+    os.makedirs(base, exist_ok=True)
+    target = os.path.join(base, table)
+    cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+    if "date" in cols:
+        con.execute(
+            f"COPY (SELECT * FROM {table}) TO '{target}' "
+            "(FORMAT PARQUET, PARTITION_BY (date), COMPRESSION zstd, OVERWRITE)"
+        )
+    else:
+        os.makedirs(target, exist_ok=True)
+        out_file = os.path.join(target, "data.parquet")
+        con.execute(
+            f"COPY (SELECT * FROM {table}) TO '{out_file}' "
+            "(FORMAT PARQUET, COMPRESSION zstd)"
+        )
     return target
 
 

@@ -124,12 +124,18 @@ def _lake_spot(codes) -> Dict[str, Dict[str, Any]]:
 
 
 def _up_read() -> Dict[str, Any]:
-    """读用户持仓账本（与 web.app._up_read 同口径；缺省/损坏 → {}）。"""
+    """读用户持仓账本（与 web.app._up_read 同口径：兼容 {"positions": {...}} 与旧扁平格式）。"""
     if not os.path.exists(USER_POSITIONS_PATH):
         return {}
     try:
         with open(USER_POSITIONS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        pos = data.get("positions")
+        if isinstance(pos, dict):
+            return {k: v for k, v in pos.items() if isinstance(v, dict)}
+        # 向后兼容无外层 positions 包装的旧测试 fixture
         return {k: v for k, v in data.items() if isinstance(v, dict)}
     except (OSError, ValueError):
         return {}
@@ -149,17 +155,18 @@ def run(dry_run: bool = False) -> int:
 
     rows = None
     universe: list = []
+    _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
+    since_map = {
+        c: (u.get("since_date") or "")
+        for c, u in user.items() if isinstance(u, dict) and u.get("since_date")
+    }
     for _attempt in range(_LAKE_RETRY_ATTEMPTS):
         try:
-            # v8.1.0：tp = 首仓双条件②参数（状态机与回测同口径）
             _sp2, _up2, con, pool = _load_pool_ctx()
             try:
                 universe = sorted(set(pool.codes) | set(user.keys()))
-                # v7.0.32 除权日修正参照日（北京日期）：正常 20:05 跑时湖已同步
-                # 当日 bar（无 pending 事件、零影响）；湖同步失败日兜底生效
-                _bj_today = datetime.now(timezone(timedelta(hours=8))).date()
                 rows = state_rows(_sp2, con, universe, include_buys=True,
-                                  now=_bj_today, tp=_tp_cfg)
+                                  now=_bj_today, tp=_tp_cfg, since_map=since_map)
             finally:
                 con.close()
             break
@@ -177,7 +184,6 @@ def run(dry_run: bool = False) -> int:
         return 0
 
     # 2) 实时行情（批量一次；high/low = 最新行情日当日高/低）
-    # v1.1（Gate 3，设计 §5）：一主一备统一入口（腾讯主 → push2delay 备，整批切换）
     spot = {}
     try:
         from screener.data.realtime import fetch_spot
@@ -187,7 +193,6 @@ def run(dry_run: bool = False) -> int:
         log.warning("实时行情主备皆败: %s", exc)
         spot = {}
     if not any(v.get("low") is not None for v in spot.values()):
-        # v8.2.0 补：实时主备皆败（WAF/降级）→ 本地湖兜底（零网络）
         log.warning("行情整体失败（无当日 low）→ 本地湖兜底（kline_daily 最新 bar）")
         lake_spot = _lake_spot(universe)
         if lake_spot:
@@ -197,11 +202,46 @@ def run(dry_run: bool = False) -> int:
             log.warning("行情+湖兜底皆败（下轮重试，不清状态）")
             return 4
 
-    # 3) 触碰事件（date = 各股行情日；停牌股行情停在旧日 → 落旧日，不污染当日）。
-    #    held_codes = 持仓账本：持仓股按加仓档口径、非持仓按首仓线口径（v7.0.23
-    #    与页面信号线同一分支 touches.trigger_price(row, held)）
-    events = touches.compute_touches(rows, spot, _sp2,
-                                     held_codes=frozenset(user))
+    # 3) 触碰事件：与 Web/微信统一接入「首仓时机门 + 持仓差值门」，防高分位/已够仓污染历史
+    raw_events = touches.compute_touches(rows, spot, _sp2,
+                                         held_codes=frozenset(user))
+    events = []
+    if raw_events:
+        # 对触碰首仓（first_of_round=True）计算当日最低价实时分位；失败则不额外过滤以免全丢
+        first_codes = [ev["ts_code"] for ev in raw_events if ev.get("first_of_round")]
+        live_pct: Dict[str, Optional[float]] = {}
+        if first_codes:
+            try:
+                from martingale.data import connect_readonly
+                from martingale.timing import live_pctile_map
+                con_t = connect_readonly(None)
+                try:
+                    pm = {ev["ts_code"]: ev.get("low_price") or ev.get("price")
+                          for ev in raw_events if ev.get("first_of_round")}
+                    live_pct = live_pctile_map(con_t, first_codes, pm, _tp_cfg, now=_bj_today)
+                finally:
+                    con_t.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("触碰时机门计算失败（保留原触碰集）: %s", exc)
+                live_pct = {}
+        from martingale.signals import judge_held_lots
+        for ev in raw_events:
+            c = ev["ts_code"]
+            if ev.get("first_of_round") and first_codes and live_pct:
+                pct = live_pct.get(c)
+                if pct is None or pct > _tp_cfg.price_pctile_max:
+                    continue
+            if c in user and isinstance(user[c], dict):
+                r = rows.get(c) or {}
+                k_lv = r.get("k_level") or 0
+                sug, _extra, judged = judge_held_lots(
+                    _sp2, k_lv, bool(r.get("in_pos")), ev.get("lots"),
+                    r.get("shares_since"), float(user[c].get("shares") or 0))
+                if judged and sug is None:
+                    continue  # 持仓已够，不记触碰
+                if sug is not None:
+                    ev["lots"] = sug
+            events.append(ev)
     if not events:
         log.info("无触碰（%d 只检查完毕）", len(universe))
         return 0

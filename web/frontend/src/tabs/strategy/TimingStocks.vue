@@ -41,6 +41,7 @@ async function saveAdd(r) {
     msg[r.ts_code] = { ok: true, text: `已加入「我的持仓」（${r.name} ${shares} 股 @${cost}），持仓策略接管后续档位` };
     delete open[r.ts_code];
     invalidate("my_positions");
+    invalidate("strategy_signals");
   } catch (e) {
     msg[r.ts_code] = { ok: false, text: String((e && e.message) || e) };
   } finally {
@@ -104,7 +105,7 @@ function fmt(v, suffix = "") {
               </td>
             </tr>
             <tr v-if="open[r.ts_code]" class="ts-add-row">
-              <td :colspan="8">
+              <td :colspan="7">
                 <span class="ts-add-label">加入我的持仓 · {{ r.name }}</span>
                 <input v-model="open[r.ts_code].shares" class="inp num ts-inp"
                        placeholder="股数（如 1000）" @keyup.enter="saveAdd(r)" />

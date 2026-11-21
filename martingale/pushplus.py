@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-PUSHPLUS_SEND_URL = "http://www.pushplus.plus/send"
+PUSHPLUS_SEND_URL = "https://www.pushplus.plus/send"
 
 
 def load_token(env_path: Optional[str] = None) -> Optional[str]:

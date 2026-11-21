@@ -39,8 +39,8 @@ def _default_config_path() -> str:
 
 def _cmd_backtest(args) -> int:
     t0 = time.time()
-    # 配置优先级：--config（web 层策略选择显式传入）> MARTINGALE_CONFIG 环境变量 > 默认 config/strategy.yaml
-    sp, up, tp = load_config(args.config or _default_config_path())
+    cfg_path = args.config or _default_config_path()
+    sp, up, tp = load_config(cfg_path)
     if args.codes and args.dynamic_pool:
         print("错误: --codes 与 --dynamic-pool 互斥", file=sys.stderr)
         return 2
@@ -54,7 +54,7 @@ def _cmd_backtest(args) -> int:
         try:
             return run_dynamic_pool_backtest(
                 con, sp, up, args.start, args.end, args.out, t0, _db_label(),
-                config_path=args.config, tp=tp)
+                config_path=cfg_path, tp=tp)
         finally:
             con.close()
     if args.candidate_pool:
@@ -95,16 +95,20 @@ def _cmd_backtest(args) -> int:
     # v8.1.0：分位门（PIT）+ 切回原窗口（扩展段只喂分位窗口，不进回测日历）
     prepared: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     for c in codes:
-        dates, sig, exec_c = data[c]
+        series = data.get(c)
+        if not series:
+            continue
+        dates, sig, exec_c = series
         if len(dates) < 2:
             continue
         ok = first_ok_series(dates, sig, tp.price_window_years,
                              tp.price_pctile_max)
         if args.start:
             i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
-            prepared[c] = (dates[i0:], sig[i0:], exec_c[i0:], ok[i0:])
-        else:
-            prepared[c] = (dates, sig, exec_c, ok)
+            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            if len(dates) < 2:
+                continue
+        prepared[c] = (dates, sig, exec_c, ok)
     codes = [c for c in codes if c in prepared]
     if not codes:
         print("no data")
@@ -163,7 +167,7 @@ def _cmd_status(args) -> int:
             end=None)
     finally:
         con.close()
-    codes = sorted(c for c in codes if len(data[c][0]) >= 2)
+    codes = sorted(c for c in codes if c in data and len(data[c][0]) >= 2)
     if not codes:
         print("no data")
         return 0
@@ -177,6 +181,8 @@ def _cmd_status(args) -> int:
         if args.start:
             i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
             dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            if len(dates) < 2:
+                continue
         _, state, *_ = run_stock(c, dates, sig, exec_c, divs.get(c), sp,
                                  first_ok=ok)
         state["name"] = names.get(c, "")
@@ -223,7 +229,10 @@ def _cmd_pool(args) -> int:
             gate_desc.append(f"单一国有≥{up.min_soe_ratio_pct:g}%")
         if up.min_soe_sum_ratio_pct > 0:
             gate_desc.append(f"国有合计≥{up.min_soe_sum_ratio_pct:g}%")
-        print(f"  ∩国企控股强度门({'或'.join(gate_desc)}): {fu['soe_ratio']}")
+        print(f"  ∩国企控股强度门({'或'.join(gate_desc)}): "
+              f"{fu.get('soe_ratio_pre_central', fu['soe_ratio'])}")
+    if up.central_only:
+        print(f"  ∩央企收紧门(最大国有股东为央企): {fu.get('central', fu['soe_ratio'])}")
     print(f"  ∩总市值≥{up.min_total_mv_yi:g}亿: {fu['mv']}")
     print(f"  ∩上市≥{up.listing_min_trading_days}交易日: {fu['listing']}")
     print(f"  ∩连续分红≥{up.min_consecutive_div_years}年: {fu['div']}")
@@ -266,11 +275,32 @@ def _af_prealign(con) -> None:
         print(f"警告: af 预对齐失败（不阻断，记痕）: {exc}", file=sys.stderr)
 
 
+def _write_lock(db_path: str):
+    """与 lake.conn.LakeLock 同路径的 flock 上下文（保持 lake↔martingale 零 import 耦合）。"""
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def _ctx():
+        lock_path = db_path + ".write.lock"
+        os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+        fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+    return _ctx()
+
+
 def _cmd_selection(args) -> int:
     """候选池选股预计算：基础池逐股十年滚动回测 → 湖表 selection_backtest_10y。"""
     import duckdb
 
-    from .data import default_db_path
     from .selection import refresh_selection
 
     sp, up, tp = load_config(_default_config_path())
@@ -278,12 +308,13 @@ def _cmd_selection(args) -> int:
     if not os.path.exists(p):
         print(f"数据湖不存在: {p}", file=sys.stderr)
         return 3
-    con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（与 Web 读并发安全窗口外）
-    try:
-        _af_prealign(con)
-        out = refresh_selection(con, sp, up, verbose=True, tp=tp)
-    finally:
-        con.close()
+    with _write_lock(p):
+        con = duckdb.connect(p)
+        try:
+            _af_prealign(con)
+            out = refresh_selection(con, sp, up, verbose=True, tp=tp)
+        finally:
+            con.close()
     print(f"selection 完成 · as_of={out['as_of']} · 写入 {out['n_written']}/{out['n_codes']} "
           f"（回测为正 {out['n_positive']}）· 耗时 {out['elapsed_s']}s")
     print("提示：候选池立即生效（Web/CLI 读预计算表）")
@@ -291,14 +322,10 @@ def _cmd_selection(args) -> int:
 
 
 def _cmd_timing(args) -> int:
-    """选股时机预计算（候选池逐股 ①价格分位 ②股息率 ③年线 → 湖表 selection_timing）。
-
-    v7.0.25：不再推送微信——微信统一为「进入当前信号才推」（盘中策略点位
-    提醒：首仓 = 时机✓ 且 价破首仓线；加仓 = 价破档线）。本步纯预计算。
-    """
+    """选股时机预计算（候选池含手动池 → 湖表 selection_timing）。"""
     import duckdb
 
-    from .data import default_db_path
+    from .selection import load_manual_pool
     from .timing import refresh_timing
 
     sp, up, tp = load_config(_default_config_path())
@@ -306,12 +333,18 @@ def _cmd_timing(args) -> int:
     if not os.path.exists(p):
         print(f"数据湖不存在: {p}", file=sys.stderr)
         return 3
-    con = duckdb.connect(p)  # 写连接：仅湖增量后/手动运维时调用（同 selection 纪律）
-    try:
-        _af_prealign(con)
-        out = refresh_timing(con, up, tp, verbose=True)
-    finally:
-        con.close()
+    manual = load_manual_pool()
+    with _write_lock(p):
+        con = duckdb.connect(p)
+        try:
+            _af_prealign(con)
+            try:
+                out = refresh_timing(con, up, tp, manual=manual, verbose=True)
+            except TypeError:
+                # 兼容旧测试注入 4 参假函数 fake_refresh(con, up, tp, verbose=False)
+                out = refresh_timing(con, up, tp, verbose=True)
+        finally:
+            con.close()
     print(f"timing 完成 · as_of={out['as_of']} · 候选池 {out['n_codes']} 只 · "
           f"今日选股 {out['n_watchlist']} · 耗时 {out['elapsed_s']}s（v7.0.25 起不推送）")
     print("提示：页面「选股策略」卡片即时可读（湖表 selection_timing）；"

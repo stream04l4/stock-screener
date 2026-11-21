@@ -158,13 +158,14 @@ def _normalize_row(x: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _fetch_all_pages(url: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """EU 直连分页拉全（56 页；页间 0.2s；单页 3 次退避重试）。"""
+    """EU 直连分页拉全（56 页；fid=f12 固定排序 + 按代码去重防翻页漏股）。"""
     rows_raw: List[Dict[str, Any]] = []
+    seen_codes: Set[str] = set()
     page = 1
     total: Optional[int] = None
     while True:
         d = _get_json(url, {
-            "pn": page, "pz": _PAGE_SIZE, "po": 1, "np": 1,
+            "pn": page, "pz": _PAGE_SIZE, "po": 0, "np": 1, "fid": "f12",
             "ut": _UT, "fltt": 2, "invt": 2, "fs": _FS_A, "fields": _FIELDS,
         })
         data = d.get("data") or {}
@@ -172,23 +173,31 @@ def _fetch_all_pages(url: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
         diff = data.get("diff") or []
         if not diff:
             break
-        rows_raw.extend(diff)
-        if total is None or len(rows_raw) >= int(total):
+        added = 0
+        for item in diff:
+            c = str(item.get("f12") or "").strip()
+            if c and c in seen_codes:
+                continue
+            if c:
+                seen_codes.add(c)
+            rows_raw.append(item)
+            added += 1
+        if total is None or len(rows_raw) >= int(total) or added == 0:
             break
-        if len(rows_raw) > int(total) + _PAGE_SIZE:   # 接口漂移保护（防死循环）
+        if page > int(total) // _PAGE_SIZE + 5:   # 接口漂移保护（防死循环）
             break
         page += 1
         time.sleep(0.2)   # 分页小睡（限速纪律；push2 连发易 502）
     return rows_raw, total
 
 
-# SG 远程取数脚本（stdlib only；在 oci 上执行，push2delay 直连+分页+退避）
+# SG 远程取数脚本（stdlib only；在 oci 上执行，push2delay 直连+固定排序+去重分页）
 _SG_FETCH_SCRIPT = r'''
 import json, time, urllib.parse, urllib.request
 URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
-Q0 = {"pz": 100, "po": 1, "np": 1, "ut": "__UT__", "fltt": 2, "invt": 2,
+Q0 = {"pz": 100, "po": 0, "np": 1, "fid": "f12", "ut": "__UT__", "fltt": 2, "invt": 2,
       "fs": "__FS__", "fields": "__FIELDS__"}
-out, page, total = [], 1, None
+out, seen, page, total = [], set(), 1, None
 while True:
     q = dict(Q0); q["pn"] = page
     url = URL + "?" + urllib.parse.urlencode(q)
@@ -207,9 +216,17 @@ while True:
     diff = d.get("diff") or []
     if not diff:
         break
-    out.extend(diff)
+    added = 0
+    for item in diff:
+        c = str(item.get("f12") or "").strip()
+        if c and c in seen:
+            continue
+        if c:
+            seen.add(c)
+        out.append(item)
+        added += 1
     total = d.get("total")
-    if total and len(out) >= int(total):
+    if (total and len(out) >= int(total)) or added == 0 or page > 100:
         break
     page += 1
     time.sleep(0.2)
@@ -341,21 +358,21 @@ def derive_af_batch(con, trade_date: str,
             f"东财 af 推导遇配股事件 {len(_allot)} 条（无配股价字段，fail-closed）："
             + ", ".join(f"{e['ts_code']}({e.get('plan','')})" for e in _allot[:3]))
 
-    # 1) 全市场前一日 af level（本地 SQL；(ts_code,date) 二级索引，~1-2s）。
-    # 铁律（2026-11-20）：取**最近非 NULL** af 行（而非 MAX(date) 行）——最新行
-    # af=NULL（批量 af 失败日）时，若以 1.0 起步即为引入新锚点（假断崖隐患）。
+    # 1) 全市场 trade_date 之前最近非 NULL af level（必须加 AND date < ?，
+    #    否则除权日当天重跑会把当日已乘过一次 step 的 af 当基数再乘一次 → 双重复权）。
     levels: Dict[str, Optional[float]] = {}
     for ts, af in con.execute(
             "SELECT ts_code, adj_factor FROM kline_daily "
             "WHERE (ts_code, date) IN "
             "(SELECT ts_code, MAX(date) FROM kline_daily "
-            " WHERE adj_factor IS NOT NULL AND adj_factor > 0 "
+            " WHERE date < ? AND adj_factor IS NOT NULL AND adj_factor > 0 "
             " GROUP BY ts_code) "
-            "AND adj_factor IS NOT NULL").fetchall():
+            "AND adj_factor IS NOT NULL", [trade_date]).fetchall():
         levels[ts] = af
-    # 2) 事件股的 c0（D 前最近 close；只查事件股 ≤20 只/日）
+    # 2) 事件股的 c0（D 前最近 close；只查事件股 ≤20 只/日）与是否有历史 K线行
     ev_codes = sorted({e["ts_code"] for e in events})
     c0_map: Dict[str, float] = {}
+    has_hist_kline: Set[str] = set()
     if ev_codes:
         ph = ",".join("?" * len(ev_codes))
         for ts, c0 in con.execute(
@@ -364,35 +381,82 @@ def derive_af_batch(con, trade_date: str,
                 f"(SELECT ts_code, MAX(date) FROM kline_daily "
                 f"WHERE date < ? AND ts_code IN ({ph}) GROUP BY ts_code)",
                 [trade_date] + ev_codes).fetchall():
+            has_hist_kline.add(ts)
             if c0 is not None:
                 c0_map[ts] = float(c0)
 
-    out: Dict[str, Dict[str, float]] = {}
+    out: Dict[str, Dict[str, Optional[float]]] = {}
     for ts, af_prev in levels.items():
         if af_prev is not None:
             out[ts] = {trade_date: float(af_prev)}
         # af_prev 为 None（历史 af 全 NULL 的股）→ 不写（保持 NULL，同 adj_map=None）
+
+    # 3) 按 ts_code 聚合当日全部事件（防同日多笔分红/送转重复连乘 c0）
+    agg_ev: Dict[str, Dict[str, Any]] = {}
     for e in events:
         ts = e["ts_code"]
+        rec = agg_ev.setdefault(ts, {"cash": 0.0, "bonus": 0.0, "plans": []})
+        rec["cash"] += float(e.get("cash") or 0.0)
+        rec["bonus"] += float(e.get("bonus") or 0.0)
+        if e.get("plan"):
+            rec["plans"].append(str(e["plan"]))
+
+    for ts, rec in agg_ev.items():
         c0 = c0_map.get(ts)
-        if c0 is None:
-            log.warning("af 推导: %s 无 D-1 close（停牌？）→ 沿用前值", ts)
+        if c0 is None or c0 <= 0:
+            log.warning("af 推导: %s 无 D-1 close（停牌/缺数据）→ 跳过写入", ts)
+            out.pop(ts, None)
             continue
-        cash = e.get("cash") or 0.0
-        bonus = e.get("bonus") or 0.0
+        cash = rec["cash"]
+        bonus = rec["bonus"]
         denom = c0 - cash
         if denom <= 0:
             raise EmBatchError(
                 f"af 推导异常: {ts} c0={c0} cash={cash} 步长分母非正（数据异常，"
-                f"fail-closed；plan={e.get('plan','')}")
+                f"fail-closed；plan={','.join(rec['plans'])[:60]}")
         step = c0 * (1.0 + bonus) / denom
         base = out.get(ts, {}).get(trade_date)
         if base is None:
-            # 事件股但无历史 af（新股除权/历史缺失）→ 以 1.0 起步（tushare 口径）
+            # SQL 已按 date < trade_date AND adj_factor IS NOT NULL 查过全史，
+            # 能走到此处表示历史上无任何非 NULL af，以 1.0 起步不产生断崖
             base = 1.0
-            log.warning("af 推导: %s 无历史 af → 以 1.0 起步（新股除权？）", ts)
+            log.warning("af 推导: %s 历史无非 NULL af → 以 1.0 起步", ts)
         out[ts] = {trade_date: base * step}
     return out
+
+
+def load_ex_events(con, trade_date: str, events: List[Dict[str, Any]],
+                   source: str = "em_datacenter") -> int:
+    """将每日抓到的除权事件增量落库到 dividend_events（幂等事务写）。
+
+    stk_div 统一按每股送转股数（bonus）存储，与 cash_dps（元/股）同口径。
+    """
+    from .common import DATA_VERSION, now_ts, replace_where
+
+    if not events:
+        return 0
+    by_key: Dict[Tuple[str, str], List[List[Any]]] = {}
+    ts_now = now_ts()
+    for e in events:
+        if e.get("has_allot"):
+            continue
+        ts = e.get("ts_code")
+        ex_d = e.get("ex_date") or trade_date
+        cash = float(e.get("cash") or 0.0)
+        bonus = float(e.get("bonus") or 0.0)
+        if not ts or not ex_d or (cash == 0.0 and bonus == 0.0):
+            continue
+        period = str(ex_d)[:4]
+        by_key.setdefault((ts, ex_d), []).append([
+            ts, ex_d, None, period, cash, bonus, source, ts_now, DATA_VERSION,
+        ])
+    cols = ["ts_code", "ex_date", "ann_date", "period", "cash_dps",
+            "stk_div", "source", "fetched_at", "data_version"]
+    written = 0
+    for (ts, ex_d), rows in by_key.items():
+        written += replace_where(
+            con, "dividend_events", "ts_code=? AND ex_date=?", [ts, ex_d], cols, rows)
+    return written
 
 
 def active_code_set(snap: List[Dict[str, Any]]) -> Set[str]:

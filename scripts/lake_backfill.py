@@ -304,30 +304,35 @@ def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
     # 写回——新上市股无旧行 → NULL，正确）。
     df_l = pro.stock_basic(exchange="", list_status="L",
                            fields="ts_code,name,industry,market,list_date")
-    delist_map = {r[0]: r[1] for r in con.execute(
-        "SELECT ts_code, delist_date FROM stock_master").fetchall()}
+    if df_l is None or getattr(df_l, "empty", False):
+        raise RuntimeError("tushare stock_basic(L) 返回空（限频/接口异常）")
+    # 读回既有扩展列，防止全行 upsert 把已人工/历史写入的字段覆盖为 NULL
+    prev_map = {
+        r[0]: r[1:] for r in con.execute(
+            "SELECT ts_code, industry_csric2, delist_date, is_st, st_since, "
+            "soe_flag, soe_basis FROM stock_master").fetchall()
+    }
     _MARKET_BOARD = {"主板": "主板", "创业板": "创业", "科创板": "科创"}
     rows = []
     for r in df_l.itertuples(index=False):
         if r.market not in _MARKET_BOARD:   # 排除北交所（universe=沪深，口径不变）
             continue
-        # **必须转湖格式**（tushare 原生 601398.SH → 湖 sh.601398）：stock_master PK 与
-        # kline/market 各表 JOIN 键全部是湖格式；漏转会插入同股异码的重复行
-        # （2026-10-26 生产实锤：5224 行 tushare 格式未命中 PK，5556+5224 双轨并存）。
         ts = ti._to_lake_code(r.ts_code)
         if ts is None:
             continue  # 双保险（market 过滤已排除北交所；BJ 等湖不覆盖）
         ind = (str(r.industry).strip() or None) if getattr(r, "industry", None) else None
+        p_ind2, p_delist, p_st, p_st_since, p_soe_f, p_soe_b = prev_map.get(
+            ts, (None, None, None, None, None, None))
         rows.append([
             ts,
             str(r.name),            # name：腾讯快照随后覆盖（v5 口径）
-            None,                   # industry_csric2：粗分类口径下不再维护（NULL）
+            p_ind2,                 # 保留既有行业二级码
             ind,                    # industry_name：tushare 粗分类（如"电气设备"）
             clean_date(getattr(r, "list_date")),
-            delist_map.get(ts),
+            p_delist,
             _MARKET_BOARD[r.market],
-            None,                   # is_st：腾讯快照补（名称含 ST → 1）
-            None, None, None,       # st_since / soe_flag / soe_basis
+            p_st,                   # 保留既有 ST 态（腾讯快照随后更新）
+            p_st_since, p_soe_f, p_soe_b,
             "tushare", now_ts(), DATA_VERSION,
         ])
     n = upsert(con, "stock_master", [
@@ -546,7 +551,8 @@ def run_t7(con, db_path: str, days: int, runner, force: bool = False) -> Dict[st
             conflict = sp.cross_check_kline(kl, source, tdx_rows, "tdx",
                                             close_pct=t7_close_pct)
         if kl:
-            load_t7(con, ic, kl, source=source, conflict_src=conflict)
+            load_t7(con, ic, kl, source=source, conflict_src=conflict,
+                    volume_is_shares=bool(srcs))
         time.sleep(0.3)  # 限速纪律（指数间小睡）
 
     stats = runner.run(tasks, worker)
@@ -712,7 +718,7 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
                     log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
 
         load_t2(con, code, kl, adj_map=adj_map, source=source,
-                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
+                conflict_src=conflict_src, volume_is_shares=True)
         time.sleep(0.3)  # brief 限速红线：≥0.3s/股（保留）
 
     stats.update(runner.run(tasks, worker))
@@ -723,8 +729,7 @@ def run_t3(con, db_path: str, codes: Optional[List[str]], runner,
            as_of: str) -> Dict[str, Any]:
     """T3：腾讯批量快照（50/批，批间小睡）→ valuation_daily。
 
-    快照是"当前时点"数据——as_of=今日；done 键 (valuation_daily, ts_code, as_of)
-    → 同日重跑跳过已灌股（中断续跑），次日新 as_of 自动重新覆盖。
+    弱网/限流加固：真正按 50 只分批请求腾讯（请求次数降 50 倍），避免逐只 5200 次 HTTP。
     """
     from lake.backfill import Task
     from lake.ingest.tencent_ingest import fetch_snapshot, load_t3
@@ -736,13 +741,26 @@ def run_t3(con, db_path: str, codes: Optional[List[str]], runner,
     tclient = TencentClient()
     stats: Dict[str, Any] = {"codes_requested": len(codes), "as_of": as_of}
 
+    # 按 50 只一批惰性缓存批量快照，减少 50× 网络请求
+    todo_codes = [t.ts_code for t in tasks if not runner.is_done(t)]
+    chunk_of: Dict[str, List[str]] = {}
+    for i in range(0, len(todo_codes), 50):
+        ch = todo_codes[i : i + 50]
+        for c in ch:
+            chunk_of[c] = ch
+    snap_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
     def worker(task: Task) -> None:
-        # 批量快照：50/批（TencentClient.fetch 内部已分批），批间小睡
-        snaps = fetch_snapshot(tclient, [task.ts_code])
-        snap = snaps.get(task.ts_code)
+        code = task.ts_code
+        if code not in snap_cache:
+            batch_codes = chunk_of.get(code) or [code]
+            snaps = fetch_snapshot(tclient, batch_codes)
+            for c in batch_codes:
+                snap_cache[c] = snaps.get(c)
+            time.sleep(0.3)
+        snap = snap_cache.get(code)
         if snap:
-            load_t3(con, task.ts_code, snap, as_of)
-        time.sleep(0.3)
+            load_t3(con, code, snap, as_of)
 
     stats.update(runner.run(tasks, worker))
     return {"table": "valuation_daily", **stats}
@@ -1095,17 +1113,28 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                     adj_derived = m
                     break
         _has_level = con.execute(
-            "SELECT 1 FROM kline_daily WHERE ts_code=? "
-            "AND adj_factor IS NOT NULL AND adj_factor > 0 LIMIT 1",
+            "SELECT MIN(date) FROM kline_daily WHERE ts_code=? "
+            "AND adj_factor IS NOT NULL AND adj_factor > 0",
             [code]).fetchone()
-        if _has_level:
+        _first_af_date = str(_has_level[0])[:10] if (_has_level and _has_level[0] is not None) else None
+        if _first_af_date is not None:
+            # 保留早于最早锚点日的既有 af（不刷成 NULL）；锚点日之后走无锚点填充
+            _close_map = {str(r["date"])[:10]: float(r["close"])
+                          for r in kl if r.get("close") is not None and float(r["close"]) > 0}
             adj_map = no_anchor_af_range(
                 con, code, start_date, end_date,
-                dates=[str(r["date"])[:10] for r in kl]) or None
+                dates=[str(r["date"])[:10] for r in kl],
+                close_map=_close_map) or None
         else:
-            # 全史 bootstrap：源推导值作唯一锚点（{事件日: af}，load_t2 前向填充）
-            adj_map = cast("Optional[Dict[str, Optional[float]]]",
-                           dict(adj_derived) if adj_derived else None)
+            # 仅在完全无历史 K 线的新股首灌场景下允许以源推导值作为 bootstrap 锚点；
+            # 已有历史 K 线但 af 全 NULL 时严守单源铁律保持 None 等 tushare 补齐。
+            _has_any_kline = con.execute(
+                "SELECT 1 FROM kline_daily WHERE ts_code=? LIMIT 1", [code]).fetchone()
+            if not _has_any_kline:
+                adj_map = cast("Optional[Dict[str, Optional[float]]]",
+                               dict(adj_derived) if adj_derived else None)
+            else:
+                adj_map = None
 
         # cross_check（≥2源时）：采用新浪主源 → tdx 最近窗口轻量验证（close/amount/末因子）
         conflict_src: Optional[str] = None
@@ -1131,7 +1160,7 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                     log.warning("T2 %s tdx 交叉校验失败（不阻断）: %s", code, exc)
 
         load_t2(con, code, kl, adj_map=adj_map, source=source,
-                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
+                conflict_src=conflict_src, volume_is_shares=True)
         time.sleep(0.3)
 
     # DEFECT-HANG-1（R3）：进度停滞看门狗——progress 文件 mtime 连续 hang_stall_minutes
@@ -1543,18 +1572,16 @@ def run_reconcile(con, db_path: str, codes: Optional[List[str]],
                     parts.append(f"amount:sina:{sp._fmt_num(amount)}|tdx:{sp._fmt_num(vs['amount'])}")
             if parts:
                 conflicted_dates.append((str(d), ";".join(parts)[:256]))
-        # 末因子 adj 校验（DB 最新非空 af vs tdx 推导末因子）
+        # 末因子 adj 校验（按相邻日比值比对，消除不同源绝对基准差异）
         vadj = (vres or {}).get("adj_factor") or {}
         if vadj:
-            last_af_row = con.execute(
+            db_af_rows = con.execute(
                 "SELECT date, adj_factor FROM kline_daily WHERE ts_code=? AND adj_factor IS NOT NULL "
-                "ORDER BY date DESC LIMIT 1", [code]).fetchone()
-            if last_af_row and str(last_af_row[0]) in vadj:
-                db_af, tdx_af = float(last_af_row[1]), float(vadj[str(last_af_row[0])])
-                if db_af != 0 and sp._rel_diff_pct(db_af, tdx_af) > t2_af_pct:
-                    conflicted_dates.append(
-                        (str(last_af_row[0]),
-                         f"adj:sina:{sp._fmt_num(db_af)}|tdx:{sp._fmt_num(tdx_af)}"))
+                "ORDER BY date DESC LIMIT 60", [code]).fetchall()
+            db_af_map = {str(r[0])[:10]: float(r[1]) for r in db_af_rows}
+            af_conf = sp.cross_check_adj_factor(db_af_map, "sina", vadj, "tdx", pct=t2_af_pct)
+            if af_conf and db_af_rows:
+                conflicted_dates.append((str(db_af_rows[0][0])[:10], af_conf))
         for d, summary in conflicted_dates:
             t2_stat["rows_conflicted"] += 1
             con.execute("UPDATE kline_daily SET conflict_src=? WHERE ts_code=? AND date=?",
@@ -1672,25 +1699,30 @@ def _t3_yield_gate(con, date) -> Dict[str, Any]:
                 "ok": True}
     log.warning("T3 息率质量门触发: %s NULL %d/%d（%.0f%%）→ 结转+派生补齐",
                 date, total - non_null, total, (total - non_null) / total * 100)
-    # ① 前 ≤10 日最近有值日结转（价格调整）——只填仍 NULL 的行
-    #    （SET 内标量子查询；子查询 0 行 → NULL → 行保持 NULL）
-    con.execute("""
+    # ① 前 ≤10 日最近有值日结转（有 adj_factor 列时按后复权价格调整以吸收送转摊薄 + 除零保护）
+    _kcols = {str(r[1]).lower() for r in con.execute("PRAGMA table_info('kline_daily')").fetchall()}
+    _af_expr = "COALESCE(adj_factor, 1.0)" if "adj_factor" in _kcols else "1.0"
+    _af_expr_k2 = "COALESCE(k2.adj_factor, 1.0)" if "adj_factor" in _kcols else "1.0"
+    con.execute(f"""
         UPDATE valuation_daily v SET ttm_yield_pct =
-            (SELECT py.y * pc.c / kf.c
-             FROM (SELECT close AS c FROM kline_daily
+            (SELECT py.y * (pc.c * pc.af) / (kf.c * kf.af)
+             FROM (SELECT close AS c, {_af_expr} AS af FROM kline_daily
                    WHERE ts_code = v.ts_code AND date = v.date) kf,
                   (SELECT v2.ttm_yield_pct AS y FROM valuation_daily v2
                    WHERE v2.ts_code = v.ts_code AND v2.date < v.date
                      AND v2.date >= v.date - INTERVAL 10 DAY
                      AND v2.ttm_yield_pct IS NOT NULL
                    ORDER BY v2.date DESC LIMIT 1) py,
-                  (SELECT k2.close AS c FROM kline_daily k2
+                  (SELECT k2.close AS c, {_af_expr_k2} AS af FROM kline_daily k2
                    WHERE k2.ts_code = v.ts_code AND k2.date =
                      (SELECT MAX(v3.date) FROM valuation_daily v3
                       WHERE v3.ts_code = v.ts_code AND v3.date < v.date
                         AND v3.date >= v.date - INTERVAL 10 DAY
                         AND v3.ttm_yield_pct IS NOT NULL)) pc
-             WHERE kf.c IS NOT NULL AND py.y IS NOT NULL AND pc.c IS NOT NULL)
+             WHERE kf.c IS NOT NULL AND kf.c > 0
+               AND py.y IS NOT NULL
+               AND pc.c IS NOT NULL AND pc.c > 0
+               AND (kf.c * kf.af) > 0)
         WHERE v.date = ? AND v.ttm_yield_pct IS NULL
     """, [date])
     con.commit()
@@ -1788,6 +1820,72 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # ---- T2 kline_daily：每股最近缺口（date_max+1→今日；无行→近 250 日）----
     gap_starts: Dict[str, str] = {c: _kline_gap_start(con, c, 250) for c in codes}
 
+    # ---- 表级预检前置（零/极轻网络，先于东财/tushare 批量通道，节省宝贵限额）----
+    _early_idx_dates: set = set()
+    _early_idx_max: Optional[str] = None
+    try:
+        from lake.ingest.tencent_ingest import fetch_kline_ohlcv as _fki_early
+        _eidx = _fki_early(tclient, "sh000001", n=10) or []
+        _early_idx_dates = {str(r["date"]) for r in _eidx}
+        _early_idx_max = max(_early_idx_dates, default=None)
+    except Exception:  # noqa: BLE001 - 探测失败不阻断，后续再走正常流程
+        pass
+
+    def _run_table_precheck(d_date: Optional[str]) -> Dict[str, Any]:
+        pc: Dict[str, Any] = {"data_date": d_date, "t2": False, "t3": False,
+                              "t7": False, "t8": False}
+        if not d_date or not codes:
+            return pc
+        try:
+            # 传 --codes 子集时严格限定 ts_code IN (...)，防全表计数误判跳过
+            if len(codes) < 500:
+                ph = ",".join("?" * len(codes))
+                n_t2 = con.execute(
+                    f"SELECT COUNT(DISTINCT ts_code) FROM kline_daily "
+                    f"WHERE date=? AND ts_code IN ({ph})",
+                    [d_date, *codes]).fetchone()[0]
+                n_t3 = con.execute(
+                    f"SELECT COUNT(DISTINCT ts_code) FROM valuation_daily "
+                    f"WHERE date IN (?, ?) AND ts_code IN ({ph})",
+                    [d_date, today_s, *codes]).fetchone()[0]
+                pc["t2"] = n_t2 >= len(codes)
+                pc["t3"] = n_t3 >= len(codes)
+            else:
+                # 全市场常态有数十只停牌股在 kline_daily 当日无行，用 ≥95% 覆盖率
+                # 结合 valuation_daily 当日齐（含停牌股）判定，避免预检恒 False
+                n_t2 = con.execute(
+                    "SELECT COUNT(DISTINCT ts_code) FROM kline_daily WHERE date=?",
+                    [d_date]).fetchone()[0]
+                n_t3 = con.execute(
+                    "SELECT COUNT(DISTINCT ts_code) FROM valuation_daily "
+                    "WHERE date IN (?, ?)", [d_date, today_s]).fetchone()[0]
+                pc["t3"] = n_t3 >= int(len(codes) * 0.98)
+                pc["t2"] = (n_t2 >= len(codes)) or (n_t2 >= int(len(codes) * 0.95) and pc["t3"])
+            pc["t7"] = con.execute(
+                "SELECT COUNT(DISTINCT index_code) FROM index_daily WHERE date=?",
+                [d_date]).fetchone()[0] >= len(INDEX_CODES)
+            _t8_max = con.execute(
+                "SELECT MAX(as_of_date) FROM factor_snapshot").fetchone()[0]
+            pc["t8"] = _t8_max is not None and str(_t8_max)[:10] == d_date
+        except Exception as exc:  # noqa: BLE001 - 预检 SQL 失败 → 回退全扫（fail-open）
+            log.warning("incremental 预检 SQL 失败（回退全扫）: %s", exc)
+            pc["t2"] = pc["t3"] = pc["t7"] = pc["t8"] = False
+        return pc
+
+    if _early_idx_max:
+        _early_pc = _run_table_precheck(_early_idx_max)
+        if _early_pc["t2"] and _early_pc["t3"] and _early_pc["t7"] and _early_pc["t8"]:
+            _early_pc["result"] = "all_up_to_date"
+            stats["precheck"] = _early_pc
+            log.info("incremental 前置预检: 全部表 %s 已齐 → 跳过批量拉取直接返回（零配额消耗）",
+                     _early_idx_max)
+            _mark_precheck_done_views(db_path, _early_pc, len(codes))
+            return {"sub": "incremental", "db_path": db_path, "as_of": today_s, **stats,
+                    "source_health": health_res,
+                    "multisource": bool(ohlcv_srcs or adj_srcs),
+                    "ohlcv_sources": [a.name for a in ohlcv_srcs],
+                    "adj_sources": [a.name for a in adj_srcs]}
+
     # ---- v7.0.33：全市场单日批量（2026-11-15 Joel 拍板：tushare 全面取代）----
     # 通道链：① 东财 clist 主源（快照只含**最近交易日**数据 → 触发条件=缺口众数
     # 日=指数最新交易日，或周末/节假日陈旧缺口（众数日前无其他交易日，refetch
@@ -1803,15 +1901,16 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         _min_codes = int(lake_cfg().get("batch_min_codes", 3000) or 3000)
         if _mode_n >= _min_codes:
             _batch_errs: List[str] = []
-            _idx_dates: set = set()
-            _idx_max: Optional[str] = None
-            try:
-                from lake.ingest.tencent_ingest import fetch_kline_ohlcv as _fki
-                _idx = _fki(tclient, "sh000001", n=10) or []
-                _idx_dates = {str(r["date"]) for r in _idx}
-                _idx_max = max(_idx_dates, default=None)
-            except Exception as exc:  # noqa: BLE001 - 指数探测失败 → 批量无日期锚 → 逐只
-                log.warning("incremental 批量: 指数探测失败（批量跳过，走逐只）: %s", exc)
+            _idx_dates: set = set(_early_idx_dates)
+            _idx_max: Optional[str] = _early_idx_max
+            if _idx_max is None:
+                try:
+                    from lake.ingest.tencent_ingest import fetch_kline_ohlcv as _fki
+                    _idx = _fki(tclient, "sh000001", n=10) or []
+                    _idx_dates = {str(r["date"]) for r in _idx}
+                    _idx_max = max(_idx_dates, default=None)
+                except Exception as exc:  # noqa: BLE001 - 指数探测失败 → 批量无日期锚 → 逐只
+                    log.warning("incremental 批量: 指数探测失败（批量跳过，走逐只）: %s", exc)
             # —— ① EM 主通道（快照=指数最新交易日；陈旧缺口 refetch 语义同 v7.0.8）——
             if _idx_max is not None and not batch.get("date"):
                 _em_bdate: Optional[str] = None
@@ -1841,6 +1940,15 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                                 f"EM 批量行数异常 {len(_t2_rows)}<{_min_rows}"
                                 "（接口漂移？）")
                         _events = emb.fetch_ex_events(_em_bdate)
+                        # 将每日除权事件增量落库到 dividend_events（修复 T4 静态冻结，
+                        # 供 af_rebase 理论步长校验、martingale 回测与除权日盘中修正复用）
+                        try:
+                            _ev_written = emb.load_ex_events(con, _em_bdate, _events)
+                            if _ev_written:
+                                log.info("incremental T4 除权事件增量落库 %s: %d 行",
+                                         _em_bdate, _ev_written)
+                        except Exception as _ev_exc:  # noqa: BLE001 - 不阻断主通道
+                            log.warning("incremental T4 除权事件落库失败（不阻断）: %s", _ev_exc)
                         _afb = emb.derive_af_batch(con, _em_bdate, _events)
                         batch = {"date": _em_bdate,
                                  "t2": {r["ts_code"]: r for r in _t2_rows},
@@ -1971,31 +2079,16 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         _below = [d for d in batch.get("idx_dates", ()) if d < batch["date"]]
         data_date = max(_below) if _below else None   # no_trade：数据日=缺口日前最近交易日
     if data_date is None and not batch.get("failed"):
-        # 批量未触发/未执行（缺口分散、tushare 不可用等）→ 指数最新 bar 定数据日
-        try:
-            _idx_probe = fetch_kline_ohlcv(tclient, "sh000001", n=10) or []
-            data_date = max((str(r["date"]) for r in _idx_probe), default=None)
-        except Exception:  # noqa: BLE001 - 探测失败 → 不预检（fail-open 全扫）
-            data_date = None
-    precheck: Dict[str, Any] = {"data_date": data_date, "t2": False, "t3": False,
-                                "t7": False, "t8": False}
-    if data_date:
-        try:
-            precheck["t2"] = con.execute(
-                "SELECT COUNT(DISTINCT ts_code) FROM kline_daily WHERE date=?",
-                [data_date]).fetchone()[0] >= len(codes)
-            precheck["t3"] = con.execute(
-                "SELECT COUNT(DISTINCT ts_code) FROM valuation_daily "
-                "WHERE date IN (?, ?)", [data_date, today_s]).fetchone()[0] >= len(codes)
-            precheck["t7"] = con.execute(
-                "SELECT COUNT(DISTINCT index_code) FROM index_daily WHERE date=?",
-                [data_date]).fetchone()[0] >= len(INDEX_CODES)
-            _t8_max = con.execute(
-                "SELECT MAX(as_of_date) FROM factor_snapshot").fetchone()[0]
-            precheck["t8"] = _t8_max is not None and str(_t8_max)[:10] == data_date
-        except Exception as exc:  # noqa: BLE001 - 预检 SQL 失败 → 回退全扫（fail-open）
-            log.warning("incremental 预检 SQL 失败（回退全扫）: %s", exc)
-            precheck["t2"] = precheck["t3"] = precheck["t7"] = precheck["t8"] = False
+        if _early_idx_max is not None:
+            data_date = _early_idx_max
+        else:
+            # 批量未触发/未执行且前置探测失败 → 再次探测指数最新 bar 定数据日
+            try:
+                _idx_probe = fetch_kline_ohlcv(tclient, "sh000001", n=10) or []
+                data_date = max((str(r["date"]) for r in _idx_probe), default=None)
+            except Exception:  # noqa: BLE001 - 探测失败 → 不预检（fail-open 全扫）
+                data_date = None
+    precheck = _run_table_precheck(data_date)
     stats["precheck"] = precheck
     log.info("incremental 预检 (data_date=%s): K线=%s 估值=%s 指数=%s 因子=%s",
              data_date, precheck["t2"], precheck["t3"], precheck["t7"], precheck["t8"])
@@ -2108,9 +2201,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         # （批量通道命中分支已写入）。逐只 fallback **不再取任何源私有推导值**
         # （sina/tdx hfq÷raw=源私有归一化，写湖即换源假断崖）——统一无锚点填充：
         # 沿用湖内现有 level+官方除权步长；无 level→None（下次 tushare 批量补）。
+        _close_map = {str(r["date"])[:10]: float(r["close"])
+                      for r in kl if r.get("close") is not None and float(r["close"]) > 0}
         adj_map = no_anchor_af_range(
             con, code, start, today_s,
-            dates=[str(r["date"])[:10] for r in kl]) or None
+            dates=[str(r["date"])[:10] for r in kl],
+            close_map=_close_map) or None
 
         # v6.3.5（Joel 拍板）：incremental **不做** tdx 交叉验证——此前每只 sina
         # 主源股多 1 次 tdx 窗口取数 ~4s（×5112 ≈ 5.7h），只为写 conflict_src
@@ -2120,7 +2216,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         conflict_src: Optional[str] = None
 
         load_t2(con, code, kl, adj_map=adj_map, source=source,
-                conflict_src=conflict_src, volume_is_shares=(source != "tencent"))
+                conflict_src=conflict_src, volume_is_shares=True)
         time.sleep(0.3)   # 限速纪律（adapter RateLimiter 之外的兜底小睡，同 run_t2）
 
     # v7.0.9：预检不齐 → 只扫"真缺 data_date 行"的股票（NOT EXISTS 等值过滤，
@@ -2158,36 +2254,48 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     else:
         t3_codes = [c for c in codes if c not in batch.get("t3", {})]
     _t3_legacy = [c for c in t3_codes if c not in batch.get("t3", {})]
+    _t3_chunk_of: Dict[str, List[str]] = {}
+    _t3_snap_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     if _t3_legacy:
         probe_snaps = fetch_snapshot(tclient, _t3_legacy[:50])
         if not probe_snaps:
             raise RuntimeError("T3 估值快照全空（腾讯接口故障？）——本轮增量中止，"
                                "不标 done（下轮重试）")
+        # 复用首 50 只探测结果，剩余按 50 只分批缓存（减少 50 倍弱网 HTTP 请求）
+        for c in _t3_legacy[:50]:
+            _t3_snap_cache[c] = probe_snaps.get(c)
+        for i in range(50, len(_t3_legacy), 50):
+            ch = _t3_legacy[i : i + 50]
+            for c in ch:
+                _t3_chunk_of[c] = ch
 
     def t3_worker(task: Task) -> None:
-        # v7.0.8：批量缓存命中 → 零网络落库（单位已换算：亿元/与湖一致列名）
-        # v7.0.33：日期用批量行自带 date（周末 refetch 场景=最近交易日，非今日）
         _bsnap = batch.get("t3", {}).get(task.ts_code)
         if _bsnap:
             load_t3(con, task.ts_code, _bsnap, str(_bsnap["date"]),
                     source="em_batch" if batch.get("channel") == "em" else "tushare")
             return
-        snaps = fetch_snapshot(tclient, [task.ts_code])
-        snap = snaps.get(task.ts_code)
+        code = task.ts_code
+        if code not in _t3_snap_cache:
+            batch_codes = _t3_chunk_of.get(code) or [code]
+            snaps = fetch_snapshot(tclient, batch_codes)
+            for c in batch_codes:
+                _t3_snap_cache[c] = snaps.get(c)
+            time.sleep(0.3)
+        snap = _t3_snap_cache.get(code)
         if snap:
-            load_t3(con, task.ts_code, snap, today_s)
-        # 缺失（停牌/批次失败）→ 跳过不写（视为完成；次日新键重取）
-        time.sleep(0.3)
+            load_t3(con, code, snap, today_s)
 
     t3_tasks = [Task(priority=3, table="valuation_daily", ts_code=c,
                      period_or_date=today_s, tier="P3") for c in t3_codes]
     stats["t3"] = runner.run(t3_tasks, t3_worker)
 
-    # ---- v8.2.0 补 T3 息率质量门（2026-11-17 em_batch 息率全 NULL → 池归零）----
-    # 在 selection/timing 重算之前收口（它们读预计算表，而预计算/池 G8 读
-    # valuation_daily 最新行）；失败不阻断增量（记痕，下轮重跑幂等重试）。
-    _gate_date = batch.get("date") or data_date
-    if _gate_date:
+    # ---- v8.2.0 补 T3 息率质量门（覆盖批量日期与腾讯回退写入的 today_s）----
+    _gate_dates = []
+    for _gd in (batch.get("date") or data_date, today_s if _t3_legacy else None):
+        if _gd and _gd not in _gate_dates:
+            _gate_dates.append(_gd)
+    for _gate_date in _gate_dates:
         try:
             stats["t3_yield_gate"] = _t3_yield_gate(con, _gate_date)
         except Exception as exc:  # noqa: BLE001 - 质量门失败不阻断（记痕，不静默）
@@ -2233,7 +2341,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
             conflict = sp.cross_check_kline(kl, source, tdx_rows, "tdx",
                                             close_pct=crosscheck_threshold("t7_close_pct", 0.3))
         if kl:
-            load_t7(con, ic, kl, source=source, conflict_src=conflict)
+            load_t7(con, ic, kl, source=source, conflict_src=conflict,
+                    volume_is_shares=bool(srcs))
         time.sleep(0.3)   # 指数间小睡（同 run_t7）
 
     t7_tasks = [Task(priority=3, table="index_daily", ts_code=ic,

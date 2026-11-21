@@ -170,7 +170,7 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                       f"{a['invested_div']:,.0f} | {a['div_surplus']:,.0f} | "
                       f"{a['price_pnl']:+,.0f} | {a['end_assets']:,.0f} |")
                 A("")
-    else:
+    elif n_t:
         A("## 前 10 / 后 10（按收益率排序，仅触发过建仓的股票）")
         if len(tp):
             for label, sub in (("前 10", _sort_per_stock(triggered)[:10]),
@@ -180,23 +180,20 @@ def _summary_lines(sp, db_path: str, gdates, n_dates: int, rows: List[dict],
                 A("| 代码 | 名称 | 买入次数 | 总投入 | 总盈亏 | 收益率 | 分红/上涨占比 | 状态 |")
                 A("|---|---|---|---|---|---|---|---|")
                 for r in sub:
-                    tp = float(r["total_pnl"])
-                    # v8.0.10：分红/上涨占比（与个股明细「拆分」行同口径：
-                    # 分红余额 vs 价差盈亏；总盈亏≤0 不拆，显示 —）
-                    if tp > 0:
-                        split = (f"{float(r.get('div_pool', 0.0)) / tp:.0%} / "
-                                 f"{float(r['price_pnl']) / tp:.0%}")
+                    r_pnl = float(r["total_pnl"])
+                    if r_pnl > 0:
+                        split = (f"{float(r.get('div_pool', 0.0)) / r_pnl:.0%} / "
+                                 f"{float(r['price_pnl']) / r_pnl:.0%}")
                     else:
                         split = "—"
                     A(f"| {r['ts_code']} | {r['name']} | {r['n_buys']} | "
-                      f"{float(r['total_invested']):,.0f} | {float(r['total_pnl']):,.0f} | "
+                      f"{float(r['total_invested']):,.0f} | {r_pnl:,.0f} | "
                       f"{float(r['pnl_pct']):.1%} | {split} | {_STATUS_CN.get(r['last_status'], r['last_status'])} |")
                 A("")
     A("")
     A("## 术语表")
-    A("- 首仓：一轮里的第一次买入（固定 首仓手数）；加仓：后续逐档买入，每档加 加仓手数步长 手，"
-      "触发线比上一档再低 加仓价格步长")
-    A("- 档位线：第 k 档 = 本轮高点 × (1 − 首仓回撤线 − k × 加仓价格步长)")
+    A("- 首仓（k=0）：一轮里的第一次买入，须同时满足双条件——① 较本轮高点回撤 ≥ 首仓回撤线，且 ② 近 N 年收盘分位 ≤ 时机分位上限；首仓价记为本轮锚点 P0")
+    A("- 档位线（v8.1.0）：首仓线 = 本轮高点 H × (1 − 首仓回撤线)；后续第 k 档加仓线 = 首仓锚点 P0 × (1 − k × 加仓价格步长)，每次加仓无分位限制，手数按 首仓手数 + k × 加仓手数步长 递增")
     A("- 再武装（rearm）：一轮买满后，价格从低点反弹 再武装幅度（或创出新高，视模式）→ "
       "状态机复位，刷新本轮高点，重新起新一轮的档位线")
     A("- 轮次：一次再武装到下一次再武装之间为一轮")

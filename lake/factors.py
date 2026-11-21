@@ -54,6 +54,16 @@ def _log_returns(series: List[tuple]) -> List[float]:
     return out
 
 
+def _log_returns_by_date(series: List[tuple]) -> Dict[str, float]:
+    """按日期键的对数收益率映射 {date: ret}（供 _beta 按公共日期对齐）。"""
+    out: Dict[str, float] = {}
+    for i in range(1, len(series)):
+        prev, cur = series[i - 1][1], series[i][1]
+        if prev > 0 and cur > 0:
+            out[str(series[i][0])[:10]] = math.log(cur / prev)
+    return out
+
+
 def _annual_vol(rets: List[float], years: int) -> Optional[float]:
     """年化波动率（%）。窗口不足 → None。"""
     window = int(years * 252)
@@ -81,12 +91,20 @@ def _max_drawdown(series: List[tuple]) -> Optional[float]:
     return mdd
 
 
-def _beta(stock_rets: List[float], bench_rets: List[float]) -> Optional[float]:
-    """beta（对沪深300）。两序列按公共日期对齐后算协方差/方差。"""
-    if len(stock_rets) < 60 or len(bench_rets) < 60:
-        return None
-    n = min(len(stock_rets), len(bench_rets))
-    s, b = stock_rets[-n:], bench_rets[-n:]
+def _beta(stock_rets: Any, bench_rets: Any) -> Optional[float]:
+    """beta（对沪深300）。支持 {date: ret} 按公共日期对齐，亦向后兼容 List[float]。"""
+    if isinstance(stock_rets, dict) and isinstance(bench_rets, dict):
+        common = sorted(stock_rets.keys() & bench_rets.keys())
+        if len(common) < 60:
+            return None
+        s = [stock_rets[d] for d in common]
+        b = [bench_rets[d] for d in common]
+        n = len(common)
+    else:
+        if len(stock_rets) < 60 or len(bench_rets) < 60:
+            return None
+        n = min(len(stock_rets), len(bench_rets))
+        s, b = list(stock_rets)[-n:], list(bench_rets)[-n:]
     ms, mb = sum(s) / n, sum(b) / n
     cov = sum((s[i] - ms) * (b[i] - mb) for i in range(n)) / max(1, n - 1)
     var = sum((x - mb) ** 2 for x in b) / max(1, n - 1)
@@ -99,10 +117,10 @@ def _beta(stock_rets: List[float], bench_rets: List[float]) -> Optional[float]:
 # 因子计算（单股）
 # ---------------------------------------------------------------------------
 def compute_stock_factors(con, ts_code: str, as_of_date: str,
-                          hs300_rets: Optional[List[float]] = None) -> Dict[str, float]:
+                          hs300_rets: Optional[Any] = None) -> Dict[str, float]:
     """算单股全部 T8 因子 → {factor_name: value}（None 值跳过）。
 
-    :param hs300_rets: 沪深300 对数收益序列（可预取复用，避免每股重读 T7）。
+    :param hs300_rets: 沪深300 对数收益（{date: ret} 或 List[float]，可预取复用）。
     """
     series = _hfq_close_series(con, ts_code)
     out: Dict[str, float] = {}
@@ -122,31 +140,41 @@ def compute_stock_factors(con, ts_code: str, as_of_date: str,
             cur = recent[-1][1]
             if high > 0:
                 out["drawdown_from_250d_high"] = round((cur / high - 1.0) * 100.0, 4)
-        # beta vs hs300
+        # beta vs hs300（按公共日期对齐）
         if hs300_rets is None:
             bench = _index_close_series(con, "sh000300")
-            hs300_rets = _log_returns(bench)
-        b = _beta(rets, hs300_rets)
+            hs300_rets = _log_returns_by_date(bench)
+        stock_beta_in = _log_returns_by_date(series) if isinstance(hs300_rets, dict) else rets
+        b = _beta(stock_beta_in, hs300_rets)
         if b is not None:
             out["beta_vs_hs300"] = round(b, 4)
-    # 估值时机：yield/pe/pb 自身历史分位（T3）
-    out.update(_valuation_pctiles(con, ts_code))
+    # 估值时机：yield/pe/pb 自身历史分位（T3，PIT ≤ as_of_date）
+    out.update(_valuation_pctiles(con, ts_code, as_of_date=as_of_date))
     return out
 
 
-def _valuation_pctiles(con, ts_code: str) -> Dict[str, float]:
-    """T3 估值字段自身历史分位（yield_pctile_own_hist / pe_pctile / pb_pctile）。"""
+def _valuation_pctiles(con, ts_code: str, as_of_date: Optional[str] = None) -> Dict[str, float]:
+    """T3 估值字段自身历史分位（yield_pctile_own_hist / pe_pctile / pb_pctile）。
+
+    按日期升序取最新日期值 cur（而非排序后的最大值），再计算历史中 <= cur 的占比。
+    """
     out: Dict[str, float] = {}
     for col, name in [("ttm_yield_pct", "yield_pctile_own_hist"),
                       ("pe_ttm", "pe_pctile"), ("pb", "pb_pctile")]:
-        rows = con.execute(
-            f"SELECT {col} FROM valuation_daily WHERE ts_code=? AND {col} IS NOT NULL "
-            "ORDER BY date", [ts_code]).fetchall()
-        vals = sorted(float(r[0]) for r in rows if r[0] is not None)
-        if len(vals) >= 10:
-            cur = vals[-1]
-            below = sum(1 for v in vals if v <= cur)
-            out[name] = round(below / len(vals) * 100.0, 4)
+        if as_of_date:
+            rows = con.execute(
+                f"SELECT {col} FROM valuation_daily WHERE ts_code=? "
+                f"AND {col} IS NOT NULL AND date <= ? ORDER BY date",
+                [ts_code, as_of_date]).fetchall()
+        else:
+            rows = con.execute(
+                f"SELECT {col} FROM valuation_daily WHERE ts_code=? "
+                f"AND {col} IS NOT NULL ORDER BY date", [ts_code]).fetchall()
+        raw_vals = [float(r[0]) for r in rows if r[0] is not None]
+        if len(raw_vals) >= 10:
+            cur = raw_vals[-1]
+            below = sum(1 for v in raw_vals if v <= cur)
+            out[name] = round(below / len(raw_vals) * 100.0, 4)
     return out
 
 
@@ -216,9 +244,9 @@ def recompute_all(con, as_of_date: str, ts_codes: Optional[Sequence[str]] = None
     if ts_codes is None:
         ts_codes = [r[0] for r in con.execute(
             "SELECT ts_code FROM stock_master").fetchall()]
-    # 预取 hs300 收益序列（复用，避免每股重读 T7）
+    # 预取 hs300 收益映射（按公共日期对齐，复用避免每股重读 T7）
     bench = _index_close_series(con, "sh000300")
-    hs300_rets = _log_returns(bench)
+    hs300_rets = _log_returns_by_date(bench)
     total = 0
     for ts in ts_codes:
         f = compute_stock_factors(con, ts, as_of_date, hs300_rets=hs300_rets)

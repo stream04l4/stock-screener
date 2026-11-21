@@ -33,9 +33,9 @@ CENTRAL_TOKENS: tuple = (
     "国家能源", "华能集团", "大唐集团", "华电集团", "三峡集团", "国家电网",
     "南方电网", "南网", "鲁能集团", "核工业集团", "中核集团", "中国核建",
     "中广核", "中国广核", "神华集团", "中煤集团", "国家电投",
-    # —— 钢铁/建材/军工材料 ——
-    "宝武集团", "宝武钢铁", "宝山钢铁", "鞍山钢铁", "首钢集团", "首钢总公司",
-    "宝钢集团", "宝钢股份", "柳州钢铁", "海钢集团", "中国建材", "新兴际华",
+    # —— 钢铁/建材/军工材料（已剔除地方国企：首钢=北京/柳钢=广西/海钢=海南）——
+    "宝武集团", "宝武钢铁", "宝山钢铁", "鞍山钢铁",
+    "宝钢集团", "宝钢股份", "中国建材", "新兴际华",
     "中国钢研",
     # —— 铁路/建工/工程 ——
     "中国铁路", "中国中铁", "中国铁建", "中国交建", "中交集团", "中国能建",
@@ -44,10 +44,10 @@ CENTRAL_TOKENS: tuple = (
     # —— 航空/航天/船舶/电子/兵器（不含泛 token「航天工业」，见模块 docstring）——
     "航空工业", "航天科技", "航天科工", "上海航天", "贵州航天", "中国船舶",
     "中国电子科技", "兵器工业集团", "兵器装备集团", "中兵投资", "中国航空",
-    # —— 运输/物流/综合央企 ——
+    # —— 运输/物流/综合央企（已剔除中国重汽=山东重工/山东国资）——
     "招商局集团", "招商局", "招商证券", "招商银行", "招商公路", "保利集团",
     "保利南方", "华侨城集团", "华润", "中信", "中国物流集团", "中国邮政集团",
-    "中国邮政", "中国旅游集团", "远洋集团", "中国远洋", "中国重汽", "先正达",
+    "中国邮政", "中国旅游集团", "远洋集团", "中国远洋", "先正达",
     # —— 中央金融 ——
     "工商银行", "农业银行", "中国银行", "建设银行", "交通银行", "邮储银行",
     "中国人寿", "中国人保", "中国再保险", "中央汇金", "证券金融",
@@ -72,8 +72,24 @@ def _match(name: str) -> bool:
 CENTRAL_OVERRIDE_CODES: frozenset = frozenset({"sh.600938", "sh.601126"})
 
 
+def _select_max_state_central(rows, min_ratio_pct: float) -> Set[str]:
+    """按每股最大国有股东（hold_ratio 最大）判定央企控股，避免地方国资第一大股东
+    + 央企/汇金/证金财务二股东被误放行。"""
+    best: dict[str, tuple[float, str]] = {}
+    for code, name, ratio in rows:
+        r = float(ratio or 0.0)
+        nm = str(name or "")
+        prev = best.get(code)
+        if prev is None or r > prev[0]:
+            best[code] = (r, nm)
+    return {
+        code for code, (r, nm) in best.items()
+        if r >= min_ratio_pct and nm and _match(nm)
+    }
+
+
 def central_soe_codes_asof(con, as_of, min_ratio_pct: float) -> Set[str]:
-    """PIT 版：≤ as_of 最近快照、top10 国有股东名命中央企 token 且占比 ≥
+    """PIT 版：≤ as_of 最近快照、top10 最大国有股东名命中央企 token 且占比 ≥
     min_ratio_pct 的 ts_code 集合（动态池回测每月重算用，与
     universe._soe_ratio_map_asof 同快照口径）。"""
     q = """
@@ -86,16 +102,11 @@ def central_soe_codes_asof(con, as_of, min_ratio_pct: float) -> Set[str]:
         WHERE h.holder_rank <= 10 AND h.share_nature = '国有股'
     """
     con.execute(q, [str(as_of)[:10]])
-    out: Set[str] = set()
-    for code, name, ratio in con.fetchall():
-        if (name and _match(name)
-                and float(ratio or 0.0) >= min_ratio_pct):
-            out.add(code)
-    return out
+    return _select_max_state_central(con.fetchall(), min_ratio_pct)
 
 
 def central_soe_codes_latest(con, min_ratio_pct: float) -> Set[str]:
-    """生产版：全局最新快照（与 universe._soe_set 同口径）。"""
+    """生产版：全局最新快照（最大国有股东为央企）。"""
     q = """
         SELECT h.ts_code, h.holder_name, h.hold_ratio
         FROM holders_snapshot h
@@ -105,9 +116,4 @@ def central_soe_codes_latest(con, min_ratio_pct: float) -> Set[str]:
         WHERE h.holder_rank <= 10 AND h.share_nature = '国有股'
     """
     con.execute(q)
-    out: Set[str] = set()
-    for code, name, ratio in con.fetchall():
-        if (name and _match(name)
-                and float(ratio or 0.0) >= min_ratio_pct):
-            out.add(code)
-    return out
+    return _select_max_state_central(con.fetchall(), min_ratio_pct)

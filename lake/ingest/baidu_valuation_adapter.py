@@ -190,17 +190,43 @@ def derive_yield_for_date(con, date, ts_codes: Optional[List[str]] = None) -> in
 
 
 def _derive_yield(con, where: str, args: List[Any]) -> None:
-    """派生 UPDATE 核心（两函数共用，保证口径一致）。"""
+    """派生 UPDATE 核心（两函数共用，保证口径一致；含除零保护与送转股本折算）。"""
+    k_cols = {str(r[1]).lower() for r in con.execute("PRAGMA table_info('kline_daily')").fetchall()}
+    has_af = "adj_factor" in k_cols
+    if has_af:
+        dps_expr = """
+            SUM(
+                dd.cash_dps * COALESCE(
+                    (SELECT kd.adj_factor FROM kline_daily kd
+                     WHERE kd.ts_code = v.ts_code AND kd.date <= dd.ex_date
+                       AND kd.adj_factor IS NOT NULL AND kd.adj_factor > 0
+                     ORDER BY kd.date DESC LIMIT 1)
+                    / NULLIF(
+                        (SELECT kv.adj_factor FROM kline_daily kv
+                         WHERE kv.ts_code = v.ts_code AND kv.date = v.date
+                           AND kv.adj_factor IS NOT NULL AND kv.adj_factor > 0
+                         LIMIT 1),
+                        0
+                    ),
+                    1.0
+                )
+            )
+        """
+    else:
+        dps_expr = "SUM(dd.cash_dps)"
     sql = f"""
     UPDATE valuation_daily v SET ttm_yield_pct = (
         SELECT dps.s / k.close * 100
-        FROM (SELECT SUM(cash_dps) AS s FROM dividend_events dd
+        FROM (SELECT {dps_expr} AS s
+              FROM dividend_events dd
               WHERE dd.ts_code = v.ts_code
+                AND dd.cash_dps IS NOT NULL
                 AND dd.ex_date <= v.date
                 AND dd.ex_date > v.date - INTERVAL 365 DAY) dps,
              (SELECT close FROM kline_daily kk
               WHERE kk.ts_code = v.ts_code AND kk.date = v.date) k
-        WHERE dps.s IS NOT NULL AND dps.s > 0 AND k.close IS NOT NULL
+        WHERE dps.s IS NOT NULL AND dps.s > 0
+          AND k.close IS NOT NULL AND k.close > 0
     )
     WHERE {where}
     """

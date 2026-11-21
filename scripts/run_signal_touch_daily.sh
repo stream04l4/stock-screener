@@ -11,7 +11,15 @@ STAMP=$(TZ=Asia/Shanghai date +%Y%m%d)
 LOG="logs/signal_touch_${STAMP}.log"
 mkdir -p logs
 echo "[$(TZ=Asia/Shanghai date +%FT%T%z)] 触碰信号落盘开始 → $LOG"
-timeout -k 30 300 .venv/bin/python scripts/signal_touch.py >> "$LOG" 2>&1
-RC=$?
+RC=0
+for i in 1 2 3 4; do
+  timeout -k 30 300 .venv/bin/python scripts/signal_touch.py >> "$LOG" 2>&1
+  RC=$?
+  if [ "$RC" -eq 0 ] || [ "$RC" -ne 3 ]; then
+    break
+  fi
+  echo "[$(TZ=Asia/Shanghai date +%FT%T%z)] 触碰信号落盘遇湖锁(rc=3)，60s 后重试 ($i/4)" >> "$LOG"
+  sleep 60
+done
 echo "[$(TZ=Asia/Shanghai date +%FT%T%z)] 触碰信号落盘退出 rc=$RC（0=完成；3=湖不可用；4=行情失败，下轮重试）"
 exit "$RC"

@@ -132,42 +132,69 @@ def _load_state() -> Dict[str, Dict[str, Any]]:
 
 
 def _save_state(state: Dict[str, Dict[str, Any]]) -> None:
+    import tempfile
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"updated_at": _beijing_now().isoformat(timespec="seconds"),
-                   "alerts": state.get("alerts", {}),
-                   "pending": state.get("pending", {})},
-                  f, ensure_ascii=False, indent=1)
-    os.replace(tmp, STATE_PATH)  # 原子替换，防半截状态
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(STATE_PATH)),
+                               prefix=".position_alert.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"updated_at": _beijing_now().isoformat(timespec="seconds"),
+                       "alerts": state.get("alerts", {}),
+                       "pending": state.get("pending", {})},
+                      f, ensure_ascii=False, indent=1, allow_nan=False)
+        os.replace(tmp, STATE_PATH)  # 原子替换，防半截状态与并发 .tmp 竞争
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _alert_key(sig: Dict[str, Any]) -> str:
-    """去重键：同一 (股票, 动作, 档, 触发价) 视为同一点位。
+    """去重键：同一 (股票, 动作, 档, 触发价) 视为同一点位（保留 2 位小数降浮点舍入抖动）。"""
+    nap = sig.get("next_add_price")
+    nap_s = f"{float(nap):.2f}" if isinstance(nap, (int, float)) else str(nap)
+    return f"{sig['ts_code']}|{sig['action']}|{sig['k_level']}|{nap_s}"
 
-    加仓成交后状态机推进 → 触发价/k 变化 → 新键可再推；同日同点位不重推。
-    """
-    return f"{sig['ts_code']}|{sig['action']}|{sig['k_level']}|{sig['next_add_price']}"
+
+def _is_already_pushed(sig: Dict[str, Any], alerts: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """检查是否已推送（兼容新 2 位小数键与历史 4 位小数旧键）。"""
+    k_new = _alert_key(sig)
+    if k_new in alerts:
+        return k_new
+    k_legacy = f"{sig['ts_code']}|{sig['action']}|{sig['k_level']}|{sig.get('next_add_price')}"
+    if k_legacy in alerts:
+        return k_legacy
+    return None
 
 
 def _prune_pending(pending: Dict[str, Dict[str, Any]],
                    alerts: Dict[str, Dict[str, Any]],
                    today: str) -> bool:
-    """pending 卫生（v7.0.31）：已推键移除；first_seen 超 TTL → 信号过期移除。
-
-    返回是否有变更（调用方按需落盘）。
-    """
+    """pending 与 alerts 卫生：移除已推/过期 pending，并滚动清理超 180 天的旧 alerts。"""
     changed = False
+    today_d = date.fromisoformat(today)
     for k in list(pending):
         if k in alerts:
             del pending[k]
             changed = True
             continue
         fs = (pending[k] or {}).get("first_seen")
-        if fs and (date.fromisoformat(today)
-                   - date.fromisoformat(fs)).days > PENDING_TTL_DAYS:
+        if fs and (today_d - date.fromisoformat(fs)).days > PENDING_TTL_DAYS:
             del pending[k]
             changed = True
+    # 滚动清理超 180 天的历史已推记录（防状态文件无限膨胀）
+    for k in list(alerts):
+        rec = alerts.get(k) or {}
+        d_s = rec.get("date") or rec.get("signal_date")
+        if d_s:
+            try:
+                if (today_d - date.fromisoformat(str(d_s)[:10])).days > 180:
+                    del alerts[k]
+                    changed = True
+            except ValueError:
+                pass
     return changed
 
 
@@ -175,25 +202,19 @@ def _prune_pending(pending: Dict[str, Dict[str, Any]],
 # 消息与推送
 # ---------------------------------------------------------------------------
 def render_message(signals: List[Dict[str, Any]], sp_name: str,
-                   price_source: str, spot_time: Optional[str]) -> tuple:
-    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
-
-    v7.0.23：双通道聚合（持仓加仓 + 非持仓首仓）。首仓信号带 note（区分口径）
-    与 timing 明细（分位；v7.0.26 起股息率参考项删除）；加仓信号无 note（持仓策略）。
-    """
+                   price_source: str, spot_time: Optional[str],
+                   spot_source: str = "", pctile_max: float = 40.0) -> tuple:
+    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。"""
     names = []
     blocks: List[str] = []
     for s in signals:
         code, name = s["ts_code"], (s.get("name") or s["ts_code"])
         names.append(name)
-        # v8.2.0 累计差值口径：建议量 = 理论累计 vs 现持的差值（build_signals
-        # 已算）；持仓够了的信号根本不会到这里（不产信号）。
         gap_note = (f"（策略理论累计 {s['theory_lots']} 手 / 现持 {s['actual_lots']} 手）"
                     if s.get("theory_lots") is not None and s.get("actual_lots") is not None
                     else "")
-        if s["action"] == "add" and s.get("new_round"):
-            # v8.2.0 补（Joel 2026-11-13 二次定案）：再武装后新一轮首档触线 =
-            # 二次建仓 → 提醒的是「建仓 N 手」，不是「加仓」
+        if s.get("new_round") and s.get("in_pos"):
+            # 再武装后新一轮首档触线 = 二次建仓（兼容统一 action="buy" 与旧 action="add"）
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
                      f"（再武装·二次建仓）")
             tail = (f"二次建仓，{s['suggested_lots']} 手{gap_note}"
@@ -205,14 +226,10 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
         else:
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
                      + (f"（{s['note']}）" if s.get("note") else ""))
-            # new_round（持仓股、模拟从未持仓轮次的首仓触线）→「建仓」口径；
-            # 非持仓首仓通道（4b）无 new_round → 沿用「首仓触发」
             prefix = "建仓" if s.get("new_round") else "首仓触发"
             tail = (f"{prefix}，{s['suggested_lots']} 手{gap_note}"
                     if s.get("suggested_lots") else prefix)
         if s.get("delayed"):
-            # v7.0.31 补推兜底：信号日非当日（前几轮应推未推成功/时机当晚才
-            # 达成）→ 显式标注，避免当成新信号误读
             line1 += f" <span style='color:#c00'>(补推，信号日 {s['first_seen']})</span>"
         bits = [f"现价: <b>{s['price']:.3f}</b>",
                 f"触发价: {s['next_add_price']:.3f}"]
@@ -225,10 +242,13 @@ def render_message(signals: List[Dict[str, Any]], sp_name: str,
     title = ("策略点位提醒：" + "、".join(names[:3]) +
              (" 等" if len(names) > 3 else "") +
              f" 到达策略点位（{len(signals)} 只）")
-    src = "腾讯实时行情" if price_source == "spot" else "湖最后收盘（实时行情缺失）"
+    if price_source == "spot":
+        src = "东财延时行情（备源）" if spot_source == "eastmoney_push2delay" else "腾讯实时行情"
+    else:
+        src = "湖最后收盘（实时行情缺失）"
     ts = f" {spot_time}" if spot_time else ""
     footer = (f"<p style='color:#888;font-size:12px'>行情: {src}{ts} ｜ "
-              f"策略: {sp_name} ｜ 持仓=越跌越买加仓 ｜ 非持仓首仓=实时分位≤40%且破首仓线 ｜ "
+              f"策略: {sp_name} ｜ 持仓=越跌越买加仓 ｜ 非持仓首仓=实时分位≤{pctile_max:g}%且破首仓线 ｜ "
               f"同一点位仅推一次，未推成功自动补推（标注信号日）</p>")
     return title, "".join(blocks) + footer
 
@@ -320,26 +340,37 @@ def run(force: bool = False, dry_run: bool = False,
         spot, spot_source = fetch_spot(sorted(universe), timeout=5.0, max_attempts=1)
     except Exception as exc:  # noqa: BLE001 - 行情失败不阻断（回退湖价）
         log.warning("实时行情主备皆败（回退湖最后价）: %s", exc)
-    # 3b) 实时分位（v7.0.31 A 案，Joel 定案）：现价（spot，无行情回退湖最后
-    #     收盘）替换 5 年前复权窗口末值重算——修「破线 + 分位破线同日达成」
-    #     被前夜快照漏推的结构性盲区。算完即关连接。
+    price_source = ("spot" if any(v.get("price") is not None for v in spot.values())
+                    else "lake")
+    spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
+
+    # 节假日门禁：若拉到实时行情但全批最新行情日早于今天（法定节假日休市），跳过避免陈旧行情误推
+    if price_source == "spot" and not force:
+        q_dates = [touches.quote_date_of((v or {}).get("timestamp")) for v in spot.values()]
+        max_qd = max((d for d in q_dates if d), default=None)
+        if max_qd and max_qd < today:
+            con.close()
+            log.info("节假日/休市（行情最新日 %s < 今日 %s），跳过推送", max_qd, today)
+            return 0
+
+    # 3b) 实时分位：现价（spot 优先，无行情回退湖最后收盘）重算 5 年分位。
+    #     仅在实时价（除权后口径）时传 now=_bj_today 乘 pending 复权比；
+    #     若整体回退湖价（除权前口径），传 now=None 避免双重复权！
     price_map: Dict[str, Optional[float]] = {}
     for c in universe:
         p = (spot.get(c) or {}).get("price")
-        if p is None:
+        if p is None or p <= 0:
             p = (rows.get(c) or {}).get("last_price")
         price_map[c] = p
     try:
         live_pct: Dict[str, Optional[float]] = timing.live_pctile_map(
-            con, sorted(universe), price_map, tp, now=_bj_today)
+            con, sorted(universe), price_map, tp,
+            now=_bj_today if price_source == "spot" else None)
     except Exception as exc:  # noqa: BLE001 - 分位失败 → 首仓通道 fail-closed
         log.warning("实时分位计算失败（首仓通道 fail-closed）: %s", exc)
         live_pct = {}
     finally:
         con.close()
-    price_source = ("spot" if any(v.get("price") is not None for v in spot.values())
-                    else "lake")
-    spot_time = next((v.get("timestamp") for v in spot.values() if v.get("timestamp")), None)
 
     # 4a) 持仓通道：持仓股 → 下一档触发价（与 Web 页面同一口径）
     positions = []
@@ -388,11 +419,23 @@ def run(force: bool = False, dry_run: bool = False,
         pct = live_pct.get(c)
         if pct is None or pct > tp.price_pctile_max:
             continue
-        price_now = (spot.get(c) or {}).get("price") or r.get("last_price")
-        if price_now is None or price_now > trig:
+        price_now = (spot.get(c) or {}).get("price")
+        if price_now is None or price_now <= 0:
+            price_now = r.get("last_price")
+        if price_now is None or price_now <= 0 or price_now > trig:
             continue
-        ev = touch_state.get(c) or {}
+        ev = touches.latest_for_code(touch_state, c) or {}
         ev_date = ev.get("date")
+        # 仅当触碰记录为近期（≤3 自然日）且触发价相近（同轮）才视作补推信号日，避免陈旧记录误标
+        use_ev_date = False
+        if ev_date and ev_date <= today:
+            try:
+                days_diff = (date.fromisoformat(today) - date.fromisoformat(ev_date)).days
+                ev_trig = ev.get("level_price")
+                trig_close = (ev_trig is None or abs(float(ev_trig) - trig) / trig <= 0.02)
+                use_ev_date = (0 <= days_diff <= 3 and trig_close)
+            except ValueError:
+                use_ev_date = False
         signals.append({
             "ts_code": c,
             "name": r.get("name") or c,
@@ -404,7 +447,7 @@ def run(force: bool = False, dry_run: bool = False,
             "action": "buy",
             "note": "非持仓·首仓信号（实时时机✓）",
             "pctile": round(pct, 1),
-            "sig_date": ev_date if ev_date and ev_date <= today else today,
+            "sig_date": ev_date if use_ev_date else today,
         })
     signals.sort(key=lambda x: x.get("ts_code") or "")
 
@@ -420,10 +463,11 @@ def run(force: bool = False, dry_run: bool = False,
         return 0
     to_push = []
     for sig in signals:
-        k = _alert_key(sig)
-        if k in alerts:
-            log.info("去重: %s 已推送过（%s），不重推", k, (alerts[k] or {}).get("at"))
+        hit_key = _is_already_pushed(sig, alerts)
+        if hit_key is not None:
+            log.info("去重: %s 已推送过（%s），不重推", hit_key, (alerts[hit_key] or {}).get("at"))
             continue
+        k = _alert_key(sig)
         pend = pending.get(k) or {}
         sig_date = sig.get("sig_date") or today
         first_seen = min(pend.get("first_seen") or sig_date, sig_date)
@@ -436,8 +480,10 @@ def run(force: bool = False, dry_run: bool = False,
         log.info("全部触发均已推送过，跳过")
         return 0
     # 6) 渲染 + dry-run 出口（不落任何状态）
-    title, content = render_message([s for _, s in to_push], getattr(_sp, "name", "策略"),
-                                    price_source, spot_time)
+    title, content = render_message(
+        [s for _, s in to_push], getattr(_sp, "name", "策略"),
+        price_source, spot_time,
+        spot_source=spot_source, pctile_max=float(getattr(tp, "price_pctile_max", 40.0)))
     n_delayed = sum(1 for _, s in to_push if s.get("delayed"))
     log.info("触发 %d 条（%s%s），标题: %s", len(to_push), price_source,
              f"，补推 {n_delayed}" if n_delayed else "", title)

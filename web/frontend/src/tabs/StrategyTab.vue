@@ -22,7 +22,7 @@ import { api } from "../api/client.js";
 import { useLiveQuery } from "../live/useLiveQuery.js";
 import { invalidate } from "../live/queryRegistry.js";
 import { useToastStore } from "../stores/toastStore.js";
-import { FIELD_TYPE, FIELD_LABELS, EXCLUDED_SECTIONS } from "../data/strategyMeta.js";
+import { FIELD_TYPE, FIELD_LABELS, EXCLUDED_SECTIONS, HIDDEN_FIELDS } from "../data/strategyMeta.js";
 import Toolbar from "./strategy/Toolbar.vue";
 import StrategyCards from "./strategy/StrategyCards.vue";
 
@@ -91,28 +91,34 @@ async function onSave() {
   let bad = false;
 
   for (const [section, fields] of Object.entries(payload)) {
-  if (!fields || typeof fields !== "object") continue;
-  for (const [field, value] of Object.entries(fields)) {
-    const t = FIELD_TYPE[field] || "str";
-    const label = FIELD_LABELS[`${section}.${field}`] || field; // 报错用通俗名（原始名排查时仍看 yaml）
-    let v;
-    if (t === "int") {
-      v = Number.isInteger(Number(value)) ? parseInt(value, 10) : NaN;
-      if (isNaN(v)) { setMsg(`✗ ${label} 必须是整数`, "err"); bad = true; continue; }
-    } else if (t === "float") {
-      v = parseFloat(value);
-      if (isNaN(v)) { setMsg(`✗ ${label} 必须是数值`, "err"); bad = true; continue; }
-    } else if (t === "bool") {
-      v = value === "true" || value === true;
-    } else if (t === "list") {
-      v = String(value).split(",").map((s) => s.trim()).filter(Boolean);
-      if (!v.length) { setMsg(`✗ ${label} 不能为空`, "err"); bad = true; continue; }
-    } else {
-      v = value; // str / enum2 / readonly：原样（enum 值域由后端校验，400 回显）
+    if (EXCLUDED_SECTIONS.includes(section)) continue;
+    if (!fields || typeof fields !== "object") continue;
+    for (const [field, value] of Object.entries(fields)) {
+      if (HIDDEN_FIELDS.has(`${section}.${field}`)) continue;
+      const t = FIELD_TYPE[field] || "str";
+      const label = FIELD_LABELS[`${section}.${field}`] || field; // 报错用通俗名（原始名排查时仍看 yaml）
+      let v;
+      if (t === "int") {
+        const s = String(value ?? "").trim();
+        v = /^-?\d+$/.test(s) ? Number.parseInt(s, 10) : NaN;
+        if (!Number.isSafeInteger(v)) { setMsg(`✗ ${label} 必须是整数`, "err"); bad = true; continue; }
+      } else if (t === "float") {
+        const s = String(value ?? "").trim();
+        v = s === "" ? NaN : Number(s);
+        if (!Number.isFinite(v)) { setMsg(`✗ ${label} 必须是数值`, "err"); bad = true; continue; }
+      } else if (t === "bool") {
+        v = value === "true" || value === true;
+      } else if (t === "list") {
+        v = Array.isArray(value)
+          ? value.map((s) => String(s).trim()).filter(Boolean)
+          : String(value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+        if (!v.length) { setMsg(`✗ ${label} 不能为空`, "err"); bad = true; continue; }
+      } else {
+        v = value; // str / enum2 / readonly：原样（enum 值域由后端校验，400 回显）
+      }
+      payload[section][field] = v;
     }
-    payload[section][field] = v;
-  }
-  if (bad) break;
+    if (bad) break;
   }
   if (bad) return; // 本地校验失败 → 不提交（旧版语义原样）
 
@@ -136,6 +142,10 @@ async function onSave() {
     setEditing(false);
     toast.toast("策略已更新");
     invalidate("strategy"); // 事件触发重拉 GET（报告 §2.1；替代旧版 setTimeout 600ms）
+    invalidate("pool");
+    invalidate("timing");
+    invalidate("my_positions");
+    invalidate("strategy_signals");
   } catch (e) {
     // 400 拒绝：保持编辑态，用户可改正后重试（saving 由 finally 恢复）
     const errs = e.body && e.body.detail && e.body.detail.errors ? e.body.detail.errors.join("\n") : e.message;

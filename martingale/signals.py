@@ -74,10 +74,13 @@ def classify_signal(price: Optional[float], trigger: Optional[float],
         approaching ∈ (0, approach_pct]，2 位小数；no_data 为 None）
     """
     k = k_level or 0
-    if price is None or trigger is None or trigger <= 0:
+    if price is None or price <= 0 or trigger is None or trigger <= 0:
         return {"status": "no_data", "action": None, "suggested_lots": None,
                 "distance_pct": None}
-    if in_pos:
+    # 统一 k==0（含再武装后二次建仓 in_pos=True, k=0）动作键为 "buy"，
+    # 避免买入登记后微信去重键 buy vs add 分裂引发重复推送及历史已推标注失效；
+    # 文案区分「首仓」与「二次建仓」由上层 new_round + in_pos 决定。
+    if in_pos and k > 0:
         action = "add"
         suggested = (sp.first_lots + k * sp.add_lots_step) if sp is not None else None
     else:
@@ -126,15 +129,15 @@ def _gap_suggested(sp: Optional[Any], pos: Dict[str, Any], k: int, in_pos: bool,
     # 信号。差值判定只约束有策略跟上的仓位（shares_since>0）。
     if theory_shares == 0:
         return base_suggested, None, False
-    stage_lots = (sp.first_lots + k * sp.add_lots_step) if in_pos else sp.first_lots
+    stage_lots = (sp.first_lots + k * sp.add_lots_step) if (in_pos and k > 0) else sp.first_lots
     theory_lots = float(theory_shares) / sp.lot_size + stage_lots
     actual_lots = float(shares) / sp.lot_size
     gap = theory_lots - actual_lots
     extra = {"theory_lots": round(theory_lots, 2), "actual_lots": round(actual_lots, 2),
              "gap_lots": round(max(0.0, gap), 2)}
-    if gap <= 0:
-        return None, extra, True  # 持仓够了（或超配）→ 不提醒
-    return max(1, math.ceil(gap)), extra, True
+    if gap <= 1e-9:
+        return None, extra, True  # 持仓够了（或超配）→ 不提醒（1e-9 防浮点残差误补 1 手）
+    return max(1, math.ceil(gap - 1e-9)), extra, True
 
 
 def judge_held_lots(sp: Optional[Any], k: int, in_pos: bool,

@@ -291,13 +291,17 @@ def _status_probe():
     db_path = _conn.default_db_path()
     if not os.path.exists(db_path):
         return "unavailable", None, None
-    try:
-        con = _conn.connect_existing(db_path)
-    except _conn.LakeLocked as exc:  # noqa: BLE001
-        # v6.0.4：灌数持锁 → ("locked", None, holder_pid)；holder_pid 尽力解析，失败 None
-        return "locked", None, exc.holder_pid
-    except Exception:  # noqa: BLE001 - 打不开（含 D-1 无效文件）→ 视为未就绪（status 不抛 503）
-        return "unavailable", None, None
+    for attempt in range(2):
+        try:
+            con = _conn.connect_existing(db_path)
+            break
+        except _conn.LakeLocked as exc:  # noqa: BLE001
+            return "locked", None, exc.holder_pid
+        except Exception as exc:  # noqa: BLE001
+            if "different configuration" in str(exc).lower() and attempt == 0:
+                time.sleep(0.15)
+                continue
+            return "unavailable", None, None
     try:
         n = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
@@ -1817,24 +1821,12 @@ def sources_toggle(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {**res, "note": "已写入配置（立即生效于下次灌数启动；运行中灌数不受影响）"}
 
 
+_PROBE_LOCK = threading.Lock()
+
+
 @router.post("/sources/probe")
 def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """O4：手动探测各源连通性（每源 ≤15s 超时隔离；写 source_health.json）。
-
-    :param payload: ``{"names": ["sina", ...]}``（缺省/空 = 全部 4 源）。
-    - 200 ``{results: {name: {available, probed_at, latency_ms, detail?,
-      sg: {available, probed_at, latency_ms, detail}}}, path, sg_path}``。
-    - **400**：names 含非白名单源名。
-
-    **超时纪律**（brief 逐字）：每源最多 15s——hang 场景不能拖死请求。
-    实现=每源一个 daemon 线程 + join(15)；超时 → available=false detail="probe timeout"
-    （线程无法强杀，hang 的后台线程泄漏但请求已返回；socket 层 10s 超时是主防线）。
-    **灌数运行中允许探测**：只读网络自检、不碰库（health 是 JSON 文件）。
-
-    **v1.2 SG 中转档**：本机探测循环之外，一次 ssh 批量探 SG 通道（独立线程 +
-    ≤45s 墙钟）；SG 结果并入 results[name].sg + 写 source_health_sg.json（独立
-    文件，灌数 driver 全量覆盖 source_health.json 冲不掉）。SG 失败只记 sg 档。
-    """
+    """O4：手动探测各源连通性（单飞互斥防并发打满线程池与 SG 连接；每源 ≤15s 超时隔离）。"""
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body 必须是 JSON 对象 {names:[...]}")
     names = payload.get("names") or list(_PROBE_NAMES)
@@ -1846,6 +1838,15 @@ def sources_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
             status_code=400,
             detail=f"非法源名: {bad}（白名单: {', '.join(_PROBE_NAMES)}）")
 
+    if not _PROBE_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="数据源探测正在进行中，请稍后再试")
+    try:
+        return _do_sources_probe(names)
+    finally:
+        _PROBE_LOCK.release()
+
+
+def _do_sources_probe(names: List[str]) -> Dict[str, Any]:
     # v1.2：SG 中转档与本机探测**并行**（独立线程；SG 失败不拖累本机档/请求）
     probe_names = list(dict.fromkeys(names))
     sg_holder: Dict[str, Any] = {}
@@ -1960,6 +1961,11 @@ def sync_start(codes: Optional[str] = Query(default=None),
     extra_args: Optional[List[str]] = None
     if codes and codes.strip():
         cs = [c.strip() for c in codes.split(",") if c.strip()]
+        if len(cs) > 200:
+            raise HTTPException(status_code=400, detail="单次指定 codes 最多 200 只")
+        for c in cs:
+            if not re.fullmatch(r"(?:(?:sh|sz|bj)\.)?\d{6}", c):
+                raise HTTPException(status_code=400, detail=f"非法股票代码: {c!r}")
         if cs:
             extra_args = ["--codes", ",".join(cs)]
     # v6.1.6：full → driver `full` 子命令（单进程顺序三阶段，同一把锁贯穿全程）。

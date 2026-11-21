@@ -61,16 +61,21 @@ __all__ = [
 
 def classify_boundary(af0: float, af1: float, close0: float, close1: float,
                       has_known_event: bool,
-                      tol: float = DEFAULT_TOL) -> Tuple[bool, str]:
+                      tol: float = DEFAULT_TOL,
+                      expected_move: Optional[float] = None) -> Tuple[bool, str]:
     """判定边界 (d0→d1) 是否假基准跳变。
 
+    :param expected_move: 已知除权事件的理论官方复权步长（c0*(1+bonus)/(c0-cash)）；
+        提供时用它替代含当日市场涨跌幅的 close0/close1，避免除权日正常涨跌 >2%
+        被误杀抹平。缺省 None 回退旧 price_ratio 判定（兼容无金额事件与旧调用方）。
     :return: (is_spurious, kind)，kind ∈ {"no_event","event","suspected"}。
     """
     af_move = af1 / af0
     price_ratio = close0 / close1
     if has_known_event:
         kind = "event"
-        spurious = abs(math.log(af_move / price_ratio)) > tol
+        ref_move = expected_move if (expected_move is not None and expected_move > 0) else price_ratio
+        spurious = abs(math.log(af_move / ref_move)) > tol
     elif price_ratio >= LARGE_DROP_RATIO:
         kind = "suspected"
         spurious = (abs(math.log(af_move / price_ratio)) > tol
@@ -81,11 +86,67 @@ def classify_boundary(af0: float, af1: float, close0: float, close1: float,
     return spurious, kind
 
 
+def _expected_event_move(c0: float,
+                         ev_list: List[Tuple[str, float, float]]) -> Optional[float]:
+    """根据 (d0, d1] 区间内聚合后的除权事件列表计算理论官方复权步长。
+
+    :param ev_list: [(ex_date, cash_dps_sum, stk_div_per_share_sum), ...] 升序。
+    :return: >0 的理论步长；若所有事件均无金额/送转（仅日期占位）或数据异常 → None。
+    """
+    cur_p = float(c0)
+    move = 1.0
+    has_quant = False
+    for _ex, cash, bonus in ev_list:
+        cash_f = float(cash or 0.0)
+        bonus_f = float(bonus or 0.0)
+        if cash_f == 0.0 and bonus_f == 0.0:
+            continue
+        denom = cur_p - cash_f
+        if denom <= 0 or (1.0 + bonus_f) <= 0:
+            return None
+        p_ex = denom / (1.0 + bonus_f)
+        move *= cur_p / p_ex
+        cur_p = p_ex
+        has_quant = True
+    return move if has_quant and move > 0 else None
+
+
+def _events_in_interval(sorted_events: List[Tuple[str, float, float]],
+                        d0: str, d1: str) -> List[Tuple[str, float, float]]:
+    """返回落在 (d0, d1] 区间内的全部除权事件（覆盖当日与停牌顺延除权）。"""
+    return [e for e in sorted_events if d0 < e[0] <= d1]
+
+
+def _load_div_events(con, ts_code: Optional[str] = None) -> Dict[str, List[Tuple[str, float, float]]]:
+    """读取 dividend_events（自动兼容只含 ts_code/ex_date 的精简表）。"""
+    cols = {str(r[1]).lower() for r in con.execute("PRAGMA table_info('dividend_events')").fetchall()}
+    has_cash = "cash_dps" in cols
+    has_stk = "stk_div" in cols
+    cash_expr = "SUM(COALESCE(cash_dps, 0))" if has_cash else "0.0"
+    stk_expr = "SUM(COALESCE(stk_div, 0))" if has_stk else "0.0"
+    out: Dict[str, List[Tuple[str, float, float]]] = {}
+    if ts_code is not None:
+        rows = con.execute(
+            f"SELECT ex_date, {cash_expr}, {stk_expr} "
+            "FROM dividend_events WHERE ts_code=? AND ex_date IS NOT NULL "
+            "GROUP BY ex_date ORDER BY ex_date",
+            [ts_code]).fetchall()
+        out[ts_code] = [(str(d)[:10], float(cd or 0.0), float(sd or 0.0)) for d, cd, sd in rows]
+    else:
+        rows = con.execute(
+            f"SELECT ts_code, ex_date, {cash_expr}, {stk_expr} "
+            "FROM dividend_events WHERE ex_date IS NOT NULL "
+            "GROUP BY ts_code, ex_date ORDER BY ts_code, ex_date").fetchall()
+        for code, d, cd, sd in rows:
+            out.setdefault(code, []).append((str(d)[:10], float(cd or 0.0), float(sd or 0.0)))
+    return out
+
+
 def rebase_stock_af(con, ts_code: str,
                     tol: float = DEFAULT_TOL) -> Dict[str, Any]:
     """单股 af 基准对齐：检测全部假跳变并把各段 af 换算到最早段基准后写回。
 
-    幂等：已对齐的股票（无假跳变）零写入。
+    幂等：已对齐的股票（无假跳变）零写入；多段写回包裹在同一事务内防半写。
     :param con: 可写 DuckDB 连接（生产湖或测试合成库）。
     """
     rows = con.execute(
@@ -94,9 +155,7 @@ def rebase_stock_af(con, ts_code: str,
         "ORDER BY date", [ts_code]).fetchall()
     if len(rows) < 2:
         return {"ts_code": ts_code, "rows": len(rows), "jumps": [], "rewritten": 0}
-    events: Set[str] = {str(d)[:10] for (d,) in con.execute(
-        "SELECT DISTINCT ex_date FROM dividend_events WHERE ts_code=?",
-        [ts_code]).fetchall()}
+    sorted_events = _load_div_events(con, ts_code=ts_code).get(ts_code, [])
     norm = [{"date": str(d)[:10], "close": c, "af": a} for d, c, a in rows]
 
     # 逐边界判定 + 累积段换算系数（scale 从 1 起，每遇假跳变乘一次修正）
@@ -108,14 +167,21 @@ def rebase_stock_af(con, ts_code: str,
         r0, r1 = norm[i - 1], norm[i]
         if None in (r0["close"], r1["close"]) or r0["close"] <= 0 or r1["close"] <= 0:
             continue  # 缺值对：不可判定，保持同段
-        spurious, kind = classify_boundary(r0["af"], r1["af"], r0["close"],
-                                           r1["close"], r1["date"] in events, tol)
+        interval_evs = _events_in_interval(sorted_events, r0["date"], r1["date"])
+        has_ev = bool(interval_evs)
+        exp_move = _expected_event_move(r0["close"], interval_evs) if has_ev else None
+        spurious, kind = classify_boundary(
+            r0["af"], r1["af"], r0["close"], r1["close"],
+            has_ev, tol, expected_move=exp_move)
         if not spurious:
             continue
         old_scale = scale
         if kind == "no_event":
             scale = scale * r0["af"] / r1["af"]
-        else:  # event / suspected：真实事件已被价格吸收（见模块 docstring）
+        elif exp_move is not None and exp_move > 0:
+            # 已知除权事件：对齐到官方理论步长，保留除权日真实市场涨跌幅
+            scale = scale * (r0["af"] * exp_move) / r1["af"]
+        else:  # suspected 或无金额占位事件：回退价格吸收公式
             scale = scale * (r0["close"] * r0["af"]) / (r1["close"] * r1["af"])
         jumps.append({"date": r1["date"], "kind": kind,
                       "af_ratio": round(r1["af"] / r0["af"], 6),
@@ -125,17 +191,33 @@ def rebase_stock_af(con, ts_code: str,
         seg_start = i
     segments.append((scale, seg_start, len(norm) - 1))
 
+    to_write = [(s, i0, i1) for s, i0, i1 in segments if abs(s - 1.0) >= 1e-9]
     rewritten = 0
-    for s_scale, i0, i1 in segments:
-        if abs(s_scale - 1.0) < 1e-9:
-            continue
-        # 段内一次性乘换算（set-based；段内可能夹 NULL-af 行 → NULL×s 仍 NULL，安全）
-        n = con.execute(
-            "UPDATE kline_daily SET adj_factor = adj_factor * ? "
-            "WHERE ts_code=? AND date BETWEEN ? AND ? "
-            "AND adj_factor IS NOT NULL RETURNING adj_factor",
-            [s_scale, ts_code, norm[i0]["date"], norm[i1]["date"]]).fetchall()
-        rewritten += len(n)
+    if to_write:
+        in_tx = False
+        try:
+            con.execute("BEGIN TRANSACTION")
+            in_tx = True
+        except Exception:  # noqa: BLE001 - 已在外部事务内
+            in_tx = False
+        try:
+            for s_scale, i0, i1 in to_write:
+                # 段内一次性乘换算（set-based；段内可能夹 NULL-af 行 → NULL×s 仍 NULL，安全）
+                n = con.execute(
+                    "UPDATE kline_daily SET adj_factor = adj_factor * ? "
+                    "WHERE ts_code=? AND date BETWEEN ? AND ? "
+                    "AND adj_factor IS NOT NULL RETURNING adj_factor",
+                    [s_scale, ts_code, norm[i0]["date"], norm[i1]["date"]]).fetchall()
+                rewritten += len(n)
+            if in_tx:
+                con.execute("COMMIT")
+        except Exception:
+            if in_tx:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
     if jumps:
         log.warning("af_rebase %s：%d 个假基准跳变已对齐（%d 行改写，示例 %s）",
                     ts_code, len(jumps), rewritten, jumps[:3])
@@ -169,21 +251,22 @@ def find_spurious_jumps(con, since_date: Optional[str] = None,
               WINDOW w AS (PARTITION BY ts_code ORDER BY date)) t
         WHERE t.d0 IS NOT NULL
           {where}
+        ORDER BY t.ts_code, t.d1
         LIMIT {int(max_pairs)}
     """, params).fetchall()
-    events_by_code: Dict[str, Set[str]] = {}
-    for code, d in con.execute(
-            "SELECT ts_code, ex_date FROM dividend_events").fetchall():
-        events_by_code.setdefault(code, set()).add(str(d)[:10])
+    events_by_code = _load_div_events(con, ts_code=None)
     out: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     for code, d0, d1, c0, c1, af0, af1 in pairs:
+        d0s, d1s = str(d0)[:10], str(d1)[:10]
+        interval_evs = _events_in_interval(events_by_code.get(code, []), d0s, d1s)
+        has_ev = bool(interval_evs)
+        exp_move = _expected_event_move(c0, interval_evs) if has_ev else None
         spurious, kind = classify_boundary(
-            af0, af1, c0, c1,
-            str(d1)[:10] in events_by_code.get(code, ()))
+            af0, af1, c0, c1, has_ev, expected_move=exp_move)
         if spurious:
             seen.add(code)
-            out.append({"ts_code": code, "date": str(d1)[:10], "kind": kind,
+            out.append({"ts_code": code, "date": d1s, "kind": kind,
                         "af_ratio": round(af1 / af0, 6)})
     log.info("af_rebase 扫描：相邻对 %d，假基准跳变 %d（涉及 %d 股）",
              len(pairs), len(out), len(seen))

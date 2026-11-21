@@ -184,9 +184,9 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
-    # 状态落盘（键含 点位+k+动作；v7.0.31：alerts/pending 双区）
+    # 状态落盘（键含 点位 2dp+k+动作；v7.0.31：alerts/pending 双区）
     st = json.load(open(state_path, encoding="utf-8"))
-    assert "sh.601728|add|1|6.0" in st["alerts"]
+    assert "sh.601728|add|1|6.00" in st["alerts"]
     assert st["pending"] == {}, "推送成功后 pending 清空"
 
     # 同日第二轮 → 去重不重推
@@ -294,7 +294,7 @@ def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):
     assert rc == 4, "推送失败退出码 4"
     st = json.load(open(state_path, encoding="utf-8"))
     assert st["alerts"] == {}, "推送失败不落 alerts"
-    pend = st["pending"]["sh.601728|add|1|6.0"]
+    pend = st["pending"]["sh.601728|add|1|6.00"]
     assert pend["first_seen"] == "2026-10-26"
 
     # 次日信号仍当前 → 重推 + 补推标注（恢复成功推送桩）
@@ -319,7 +319,7 @@ def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):
     content = posts[0]["json"]["content"]
     assert "(补推，信号日 2026-10-26)" in content
     st2 = json.load(open(state_path, encoding="utf-8"))
-    assert "sh.601728|add|1|6.0" in st2["alerts"]
+    assert "sh.601728|add|1|6.00" in st2["alerts"]
     assert st2["pending"] == {}
 
 
@@ -485,9 +485,9 @@ def test_run_first_position_dual_condition(monkeypatch, tmp_path):
     assert "1 手" in content                            # 首仓 first_lots=1 手（v7.0.28）
     assert "时机未过" not in content and "价格未过" not in content  # 单条件不推
     assert "策略点位提醒" in body["title"]
-    # 去重键：code|buy|0|首仓线
+    # 去重键：code|buy|0|首仓线（2dp）
     st = json.load(open(state_path, encoding="utf-8"))
-    assert "sh.600001|buy|0|9.0" in st["alerts"]
+    assert "sh.600001|buy|0|9.00" in st["alerts"]
     # 同日第二轮 → 去重不重推
     rc2 = pa.run(force=True, state_path=state_path)
     assert rc2 == 0 and len(posts) == 1

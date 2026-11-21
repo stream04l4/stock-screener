@@ -109,6 +109,7 @@ export const useLakeStore = defineStore("lake", {
         // SyncControl 按锁定分支渲染（保持 disabled+"停止中…"），靠 5min 硬超时兜底释放。
         this.status = null;
         this.lastError = e.message;
+        if (e && e.status === 401) this.stopAll();
       }
     },
 
@@ -211,10 +212,16 @@ export const useLakeStore = defineStore("lake", {
       if (iv > 0) this._timer = setInterval(() => { this.fetchStatus(); }, iv);
     },
 
-    // 测试/页面卸载兜底：停定时器（组件不直接碰——生命周期归 store）
-    _stopTimerForTest() {
+    // 登出/401/页面卸载兜底：停定时器并重置激活态
+    stopAll() {
+      this.activated = false;
       if (this._timer) { clearInterval(this._timer); this._timer = null; }
       this._timerIv = 0;
+    },
+
+    // 测试/页面卸载兜底：停定时器（组件不直接碰——生命周期归 store）
+    _stopTimerForTest() {
+      this.stopAll();
     },
   },
 });

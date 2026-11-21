@@ -72,10 +72,11 @@ class PoolResult:
 
 def _div_history_ok(annual_dps: Dict[int, float], min_years: int, run_year: int,
                     list_year: Optional[int]) -> bool:
-    """连续分红判定（as-is 移植 v6.x _div_history_ok + new_stock_div_ok）。
+    """连续分红判定。
 
-    为什么新股规则更严（全部年度而非最近 N 年）：新股上市时间短，"最近 N 年"
-    会漏掉其上市首年的分红缺失；as-is 移植 = brief 允许的最终池偏差来源。
+    老股（list_year < run_year - min_years）：[run_year - min_years, run_year - 1] 全年有分红；
+    新股：上市次年至 run_year - 1 全部年度有分红，且至少有 1 个完整分红年度（防止从未分红的
+    次新股因 years=[] 天然通过）。
     """
     min_year = run_year - min_years
     if list_year is None or list_year < min_year:
@@ -83,7 +84,8 @@ def _div_history_ok(annual_dps: Dict[int, float], min_years: int, run_year: int,
         return all(annual_dps.get(y, 0.0) > 0.0 for y in range(min_year, run_year))
     years = list(range(list_year + 1, run_year))
     if not years:
-        return True
+        # 上市未满一个完整自然年的次新股：仅当上市年或当年已有实际现金分红才放行
+        return any(v > 0.0 for v in annual_dps.values())
     return all(annual_dps.get(y, 0.0) > 0.0 for y in years)
 
 
@@ -199,7 +201,7 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
     a = str(as_of)[:10]
     run_year = int(str(as_of)[:4])
 
-    # 2) 白名单 + 存活(as_of) + 非ST(as_of)
+    # 2) 白名单 + 存活(as_of) + 非ST(as_of，结合 kline_daily.is_st 的 PIT 状态)
     if set(up.industry_whitelist_csric2) == {"*"}:
         wl_sql = """
             SELECT ts_code, name, industry_csric2, list_date
@@ -218,10 +220,24 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
         """
         con.execute(wl_sql, [f"{c}%" for c in up.industry_whitelist_csric2] + [a, a])
     wl_rows = con.fetchall()
-    wl = {r[0]: r for r in wl_rows}
+    # 结合 kline_daily 在 <= as_of 最近交易日的 is_st（覆盖历史曾 ST 后摘帽的股票）
+    st_pit = {
+        r[0] for r in con.execute("""
+            SELECT k.ts_code FROM kline_daily k
+            JOIN (SELECT ts_code, MAX(date) md FROM kline_daily
+                  WHERE date <= ? GROUP BY ts_code) x
+              ON k.ts_code = x.ts_code AND k.date = x.md
+            WHERE COALESCE(k.is_st, 0) != 0
+        """, [a]).fetchall()
+    }
+    wl = {r[0]: r for r in wl_rows if r[0] not in st_pit}
 
-    # 3) SOE（PIT）
+    # 3) SOE（PIT；soe_control_overrides 在步骤 3-a 即纳入豁免，防标注缺口股被提前淘汰）
     soe = _soe_set_asof(con, a, up.soe_keywords)
+    ov = set(up.soe_control_overrides)
+    for c in ov:
+        if c in wl and c not in soe:
+            soe[c] = "人工豁免"
     soe_codes = sorted(set(wl) & set(soe))
     soe_raw = len(soe_codes)
 
@@ -230,18 +246,18 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
         excl = set(up.exclude_codes)
         soe_codes = [c for c in soe_codes if c not in excl]
 
-    # 3-c) 控股强度门（PIT）
+    # 3-c) 控股强度门（PIT；修复单边设 0 时 0.0 >= 0.0 短路放行全部股票的 bug）
     if up.min_soe_ratio_pct > 0 or up.min_soe_sum_ratio_pct > 0:
         ratios = _soe_ratio_map_asof(con, a)
-        ov = set(up.soe_control_overrides)
         soe_codes = [
             c for c in soe_codes
-            if (ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct
-                or ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct
+            if ((up.min_soe_ratio_pct > 0 and ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct)
+                or (up.min_soe_sum_ratio_pct > 0 and ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct)
                 or c in ov)
         ]
+    soe_ratio_cnt = len(soe_codes)
 
-    # 3-d) v8.1.1 央企收紧门（PIT；口径同生产版，快照 ≤ as_of）
+    # 3-d) v8.1.1 央企收紧门（PIT；最大国有股东为央企，快照 ≤ as_of）
     if up.central_only:
         from .central_soe import CENTRAL_OVERRIDE_CODES, central_soe_codes_asof
         _minr = up.min_soe_ratio_pct if up.min_soe_ratio_pct > 0 else 8.0
@@ -315,6 +331,8 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
         "whitelist": len(wl),
         "soe": soe_raw,
         "soe_ratio": len(soe_codes),
+        "soe_ratio_pre_central": soe_ratio_cnt,
+        "central": len(soe_codes),
         "mv": len(mv_codes),
         "listing": len(listing_codes),
         "div": len(div_codes),
@@ -325,8 +343,13 @@ def build_pool_asof(con, up: UniverseParams, as_of) -> PoolResult:
 
 def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolResult:
     """构建股票池。:param con: 只读 duckdb 连接；:param run_year: 分红判定的
-    "当前年"（缺省 = 当年；测试可注入以复现历史口径）。"""
-    run_year = run_year or _date.today().year
+    "当前年"（缺省优先取湖最新 K 线年份，湖空回退当年）。"""
+    if run_year is None:
+        _r = con.execute("SELECT MAX(date) FROM kline_daily").fetchone()
+        if _r and _r[0] is not None:
+            run_year = int(str(_r[0])[:4])
+        else:
+            run_year = _date.today().year
 
     # 2) 白名单 + 存活 + 非ST（industry_csric2 前缀匹配；v8.0.8：["*"] = 全放开）
     if set(up.industry_whitelist_csric2) == {"*"}:
@@ -347,8 +370,12 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
     wl_rows = con.fetchall()
     wl = {r[0]: r for r in wl_rows}
 
-    # 3) SOE
+    # 3) SOE（soe_control_overrides 在步骤 3-a 即纳入豁免，防标注缺口股被提前淘汰）
     soe = _soe_set(con, up.soe_keywords)
+    ov = set(up.soe_control_overrides)
+    for c in ov:
+        if c in wl and c not in soe:
+            soe[c] = "人工豁免"
     soe_codes = sorted(set(wl) & set(soe))
     soe_raw = len(soe_codes)  # 漏斗展示用：交后计数（门前的口径）
 
@@ -357,34 +384,38 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
         excl = set(up.exclude_codes)
         soe_codes = [c for c in soe_codes if c not in excl]
 
-    # 3-c) v8.0.8 SOE 控股强度门（两键均 0 = 关闭，回退 v8.0.0 行为）：
-    # 最大单一国有占比 ≥ min_soe_ratio_pct 或 top10 国有合计 ≥ min_soe_sum_ratio_pct
-    # 或命中 soe_control_overrides（湖数据标注缺口豁免）→ 保留。
+    # 3-c) v8.0.8 SOE 控股强度门（修复单边设 0 时 0.0 >= 0.0 短路失效的 bug）
     if up.min_soe_ratio_pct > 0 or up.min_soe_sum_ratio_pct > 0:
         ratios = _soe_ratio_map(con)
-        ov = set(up.soe_control_overrides)
         soe_codes = [
             c for c in soe_codes
-            if (ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct
-                or ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct
+            if ((up.min_soe_ratio_pct > 0 and ratios.get(c, (0.0, 0.0))[0] >= up.min_soe_ratio_pct)
+                or (up.min_soe_sum_ratio_pct > 0 and ratios.get(c, (0.0, 0.0))[1] >= up.min_soe_sum_ratio_pct)
                 or c in ov)
         ]
+    soe_ratio_cnt = len(soe_codes)
 
-    # 3-d) v8.1.1 央企收紧门（可选；默认关 = 零行为变化）：最大国有股东
-    # （≥ 控股强度门槛，缺省 8%）须为央企（central_soe.CENTRAL_TOKENS）。
+    # 3-d) v8.1.1 央企收紧门（最大国有股东 ≥ 控股强度门槛 须为央企）
     if up.central_only:
         from .central_soe import CENTRAL_OVERRIDE_CODES, central_soe_codes_latest
         _minr = up.min_soe_ratio_pct if up.min_soe_ratio_pct > 0 else 8.0
         central = central_soe_codes_latest(con, _minr) | CENTRAL_OVERRIDE_CODES
         soe_codes = [c for c in soe_codes if c in central]
 
-    # 4) 市值（最新估值日 total_mv；valuation_daily 日期列名 = date）
+    # 4) 市值（每股各自最近估值日且距全局最新估值日 ≤30 天，避免当日临时停牌股被误杀）
     mv_sql = """
-        SELECT ts_code, total_mv FROM valuation_daily
-        WHERE date = (SELECT MAX(date) FROM valuation_daily)
+        SELECT v.ts_code, v.total_mv, v.ttm_yield_pct
+        FROM valuation_daily v
+        JOIN (SELECT ts_code, MAX(date) AS md FROM valuation_daily GROUP BY ts_code) x
+          ON v.ts_code = x.ts_code AND v.date = x.md
+        WHERE v.date >= (SELECT MAX(date) - INTERVAL 30 DAY FROM valuation_daily)
     """
     con.execute(mv_sql)
-    mv_map = dict(con.fetchall())
+    mv_map: Dict[str, Optional[float]] = {}
+    ttm_map: Dict[str, Optional[float]] = {}
+    for c, mv, ttm in con.fetchall():
+        mv_map[c] = mv
+        ttm_map[c] = float(ttm) if ttm is not None else None
     mv_codes = sorted(c for c in soe_codes
                       if (mv_map.get(c) is not None and mv_map[c] >= up.min_total_mv_yi))
 
@@ -414,7 +445,7 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
             div_codes.append(c)
     div_codes = sorted(div_codes)
 
-    # 成员详情
+    # 成员详情（复用批量 ttm_map，消除 N+1 SQL 查询）
     members: List[Member] = []
     for c in div_codes:
         name = wl[c][1]
@@ -422,12 +453,7 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
         ld = wl[c][3]
         list_date = str(ld)[:10] if ld is not None else None
         tv = mv_map.get(c)
-        con.execute(
-            "SELECT ttm_yield_pct FROM valuation_daily WHERE ts_code = ? AND date = "
-            "(SELECT MAX(date) FROM valuation_daily WHERE ts_code = ?) ORDER BY date DESC LIMIT 1",
-            [c, c])
-        r = con.fetchone()
-        ttm = float(r[0]) if r and r[0] is not None else None
+        ttm = ttm_map.get(c)
         members.append(Member(
             ts_code=c, name=str(name) if name is not None else "",
             industry_csric2=str(industry), soe_basis=soe[c],
@@ -439,7 +465,9 @@ def build_pool(con, up: UniverseParams, run_year: Optional[int] = None) -> PoolR
         "total": int(con.execute("SELECT COUNT(*) FROM stock_master").fetchone()[0]),
         "whitelist": len(wl),
         "soe": soe_raw,
-        "soe_ratio": len(soe_codes),  # v8.0.8 排除+控股强度门后的计数（门关闭时=soe）
+        "soe_ratio": len(soe_codes),
+        "soe_ratio_pre_central": soe_ratio_cnt,
+        "central": len(soe_codes),
         "mv": len(mv_codes),
         "listing": len(listing_codes),
         "div": len(div_codes),

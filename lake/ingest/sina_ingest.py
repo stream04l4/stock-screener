@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
-from .common import DATA_VERSION, clean_date, delete_where, insert_many, now_ts, to_float
+from .common import DATA_VERSION, clean_date, now_ts, replace_where, to_float
 
 log = logging.getLogger("lake.ingest.sina")
 
@@ -61,11 +61,10 @@ def load_t6(con, ts_code: str, periods: Sequence[Dict[str, Any]],
         "share_nature",
         "source", "fetched_at", "data_version"]
     if as_of_date:
-        con.execute(
-            'DELETE FROM holders_snapshot WHERE ts_code=? AND as_of_date=?',
-            [ts_code, as_of_date])
-    else:
-        delete_where(con, "holders_snapshot", "ts_code", ts_code)
-    return insert_many(con, "holders_snapshot", cols, rows)
+        return replace_where(
+            con, "holders_snapshot", "ts_code=? AND as_of_date=?",
+            [ts_code, as_of_date], cols, rows)
+    return replace_where(
+        con, "holders_snapshot", "ts_code=?", [ts_code], cols, rows)
 
 

@@ -147,6 +147,8 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
                                  tp.price_pctile_max)
             i0 = int(np.searchsorted(dates, np.datetime64(start)))
             dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            if len(dates) < 2:
+                continue  # 仅扩展段有数据而主窗口停牌/断更 → 不写行（fail-closed）
         stat, _state, _v, _cst, _f, _buys = run_stock(
             c, dates, sig, exec_c, divs.get(c), sp, verbose=verbose,
             first_ok=ok)
@@ -234,37 +236,39 @@ def build_candidate_pool(con, up: UniverseParams,
     返回 PoolResult：funnel 扩展键 backtest/yield/price/final/manual；
     Member 扩展字段（bt_pnl_pct/bt_n_buys/price_latest/is_manual）填充。
     """
-    manual = manual or {}
+    manual = manual if manual is not None else {}
     base = base or build_pool(con, up)
 
-    # G9：最新收盘价（每只一行）
-    con.execute(
-        "SELECT ts_code, close FROM kline_daily "
-        "WHERE date = (SELECT MAX(date) FROM kline_daily)")
+    # G9：最新收盘价（每股各自最近交易日且距全局最新日 ≤30 天，避免当日临时停牌股被误杀）
+    con.execute("""
+        SELECT k.ts_code, k.close FROM kline_daily k
+        JOIN (SELECT ts_code, MAX(date) AS md FROM kline_daily GROUP BY ts_code) x
+          ON k.ts_code = x.ts_code AND k.date = x.md
+        WHERE k.date >= (SELECT MAX(date) - INTERVAL 30 DAY FROM kline_daily)
+    """)
     price_map: Dict[str, float] = {}
     for c, cl in con.fetchall():
         if cl is not None:
             price_map[str(c)] = float(cl)
 
-    bt = load_backtest_map(con) if up.backtest_positive else {}
+    bt = load_backtest_map(con)
 
     n_g7 = n_g8 = 0
     auto: List[Member] = []
     for m in base.members:
         b = bt.get(m.ts_code)
-        # G7（v7.0.39）：≥1 次触发 且 净收益率 ≥ 门槛（百分数口径对比：
-        # 表内 pnl_pct 是小数 ×100）。NULL 收益率 fail-closed 不入选。
-        # 门槛 0 时语义 ≈ 原「必须为正」（pnl_pct ≥ 0 ⟺ total_pnl ≥ 0，
-        # n_buys≥1 时 total_invested>0）。
+        # G7（v7.0.39）：≥1 次触发 且 净收益率 ≥ 门槛；NaN/NULL 均 fail-closed
         g7 = (not up.backtest_positive) or (
             b is not None and int(b["n_buys"] or 0) >= 1
             and b.get("pnl_pct") is not None
+            and not math.isnan(float(b["pnl_pct"]))
             and float(b["pnl_pct"]) * 100.0 >= up.backtest_min_return_pct)
         if not g7:
             continue
         n_g7 += 1
         yld = m.ttm_yield_pct
-        if yld is None or yld < up.min_ttm_yield_pct:
+        # 用 not (yld >= ...) 确保 NaN 同样 fail-closed 不入选
+        if yld is None or not (yld >= up.min_ttm_yield_pct):
             continue
         n_g8 += 1
         px = price_map.get(m.ts_code)
@@ -402,21 +406,33 @@ def load_manual_pool(path: Optional[str] = None) -> Dict[str, Dict[str, str]]:
 
 def save_manual_pool(stocks: Dict[str, Dict[str, str]],
                      path: Optional[str] = None) -> None:
+    import tempfile
     p = path or default_manual_pool_path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "stocks": stocks,
-        }, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)  # 原子替换
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(p)),
+                               prefix=".manual_pool.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "stocks": stocks,
+            }, f, ensure_ascii=False, indent=1, allow_nan=False)
+        os.replace(tmp, p)  # 原子替换（防并发竞争同一 .tmp）
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def normalize_ts_code(raw: str) -> str:
-    """'600000' / 'SH.600000' / 'sh600000' → 'sh.600000'。非法 → ValueError。"""
+    """'600000' / 'SH.600000' / 'sh600000' / '000001.SZ' → 'sh.600000'。非法 → ValueError。"""
     s = str(raw).strip().lower().replace(" ", "")
-    s = s.replace("sh.", "sh.").removesuffix(".sh")
+    # 兼容 Tushare 后缀格式（600000.SH / 000001.SZ / 920001.BJ）
+    m_suf = re.match(r"^(\d{6})\.(sh|sz|bj)$", s)
+    if m_suf:
+        return f"{m_suf.group(2)}.{m_suf.group(1)}"
     if _CODE_RE.match(s):
         return s
     m = _CODE_NODOT_RE.match(s)  # 'sh600000'（无点写法）
@@ -425,12 +441,12 @@ def normalize_ts_code(raw: str) -> str:
     m = _BARE_RE.match(s)
     if m:
         d = m.group(1)
+        if d.startswith("92") or d[0] in "48":  # 北交所须先于沪市 9
+            return f"bj.{d}"
         if d[0] in ("6", "9"):
             return f"sh.{d}"
         if d[0] in "03":
             return f"sz.{d}"
-        if d[0] in "48":
-            return f"bj.{d}"
     raise ValueError(f"股票代码非法: {raw!r}（应形如 600000 或 sh.600000）")
 
 

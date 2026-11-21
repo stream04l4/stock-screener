@@ -22,7 +22,11 @@ export function useSSE(url, onEvent, opts = {}) {
       opts.onDowngrade && opts.onDowngrade();
       return;
     }
-    es.onopen = () => { failCount.value = 0; alive.value = true; };
+    es.onopen = () => {
+      failCount.value = 0;
+      alive.value = true;
+      opts.onOpen && opts.onOpen();
+    };
     es.onmessage = (ev) => {
       if (closedByUser) return;
       onEvent({ lastId: ev.lastEventId || null, data: ev.data });

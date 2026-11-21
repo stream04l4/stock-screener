@@ -83,18 +83,23 @@ const sigActive = computed(() => sigStocks.value.filter(
 //    同 ② 的时机口径（临近时机线 10% 以内）——v7.0.22 旧「持仓 approaching
 //    恒展示」随 k=0 时机门废除（k=0 是双条件信号，时机远离时展示 = 噪音）。
 // 分位缺失（无时机数据 fail-closed）→ ②③ 不入段。
-const sigApproach = computed(() => sigStocks.value.filter((s) => {
-  const pct = s.timing_pctile;
-  const hasPct = typeof pct === "number";
-  const inZone = s.status === "active" || s.status === "touched";
-  const nearLine = s.status === "approaching";
-  // ① 持仓轮内加仓档（k≥1）：无时机限制，临近加仓线 5% 即入段
-  if (s.held && s.in_pos && (s.k_level ?? 0) > 0) return nearLine;
-  // ② 非持仓（未建仓）/ ③ 持仓 k=0（再武装未二次建仓）：临近时机线 10%
-  if (nearLine) return hasPct && pct <= 50;
-  if (inZone) return s.action == null && hasPct && pct > 40 && pct <= 50;
-  return false;
-}));
+const sigApproach = computed(() => {
+  const maxPct = Number(sigData.value?.price_pctile_max ?? 40);
+  const nearPct = maxPct + 10;
+  return sigStocks.value.filter((s) => {
+    if (s.held_sufficient) return false;
+    const pct = s.timing_pctile;
+    const hasPct = typeof pct === "number";
+    const inZone = s.status === "active" || s.status === "touched";
+    const nearLine = s.status === "approaching";
+    // ① 持仓轮内加仓档（k≥1）：无时机限制，临近加仓线 5% 即入段
+    if (s.held && s.in_pos && (s.k_level ?? 0) > 0) return nearLine;
+    // ② 非持仓（未建仓）/ ③ 持仓 k=0（再武装未二次建仓）：临近时机线 +10%
+    if (nearLine) return hasPct && pct <= nearPct;
+    if (inZone) return s.action == null && hasPct && pct > maxPct && pct <= nearPct;
+    return false;
+  });
+});
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 

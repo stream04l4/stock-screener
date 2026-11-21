@@ -5,7 +5,7 @@
 //   换订阅（旧 key 退订、新 key 按 TTL/会话缓存语义决定是否发请求）。
 // - 生命周期：onMounted 订阅 / onUnmounted 退订（引用计数，refcount=0 停定时器）。
 // - SWR：TTL 过期时 data 先返旧值（loading 不翻转），后台刷新完成后自动更新。
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import { subscribe, unsubscribe } from "./queryRegistry.js";
 
 export function useLiveQuery(keyOrGetter, fetcher, opts = {}) {
@@ -45,8 +45,12 @@ export function useLiveQuery(keyOrGetter, fetcher, opts = {}) {
     sync();
   }
 
-  onMounted(attach);
-  onUnmounted(detach);
+  let mounted = false;
+
+  onMounted(() => { mounted = true; attach(); });
+  onActivated(() => { if (mounted && !entry) attach(); });
+  onDeactivated(detach);
+  onUnmounted(() => { mounted = false; detach(); });
   watch(keyRef, (k) => { if (k != null) attach(); else detach(); });
 
   return { data, loading, error };

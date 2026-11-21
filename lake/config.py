@@ -86,6 +86,9 @@ _DEFAULTS: Dict[str, Any] = {
     # 10min，config 可调"）；正常最坏任务间隔 = 单取数墙钟上限(30s)×源数 + 限速 ≈ 分钟级，
     # 10min 对健康运行零误杀。<=0 → 看门狗禁用（不启动）。
     "hang_stall_minutes": 10.0,
+
+    # v8.2.0 补：T3 息率质量门触发阈值（当日 NULL 率严格 > 此值触发结转+派生）
+    "t3_yield_null_max": 0.5,
 }
 
 
@@ -152,20 +155,49 @@ def set_lake_source_switch(name: str, enabled: bool) -> Dict[str, Any]:
     # ruamel CommentedMap：直接赋值保留既有注释；新键追加到段尾（roundtrip 保序）
     lake[key] = bool(enabled)
 
-    # 原子写：tmp + rename（同目录，防半截文件被灌数进程读到）
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml_rt.dump(doc, f)
-    os.replace(tmp, path)
+    # 原子写：mkstemp + rename（同目录，防并发写竞争同一 .tmp）
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                               prefix=".strategy.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(doc, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return {"name": name, "key": key, "enabled": bool(enabled),
             "path": path, "backup": backup if os.path.exists(backup) else None}
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in base.items():
+        out[k] = _deep_copy_val(v)
+    for k, v in override.items():
+        if isinstance(out.get(k), dict) and isinstance(v, dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = _deep_copy_val(v)
+    return out
+
+
+def _deep_copy_val(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {k: _deep_copy_val(vv) for k, vv in v.items()}
+    if isinstance(v, list):
+        return list(v)
+    return v
 
 
 def lake_cfg() -> Dict[str, Any]:
     """读 strategy.yaml 的 ``lake`` 段，叠加缺省值。文件缺失/无 lake 段 → 纯缺省。
 
-    v6.1：嵌套 dict（source_priority/crosscheck_thresholds）做**浅合并**——yaml 只写
-    部分字段组时不整块覆盖缺省（防 yaml 半配置导致某表优先级丢失）。
+    嵌套 dict（source_priority/crosscheck_thresholds）做**递归深合并**——yaml 只写
+    部分字段组时不丢失同表其余字段组缺省。
     """
     cfg = _deep_default()
     path = strategy_yaml_path()   # v6.1.4 O4：与写盘同一路径函数（测试 monkeypatch 注入点）
@@ -180,9 +212,7 @@ def lake_cfg() -> Dict[str, Any]:
                 if k in lake and lake[k] is not None:
                     v = lake[k]
                     if isinstance(_DEFAULTS[k], dict) and isinstance(v, dict):
-                        merged = dict(_DEFAULTS[k])
-                        merged.update(v)  # 浅合并：yaml 显式值优先，缺的字段组保留缺省
-                        cfg[k] = merged
+                        cfg[k] = _deep_merge_dict(_DEFAULTS[k], v)
                     else:
                         cfg[k] = v
     except (OSError, ValueError):
@@ -191,11 +221,8 @@ def lake_cfg() -> Dict[str, Any]:
 
 
 def _deep_default() -> Dict[str, Any]:
-    """缺省值深拷贝一层（嵌套 dict 单独复制，防调用方改缺省污染）。"""
-    out: Dict[str, Any] = {}
-    for k, v in _DEFAULTS.items():
-        out[k] = dict(v) if isinstance(v, dict) else v
-    return out
+    """缺省值深拷贝（嵌套 dict/list 全部复制，防调用方改缺省污染）。"""
+    return _deep_copy_val(_DEFAULTS)
 
 
 def source_priority(table: str, field_group: str) -> list:

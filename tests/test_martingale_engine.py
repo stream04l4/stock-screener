@@ -161,10 +161,10 @@ def test_cash_dividend_collected_on_prev_close_holding():
 
 
 def test_stk_div_adds_shares_proportionally():
-    """送转：10 送 2 → shares ×1.2（与现金分红同日事件合并处理）。"""
+    """送转（每股口径 stk_div=0.2 即 10 送 2）：shares ×1.2（与现金分红同日事件合并处理）。"""
     p = _params()
     d = _dates("2020-01-01", "2020-01-02", "2020-01-03")
-    exmap = {np.datetime64("2020-01-03", "D").astype("datetime64[ns]"): (0.0, 2.0)}
+    exmap = {np.datetime64("2020-01-03", "D").astype("datetime64[ns]"): (0.0, 0.2)}
     stat, state, *_ = run_stock("t", d, np.array([100.0, 81.0, 82.0]),
                                 np.array([100.0, 81.0, 82.0]), exmap, p, verbose=False)
     s0 = 100.0  # 1 手 = 100 股
@@ -411,11 +411,9 @@ def test_aggregate_into_fill_last_value():
     c_arr = np.array([50.0, 50.0])
     flag = np.array([1, 1], dtype=np.int8)
     aggregate_into(gdates, g_value, g_cost, g_open, dates, v_arr, c_arr, flag)
-    # 末值结转从该股末 bar 当日开始（含当日，参考脚本 L409-412 逐行语义：
-    # scatter 与结转在末 bar 当日重叠 —— f6 七股数据都到窗口末、不触发此分支，
-    # 仅在数据早于全局窗口末端时可见）
-    assert list(g_value) == [100.0, 300.0, 150.0, 150.0, 150.0]
-    assert list(g_open) == [1, 2, 1, 1, 1]  # 末 bar 当日 flag 同样重叠 +1
+    # 完整前向结转（ffill）：停牌后持仓沿用末值，且末 bar 当日不重复叠加
+    assert list(g_value) == [100.0, 150.0, 150.0, 150.0, 150.0]
+    assert list(g_open) == [1, 1, 1, 1, 1]
 
 
 # ---------------------------------------------------------------------------

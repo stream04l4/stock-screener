@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from .common import (DATA_VERSION, clean_date, delete_where, insert_many, now_ts,
+from .common import (DATA_VERSION, clean_date, now_ts, replace_where,
                      to_float, to_ts_code)
 
 log = logging.getLogger("lake.ingest.em_dividend")
@@ -43,11 +43,17 @@ def load_dividends(con, cache_dir: str, ts_codes: Optional[List[str]] = None,
     by_code: Dict[str, List[List[Any]]] = {}
     n = 0
     for r in rows:
+        # 仅保留已实施分配且有有效除权日的行（避免未实施/否决预案污染 T4）
+        prog = r.get("progress")
+        if prog is not None and str(prog).strip() and str(prog).strip() != "实施分配":
+            continue
         code6 = str(r["code"])
         ts = to_ts_code(code6)
         if want is not None and ts not in want:
             continue
         ex_date = clean_date(r.get("ex_date"))
+        if not ex_date:
+            continue
         ann_date = clean_date(r.get("plan_notice_date"))
         # period = report_date 年份（分红归属年度；report_date 形如 2026-06-30）
         rd = clean_date(r.get("report_date"))
@@ -55,7 +61,7 @@ def load_dividends(con, cache_dir: str, ts_codes: Optional[List[str]] = None,
         by_code.setdefault(ts, []).append([
             ts, ex_date, ann_date, period,
             to_float(r.get("dps_pretax")),  # cash_dps 元/股（em 已 /10）
-            None,                           # stk_div：暂无源 → NULL
+            None,                           # stk_div：暂无源 → NULL（每股口径）
             source, now_ts(), DATA_VERSION,
         ])
         n += 1
@@ -63,9 +69,9 @@ def load_dividends(con, cache_dir: str, ts_codes: Optional[List[str]] = None,
             "stk_div", "source", "fetched_at", "data_version"]
     written = 0
     for ts, code_rows in by_code.items():
-        # 无 PK 事件表：先删后插（INSERT OR REPLACE 要求 PK，此处不可用）
-        delete_where(con, "dividend_events", "ts_code", ts)
-        written += insert_many(con, "dividend_events", cols, code_rows)
+        # 无 PK 事件表：事务内先删后插（防中途异常丢全史分红）
+        written += replace_where(
+            con, "dividend_events", "ts_code = ?", [ts], cols, code_rows)
     log.info("T4 分红灌入 %d 行（%d 股；源 %s，as_of=%s）",
              written, len(by_code), source, meta.get("as_of"))
     return written

@@ -14,9 +14,12 @@
 # 纪律：BaoStock 走 QuotaGuard（incremental 内部）；限速在 adapter 内。
 set -uo pipefail
 cd /home/ubuntu/stock-screener || exit 1
+mkdir -p logs data/lake
 
-if pgrep -f "lake_backfill.py" > /dev/null 2>&1; then
-  echo "[$(date -u +%FT%TZ)] lake_backfill 已在运行，跳过本次增量"
+# 原子文件锁防重入（替代 pgrep TOCTOU 竞态，不误伤 status 等只读子命令）
+exec 9>data/lake/lake_sync_daily.lock
+if ! flock -n 9; then
+  echo "[$(date -u +%FT%TZ)] lake_sync_daily 锁已被持有，跳过本次增量"
   exit 0
 fi
 
@@ -27,44 +30,43 @@ timeout -k 60 36000 .venv/bin/python scripts/lake_backfill.py incremental >> "$L
 RC=$?
 echo "[$(date -u +%FT%TZ)] 湖增量退出 rc=$RC（0=完成；非0=部分失败，断点续传次日补）"
 
-# v7.0.12：候选池选股预计算（基础池十年滚动回测 → selection_backtest_10y）。
-# 纯湖内计算零网络；增量持锁已结束，此处独占写连接安全。
-# 失败不阻断：Web 候选池 G7 读旧快照（fail-closed：缺行不入选），次日自动重算。
-# v7.0.21（2026-11-08）：湖进程退出瞬间锁可能未释放（今日实锤 selection/timing
-# 双双 Conflicting lock rc=1）→ 锁竞争时等待 5s 重试一次。
 run_step() {  # run_step <label> <timeout-s> <cmd...>
   local label="$1" tmo="$2"; shift 2
-  local out rc i
-  for i in 1 2; do
+  local out="" rc=1 i
+  for i in 1 2 3; do
     out=$( { timeout -k 30 "$tmo" "$@"; } 2>&1 )
     rc=$?
     if [ "$rc" -eq 0 ]; then
       printf '%s\n' "$out" >> "$LOG"; return 0
     fi
     if printf '%s' "$out" | grep -q "Conflicting lock"; then
-      echo "[$(date -u +%FT%TZ)] $label: DuckDB 锁竞争（湖进程未完全退出）→ 5s 后重试 ($i/1)"
-      sleep 5
+      echo "[$(date -u +%FT%TZ)] $label: DuckDB 锁竞争 → 10s 后重试 ($i/3)"
+      sleep 10
       continue
     fi
     printf '%s\n' "$out" >> "$LOG"
     return "$rc"
   done
+  # 重试耗尽仍锁冲突：确保输出落盘不丢日志
+  printf '%s\n' "$out" >> "$LOG"
   return "$rc"
 }
 
-run_step "候选池选股" 600 .venv/bin/python -m martingale selection
-SRC=$?
-if [ "$SRC" -ne 0 ]; then
-  echo "[$(date -u +%FT%TZ)] 候选池选股失败 rc=$SRC（Web 回退旧快照，日志见 $LOG 尾部）"
-fi
+if [ "$RC" -ne 0 ]; then
+  echo "[$(date -u +%FT%TZ)] 湖增量异常退出 rc=$RC → 跳过本轮 selection/timing 预计算以防脏快照覆盖" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] 湖增量异常退出 rc=$RC → 跳过 selection/timing"
+else
+  run_step "候选池选股" 600 .venv/bin/python -m martingale selection
+  SRC=$?
+  if [ "$SRC" -ne 0 ]; then
+    echo "[$(date -u +%FT%TZ)] 候选池选股失败 rc=$SRC（Web 回退旧快照，日志见 $LOG 尾部）"
+  fi
 
-# v7.0.13：选股时机预计算 + 新触发微信提醒（候选池 ①价格分位 ②股息率 ③年线）。
-# 纯湖内计算零行情零配额；唯一外部调用 = PushPlus 推送（新触发才推）。
-# 失败不阻断：Web「今日选股」读旧快照（fail-closed），次日自动重算重推。
-run_step "选股时机" 300 .venv/bin/python -m martingale timing
-TRC=$?
-if [ "$TRC" -ne 0 ]; then
-  echo "[$(date -u +%FT%TZ)] 选股时机失败 rc=$TRC（Web 回退旧快照，日志见 $LOG 尾部）"
+  run_step "选股时机" 300 .venv/bin/python -m martingale timing
+  TRC=$?
+  if [ "$TRC" -ne 0 ]; then
+    echo "[$(date -u +%FT%TZ)] 选股时机失败 rc=$TRC（Web 回退旧快照，日志见 $LOG 尾部）"
+  fi
 fi
 
 # v1.1（Gate 1 观察期，设计 §6/§8，2026-11-10）：只读交叉验证（零写入——

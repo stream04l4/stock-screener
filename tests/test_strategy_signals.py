@@ -70,10 +70,10 @@ def test_classify_active_unheld_buy():
 
 
 def test_classify_approaching_band_and_boundary():
-    # 触发价上方 2%（默认带 5% 内）→ approaching
+    # 触发价上方 2%（默认带 5% 内）→ approaching（k=0 统一 action="buy"）
     c = classify_signal(30.6, 30.0, True, 0, SP)
     assert c["status"] == "approaching"
-    assert c["action"] == "add"  # approaching 也预告动作
+    assert c["action"] == "buy"  # k=0 首仓/二次建仓统一动作键 "buy"
     assert c["distance_pct"] == pytest.approx(2.0)
     # +4%（v7.0.30 放宽后入带；旧 3% 带为 idle——带宽生效断言）
     assert classify_signal(31.2, 30.0, True, 0, SP)["status"] == "approaching"
@@ -155,7 +155,7 @@ def test_build_signals_k0_timing_gate():
     out = build_signals([pos_k0], SP, timing_map={"sh.600036": True})
     assert len(out) == 1
     assert out[0]["new_round"] is True and out[0]["in_pos"] is True
-    assert out[0]["action"] == "add" and out[0]["suggested_lots"] == 1
+    assert out[0]["action"] == "buy" and out[0]["suggested_lots"] == 1
     # k≥1 轮内加仓不受约束：timing_map=False 也照常产信号
     out1 = build_signals([pos_k1], SP, timing_map={"sh.600546": False})
     assert len(out1) == 1 and out1[0]["new_round"] is False
@@ -167,10 +167,13 @@ def test_held_first_timing_pool_outside_live(monkeypatch):
     """v8.2.0 补：池外持仓股（无 tmap 行，如中粮糖业）k=0 时机门 → 现算实时
     分位（与微信 position_alert 的 live_pctile_map 同口径），避免「微信能推
     而页面恒 fail-closed」的两处不一致；湖不可用 → fail-closed。"""
-    # tmap 空 → 走现算分支；实时分位 35% ≤ 40 → 过
+    # tmap 空 → 走现算分支；实时分位 35% ≤ 40 → 过（离线 mock connect_readonly，不依赖磁盘真湖）
+    monkeypatch.setattr("martingale.data.connect_readonly",
+                        lambda cfg=None: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr("martingale.timing.live_pctile_map",
                         lambda con, codes, prices, tp, **kw:
                         {c: 35.0 for c in codes})
+    wapp._HELD_PCT_CACHE.clear()
     ok, pct, reasons = wapp._held_first_timing("sh.600737", {}, 13.0)
     assert ok is True and pct == 35.0 and "池外现算" in reasons
     # 分位 55% > 40 → 未过
@@ -882,12 +885,12 @@ def test_strategy_signals_held_anchor_gap_gate(monkeypatch, tmp_path):
     # D：非持仓正常逻辑（时机✓ → 买入·首仓 1 手；shares_since 不参与）
     assert by["sh.600104"]["action"] == "buy" and by["sh.600104"]["suggested_lots"] == 1
     assert by["sh.600104"]["theory_lots"] is None
-    # E：k=0 时机✓ + 缺 shares_since → 回退旧行为（建仓 1 手，new_round 标记在）
-    assert by["sh.600105"]["action"] == "add" and by["sh.600105"]["suggested_lots"] == 1
+    # E：k=0 时机✓ + 缺 shares_since → 回退旧行为（建仓 1 手，action="buy"，new_round 标记在）
+    assert by["sh.600105"]["action"] == "buy" and by["sh.600105"]["suggested_lots"] == 1
     assert by["sh.600105"]["new_round"] is True
     assert by["sh.600105"]["timing_pctile"] == 30.0
-    # F：二次建仓（k=0）时机✓ → 提醒「建仓」本档 1 手，new_round=True
-    assert by["sh.600106"]["action"] == "add" and by["sh.600106"]["suggested_lots"] == 1
+    # F：二次建仓（k=0）时机✓ → 提醒「建仓」本档 1 手，action="buy"，new_round=True
+    assert by["sh.600106"]["action"] == "buy" and by["sh.600106"]["suggested_lots"] == 1
     assert by["sh.600106"]["new_round"] is True and by["sh.600106"]["in_pos"] is True
     assert by["sh.600106"]["timing_ok"] is True
     assert by["sh.600106"]["theory_lots"] is None  # since=0 不判差值
@@ -917,7 +920,7 @@ def test_strategy_signals_touch_current_retained(monkeypatch, tmp_path):
     s3 = next(x for x in out["stocks"] if x["ts_code"] == "sh.600003")
     assert s3["status"] == "touched" and s3["touched"] is True
     assert s3["day_low"] == 29.9
-    assert s3["action"] == "add" and s3["suggested_lots"] == 1  # 第 k=0 档
+    assert s3["action"] == "buy" and s3["suggested_lots"] == 1  # 第 k=0 档（二次建仓统一 buy）
     assert s3["distance_pct"] == pytest.approx(2.0)  # 价格状态仍如实展示
     t = out["totals"]
     assert t["n_touched"] == 1 and t["n_approaching"] == 0 and t["n_active"] == 3
@@ -1065,9 +1068,13 @@ def test_touches_merge_idempotent_and_window():
         {"ts_code": "c", "date": "2026-11-06", "level": 0, "name": "C"},
     ]
     merged = touches_mod.merge_events(existing, new)
-    assert set(merged) == {"a", "b", "c"}
-    assert merged["a"]["date"] == "2026-11-06"  # 覆盖旧事件
-    # 最大日期 11-06 − 90 天 = 2026-08-08 → b(10-01) 在窗内保留
+    assert set(merged) == {"a|2026-11-06", "b|2026-10-01", "c|2026-11-06"}
+    assert merged["a|2026-11-06"]["date"] == "2026-11-06"
+    # 同股不同日共存（窗口内保留历史触碰）
+    merged2 = touches_mod.merge_events(
+        merged, [{"ts_code": "a", "date": "2026-11-07", "level": 1, "name": "A"}])
+    assert {"a|2026-11-06", "a|2026-11-07"}.issubset(set(merged2))
+    # 最大日期 11-06 − 90 天 = 2026-08-08 → b(10-01) 在窗内保留，a(01-01) 窗口外淘汰
     assert all(e["date"] >= "2026-08-08" for e in merged.values())
     # 幂等：同一批再合并不变
     assert touches_mod.merge_events(merged, new) == merged
