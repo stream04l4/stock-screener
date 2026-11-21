@@ -58,7 +58,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Joel 拍板）——common.py no_anchor_af_range 无锚点填充 + forward_fill_af
 # {d:None} 重置 + tencent/em_batch 加固 + lake_backfill 9 处接入（他源推导
 # 值禁写湖、NULL 洞禁写），lake/ 有意变更，基线前移。
-BASELINE = "167c653"   # v7.0.35: driver 启动探测覆盖 3 展示源（lake/web_api.py 注释同步）
+# A股系统审查修复（e088705）：数据湖防断崖/T4增量落库/分页去重/并发RO只读/
+# 因子分位与Beta日期对齐/成交量单位统一/断网不毒化，lake/ 有意变更，基线前移。
+BASELINE = "e088705"   # fix(stock): A股系统全量审查修复（lake/ 有意变更基线前移）
 
 
 def _git(*args) -> str:
