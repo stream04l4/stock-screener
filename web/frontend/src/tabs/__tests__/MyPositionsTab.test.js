@@ -133,7 +133,7 @@ const SIG = {
     { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
       price: 28.56, next_add_price_raw: 28.0, status: "approaching", touched: false,
       day_low: 27.9, distance_pct: 2.0,
-      action: "add", suggested_lots: 1, n_history: 1, end_date: "2026-11-06",
+      action: "add", suggested_lots: 1, next_lots: 1, n_history: 1, end_date: "2026-11-06",
       timing_ok: true, timing_pctile: 38.0,
       timing_reasons: "✓ 5年分位 38.0%（需≤40%）",
       bt_pnl_pct: 30.1, bt_n_buys: 3 },
@@ -142,7 +142,8 @@ const SIG = {
     { ts_code: "sh.601328", name: "交通银行", held: false, in_pos: false, k_level: 0,
       price: 7.55, next_add_price_raw: 7.40, status: "approaching", touched: false,
       day_low: 7.5, distance_pct: 2.0,
-      action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
+      action: "buy", suggested_lots: 1, next_lots: null, n_history: 0,
+      end_date: "2026-11-06",
       timing_ok: true, timing_pctile: 33.5,
       timing_reasons: "✓ 5年分位 33.5%（需≤40%） · ✓ 股息率 5.02%（需≥4.5%）",
       bt_pnl_pct: null, bt_n_buys: null },
@@ -161,7 +162,8 @@ const SIG = {
     { ts_code: "sh.600546", name: "山煤国际", held: false, in_pos: false, k_level: 0,
       price: 11.01, next_add_price_raw: 11.2478, status: "approaching", touched: false,
       day_low: 10.96, distance_pct: 2.14,
-      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
+      action: null, suggested_lots: null, next_lots: 1, n_history: 0,
+      end_date: "2026-11-06",
       timing_ok: false, timing_pctile: 45.0,
       timing_reasons: "✗ 5年分位 45.0%（需≤40%）",
       bt_pnl_pct: null, bt_n_buys: null },
@@ -181,7 +183,8 @@ const SIG = {
     { ts_code: "sh.600500", name: "中国石化", held: true, in_pos: true, k_level: 0,
       price: 6.12, next_add_price_raw: 6.48, status: "active", touched: false,
       day_low: 6.1, distance_pct: -5.6,
-      action: null, suggested_lots: null, n_history: 0, end_date: "2026-11-06",
+      action: null, suggested_lots: null, next_lots: 1, n_history: 0,
+      end_date: "2026-11-06",
       timing_ok: false, timing_pctile: 45.0,
       timing_reasons: "✗ 5年分位 45.0%（需≤40%）",
       bt_pnl_pct: null, bt_n_buys: null },
@@ -981,6 +984,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).not.toContain("中粮糖业");
     // 三分类 ③ 反例：持仓 k=0 价格临区但分位 76.8% 远离时机线 → 不入段
     expect(w.text()).not.toContain("国电电力");
+    // v8.2.0 补（Joel 2026-11-21）：「下一档手数」列——next_lots 单点原值
+    //（时机未过的山煤/石化也显示首仓手数；交通银行 next_lots=null → —）
+    expect(w.text()).toContain("下一档手数");
+    expect(w.text()).toContain("1 手");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // 历史日期降序：2026-11-02 在前，2026-10-11 在后

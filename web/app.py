@@ -1772,6 +1772,11 @@ def get_strategy_signals() -> Dict[str, Any]:
     - 策略固定 = 当前活动策略（v7.0.29）；价源 / 湖降级语义与 /api/my_positions 一致；分类走
       martingale.signals.classify_signal（与 /api/my_positions、微信点位提醒
       同一单一定义点，防口径漂移）。
+    - 行内 next_lots（v8.2.0 补，Joel 2026-11-21）= classify_signal 单点
+      suggested_lots 原值（下一档若到线将买的手数：in_pos k≥1 →
+      first_lots + k×add_lots_step；k=0 → first_lots），**不受时机门 /
+      持仓已够判定门控**（那两处门控只作用于 action/suggested_lots）——
+      供前端「即将进入」段「下一档手数」列展示；sp 缺失/no_data → None。
     """
     from martingale.signals import classify_signal, judge_held_lots
 
@@ -1924,6 +1929,9 @@ def get_strategy_signals() -> Dict[str, Any]:
                 timing_reasons = _timing_breakdown(trow, tp_obj)
         action = cls["action"]
         suggested = cls["suggested_lots"]
+        # v8.2.0 补：下一档手数 = 单点原值（下方各门控只改 suggested，
+        # next_lots 保持「到线即买几手」的纯配置口径，供「即将进入」段展示）
+        next_lots = cls["suggested_lots"]
         if touched and action is None and sp_obj is not None:
             if in_pos and held and k > 0:
                 action = "add"
@@ -1974,6 +1982,7 @@ def get_strategy_signals() -> Dict[str, Any]:
             "distance_pct": cls["distance_pct"],
             "action": action,
             "suggested_lots": suggested,
+            "next_lots": next_lots,
             "held_sufficient": held_sufficient,
             "new_round": bool(held_first and action is not None),
             "theory_lots": (held_extra or {}).get("theory_lots"),

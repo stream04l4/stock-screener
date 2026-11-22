@@ -541,6 +541,14 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     s5 = by["sh.600005"]
     assert s5["status"] == "no_data" and s5["held"] is False and s5["price"] is None
     assert s5["timing_ok"] is False and s5["timing_reasons"] == "无时机数据"
+    # v8.2.0 补（Joel 2026-11-21）：next_lots = 下一档手数单点原值
+    #（classify_signal suggested_lots），不受时机门/持仓已够判定门控
+    #（那两处只作用于 action/suggested_lots）——「即将进入」段展示列
+    assert s1["next_lots"] == 2  # in_pos k=1 → first_lots + 1×add_lots_step
+    assert s2["next_lots"] == 1  # 非持仓 → 首仓 first_lots
+    assert s3["next_lots"] == 1  # 持仓 k=0（再武装位）→ 首仓 first_lots
+    assert s4["next_lots"] == 1  # 时机门未过：suggested_lots=None 但手数不门控
+    assert s5["next_lots"] is None  # no_data
 
     t = out["totals"]
     assert t == {"n_stocks": 5, "n_active": 3, "n_touched": 0, "n_approaching": 1,

@@ -156,6 +156,9 @@ const sigShown = computed(() => {
         + (((s.status === "active" || s.status === "touched") && s.action == null)
            ? " · 临近时机线" : ""),
       distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
+      // v8.2.0 补（Joel 2026-11-21）：下一档手数 = API next_lots（单点原值，
+      // 不受时机门/持仓已够门控——临近时机线的 k=0 行也显示首仓手数）
+      lots_s: s.next_lots == null ? "—" : `${s.next_lots} 手`,
       // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓
       level_label: (s.held && s.in_pos)
         ? (s.k_level === 0 ? "再武装·建仓（第1档）"
@@ -182,6 +185,8 @@ const SIG_APPROACH_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true, fmtPrice], ["next_add_price_raw", "触发价", true, fmtPrice],
   ["distance_s", "距触发", true], ["level_label", "档位"],
+  // v8.2.0 补（Joel 2026-11-21）：下一档到线将买的手数（整数，格式三规则）
+  ["lots_s", "下一档手数"],
   ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_HISTORY_COLS = [
@@ -654,7 +659,8 @@ function pnlColor(v) {
         临近加仓线 {{ sigData?.approach_pct ?? 5 }}% 以内；未建仓 / 已再武装
         未二次建仓（k=0）= 临近时机线 10% 以内（40% &lt; 5 年分位 ≤50%）且
         价格已在区或距线 ≤{{ sigData?.approach_pct ?? 5 }}%（标「临近时机线」，
-        见「时机」列）
+        见「时机」列）·「下一档手数」= 触发价到线将买的手数（首仓/二次建仓 =
+        首仓手数，加仓档 = 首仓 + 档×步长；不受时机门影响）
         ·「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
