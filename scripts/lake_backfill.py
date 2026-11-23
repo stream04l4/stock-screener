@@ -480,6 +480,52 @@ def run_t4(con, db_path: str, ts_codes: Optional[List[str]] = None) -> Dict[str,
     }
 
 
+def run_t4_sync(con, db_path: str,
+                start_date: Optional[str] = None,
+                end_date: Optional[str] = None,
+                lookback_days: int = 14,
+                cross_check: bool = True) -> Dict[str, Any]:
+    """T4 分红事件增量同步（EM datacenter RPT_SHAREBONUS_DET 主通道 + tushare 低频抽样校验）。
+
+    缺省 start_date 自动从湖内 MAX(ex_date <= end_date) 往前退 lookback_days（覆盖迟到修订，
+    同时自动跨越任意停更缺口如 2026-10-23→11-23）；若表空则回溯近 365 日。
+    """
+    from lake.ingest import em_batch_ingest as emb
+
+    t0 = time.monotonic()
+    end_s = (end_date or _today_beijing())[:10]
+    if start_date is None:
+        max_d = con.execute(
+            "SELECT MAX(ex_date) FROM dividend_events WHERE ex_date <= ?",
+            [end_s]).fetchone()[0]
+        if max_d is not None:
+            d_anchor = _dt.date.fromisoformat(str(max_d)[:10])
+            start_s = (d_anchor - _dt.timedelta(days=max(0, int(lookback_days)))).isoformat()
+        else:
+            d_end = _dt.date.fromisoformat(end_s)
+            start_s = (d_end - _dt.timedelta(days=365)).isoformat()
+    else:
+        start_s = str(start_date)[:10]
+
+    events = emb.fetch_ex_events_range(start_s, end_s)
+    written = emb.load_ex_events(con, end_s, events) if events else 0
+    cc = (emb.cross_check_ex_events_tushare(con, events, max_sample=2)
+          if (cross_check and events) else {"checked": 0, "skipped": True, "mismatches": []})
+    max_after = con.execute("SELECT MAX(ex_date) FROM dividend_events").fetchone()[0]
+    log.info("T4 分红增量 [%s..%s]: 抓取 %d 条，落库 %d 条，MAX(ex_date)=%s，tushare校验=%s",
+             start_s, end_s, len(events), written, max_after, cc)
+    return {
+        "table": "dividend_events",
+        "start_date": start_s,
+        "end_date": end_s,
+        "fetched": len(events),
+        "written": int(written),
+        "max_ex_date": str(max_after)[:10] if max_after is not None else None,
+        "cross_check": cc,
+        "elapsed_s": round(time.monotonic() - t0, 2),
+    }
+
+
 # ---------------------------------------------------------------------------
 # T7 index_daily（4 指数 × N 天）
 # ---------------------------------------------------------------------------
@@ -3466,6 +3512,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_history)
 
     sp = sub.add_parser(
+        "t4-sync",
+        help="T4 dividend_events 区间增量同步（EM RPT_SHAREBONUS_DET 主通道 + tushare 低频抽样校验）")
+    sp.add_argument("--start-date", default=None,
+                    help="起始除权日 YYYY-MM-DD（缺省从 MAX(ex_date)-14d 自动推算）")
+    sp.add_argument("--end-date", default=None, help="结束除权日 YYYY-MM-DD（缺省=今日北京时间）")
+    sp.add_argument("--lookback-days", type=int, default=14,
+                    help="从库内 MAX(ex_date) 往前重叠回溯天数（默认 14）")
+    sp.add_argument("--no-cross-check", action="store_true", default=False,
+                    help="跳过 tushare 低频抽样交叉校验")
+    sp.set_defaults(func=cmd_t4_sync)
+
+    sp = sub.add_parser(
         "t1-delist",
         help="v7.0.18：T1 退市档低频刷新（单次 tushare stock_basic D 调用，免费档 1 次/小时，"
              "建议每周；只更新 stock_master 命中行的 delist_date）")
@@ -3571,6 +3629,18 @@ def cmd_t1_delist(args, con, db_path: str) -> int:
     return EXIT_OK
 
 
+def cmd_t4_sync(args, con, db_path: str) -> int:
+    summary = run_t4_sync(
+        con, db_path,
+        start_date=getattr(args, "start_date", None),
+        end_date=getattr(args, "end_date", None),
+        lookback_days=int(getattr(args, "lookback_days", 14) or 14),
+        cross_check=not bool(getattr(args, "no_cross_check", False)),
+    )
+    _print_summary("t4-sync", summary)
+    return EXIT_OK
+
+
 def cmd_p0(args, con, db_path: str) -> int:
     codes = _parse_codes(args.codes)
     t4_scope = _parse_codes(args.t4_codes)
@@ -3644,7 +3714,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # t6（v6.3.4）：独立子命令同样持写锁（run_t6 写 holders_snapshot + progress）。
     # t9（v6.3.5）：历史回填持写锁（写 macro_rf）。
     write_cmd = args.cmd in ("init", "p0", "history", "full", "incremental", "reconcile",
-                             "t6", "t9", "t3-history", "t1-delist")
+                             "t6", "t9", "t3-history", "t1-delist", "t4-sync")
 
     if not write_cmd:
         return _run_unlocked(args)

@@ -288,6 +288,41 @@ def snapshot_to_t2t3(snap: List[Dict[str, Any]],
     return t2, t3
 
 
+def _parse_ex_event_row(x: Dict[str, Any],
+                        fallback_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """解析 datacenter RPT_SHAREBONUS_DET 单行 → 统一每股口径事件 dict。
+
+    仅保留沪深 A 股（0/3/6 开头）；若 ASSIGN_PROGRESS 明确标为未通过/停止/取消/预案则过滤。
+    """
+    prog = str(x.get("ASSIGN_PROGRESS") or "").strip()
+    if prog and any(bad in prog for bad in ("未通过", "停止", "取消", "不分配", "股东大会")) and "实施" not in prog:
+        return None
+    if prog and ("预案" in prog or "提议" in prog) and "实施" not in prog:
+        return None
+    c6 = str(x.get("SECURITY_CODE") or "").zfill(6)
+    if not c6 or c6[0] not in "036":
+        return None
+    ex_d = _ymd8(x.get("EX_DIVIDEND_DATE")) or fallback_date
+    if not ex_d:
+        return None
+    ann_d = _ymd8(x.get("IMPL_PLAN_NOTICE_DATE")) or _ymd8(x.get("PLAN_NOTICE_DATE"))
+    rep_d = _ymd8(x.get("REPORT_DATE"))
+    period = rep_d[:4] if rep_d else str(ex_d)[:4]
+    cash = to_float(x.get("PRETAX_BONUS_RMB"))
+    bonus = (to_float(x.get("BONUS_RATIO")) or 0.0) / 10.0 + \
+            (to_float(x.get("IT_RATIO")) or 0.0) / 10.0
+    return {
+        "ts_code": to_ts_code(c6),
+        "ex_date": ex_d,
+        "ann_date": ann_d,
+        "period": period,
+        "cash": (cash / 10.0 if cash is not None else 0.0),  # /10股→每股
+        "bonus": bonus,
+        "has_allot": (to_float(x.get("ALLOT_RATIO")) or 0.0) > 0,
+        "plan": str(x.get("IMPL_PLAN_PROFILE") or "")[:60],
+    }
+
+
 def fetch_ex_events(trade_date: str) -> List[Dict[str, Any]]:
     """datacenter 全市场除权日=指定日的分红送配事件（通常 ≤20 条/日）。
 
@@ -306,8 +341,9 @@ def fetch_ex_events(trade_date: str) -> List[Dict[str, Any]]:
         d = _get_json(_DATACENTER, {
             "sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "1",
             "pageSize": 500, "pageNumber": page, "reportName": "RPT_SHAREBONUS_DET",
-            "columns": "SECURITY_CODE,EX_DIVIDEND_DATE,PRETAX_BONUS_RMB,"
-                       "BONUS_RATIO,IT_RATIO,ALLOT_RATIO,IMPL_PLAN_PROFILE",
+            "columns": "SECURITY_CODE,EX_DIVIDEND_DATE,IMPL_PLAN_NOTICE_DATE,REPORT_DATE,"
+                       "PRETAX_BONUS_RMB,BONUS_RATIO,IT_RATIO,ALLOT_RATIO,"
+                       "IMPL_PLAN_PROFILE,ASSIGN_PROGRESS",
             "source": "WEB", "client": "WEB", "filter": filter_s,
         })
         result = d.get("result") or {}
@@ -315,24 +351,65 @@ def fetch_ex_events(trade_date: str) -> List[Dict[str, Any]]:
         if not data:
             break
         for x in data:
-            c6 = str(x.get("SECURITY_CODE") or "").zfill(6)
-            if not c6 or c6[0] not in "036":
-                continue
-            cash = to_float(x.get("PRETAX_BONUS_RMB"))
-            bonus = (to_float(x.get("BONUS_RATIO")) or 0.0) / 10.0 + \
-                    (to_float(x.get("IT_RATIO")) or 0.0) / 10.0
-            rows.append({
-                "ts_code": to_ts_code(c6),
-                "ex_date": _ymd8(x.get("EX_DIVIDEND_DATE")) or trade_date,
-                "cash": (cash / 10.0 if cash is not None else 0.0),  # /10股→每股
-                "bonus": bonus,
-                "has_allot": (to_float(x.get("ALLOT_RATIO")) or 0.0) > 0,
-                "plan": str(x.get("IMPL_PLAN_PROFILE") or "")[:60],
-            })
+            parsed = _parse_ex_event_row(x, fallback_date=trade_date)
+            if parsed is not None:
+                rows.append(parsed)
         pages = result.get("pages") or 0
         if page >= int(pages):
             break
         page += 1
+    return rows
+
+
+def fetch_ex_events_range(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    """datacenter 全市场除权日 ∈ [start_date, end_date] 的全部分红送配事件（分页+去重）。
+
+    用于：① 修复 dividend_events 历史停更缺口；② run_t4_sync 每日滚动增量（默认回看 14d）。
+    """
+    filter_s = f"(EX_DIVIDEND_DATE>='{start_date}')(EX_DIVIDEND_DATE<='{end_date}')"
+    rows: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, str, str, float, float]] = set()
+    page = 1
+    while True:
+        d = _get_json(_DATACENTER, {
+            "sortColumns": "EX_DIVIDEND_DATE,SECURITY_CODE",
+            "sortTypes": "1,1",
+            "pageSize": 500,
+            "pageNumber": page,
+            "reportName": "RPT_SHAREBONUS_DET",
+            "columns": "SECURITY_CODE,EX_DIVIDEND_DATE,IMPL_PLAN_NOTICE_DATE,REPORT_DATE,"
+                       "PRETAX_BONUS_RMB,BONUS_RATIO,IT_RATIO,ALLOT_RATIO,"
+                       "IMPL_PLAN_PROFILE,ASSIGN_PROGRESS",
+            "source": "WEB",
+            "client": "WEB",
+            "filter": filter_s,
+        })
+        result = d.get("result") or {}
+        data = result.get("data") or []
+        if not data:
+            break
+        added = 0
+        for x in data:
+            parsed = _parse_ex_event_row(x, fallback_date=None)
+            if parsed is None:
+                continue
+            dk = (
+                parsed["ts_code"],
+                str(parsed["ex_date"]),
+                str(parsed.get("period") or ""),
+                round(float(parsed.get("cash") or 0.0), 6),
+                round(float(parsed.get("bonus") or 0.0), 6),
+            )
+            if dk in seen_keys:
+                continue
+            seen_keys.add(dk)
+            rows.append(parsed)
+            added += 1
+        pages = result.get("pages") or 0
+        if page >= int(pages) or added == 0 or page >= 200:
+            break
+        page += 1
+        time.sleep(0.15)
     return rows
 
 
@@ -427,11 +504,11 @@ def derive_af_batch(con, trade_date: str,
 
 def load_ex_events(con, trade_date: str, events: List[Dict[str, Any]],
                    source: str = "em_datacenter") -> int:
-    """将每日抓到的除权事件增量落库到 dividend_events（幂等事务写）。
+    """将抓到的除权事件增量落库到 dividend_events（单事务批量幂等替换）。
 
     stk_div 统一按每股送转股数（bonus）存储，与 cash_dps（元/股）同口径。
     """
-    from .common import DATA_VERSION, now_ts, replace_where
+    from .common import DATA_VERSION, now_ts
 
     if not events:
         return 0
@@ -446,17 +523,110 @@ def load_ex_events(con, trade_date: str, events: List[Dict[str, Any]],
         bonus = float(e.get("bonus") or 0.0)
         if not ts or not ex_d or (cash == 0.0 and bonus == 0.0):
             continue
-        period = str(ex_d)[:4]
+        ann_d = e.get("ann_date")
+        period = str(e.get("period") or str(ex_d)[:4])
         by_key.setdefault((ts, ex_d), []).append([
-            ts, ex_d, None, period, cash, bonus, source, ts_now, DATA_VERSION,
+            ts, ex_d, ann_d, period, cash, bonus, source, ts_now, DATA_VERSION,
         ])
+    if not by_key:
+        return 0
     cols = ["ts_code", "ex_date", "ann_date", "period", "cash_dps",
             "stk_div", "source", "fetched_at", "data_version"]
-    written = 0
-    for (ts, ex_d), rows in by_key.items():
-        written += replace_where(
-            con, "dividend_events", "ts_code=? AND ex_date=?", [ts, ex_d], cols, rows)
-    return written
+    all_rows = [r for grp in by_key.values() for r in grp]
+    del_keys = [[ts, ex_d] for (ts, ex_d) in by_key]
+    placeholders = ",".join("?" * len(cols))
+    in_tx = False
+    try:
+        con.execute("BEGIN TRANSACTION")
+        in_tx = True
+    except Exception:  # noqa: BLE001 - 调用方已在事务内
+        in_tx = False
+    try:
+        con.executemany("DELETE FROM dividend_events WHERE ts_code=? AND ex_date=?", del_keys)
+        con.executemany(
+            f"INSERT INTO dividend_events ({','.join(cols)}) VALUES ({placeholders})",
+            all_rows)
+        if in_tx:
+            con.execute("COMMIT")
+    except Exception:
+        if in_tx:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    return len(all_rows)
+
+
+def cross_check_ex_events_tushare(con, events: List[Dict[str, Any]],
+                                  max_sample: int = 2) -> Dict[str, Any]:
+    """用 tushare dividend 对 EM 新增事件做低频抽样交叉校验（保护免费档限频）。
+
+    - max_sample 默认 2 只（取现金分红最大的样本）；
+    - tushare 不可用 / 限频 / 网络异常仅记 warning 返回，绝不阻断 EM 主通道。
+    """
+    if not events or max_sample <= 0:
+        return {"checked": 0, "skipped": True, "mismatches": []}
+    try:
+        from . import tushare_ingest as ti
+        if not ti.tushare_available():
+            return {"checked": 0, "skipped": True, "reason": "tushare_unavailable", "mismatches": []}
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": 0, "skipped": True, "reason": str(exc)[:80], "mismatches": []}
+
+    # 按每股现金分红/事件强度降序选最多 max_sample 只互不重复的股票抽样核对
+    seen_codes: Set[str] = set()
+    samples: List[Dict[str, Any]] = []
+    for ev in sorted(events, key=lambda x: -(float(x.get("cash") or 0.0) + float(x.get("bonus") or 0.0))):
+        c = str(ev.get("ts_code") or "")
+        ex_d = str(ev.get("ex_date") or "")[:10]
+        if not c or not ex_d or "." not in c or c in seen_codes:
+            continue
+        seen_codes.add(c)
+        samples.append(ev)
+        if len(samples) >= max_sample:
+            break
+
+    checked = 0
+    mismatches: List[Dict[str, Any]] = []
+    cols = {str(r[1]).lower() for r in con.execute("PRAGMA table_info('dividend_events')").fetchall()}
+    has_conflict = "conflict_src" in cols
+    for ev in samples:
+        c = ev["ts_code"]
+        ex_d = str(ev["ex_date"])[:10]
+        mkt, num = c.split(".", 1)
+        ts_fmt = f"{num}.{mkt.upper()}"
+        try:
+            ts_rows = ti.fetch_dividend(ts_fmt)
+        except Exception as exc:  # noqa: BLE001 - 限频/缺token不阻断
+            log.warning("T4 tushare 交叉校验跳过 %s: %s", c, str(exc)[:100])
+            continue
+        checked += 1
+        # 查找匹配同一 ex_date 的 tushare 分红行
+        matched = [
+            r for r in (ts_rows or [])
+            if str(r.get("ex_date") or "").replace("-", "")[:8] == ex_d.replace("-", "")
+        ]
+        em_cash = float(ev.get("cash") or 0.0)
+        if not matched:
+            if em_cash > 0.0:
+                msg = f"tushare_missing:{ex_d}"
+                mismatches.append({"ts_code": c, "ex_date": ex_d, "em_cash": em_cash, "tushare_cash": None})
+                log.warning("T4 交叉校验分歧 %s %s: EM cash=%.4f, tushare 无该日记录", c, ex_d, em_cash)
+                if has_conflict:
+                    con.execute("UPDATE dividend_events SET conflict_src=? WHERE ts_code=? AND ex_date=?",
+                                [msg[:256], c, ex_d])
+            continue
+        ts_cash = sum(float(r.get("div_cash_before_tax") or 0.0) for r in matched)
+        tol = max(0.005, 0.02 * em_cash)
+        if abs(em_cash - ts_cash) > tol:
+            msg = f"em:{em_cash:.4f}|tushare:{ts_cash:.4f}"
+            mismatches.append({"ts_code": c, "ex_date": ex_d, "em_cash": em_cash, "tushare_cash": ts_cash})
+            log.warning("T4 交叉校验分歧 %s %s: %s", c, ex_d, msg)
+            if has_conflict:
+                con.execute("UPDATE dividend_events SET conflict_src=? WHERE ts_code=? AND ex_date=?",
+                            [msg[:256], c, ex_d])
+    return {"checked": checked, "skipped": False, "mismatches": mismatches}
 
 
 def active_code_set(snap: List[Dict[str, Any]]) -> Set[str]:

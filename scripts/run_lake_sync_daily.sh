@@ -25,10 +25,6 @@ fi
 
 STAMP=$(date -u +%Y%m%d)
 LOG="logs/lake_sync_${STAMP}.log"
-echo "[$(date -u +%FT%TZ)] 湖增量开始 → $LOG"
-timeout -k 60 36000 .venv/bin/python scripts/lake_backfill.py incremental >> "$LOG" 2>&1
-RC=$?
-echo "[$(date -u +%FT%TZ)] 湖增量退出 rc=$RC（0=完成；非0=部分失败，断点续传次日补）"
 
 run_step() {  # run_step <label> <timeout-s> <cmd...>
   local label="$1" tmo="$2"; shift 2
@@ -51,6 +47,18 @@ run_step() {  # run_step <label> <timeout-s> <cmd...>
   printf '%s\n' "$out" >> "$LOG"
   return "$rc"
 }
+
+echo "[$(date -u +%FT%TZ)] 湖增量开始 → $LOG"
+# 先同步 T4 分红送配增量（EM 主通道+tushare 抽样校验），保证 subsequent incremental 的 af_rebase 基于完整事件表
+run_step "T4分红增量" 300 .venv/bin/python scripts/lake_backfill.py t4-sync
+T4RC=$?
+if [ "$T4RC" -ne 0 ]; then
+  echo "[$(date -u +%FT%TZ)] T4 分红增量失败 rc=$T4RC（不阻断主增量，日志见 $LOG）"
+fi
+
+timeout -k 60 36000 .venv/bin/python scripts/lake_backfill.py incremental >> "$LOG" 2>&1
+RC=$?
+echo "[$(date -u +%FT%TZ)] 湖增量退出 rc=$RC（0=完成；非0=部分失败，断点续传次日补）"
 
 if [ "$RC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] 湖增量异常退出 rc=$RC → 跳过本轮 selection/timing 预计算以防脏快照覆盖" >> "$LOG"

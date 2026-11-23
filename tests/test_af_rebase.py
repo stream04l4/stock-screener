@@ -169,18 +169,36 @@ def test_same_source_reanchor_caught(con):
 
 
 # ---------------------------------------------------------------------------
-# 6. 基准切换 + 无记录送转（suspected 事件公式）
+# 6. 基准切换 + 无记录大缺口（suspected 严禁按价格比盖章；核实回调后可精准对齐）
 # ---------------------------------------------------------------------------
 def test_base_switch_with_unrecorded_event(con):
     from af_rebase import rebase_stock_af
     # 10 送 10（分红表无记录）：close 10→5，真实 G(d1)=2。
     # C_A=10、C_B=2.5：af(d0)=10×1=10.0，af(d1)=2.5×2=5.0
-    # price_ratio=2.0（≥1.08→suspected）；af_move=0.5 → 双假设均偏离 → 触发
+    # price_ratio=2.0（≥1.08→suspected）；af_move=0.5 → 双假设均偏离
     rows = [("2026-05-20", 10.0, 10.0), ("2026-05-21", 5.0, 5.0)]
     add_rows(con, "sh.600708", rows)
+
+    # ① 默认离线路径：严禁以价格比盖章改写源 af，仅记 suspected
     res = rebase_stock_af(con, "sh.600708")
-    assert len(res["jumps"]) == 1 and res["jumps"][0]["kind"] == "suspected"
-    # 换算：scale=(10×10)/(5×5)=4 → af(d1)=20.0（=C_A×G=10×2）
+    assert res["jumps"] == [] and res["rewritten"] == 0
+    assert len(res["suspected"]) == 1 and res["suspected"][0]["kind"] == "suspected"
+    assert af_series(con, "sh.600708") == [10.0, 5.0]
+
+    # ② 在线/外部核实确认无除权（暴跌日换源）：按平坦对齐（10.0），完整保留 -50% 跌幅
+    res_no = rebase_stock_af(
+        con, "sh.600708",
+        verify_event_fn=lambda code, d0, d1: {"confirmed": False})
+    assert len(res_no["jumps"]) == 1 and res_no["jumps"][0]["kind"] == "verified_no_event"
+    assert af_series(con, "sh.600708") == [10.0, 10.0]
+
+    # ③ 重置后核实确认为 10 送 10（bonus=1.0）：按官方步长对齐至 20.0
+    con.execute("DELETE FROM kline_daily WHERE ts_code='sh.600708'")
+    add_rows(con, "sh.600708", rows)
+    res_yes = rebase_stock_af(
+        con, "sh.600708",
+        verify_event_fn=lambda code, d0, d1: {"confirmed": True, "cash": 0.0, "bonus": 1.0})
+    assert len(res_yes["jumps"]) == 1 and res_yes["jumps"][0]["kind"] == "verified_event"
     afs = af_series(con, "sh.600708")
     assert abs(afs[1] - 20.0) < 1e-6
     assert_hfq_continuous(con, "sh.600708")
