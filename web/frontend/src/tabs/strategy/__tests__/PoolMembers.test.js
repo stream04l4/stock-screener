@@ -22,6 +22,14 @@ vi.mock("../../../live/useLiveQuery.js", () => ({
     return { data, loading, error };
   },
 }));
+// v8.2.2：弹窗内的个股全景卡 mock 化（真件会自取 /api/lake/*；测只验挂载契约）
+vi.mock("../../lake/StockPanoramaCard.vue", () => ({
+  default: {
+    name: "StockPanoramaCard",
+    props: { code: { type: String, default: "" } },
+    template: '<div class="panorama-mock">全景{{ code }}</div>',
+  },
+}));
 
 const PoolMembers = (await import("../PoolMembers.vue")).default;
 
@@ -135,6 +143,25 @@ describe("PoolMembers · 分红占比/上涨占比 + 小数收敛（v8.0.11）",
     expect(trs[0].text()).toContain("中国神华");
     expect(trs[1].classes()).not.toContain("row-candidate");
     expect(trs[2].classes()).not.toContain("row-candidate");
+    w.unmount();
+  });
+
+  it("v8.2.2：行点击 → 个股全景弹窗（K线+基础信息）；✕ 关闭", async () => {
+    const w = mk();
+    await flushPromises();
+    // 初始无弹窗
+    expect(w.find(".modal").exists()).toBe(false);
+    // 点第一行（候选神华置顶）→ 弹窗开，标题带名+码，全景卡收到 code
+    await w.findAll("tbody tr")[0].trigger("click");
+    await flushPromises();
+    const t = w.text();
+    expect(w.find(".modal").exists()).toBe(true);
+    expect(t).toContain("中国神华 sh.601088 · 个股全景");
+    expect(t).toContain("全景sh.601088");
+    // ✕ 关闭 → 弹窗卸载（图表随之 dispose）
+    await w.find(".modal-head button").trigger("click");
+    await flushPromises();
+    expect(w.find(".modal").exists()).toBe(false);
     w.unmount();
   });
 });

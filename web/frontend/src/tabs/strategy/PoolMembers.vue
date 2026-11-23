@@ -10,12 +10,24 @@
 // - 手动添加/移除后 ManualPoolBar 会 invalidate("pool") 刷新本表。
 // - 防御：加载失败 → 显示一行错误（不拖累策略页主体）。
 <script setup>
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { api } from "../../api/client.js";
 import { useLiveQuery } from "../../live/useLiveQuery.js";
 import SimpleTable from "../../components/SimpleTable.vue";
+// v8.2.2（Joel 2026-11-23：「点击股票池行 → 弹窗展示 K 线图和基础信息」）：
+// SimpleTable 自带 row-click（行 .clickable）但此前无人监听 → 点击无反应。
+// 现挂 Modal + StockPanoramaCard（湖页签同件：日K candlestick + 基础/估值/
+// 因子/分红/季报/前十大股东；组件自取 /api/lake/stock + /api/lake/kline，
+// TTL60s；关闭 → v-if 卸载 → 图表 dispose + 订阅自动丢弃）。
+import Modal from "../../components/Modal.vue";
+import StockPanoramaCard from "../lake/StockPanoramaCard.vue";
 
 const { data, loading, error } = useLiveQuery("pool", () => api("/api/pool"), {});
+// v8.2.2：弹窗目标行（null = 关闭；保留整行供标题展示 name+code）
+const selected = ref(null);
+const selectedTitle = computed(() => (selected.value
+  ? `${selected.value.name || ""} ${selected.value.ts_code} · 个股全景`
+  : ""));
 
 // v8.0.11：展示层格式化（引擎/预计算产物全精度，只在此截断）——
 // 顺修「总市值(亿) 2165.50348228 小数太多」（Joel 2026-11-12）。
@@ -88,7 +100,12 @@ const COLS = [
       :cols="COLS"
       :row-class="(r) => (r.is_candidate ? 'row-candidate' : '')"
       empty="（基础池为空——等待每日选股预计算，或下方手动添加）"
+      @row-click="(r) => (selected = r)"
     />
+    <!-- v8.2.2：行点击弹窗——个股全景（K线 + 基础信息，湖页签同件） -->
+    <Modal :open="!!selected" :title="selectedTitle" @close="selected = null">
+      <StockPanoramaCard v-if="selected" :code="selected.ts_code" />
+    </Modal>
   </div>
 </template>
 
