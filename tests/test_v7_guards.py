@@ -62,7 +62,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # 因子分位与Beta日期对齐/成交量单位统一/断网不毒化，lake/ 有意变更，基线前移。
 # T4 分红增量补齐（ac72f7b）：em_batch_ingest.py 新增 fetch_ex_events_range 与
 # tushare 低频交叉校验及批量事务 load_ex_events，lake/ 有意变更，基线前移。
-BASELINE = "0cf9ec5"   # fix(lake): 根除暴跌日幻影盖章并补齐 T4 区间分红增量与校验
+BASELINE = "a99e60d"   # fix(lake): EM 除权拉取 columns 坏字段致静默 0 行 → ALL + success 检查（2026-11-23 TL 实锤修复）
 
 
 def _git(*args) -> str:
