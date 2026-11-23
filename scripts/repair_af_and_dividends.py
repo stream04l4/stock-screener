@@ -177,7 +177,7 @@ def _recompute_selection_and_timing(con, config_path: Optional[str] = None) -> D
     cfg_p = config_path or os.path.join(PROJECT_ROOT, "config", "strategy.yaml")
     sp, up, tp = load_config(cfg_p)
     manual = load_manual_pool()
-    sel = refresh_selection(con, sp, up, manual=manual, tp=tp)
+    sel = refresh_selection(con, sp, up, verbose=True, tp=tp)
     tim = refresh_timing(con, up, tp, manual=manual)
     return {"selection": sel, "timing": tim}
 
