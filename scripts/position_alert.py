@@ -201,27 +201,53 @@ def _prune_pending(pending: Dict[str, Dict[str, Any]],
 # ---------------------------------------------------------------------------
 # 消息与推送
 # ---------------------------------------------------------------------------
+_CN_NUM = "零一二三四五六七八九十"
+
+
+def _round_prefix(round_no: Optional[int]) -> str:
+    """v8.2.3 轮次前缀（Joel 2026-11-23 定案：前缀不带股票名）：
+    1→「首轮」、2→「第二轮」…（≤10 中文数字、>10 阿拉伯）；None/≤0→""
+    （非持仓信号/湖中无数据 → 回退旧文案，无轮次前缀）。"""
+    if not round_no or round_no <= 0:
+        return ""
+    if round_no == 1:
+        return "首轮"
+    if round_no <= 10:
+        return f"第{_CN_NUM[round_no]}轮"
+    return f"第{round_no}轮"
+
+
 def render_message(signals: List[Dict[str, Any]], sp_name: str,
                    price_source: str, spot_time: Optional[str],
                    spot_source: str = "", pctile_max: float = 40.0) -> tuple:
-    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。"""
+    """推送加消息（title 纯文本 + content HTML，微信服务号原生渲染）。
+
+    v8.2.3 轮次口径（Joel 2026-11-23 定案）：持仓股信号文案带用户相对轮次
+    前缀（「首轮第 5 档 加仓」/「首轮建仓」/「第二轮建仓」）；理论手数 = 多
+    轮总理论值（首轮窗口起点起策略累计）仅展示，建议量 = 本档手数。
+    """
     names = []
     blocks: List[str] = []
     for s in signals:
         code, name = s["ts_code"], (s.get("name") or s["ts_code"])
         names.append(name)
-        gap_note = (f"（策略理论累计 {s['theory_lots']} 手 / 现持 {s['actual_lots']} 手）"
+        rpref = _round_prefix(s.get("round_no"))
+        gap_note = (f"（多轮理论 {s['theory_lots']} 手 / 现持 {s['actual_lots']} 手）"
                     if s.get("theory_lots") is not None and s.get("actual_lots") is not None
                     else "")
         if s.get("new_round") and s.get("in_pos"):
-            # 再武装后新一轮首档触线 = 二次建仓（兼容统一 action="buy" 与旧 action="add"）
+            # 再武装后新一轮首档触线 = 建仓（v8.2.3：轮次前缀 = 用户相对轮次号；
+            # 兼容统一 action="buy" 与旧 action="add"）
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
-                     f"（再武装·二次建仓）")
-            tail = (f"二次建仓，{s['suggested_lots']} 手{gap_note}"
-                    if s.get("suggested_lots") else "二次建仓")
+                     + (f"（再武装·{rpref}建仓）" if rpref else "（再武装·二次建仓）"))
+            tail = ((f"{rpref}建仓，{s['suggested_lots']} 手{gap_note}" if rpref
+                     else f"二次建仓，{s['suggested_lots']} 手{gap_note}")
+                    if s.get("suggested_lots")
+                    else (rpref + "建仓" if rpref else "二次建仓"))
         elif s["action"] == "add":
-            line1 = (f"<b>{name}（{code}）</b> 到达 <b>加仓线 第 {s['k_level']} 档</b>")
-            tail = (f"建议补至第 {s['next_level']} 档，{s['suggested_lots']} 手{gap_note}"
+            line1 = (f"<b>{name}（{code}）</b> 到达 <b>加仓线 "
+                     f"{rpref}第 {s['k_level']} 档</b>")
+            tail = (f"建议补至{rpref}第 {s['next_level']} 档，{s['suggested_lots']} 手{gap_note}"
                     if s.get("suggested_lots") else "建议加仓一档")
         else:
             line1 = (f"<b>{name}（{code}）</b> 到达 <b>首仓线</b>"
@@ -298,7 +324,8 @@ def run(force: bool = False, dry_run: bool = False,
     try:
         from web.app import _load_pool_ctx
 
-        _sp, _up, con, pool = _load_pool_ctx()
+        # v8.2.3 修（随 v8.2.1 五元组同步）：_load_pool_ctx 返回 (sp, up, tp, con, pool)
+        _sp, _up, _tp, con, pool = _load_pool_ctx()
     except Exception as exc:  # noqa: BLE001 - 湖锁定/缺失/配置错（含 HTTPException）
         log.warning("数据湖不可用（下轮重试）: %s", exc)
         return 3
@@ -373,11 +400,33 @@ def run(force: bool = False, dry_run: bool = False,
         con.close()
 
     # 4a) 持仓通道：持仓股 → 下一档触发价（与 Web 页面同一口径）
+    # v8.2.3 轮次口径（Joel 2026-11-23 定案）：轮次号 + 多轮总理论值（首轮
+    # 窗口起点起策略累计，仅展示）随信号透传；建议量 = 本档手数（build_signals
+    # 单点，v8.2.0 差值判定已退役）。
+    from martingale.signals import build_signals, user_round
     positions = []
     for c in held_codes:
         u = user[c] if isinstance(user[c], dict) else {}
         s = rows.get(c, {})
         last = s.get("last_price")
+        _marks = s.get("round_marks") or []
+        _rno, _wstart = (user_round(_marks,
+                                    str(u.get("since_date") or "")[:10]
+                                    or _bj_today_s)
+                         if _marks else (None, None))
+        # v8.2.3 修正：buys.amount 是**金额**（元）；理论手数 = 手数(lots)累计。
+        # 无轮次信息 → theory None（不附「多轮理论」注记，与页面契约一致）
+        _lot = getattr(_sp, "lot_size", None)
+        _tl = (sum(b["lots"] for b in (s.get("buys") or [])
+                   if b["date"] >= _wstart)
+               if _wstart is not None else None)
+        _theory_lots = (round(float(_tl), 2)
+                        if _tl is not None and _lot else None)
+        _actual_lots = (round(float(u.get("shares") or 0) / _lot, 2)
+                        if _lot else None)
+        _gap_lots = (round(max(0.0, _theory_lots - _actual_lots), 2)
+                     if _theory_lots is not None and _actual_lots is not None
+                     else None)
         positions.append({
             "ts_code": c,
             "name": s.get("name") or c,
@@ -386,13 +435,12 @@ def run(force: bool = False, dry_run: bool = False,
             "k_level": s.get("k_level"),
             "next_add_price_raw": s.get("next_add_price_raw"),
             "spot_price": (spot.get(c) or {}).get("price"),
-            "shares": float(u.get("shares") or 0),
-            # v8.2.0 累计差值口径：建仓日起策略买入累计（build_signals 据此算
-            # 理论 vs 实际差值——持仓够了不提醒）；strat_shares 全历史累计仅参考
-            "strat_shares_since": s.get("shares_since"),
-            "strat_shares": s.get("shares"),
+            # v8.2.3：轮次号 + 多轮总理论值（透传展示字段）
+            "round_no": _rno,
+            "theory_lots": _theory_lots,
+            "actual_lots": _actual_lots,
+            "gap_lots": _gap_lots,
         })
-    from martingale.signals import build_signals
 
     # v8.2.0 补（Joel 2026-11-13 二次定案）：首档（k=0）触线 = 建仓（再武装
     # 后新一轮 = 「二次建仓」）→ 须过当前时机门才提醒（实时分位 ≤

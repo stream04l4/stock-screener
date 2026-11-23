@@ -514,12 +514,13 @@ def test_my_positions_put_get_roundtrip(tmp_positions_file, bt_copy):
 
 
 def test_my_positions_line_kind_and_rearm_hide(tmp_positions_file, monkeypatch):
-    """v8.2.0 补（Joel 2026-11-19）：触发线语义标注 + 再武装显隐。
+    """v8.2.0 补 / v8.2.3 改（Joel 2026-11-19 + 2026-11-23）：触发线语义标注
+    + 再武装价无条件显示。
 
     - line_kind：k≥1 且本轮首仓锚点已建立 → "add"（加仓线）；否则 →
       "first"（首仓线）；无触发线 → None。
-    - 建仓日起策略零买入（shares_since=0，「理论上不持有」）→ 再武装价
-      置 None（页面「—」）；shares_since>0 → 照显。
+    - v8.2.3：再武装价恢复无条件显示（v8.2.0「shares_since=0 → 隐藏」规则
+      退役，轮次口径下高位仓也需要再武装参考）。
     零湖零网络：_state_projection 全量 fake。
     """
     from martingale.config import load_config
@@ -568,8 +569,8 @@ def test_my_positions_line_kind_and_rearm_hide(tmp_positions_file, monkeypatch):
     p0 = by["sh.600737"]
     assert p0["line_kind"] == "first"
     assert p0["next_add_price_raw"] == 13.5913     # 触发线照显（= 首仓价）
-    assert p0["next_rearm_price_raw"] is None      # 零买入 → 再武装隐藏
-    assert p0["next_rearm_price"] is None
+    assert p0["next_rearm_price_raw"] == 13.0755   # v8.2.3：再武装无条件照显
+    assert p0["next_rearm_price"] == 166.164
     p1 = by["sh.601006"]
     assert p1["line_kind"] == "add"
     assert p1["next_rearm_price_raw"] == 5.6925    # 策略有轮次 → 照显
@@ -768,15 +769,17 @@ def test_record_trade_buy_records_buys_timeline(tmp_positions_file, bt_copy):
 
 
 def test_my_positions_gap_fields_consistency(tmp_positions_file, bt_copy):
-    """v8.2.0：持仓行含 策略理论(手)/实际(手)/差值(手)。理论 = 建仓日起策略
-    买入累计（shares_since，状态机真实口径）/ 手；新建仓（since_date=今天）→
-    建仓日后策略买入为 0 → 理论 0；差值 = max(0, 理论−实际)。"""
+    """v8.2.3：持仓行含 多轮理论(手)/实际(手)/差值(手)。理论 = 用户**首轮**
+    （有持仓的第一个轮次窗口）起点起策略累计手数（多轮总值，仅展示）；
+    无轮次信息（策略从未建仓）→ round_no/theory/gap 皆 None；
+    差值 = max(0, 理论−实际)。"""
     wapp.put_my_positions({"ts_code": "sh.600036", "shares": 500, "cost_price": 10.0})
     p = wapp.get_my_positions()["positions"][0]
     assert p["actual_lots"] == 5.0  # 500 股 / 100
     assert p["strat_shares_since"] == 0.0  # 新锚点=今天，湖数据均早于今天
-    assert p["theory_lots"] == 0.0
-    assert p["gap_lots"] == 0.0
+    assert p["round_no"] is None  # 合成湖该策略从未建仓 → 无轮次
+    assert p["theory_lots"] is None
+    assert p["gap_lots"] is None
 
 
 def test_my_positions_rejects_bad_code(tmp_positions_file):
@@ -1185,14 +1188,17 @@ def test_my_positions_signal_spot_triggers(tmp_positions_file, bt_copy, monkeypa
     assert s["action"] == "buy"  # k=0 首仓/二次建仓统一为 "buy"
     assert s["price"] == 40.0 and s["price"] <= s["next_add_price"]
     assert s["k_level"] == 0 and s["next_level"] == 1
-    # v8.2.0 补（「不受约束」定案）：k=0（本轮未启动）且 shares_since=0
-    # （建仓日起策略零买入）→ 不做差值判定 → 无差值字段，建议 = 本档
-    # first_lots；持仓行理论仍按 shares_since 展示 0
+    # v8.2.3：建议 = 本档手数（first_lots，「不受约束」定案仍适用——k≥1
+    # 轮内加仓档不受时机约束，此处 k=0 建仓已过时机门）；多轮总理论值
+    # （首轮窗口起点累计）行内透传仅显示：再武装后本轮尚无买入 → 0 手
     p = out["positions"][0]
     fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
-    assert p["theory_lots"] == 0.0
+    assert p["round_no"] == 1  # 有轮次史（首仓+再武装），当前=首轮
+    assert p["theory_lots"] == 0.0  # 本轮窗口起点起策略无买入
+    assert p["gap_lots"] == 0.0
     assert s["suggested_lots"] == fl
-    assert "theory_lots" not in s  # 未判定 → 无差值明细
+    assert s["theory_lots"] == 0.0   # 行内透传（仅显示，不参与建议）
+    assert s["actual_lots"] == 1.0 and s["gap_lots"] == 0.0
     assert out["positions"][0]["spot_price"] == 40.0
 
 
@@ -1264,8 +1270,8 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert p0["in_pos"] is False and p0["k_level"] == 0
     assert p0["next_add_price_raw"] is not None and p0["last_price"] > p0["next_add_price_raw"]
     assert out0["signals"] == []
-    # 实时价 70.0 ≤ 75.0 → buy 信号；v8.2.0 补（「不受约束」定案）：从未触线
-    # （shares_since=0）→ 不做差值判定 → 无差值字段，建议 = first_lots
+    # 实时价 70.0 ≤ 75.0 → buy 信号；v8.2.3：从未触线（策略从未建仓、无轮次）
+    # → round_no/theory 皆 None；建议 = 本档 first_lots
     _mock_spot(monkeypatch, {"sh.600941": 70.0})
     out = wapp.get_my_positions()
     assert len(out["signals"]) == 1
@@ -1275,9 +1281,10 @@ def test_my_positions_signal_buy_triggers(tmp_positions_file, bt_copy, tmp_path,
     assert s["k_level"] == 0 and s["next_level"] == 1
     fl = wapp.get_strategy()["json"]["strategy"]["first_lots"]
     p = out["positions"][0]
-    assert p["theory_lots"] == 0.0  # 从未触线 → 状态机累计 0 股
+    assert p["round_no"] is None  # never → 无轮次
+    assert p["theory_lots"] is None and p["gap_lots"] is None
     assert s["suggested_lots"] == fl
-    assert "theory_lots" not in s  # 未判定 → 无差值明细
+    assert "theory_lots" not in s  # 无轮次信息 → 无理论明细
 
 
 # ---------------------------------------------------------------------------
@@ -1310,7 +1317,8 @@ def test_state_projection_cache_shared_and_invalidation(tmp_positions_file, monk
 
     def fake_ctx(cfg_path=None):
         calls["ctx"] += 1
-        return sp_stub, {}, _FakeCon(), pool_stub
+        # 五元组 (sp, up, tp, con, pool)，随 v8.2.1 同步
+        return sp_stub, {}, None, _FakeCon(), pool_stub
 
     def fake_rows(sp, con, codes, **kw):
         calls["rows"] += 1

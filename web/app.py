@@ -1500,6 +1500,7 @@ def get_my_positions() -> Dict[str, Any]:
     lake_locked = proj["lake_locked"]
     rows: Dict[str, Dict[str, Any]] = proj["rows_since"]
     _sp = proj["sp"]
+    from martingale.signals import user_round  # v8.2.3 轮次口径（单一定义点）
     positions: List[Dict[str, Any]] = []
     tot_cost = 0.0
     for c in sorted(user):
@@ -1507,16 +1508,25 @@ def get_my_positions() -> Dict[str, Any]:
         s = rows.get(c, {})
         shares = float(u.get("shares") or 0)
         cost = float(u.get("cost_price") or 0)
-        # v8.2.0 累计差值口径（Joel 2026-11-13 定案）：理论持仓 = 用户建仓日起
-        # 策略买入的累计股数（shares_since，状态机真实口径——含建仓后所有轮次
-        # 的买入；建仓早于时机/晚于多轮均正确）；实际 = 账本股数；差值 =
-        # max(0, 理论−实际)。湖中无数据 → 三字段 None。实时新档触发的补差见
-        # signals（build_signals 同口径 + 本档手数）。
+        # v8.2.3 轮次口径（Joel 2026-11-23 定案，显示层）：理论 = 用户**首轮**
+        # （有持仓的第一个轮次窗口）起点起策略累计买入股数（含其后所有轮次）；
+        # 实际 = 账本股数；差值 = max(0, 理论−实际)。三者均**仅展示**——信号
+        # 建议量 = 本档手数（build_signals，不随差值补差）。湖中无数据 → None。
         strat_shares = s.get("shares")  # 状态机全历史模拟累计股数（仅展示参考）
-        shares_since = s.get("shares_since")  # v8.2.0：建仓日起策略买入累计
+        shares_since = s.get("shares_since")  # 建仓日起策略买入累计（明细弹层参考）
         lot = int(_sp.lot_size) if _sp is not None else 100
-        theory_lots = (round(shares_since / lot, 2)
-                       if shares_since is not None else None)
+        _marks = s.get("round_marks") or []
+        _since = str(u.get("since_date") or "")[:10] or str(_beijing_today())[:10]
+        round_no, _wstart = (user_round(_marks, _since)
+                             if _marks else (None, None))
+        # v8.2.3 修正：buys.amount 是**金额**（元）；理论手数 = 手数(lots)累计。
+        # 无轮次信息（round_marks 空，策略从未建仓）→ round_no/theory 皆 None
+        # （页面「—」，与 v8.2.3 契约一致）
+        _theory_lots_v = (sum(b["lots"] for b in (s.get("buys") or [])
+                              if b["date"] >= _wstart)
+                          if _wstart is not None else None)
+        theory_lots = (round(float(_theory_lots_v), 2)
+                       if _theory_lots_v is not None else None)
         actual_lots = round(shares / lot, 2)
         gap_lots = (round(max(0.0, theory_lots - actual_lots), 2)
                     if theory_lots is not None else None)
@@ -1539,13 +1549,15 @@ def get_my_positions() -> Dict[str, Any]:
             "theory_lots": theory_lots,
             "actual_lots": actual_lots,
             "gap_lots": gap_lots,
+            # v8.2.3（Joel 2026-11-23 轮次口径）：用户相对轮次号——有持仓的
+            # 第一个轮次 = 首轮，其后每次轮内再武装 +1（湖中无数据 → None）
+            "round_no": round_no,
             "k_level": s.get("k_level"),
-            # v8.2.0 补（Joel 2026-11-19 拍板）：触发线语义标注 + 再武装显隐。
-            # 状态机行是全历史模拟：k≥1 且本轮首仓锚点已建立 → 加仓线；
-            # 否则（k=0/锚点 0）→ 首仓线。建仓日起策略零买入（shares_since=0，
-            # 「理论上不持有」的心血来潮/高位仓）→ 轮次对用户无意义：再武装价
-            # 隐藏（None → 页面「—」）；触发线照显（= 首仓价，策略下一次
-            # 建仓的价位）。展示层修正，引擎口径不动。
+            # v8.2.0 补（Joel 2026-11-19 拍板）：触发线语义标注。状态机行是
+            # 全历史模拟：k≥1 且本轮首仓锚点已建立 → 加仓线；否则（k=0/锚点
+            # 0）→ 首仓线。v8.2.3：再武装价恢复无条件显示（v8.2.0「高位仓
+            # shares_since=0 隐藏」规则随旧差值口径废除——轮次口径下再武装 =
+            # 进入新一轮首仓生命周期，任何持仓都适用）。
             "line_kind": (("add" if ((s.get("k_level") or 0) >= 1
                                       and (s.get("round_anchor") or 0.0) > 0.0)
                            else "first")
@@ -1558,11 +1570,9 @@ def get_my_positions() -> Dict[str, Any]:
             "first_price_line_raw": None,
             "timing_line_raw": None,
             "next_add_price": s.get("next_add_price"),
-            "next_rearm_price": (s.get("next_rearm_price")
-                                 if (shares_since or 0) > 0 else None),
+            "next_rearm_price": s.get("next_rearm_price"),  # v8.2.3 恢复无条件显示
             "next_add_price_raw": s.get("next_add_price_raw"),
-            "next_rearm_price_raw": (s.get("next_rearm_price_raw")
-                                     if (shares_since or 0) > 0 else None),
+            "next_rearm_price_raw": s.get("next_rearm_price_raw"),
             "end_date": s.get("end_date"),
         })
         tot_cost += shares * cost
@@ -1799,7 +1809,9 @@ def get_strategy_signals() -> Dict[str, Any]:
       约束（两次定案叠加）：11-13 = (active|touched) 且 action 非空——无动作
       的未触线价格态（时机未过/持仓已够/非持仓时机门未过）不入当前信号；
       11-23（Joel：进入信号区的信号应保留到下个交易日）= touched 行
-      （今日真实触线）action 为空也保留到当日，动作列标原因**；「即将进入」
+      （今日真实触线）action 为空也保留到当日，动作列标原因；11-23 轮次
+      口径 = **持仓行触线必保留（v8.2.0「持仓已够→不提醒」抑制已退役）**）**；
+      「即将进入」
       段入口由前端三分类定（Joel 2026-11-13
       规整）：① 持仓 in_pos k≥1（未再武装·轮内加仓档，无时机门）= 临近
       加仓线 5%；② 未建仓（非持仓）/ ③ 持仓 k=0（已再武装未二次建仓）=
@@ -1811,13 +1823,14 @@ def get_strategy_signals() -> Dict[str, Any]:
       第 N 档；非持仓股此口径 = 「从当前状态加入策略」的触发线）；未 in_pos
       （模拟尚未建仓）= 首仓线（first_level_raw = 本周期 H×(1−first_drawdown)，
       动作恒为买入·首仓、手数 = first_lots，v7.0.28）。
-    - **持仓股动作/手数走建仓日锚定判定（v8.2.0 补，Joel 2026-11-13：两处信号
-      一致）**：judge_held_lots 与 /api/my_positions、微信 position_alert 同一
-      单一定义点——有策略跟上的仓位（shares_since>0）：理论（建仓日起策略买入
-      累计 + 本档手数）≤ 实际持仓 → action=None（持仓已够，不提醒）；差值 >0
-      → 建议补差值手数；**建仓日起策略零买入（心血来潮/高位建仓）或数据缺失
-      → 正常信号（本档手数，照常提醒）**。非持仓股完全不变（正常逻辑 + 时机门）。
-      判定明细见行内 theory_lots/actual_lots/gap_lots（未判定为 None）。
+    - **持仓股走 v8.2.3 轮次口径（Joel 2026-11-23 定案，显示层）**：行内
+      round_no = 用户相对轮次号（有持仓的第一个轮次 = 首轮，其后每次轮内
+      再武装 +1；首期内未建仓则下轮仍为首轮——user_round 与
+      /api/my_positions 同一单一定义点）；theory_lots/actual_lots/gap_lots =
+      **多轮总理论值**（首轮窗口起点起策略累计，仅展示）。建议量 = 本档手数
+      （到线即执行，cls/touched 补齐同一口径）；v8.2.0 差值判定（补差建议 +
+      「持仓已够→不提醒」）已退役，触线必提醒。非持仓股完全不变（正常逻辑 +
+      时机门）。湖中无数据 → round_no/theory 字段 None。
     - 时机门（v7.0.24 定案：① 价格分位单条件）：非持仓股的买入信号须先过
       选股时机提醒口径（timing.push_eligible = ① 5年分位≤40%，读
       selection_timing 快照 O(1)）——到买入时机才给买入信号，否则 action=None
@@ -1846,7 +1859,7 @@ def get_strategy_signals() -> Dict[str, Any]:
       持仓已够判定门控**（那两处门控只作用于 action/suggested_lots）——
       供前端「即将进入」段「下一档手数」列展示；sp 缺失/no_data → None。
     """
-    from martingale.signals import classify_signal, judge_held_lots
+    from martingale.signals import classify_signal, user_round  # v8.2.3 轮次口径
 
     user = _up_read()
 
@@ -2020,19 +2033,29 @@ def get_strategy_signals() -> Dict[str, Any]:
                 c, tmap, price)
             if timing_ok is not True:
                 action, suggested = None, None
+        # v8.2.3 轮次口径（Joel 2026-11-23 定案）：持仓股 = 用户相对轮次号
+        # + 多轮总理论值（首轮窗口起点起策略累计，仅展示）。v8.2.0 差值判定
+        # （补差建议 + 「持仓已够→不提醒」抑制）已退役——建议量恒为本档手数
+        # （cls/上方 touched 补齐），触线必提醒。
+        held_round_no: Optional[int] = None
         held_extra: Optional[Dict[str, float]] = None
-        held_sufficient = False
-        if held and action is not None and sp_obj is not None:
-            adj, held_extra, judged = judge_held_lots(
-                sp_obj, k, in_pos, suggested,
-                (rows_since.get(c) or {}).get("shares_since"),
-                float((user.get(c) or {}).get("shares") or 0))
-            if judged:
-                if adj is None:
-                    action, suggested = None, None  # 持仓已够 → 不提醒
-                    held_sufficient = True
-                else:
-                    suggested = int(adj)
+        if held and r is not None:
+            _marks = r.get("round_marks") or []
+            _since = str((user.get(c) or {}).get("since_date") or "")[:10] \
+                or str(_beijing_today())[:10]
+            _rno, _wstart = user_round(_marks, _since) if _marks else (None, None)
+            held_round_no = _rno
+            if _wstart is not None and sp_obj is not None:
+                # v8.2.3 修正：buys.amount 是**金额**（元）；理论手数 = 手数累计
+                _tl = sum(b["lots"] for b in (r.get("buys") or [])
+                          if b["date"] >= _wstart)
+                _theory_lots = round(float(_tl), 2)
+                _actual_lots = round(float((user.get(c) or {}).get("shares") or 0)
+                                     / sp_obj.lot_size, 2)
+                held_extra = {"theory_lots": _theory_lots,
+                              "actual_lots": _actual_lots,
+                              "gap_lots": round(max(0.0,
+                                                    _theory_lots - _actual_lots), 2)}
         status = "touched" if touched else cls["status"]
         bt = bmap.get(c) or {}
         stocks.append({
@@ -2051,7 +2074,9 @@ def get_strategy_signals() -> Dict[str, Any]:
             "action": action,
             "suggested_lots": suggested,
             "next_lots": next_lots,
-            "held_sufficient": held_sufficient,
+            # v8.2.3：用户相对轮次号（持仓行有值，非持仓 None）；
+            # 「持仓已够 held_sufficient」字段随 v8.2.0 差值口径退役删除
+            "round_no": held_round_no,
             "new_round": bool(held_first and action is not None),
             "theory_lots": (held_extra or {}).get("theory_lots"),
             "actual_lots": (held_extra or {}).get("actual_lots"),

@@ -4,6 +4,11 @@
 契约（全离线，零真实网络/零生产数据）：
 - martingale.signals.classify_signal 纯函数四态口径
   （active / approaching / idle / no_data；边界；approach_pct 可调）；
+- **v8.2.3 轮次口径**（Joel 2026-11-23 定案，v8.2.0 累计差值口径退役）：
+  轮次窗口 round_windows + 用户相对轮次 user_round 纯函数（单一定义点）；
+  持仓行附 round_no + 多轮总理论值（首轮窗口起点起策略累计，仅展示）；
+  建议量恒 = 本档手数，无「持仓已够不提醒」抑制；k=0 时机门保留；
+  build_signals 对 round_no/theory/actual/gap 纯透传。
 - martingale.engine.run_stock buys 元组 6 元素标注（k 档下标 / first_of_round / lots
   手数，v7.0.28），前 3 元语义与历史一致（f6 红线由 test_f6_regression 守护）；
 - web /api/strategy_signals 端点：股票池 ∪ 账本、触发价（v7.0.23 定案：
@@ -41,7 +46,8 @@ from martingale.config import StrategyParams  # noqa: E402
 from martingale.engine import run_stock  # noqa: E402
 from martingale import touches as touches_mod  # noqa: E402
 from martingale.signals import (  # noqa: E402
-    DEFAULT_APPROACH_PCT, build_signals, classify_signal,
+    DEFAULT_APPROACH_PCT, build_signals, classify_signal, round_windows,
+    user_round,
 )
 from martingale.data import LakeLocked  # noqa: E402
 
@@ -128,7 +134,7 @@ def test_build_signals_unchanged_shape_and_sort():
     a = out[0]
     assert set(a.keys()) == {"ts_code", "name", "price", "next_add_price",
                              "k_level", "next_level", "suggested_lots", "action",
-                             "new_round", "in_pos"}  # v8.2.0 补：首档=建仓字段
+                             "new_round", "in_pos", "round_no"}  # v8.2.3：轮次号
     assert a["new_round"] is False and a["in_pos"] is True
     assert a["action"] == "add" and a["next_level"] == 2
     assert a["suggested_lots"] == 2  # 第 k=1 档
@@ -193,12 +199,14 @@ def test_held_first_timing_pool_outside_live(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# v8.2.0 累计差值口径（Joel 2026-11-13 定案）：
-# 理论持仓 = 用户**建仓日起**策略买入累计（strat_shares_since）+ 本档手数；
-# 实际 = 账本股数；差值 > 0 → 建议补差值（向上取整到整手）；≤ 0（够了/超配）
-# → 不产信号。**strat_shares_since=0（建仓日起策略零买入 = 心血来潮/高位建仓）
-# → 不做差值判定，正常信号照常提醒（v8.2.0 补「不受约束」定案）**。本档手数 =
-# in_pos 第 k 档 → first_lots+k×step；未持仓 → first_lots。
+# v8.2.3 轮次口径（Joel 2026-11-23 定案；v8.2.0 累计差值口径退役）：
+# - 轮次窗口 = 首轮首笔 → 轮内再武装（k≥1）切分；再武装后等待期归属下一轮
+#   首仓生命周期；user_round = 用户 since_date 落入的窗口 = 首轮，其后每再
+#   武装 +1；首轮窗口起点 = 多轮总理论值累计起点（仅展示）；
+# - 建议量恒 = 本档手数（到线即执行），无「持仓已够不提醒」抑制——持仓信号
+#   触线必提醒；k=0 首仓时机门保留（fail-closed）；
+# - build_signals 纯透传：round_no/theory/actual/gap 由 web/脚本侧计算随行
+#   传入，信号行原样带回（本区块含纯函数 + 透传守护）。
 # 生产 sizing：first_lots=2 / add_lots_step=2 / lot_size=100（2/4/6/8 手）。
 # ---------------------------------------------------------------------------
 
@@ -206,97 +214,95 @@ SP2 = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=2,
                       add_lots_step=2)
 
 
-def _gap_pos(**kw):
-    base = {"ts_code": "sh.600036", "name": "招商银行", "spot_price": 30.0,
-            "last_price": 30.0, "next_add_price_raw": 31.0,
-            "in_pos": True, "k_level": 1, "strat_shares_since": 0.0,
-            "shares": 0.0}  # 默认：首次加仓档已触发（本档 2+1×2=4 手）
+def test_round_windows_split():
+    """窗口切分：首笔开窗口；轮内再武装终结前窗口并开启新窗口（等待期归下轮）；
+    末窗口开放；首笔 rearm（防御性数据）= 单开放窗口。"""
+    marks = [("2020-01-01", "first_buy"), ("2020-03-01", "rearm"),
+             ("2020-04-01", "first_buy"), ("2020-06-01", "rearm")]
+    assert round_windows(marks) == [
+        ("2020-01-01", "2020-03-01"),   # 第 1 轮：被 03-01 再武装终结
+        ("2020-03-01", "2020-06-01"),   # 第 2 轮：04-01 首笔落在窗口内不切分
+        ("2020-06-01", None),           # 第 3 轮：开放
+    ]
+    assert round_windows([]) == []
+    assert round_windows([("2020-06-01", "rearm")]) == [("2020-06-01", None)]
+
+
+def test_user_round_window_attribution():
+    """since 落入的窗口 = 用户首轮；其后每再武装 +1（Joel：再武装 → 第二轮，
+    再再武装 → 第三轮）。当前轮号 = 窗口数 − 首轮窗口下标；理论起点 = 首轮
+    窗口起点（只算轮号不算理论，理论由调用方按起点累计）。"""
+    marks = [("2020-01-01", "first_buy"), ("2020-03-01", "rearm"),
+             ("2020-04-01", "first_buy"), ("2020-06-01", "rearm")]
+    # 3 个窗口；since 落 W0 → 用户已在第 3 轮（其后两次再武装）
+    assert user_round(marks, "2020-02-01") == (3, "2020-01-01")
+    # since 落 W1 → 第 2 轮（其后 1 次再武装）
+    assert user_round(marks, "2020-05-01") == (2, "2020-03-01")
+    # since 落 W2（当前开放轮）→ 第 1 轮（其后无再武装 = 首轮）
+    assert user_round(marks, "2020-07-01") == (1, "2020-06-01")
+    # 早于首个窗口 → 首轮 = 第 1 个窗口（当前第 3 轮）
+    assert user_round(marks, "2019-12-31") == (3, "2020-01-01")
+    # 边界 = 窗口起点
+    assert user_round(marks, "2020-01-01") == (3, "2020-01-01")
+
+
+def test_user_round_unanchored_defaults_first_round():
+    """无锚点（since_date 缺失，调用方缺省=今天）→ 今天必落末开放窗口 →
+    首轮 = 当前轮（起点 = 末窗口起点）；无 marks → (1, None) = 无数据。"""
+    marks = [("2020-01-01", "first_buy"), ("2020-03-01", "rearm")]
+    assert user_round(marks, "") == (1, "2020-03-01")
+    assert user_round(marks, None) == (1, "2020-03-01")
+    assert user_round([], "2020-01-01") == (1, None)
+
+
+def test_user_round_daqin_style():
+    """大秦铁路实案形态：marks 尾 = 当前轮首笔（轮起点 2025-11-27），用户
+    since 2026-11-01 落该轮窗口 → 首轮；理论起点 = 前次再武装日 2022-01-20
+    （本轮 4 笔 2+4+6+8 = 20 手由调用方按起点累计）。"""
+    marks = [("2022-01-20", "rearm"), ("2025-11-27", "first_buy")]
+    # 单开放窗口：since 落当前轮 → 首轮（理论起点 = 窗口起点 2022-01-20）
+    assert user_round(marks, "2026-11-01") == (1, "2022-01-20")
+
+
+def _dq_pos(**kw):
+    # 现货 4.22 = 触线当日（≤ 线 4.22）；本档 = 2+4×2 = 10 手（SP2）
+    base = {"ts_code": "sh.601006", "name": "大秦铁路", "spot_price": 4.22,
+            "last_price": 4.95, "next_add_price_raw": 4.22,
+            "in_pos": True, "k_level": 4}
     base.update(kw)
     return base
 
 
-def test_gap_unanchored_position_normal_signal():
-    """v8.2.0 补「不受约束」（Joel 例：中粮糖业型高位建仓）：建仓日起策略零买入
-    （shares_since=0）→ 不做差值判定，正常信号照常提醒（本档手数，无差值字段）。"""
-    sigs = build_signals(
-        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=200)], SP2)
-    assert len(sigs) == 1
-    assert sigs[0]["action"] == "buy" and sigs[0]["suggested_lots"] == 2
-    assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
-
-
-def test_gap_unanchored_addon_still_reminds():
-    """高位持仓 4 手 > 本档 4 手，但建仓日起策略零买入 → 照常提醒加仓 4 手
-    （不被「持仓已够」误杀）。"""
-    sigs = build_signals(
-        [_gap_pos(in_pos=True, k_level=1, strat_shares_since=0.0, shares=400)], SP2)
-    assert len(sigs) == 1
-    assert sigs[0]["action"] == "add" and sigs[0]["suggested_lots"] == 4
-    assert "gap_lots" not in sigs[0]
-
-
-def test_gap_first_addon_short_suggests_fill():
-    """首次加仓档触发：建仓后策略已买 2 手（首仓）+ 本档 4 手 = 理论 6 手，
-    实际 4 手 → 补 2 手。"""
-    sigs = build_signals([_gap_pos(strat_shares_since=200, shares=400)], SP2)
+def test_build_signals_round_fields_passthrough():
+    """v8.2.3：round_no/theory_lots/actual_lots/gap_lots 由调用方随行传入，
+    build_signals 原样透传（不做差值判定）。"""
+    pos = _dq_pos(round_no=1, theory_lots=20.0, actual_lots=1.0, gap_lots=19.0)
+    sigs = build_signals([pos], SP2)
     assert len(sigs) == 1
     s = sigs[0]
-    assert s["action"] == "add" and s["suggested_lots"] == 2
-    assert s["theory_lots"] == 6.0 and s["actual_lots"] == 4.0
-    assert s["gap_lots"] == 2.0
+    assert s["action"] == "add" and s["suggested_lots"] == 10  # 本档手数
+    assert s["round_no"] == 1
+    assert (s["theory_lots"], s["actual_lots"], s["gap_lots"]) == (20.0, 1.0, 19.0)
 
 
-def test_gap_exact_match_no_signal():
-    """建仓后策略已买 2 + 本档 4 = 6 手；实际 6 手 → 相等不提醒。"""
-    assert build_signals([_gap_pos(strat_shares_since=200, shares=600)], SP2) == []
+def test_build_signals_held_no_suppression():
+    """v8.2.3：「实际≥理论 → 不提醒」抑制已退役——持仓触线必提醒（建议量 =
+    本档手数，不随差值改）。"""
+    pos = _dq_pos(round_no=1, theory_lots=20.0, actual_lots=100.0, gap_lots=0.0)
+    sigs = build_signals([pos], SP2)
+    assert len(sigs) == 1 and sigs[0]["action"] == "add"
+    assert sigs[0]["suggested_lots"] == 10
+    assert sigs[0]["gap_lots"] == 0.0  # 差值仅为透传展示
 
 
-def test_gap_overweight_no_signal():
-    """有策略跟上（since>0）且实际 > 理论（自买超配）→ 不提醒。"""
-    sigs = build_signals(
-        [_gap_pos(in_pos=True, k_level=1, strat_shares_since=200, shares=700)], SP2)
-    assert sigs == []
-
-
-def test_gap_first_buy_unheld_suggests_first_lots():
-    """未持仓首仓档触发：建仓后策略买 0 → 不做差值判定（未持仓本就无账本），
-    正常信号 buy 本档 2 手（无差值字段）。"""
-    sigs = build_signals(
-        [_gap_pos(in_pos=False, k_level=0, strat_shares_since=0.0, shares=0)], SP2)
+def test_build_signals_no_round_fields():
+    """无轮次信息（湖中无数据/旧调用方）→ round_no None、无 theory 字段
+    （形状守护；建议量仍是本档手数）。"""
+    sigs = build_signals([_dq_pos()], SP2)
     assert len(sigs) == 1
-    assert sigs[0]["action"] == "buy" and sigs[0]["suggested_lots"] == 2
+    assert sigs[0]["round_no"] is None
     assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
-
-
-def test_gap_fractional_actual_ceil_lots():
-    """实际 4.5 手 vs 理论 6 手 → gap 1.5 → 向上取整建议 2 手。"""
-    sigs = build_signals([_gap_pos(strat_shares_since=200, shares=450)], SP2)
-    assert sigs[0]["suggested_lots"] == 2
-    assert sigs[0]["gap_lots"] == 1.5
-
-
-def test_gap_missing_strat_fallback_legacy_shape():
-    """strat_shares_since/shares 缺失（湖中无数据/旧调用方）→ 旧行为：建议本档
-    手数、不附差值字段（形状守护 test_build_signals_unchanged_shape_and_sort）。"""
-    p = _gap_pos()
-    p.pop("strat_shares_since")
-    p.pop("shares")
-    sigs = build_signals([p], SP2)  # k=1 → 本档 2+1×2=4 手
-    assert len(sigs) == 1
-    assert sigs[0]["suggested_lots"] == 4
-    assert "theory_lots" not in sigs[0] and "gap_lots" not in sigs[0]
-
-
-def test_gap_since_anchored_not_full_history():
-    """口径钉死（2026-11-13 定案）：理论用**建仓日起**策略买入累计
-    （strat_shares_since），而非全历史模拟累计（strat_shares，backtest 尺度）。
-    建仓后策略仅买 2 手、k=1 触发本档 4 手 → 理论 6 手、账本 1 手 → 补 5 手
-    （即使全历史 strat_shares 高达数百手也不计入）。"""
-    sigs = build_signals(
-        [_gap_pos(strat_shares_since=200, shares=100, strat_shares=80389)], SP2)
-    assert len(sigs) == 1
-    assert sigs[0]["suggested_lots"] == 5
-    assert sigs[0]["theory_lots"] == 6.0 and sigs[0]["actual_lots"] == 1.0
+    assert sigs[0]["suggested_lots"] == 10
 
 
 # ---------------------------------------------------------------------------
@@ -472,8 +478,11 @@ def _wire(monkeypatch, tmp_path, rows=ROWS, pool=POOL, user=USER, spot=SPOT,
                   encoding="utf-8")
     monkeypatch.setattr(wapp, "TOUCH_STATE_PATH", tp)
 
+    # _load_pool_ctx 五元组 (sp, up, tp, con, pool)：测试只用到 sp/con/pool
     def _pool_ctx(cfg=None):
-        return SP, None, SimpleNamespace(close=lambda: None), SimpleNamespace(codes=list(pool))
+        return (SP, None, None,
+                SimpleNamespace(close=lambda: None),
+                SimpleNamespace(codes=list(pool)))
 
     if lake_exc is not None:
         def _boom(cfg=None):
@@ -795,7 +804,9 @@ def test_strategy_signals_current_strategy_only(monkeypatch, tmp_path):
 
     def _ctx(cfg_path=None):
         seen["cfg"] = cfg_path
-        return SP, None, SimpleNamespace(close=lambda: None), SimpleNamespace(codes=list(POOL))
+        return (SP, None, None,
+                SimpleNamespace(close=lambda: None),
+                SimpleNamespace(codes=list(POOL)))
 
     monkeypatch.setattr(wapp, "_load_pool_ctx", _ctx)
     out = wapp.get_strategy_signals()
@@ -815,104 +826,112 @@ def test_strategy_signals_spot_fallback_lake_price(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v8.2.0 补 持仓股建仓日锚定判定（Joel 2026-11-13：两处信号一致）
+# v8.2.3 持仓股轮次显示（Joel 2026-11-23：三处信号一致；v8.2.0 锚定判定退役）
 # ---------------------------------------------------------------------------
 
-def test_strategy_signals_held_anchor_gap_gate(monkeypatch, tmp_path):
-    """持仓股动作/手数走建仓日锚定判定 + 首档时机门（与 /api/my_positions、
-    微信同一口径）：
-    - 有策略跟上的仓位（shares_since>0）→ 差值判定（≤实际=持仓已够/差值>0=补差）；
-    - 建仓日起策略零买入（心血来潮/高位建仓）→ 不做差值判定，正常信号照常提醒；
-    - 首档（k=0，再武装后新一轮 = 二次建仓）→ 须当前时机门通过才提醒
-      （fail-closed：无时机行 = 未过）；
-    - 非持仓股完全不受影响（正常逻辑 + 时机门）；shares_since 缺失 → 回退旧行为。"""
+def test_strategy_signals_held_round_display(monkeypatch, tmp_path):
+    """持仓股行附用户相对轮次 + 多轮总理论值（仅展示）+ 首档时机门：
+    - round_no = user_round（since_date 落点窗口 = 首轮，其后再武装 +1）；
+    - 理论手数 = 首轮窗口起点起策略 buys 累计（湖中无数据 → None）；
+    - 无「持仓已够 → 不提醒」抑制：触线必提醒（建议 = 本档手数）；
+    - k=0 首仓时机门保留（fail-closed：无时机行 = 未过）；
+    - 非持仓股完全不受影响（正常逻辑 + 时机门）。"""
     rows = {
-        # A 高位建仓（since=0）+ k=1 轮内加仓档 → 不判定、不受时机约束，
-        #    照常提醒加仓（本档 2 手）
+        # A k=1 轮内加仓档 + 无轮次信息（湖中无 round_marks）→ 正常加仓信号，
+        #    round_no None、无理论字段
         "sh.600101": {"name": "甲", "last_price": 9.9, "in_pos": True, "k_level": 1,
                       "next_add_price_raw": 10.0, "first_level_raw": 12.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # B 对齐仓位恰好够（k=0，须时机过才到差值判定）：since=2 手 + 本档 1 手
-        #    = 3 手 = 实际 3 手 → 不提醒
+                      "end_date": "2026-11-06", "buys": []},
+        # B k=0 时机✓ + since 2026-10-15 落 10-01 首笔窗口 → 首轮：建仓信号
+        #    不抑制（v8.2.3 退役「恰好够不提醒」），round_no=1，理论 = 10-05
+        #    买入 100 股 = 1 手，实际 1 手，差 0
         "sh.600102": {"name": "乙", "last_price": 29.0, "in_pos": True, "k_level": 0,
                       "next_add_price_raw": 30.0, "first_level_raw": 30.0,
-                      "end_date": "2026-11-06", "shares_since": 200.0, "buys": []},
-        # C 对齐仓位差值 +2：since=1 手 + 本档 3 手 = 4 手，实际 2 手 → 补 2 手
+                      "end_date": "2026-11-06",
+                      "round_marks": [("2026-10-01", "first_buy")],
+                      "buys": [{"date": "2026-10-05", "price": 28.0, "amount": 100.0,
+                                "level": 0, "first_of_round": True, "lots": 1}]},
+        # C k=2 + since 09-05 落第 1 窗口 → 用户已历 3 轮（10-10/10-25 两次
+        #    再武装）→ round_no=3；多轮总理论 = 首轮起点 09-01 起累计两笔
+        #    = 2 手（「策略理论手数按照多轮的总理论值」核心断言）
         "sh.600103": {"name": "丙", "last_price": 19.0, "in_pos": True, "k_level": 2,
                       "next_add_price_raw": 20.0, "first_level_raw": 22.0,
-                      "end_date": "2026-11-06", "shares_since": 100.0, "buys": []},
-        # D 非持仓 + 时机✓：正常逻辑买入·首仓 1 手（shares_since 对其无效）
+                      "end_date": "2026-11-06",
+                      "round_marks": [("2026-09-01", "first_buy"),
+                                      ("2026-10-10", "rearm"),
+                                      ("2026-10-12", "first_buy"),
+                                      ("2026-10-25", "rearm")],
+                      "buys": [
+                          {"date": "2026-09-02", "price": 21.0, "amount": 100.0,
+                           "level": 0, "first_of_round": True, "lots": 1},
+                          {"date": "2026-10-26", "price": 19.5, "amount": 100.0,
+                           "level": 0, "first_of_round": True, "lots": 1}]},
+        # D 非持仓 + 时机✓：正常逻辑买入·首仓 1 手（round_no None、无理论）
         "sh.600104": {"name": "丁", "last_price": 24.5, "in_pos": True, "k_level": 2,
                       "next_add_price_raw": 24.0, "first_level_raw": 25.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # E k=0 + 时机✓ 但 shares_since 缺失（湖中无数据等）→ 过门后回退旧行为
-        "sh.600105": {"name": "戊", "last_price": 14.0, "in_pos": True, "k_level": 0,
-                      "next_add_price_raw": 15.0, "first_level_raw": 15.0,
                       "end_date": "2026-11-06", "buys": []},
-        # F 二次建仓（k=0 再武装后新一轮）+ 时机✓ + since=0 → 照常提醒「建仓」
-        #    本档 1 手（new_round=True），无差值明细
-        "sh.600106": {"name": "己", "last_price": 14.0, "in_pos": True, "k_level": 0,
-                      "next_add_price_raw": 15.0, "first_level_raw": 15.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
-        # G 二次建仓 + 时机未过（无时机行 → fail-closed）→ 不提醒（时机未过）
-        "sh.600107": {"name": "庚", "last_price": 15.0, "in_pos": True, "k_level": 0,
+        # E k=0 再武装后新一轮 + 时机未过（无时机行 → fail-closed）→ 不提醒；
+        #    轮次字段照附（round_no=1；buys 空 → 理论 0 手）
+        "sh.600105": {"name": "戊", "last_price": 15.0, "in_pos": True, "k_level": 0,
                       "next_add_price_raw": 16.0, "first_level_raw": 16.0,
-                      "end_date": "2026-11-06", "shares_since": 0.0, "buys": []},
+                      "end_date": "2026-11-06",
+                      "round_marks": [("2026-10-01", "first_buy")], "buys": []},
     }
-    user = {c: {"shares": 100.0, "cost_price": 10.0,
-                "updated_at": "2026-11-07T00:00:00Z"} for c in
-            ("sh.600101", "sh.600102", "sh.600103", "sh.600105", "sh.600106",
-             "sh.600107")}
-    user["sh.600101"] = dict(user["sh.600101"], shares=300.0)
-    user["sh.600102"] = dict(user["sh.600102"], shares=300.0)
-    user["sh.600103"] = dict(user["sh.600103"], shares=200.0)
+    user = {
+        "sh.600101": {"shares": 300.0, "cost_price": 10.0,
+                      "since_date": "2026-11-01",
+                      "updated_at": "2026-11-07T00:00:00Z"},
+        "sh.600102": {"shares": 100.0, "cost_price": 29.0,
+                      "since_date": "2026-10-15",
+                      "updated_at": "2026-11-07T00:00:00Z"},
+        "sh.600103": {"shares": 100.0, "cost_price": 19.0,
+                      "since_date": "2026-09-05",
+                      "updated_at": "2026-11-07T00:00:00Z"},
+        "sh.600105": {"shares": 100.0, "cost_price": 15.0,
+                      "since_date": "2026-10-05",
+                      "updated_at": "2026-11-07T00:00:00Z"},
+    }
     spot = {c: {"price": rows[c]["last_price"], "timestamp": "20261107093000"}
             for c in rows}
-    tmap = {"sh.600104": {"ts_code": "sh.600104", "push_eligible": True,
-                          "cond_price_low": True, "pctile_window": 20.0},
-            # B/E/F 的 k=0 时机门通过；G 故意无行（fail-closed）
-            "sh.600102": {"ts_code": "sh.600102", "push_eligible": True,
+    tmap = {"sh.600102": {"ts_code": "sh.600102", "push_eligible": True,
                           "cond_price_low": True, "pctile_window": 25.0},
-            "sh.600105": {"ts_code": "sh.600105", "push_eligible": True,
-                          "cond_price_low": True, "pctile_window": 30.0},
-            "sh.600106": {"ts_code": "sh.600106", "push_eligible": True,
-                          "cond_price_low": True, "pctile_window": 35.0}}
+            "sh.600104": {"ts_code": "sh.600104", "push_eligible": True,
+                          "cond_price_low": True, "pctile_window": 20.0}}
     _wire(monkeypatch, tmp_path, rows=rows, pool=list(rows), user=user,
           spot=spot, tmap=tmap)
     out = wapp.get_strategy_signals()
     by = {s["ts_code"]: s for s in out["stocks"]}
-    # A：高位建仓（策略零买入）+ 轮内加仓档 → 不做差值判定、不受时机约束，
-    #    正常信号（加仓本档 2 手），价格态 active 照展示
+    # A：轮内加仓档 + 无轮次信息 → 正常加仓本档 2 手，round_no/theory 皆 None
     assert by["sh.600101"]["status"] == "active"
     assert by["sh.600101"]["action"] == "add"
     assert by["sh.600101"]["suggested_lots"] == 2
-    assert (by["sh.600101"]["theory_lots"], by["sh.600101"]["actual_lots"],
-            by["sh.600101"]["gap_lots"]) == (None, None, None)
-    # B：k=0 时机过 → 差值判定：对齐仓位恰好够 → 不提醒，附判定明细
-    assert by["sh.600102"]["action"] is None and by["sh.600102"]["suggested_lots"] is None
+    assert by["sh.600101"]["round_no"] is None
+    assert by["sh.600101"]["theory_lots"] is None
+    # B：k=0 时机✓ → 建仓信号不抑制（v8.2.3 核心：触线必提醒），首轮，
+    #    理论 1 / 实际 1 / 差 0 仅展示
+    assert by["sh.600102"]["action"] == "buy" and by["sh.600102"]["suggested_lots"] == 1
+    assert by["sh.600102"]["new_round"] is True and by["sh.600102"]["in_pos"] is True
     assert by["sh.600102"]["timing_ok"] is True
+    assert by["sh.600102"]["round_no"] == 1
     assert (by["sh.600102"]["theory_lots"], by["sh.600102"]["actual_lots"],
-            by["sh.600102"]["gap_lots"]) == (3.0, 3.0, 0.0)
-    # C：对齐仓位差值 +2 → 补 2 手
-    assert by["sh.600103"]["action"] == "add"
-    assert by["sh.600103"]["suggested_lots"] == 2
-    assert by["sh.600103"]["gap_lots"] == 2.0
-    assert by["sh.600103"]["theory_lots"] == 4.0
-    # D：非持仓正常逻辑（时机✓ → 买入·首仓 1 手；shares_since 不参与）
+            by["sh.600102"]["gap_lots"]) == (1.0, 1.0, 0.0)
+    # C：用户第 3 轮；本档 1+2×1=3 手；多轮总理论 = 首轮起点 09-01 起累计
+    #    两笔 = 2 手（实际 1 手 → 差 1）
+    assert by["sh.600103"]["action"] == "add" and by["sh.600103"]["suggested_lots"] == 3
+    assert by["sh.600103"]["round_no"] == 3
+    assert by["sh.600103"]["theory_lots"] == 2.0
+    assert by["sh.600103"]["actual_lots"] == 1.0
+    assert by["sh.600103"]["gap_lots"] == 1.0
+    # D：非持仓正常逻辑（时机✓ → 买入·首仓 1 手）
     assert by["sh.600104"]["action"] == "buy" and by["sh.600104"]["suggested_lots"] == 1
+    assert by["sh.600104"]["round_no"] is None
     assert by["sh.600104"]["theory_lots"] is None
-    # E：k=0 时机✓ + 缺 shares_since → 回退旧行为（建仓 1 手，action="buy"，new_round 标记在）
-    assert by["sh.600105"]["action"] == "buy" and by["sh.600105"]["suggested_lots"] == 1
-    assert by["sh.600105"]["new_round"] is True
-    assert by["sh.600105"]["timing_pctile"] == 30.0
-    # F：二次建仓（k=0）时机✓ → 提醒「建仓」本档 1 手，action="buy"，new_round=True
-    assert by["sh.600106"]["action"] == "buy" and by["sh.600106"]["suggested_lots"] == 1
-    assert by["sh.600106"]["new_round"] is True and by["sh.600106"]["in_pos"] is True
-    assert by["sh.600106"]["timing_ok"] is True
-    assert by["sh.600106"]["theory_lots"] is None  # since=0 不判差值
-    # G：二次建仓时机未过（无时机行 → fail-closed）→ 不提醒
-    assert by["sh.600107"]["action"] is None and by["sh.600107"]["new_round"] is False
-    assert by["sh.600107"]["timing_ok"] is False
+    # E：k=0 时机未过（fail-closed）→ 不提醒；轮次字段照附
+    assert by["sh.600105"]["action"] is None and by["sh.600105"]["new_round"] is False
+    assert by["sh.600105"]["timing_ok"] is False
+    assert by["sh.600105"]["round_no"] == 1
+    assert (by["sh.600105"]["theory_lots"], by["sh.600105"]["actual_lots"],
+            by["sh.600105"]["gap_lots"]) == (0.0, 1.0, 0.0)
 
 
 # ---------------------------------------------------------------------------

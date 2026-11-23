@@ -33,20 +33,27 @@ import position_alert as pa  # noqa: E402
 from martingale.signals import build_signals  # noqa: E402
 
 FAKE_NOW = "2026-10-26T14:30:00+08:00"   # 周一 14:30 北京（交易时段内）
-# v8.2.0 差值口径（建仓日锚定）：601728 shares_since=100（1 手，策略有跟上）
-# → 理论 = 1 + 本档 1+1×1 = 3 手；账本 1 手 → 补 2 手；账本 3 手 → 恰好够不推
-# （v8.2.0 补：shares_since=0 = 心血来潮/高位建仓 → 不判定，正常信号照常提醒，
-# 见 test_run_unanchored_position_still_pushes）
+# v8.2.3 轮次口径（Joel 2026-11-23 定案，v8.2.0 差值判定退役）：601728 两轮
+# （第 1 轮 09-01 首笔 → 10-05 再武装终结；第 2 轮 10-05 起开放，10-20 首笔
+# 为该轮建仓——first_buy 不切窗口，仅 k≥1 再武装终结一轮）。用户 since
+# 2026-10-26 落第 2 轮窗口（其首轮）→ 首轮；多轮理论 = 窗口起点（10-05）
+# 起策略累计 = 10-22 买入 1 手。
+# 建议量 = 本档手数（k=1 → 1+1×1=2 手），触线必提醒（无「持仓已够不推」）。
 USER = {
-    "sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+    "sh.601728": {"shares": 100.0, "cost_price": 6.0,
+                  "since_date": "2026-10-26", "updated_at": FAKE_NOW},
     "sh.601398": {"shares": 1000.0, "cost_price": 8.0, "updated_at": FAKE_NOW},
 }
-# 601728 触发（5.98 ≤ 6.00，in_pos k=1）；601398 未触发（8.50 > 8.00）
-# shares_since：v8.2.0 建仓日起策略买入累计（601728=1 手，「策略有跟上」场景；
-# 601398=0，未触发不影响断言）
+# 601728 触发（5.98 ≤ 6.00，in_pos k=1）；601398 未触发（8.50 > 8.00，无轮次
+# 信息 → round_no None）
 ROWS = {
     "sh.601728": {"name": "中国神华", "last_price": 6.02, "in_pos": True,
-                  "k_level": 1, "next_add_price_raw": 6.0, "shares_since": 100.0},
+                  "k_level": 1, "next_add_price_raw": 6.0, "shares_since": 100.0,
+                  "round_marks": [("2026-09-01", "first_buy"),
+                                  ("2026-10-05", "rearm"),
+                                  ("2026-10-20", "first_buy")],
+                  "buys": [{"date": "2026-10-22", "price": 5.8, "amount": 100.0,
+                            "level": 0, "first_of_round": True, "lots": 1}]},
     "sh.601398": {"name": "工商银行", "last_price": 8.55, "in_pos": True,
                   "k_level": 0, "next_add_price_raw": 8.0, "shares_since": 0.0},
 }
@@ -78,8 +85,9 @@ def _wire(monkeypatch, tmp_path, spot=None, lake_rc="ok", posts=None,
     con = SimpleNamespace(close=lambda: None)
     pool = SimpleNamespace(codes=pool_codes)
     if lake_rc == "ok":
+        # 五元组 (sp, up, tp, con, pool)，随 v8.2.1 同步
         monkeypatch.setattr(wapp, "_load_pool_ctx",
-                            lambda cfg_path=None: (SP, None, con, pool))
+                            lambda cfg_path=None: (SP, None, None, con, pool))
         monkeypatch.setattr(wapp, "_strategy_state_rows",
                             lambda sp, con2, codes, **kw: dict(rows))
         import martingale.timing as tmod
@@ -177,10 +185,12 @@ def test_run_pushes_once_and_dedupes_same_day(monkeypatch, tmp_path):
     content = body["content"]
     assert "中国神华" in content and "sh.601728" in content
     assert "5.980" in content and "6.000" in content   # 现价/触发价
-    # v8.2.0 建仓日锚定：理论 = shares_since(1)/100 + 本档 1+1×1 = 3 手，
-    # 账本 1 手 → 补 2 手
+    # v8.2.3 轮次口径：since 10-26 落第 3 轮窗口 → 首轮；建议 = 本档 2 手
+    # （触线必提醒，无差值判定）；多轮理论 1 手（10-20 起点起累计）仅展示
     assert "2 手" in content
-    assert "策略理论累计 3.0 手 / 现持 1.0 手" in content
+    assert "加仓线 首轮第 1 档" in content
+    assert "建议补至首轮第 2 档，2 手" in content
+    assert "多轮理论 1.0 手 / 现持 1.0 手" in content
     assert "工商银行" not in content                    # 未触发不出现
     assert "中国神华" in body["title"]
 
@@ -207,59 +217,105 @@ def test_run_no_repush_after_pushed(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v8.2.0 建仓日锚定口径（管道级：账本 vs shares_since + 本档）
+# v8.2.3 轮次口径（管道级：轮次前缀 + 多轮理论值展示）
 # SP（first_lots=1/step=1）+ ROWS 601728（k=1 触发 → 本档 1+1×1=2 手；
-# shares_since=1 手 → 理论 3 手）
+# since 10-26 落第 3 轮窗口 → 首轮；多轮理论 = 10-20 起点起累计 1 手）
 # ---------------------------------------------------------------------------
 
-def test_run_gap_sufficient_no_push(monkeypatch, tmp_path):
-    """账本 3 手 = 理论 3 手（since 1 手 + 本档 2 手）→ 不推（恰好够）。"""
-    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+def test_run_round_theory_still_pushes(monkeypatch, tmp_path):
+    """v8.2.3：「持仓已够 → 不推」抑制退役——账本 3 手（> 多轮理论 1 手）也
+    照常推（建议 = 本档 2 手），差值仅展示（gap=0）。"""
+    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0,
+                          "since_date": "2026-10-26", "updated_at": FAKE_NOW},
             "sh.601398": USER["sh.601398"]}
     posts, state_path = _wire(monkeypatch, tmp_path, user=user)
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
-    assert posts == [], f"持仓够了不该推: {posts}"
+    assert len(posts) == 1, f"触线必提醒，不该被差值抑制: {posts}"
+    content = posts[0]["json"]["content"]
+    assert "建议补至首轮第 2 档，2 手" in content
+    assert "多轮理论 1.0 手 / 现持 3.0 手" in content
 
 
-def test_run_gap_short_pushes_fill(monkeypatch, tmp_path):
-    """账本 1 手 < 理论 3 手 → 补 2 手并标注差值。"""
-    user = {"sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
-            "sh.601398": USER["sh.601398"]}
-    posts, state_path = _wire(monkeypatch, tmp_path, user=user)
+def test_run_round_theory_short_pushes(monkeypatch, tmp_path):
+    """账本 1 手 < 多轮理论 1 手（实际=1.0，理论=1.0 → gap 0，展示口径）→
+    照常推本档 2 手。"""
+    posts, state_path = _wire(monkeypatch, tmp_path)
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
     assert len(posts) == 1, posts
     content = posts[0]["json"]["content"]
     assert "sh.601728" in content
-    assert "建议补至第 2 档，2 手" in content
-    assert "策略理论累计 3.0 手 / 现持 1.0 手" in content
+    assert "建议补至首轮第 2 档，2 手" in content
+    assert "多轮理论 1.0 手 / 现持 1.0 手" in content
     assert "工商银行" not in content
 
 
-def test_run_unanchored_position_still_pushes(monkeypatch, tmp_path):
-    """v8.2.0 补「不受约束」（Joel 2026-11-13：中粮糖业型高位建仓）：建仓日起策略
-    零买入（shares_since=0）→ 不做差值判定，账本再厚也照常提醒（本档 2 手，
-    无差值文案）。"""
-    rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"], "shares_since": 0.0}}
-    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
+def test_run_no_round_info_no_prefix(monkeypatch, tmp_path):
+    """湖中无 round_marks（601398 形态 / 旧数据）→ 无轮次前缀、无理论文案，
+    正常信号照常提醒（回退旧文案）。"""
+    rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"],
+                                  "round_marks": [], "buys": []}}
+    user = {"sh.601728": {"shares": 300.0, "cost_price": 6.0,
+                          "since_date": "2026-10-26", "updated_at": FAKE_NOW},
             "sh.601398": USER["sh.601398"]}
     posts, state_path = _wire(monkeypatch, tmp_path, user=user, rows=rows)
     rc = pa.run(force=True, state_path=state_path)
     assert rc == 0
-    assert len(posts) == 1, f"高位仓位应照常提醒: {posts}"
+    assert len(posts) == 1, f"无轮次信息应照常提醒: {posts}"
     content = posts[0]["json"]["content"]
     assert "建议补至第 2 档，2 手" in content
-    assert "策略理论累计" not in content  # 未判定 → 无差值文案
+    assert "首轮" not in content and "多轮理论" not in content
+
+
+def test_run_round_prefix_first_and_second(monkeypatch, tmp_path):
+    """v8.2.3 轮次前缀（Joel：「首轮第 N 档 加仓」/「第二轮…」，不带股票名）：
+    用户当前轮号 = 1 + 其首轮窗口后发生的再武装次数：
+    - since 10-26 落当前开放窗口 W2（起点 10-05，其后无再武装）→ 首轮；
+      多轮理论 = 起点起 10-21 + 10-24 两笔 = 2 手；
+    - since 09-15 落上一窗口 W1（09-01→10-05，其后 1 次再武装）→ 第二轮；
+      理论 = 09-01 起累计 = 2 手。"""
+    rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"], "buys": [
+        {"date": "2026-10-21", "price": 5.9, "amount": 100.0,
+         "level": 0, "first_of_round": True, "lots": 1},
+        {"date": "2026-10-24", "price": 5.8, "amount": 100.0,
+         "level": 0, "first_of_round": True, "lots": 1}]}}
+    # 首轮（since 10-26）
+    user1 = {"sh.601728": {"shares": 100.0, "cost_price": 6.0,
+                           "since_date": "2026-10-26", "updated_at": FAKE_NOW},
+             "sh.601398": USER["sh.601398"]}
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user1, rows=rows)
+    assert pa.run(force=True, state_path=state_path) == 0
+    assert len(posts) == 1, posts
+    c1 = posts[0]["json"]["content"]
+    assert "加仓线 首轮第 1 档" in c1
+    assert "建议补至首轮第 2 档，2 手" in c1
+    assert "多轮理论 2.0 手 / 现持 1.0 手" in c1
+    # 第二轮（since 09-15 落 W1，其后 10-05 再武装 1 次，同股新 state）：
+    # 清去重状态，避免首次推送记录吞掉
+    import os
+    if os.path.exists(state_path):
+        os.remove(state_path)
+    user2 = {"sh.601728": {"shares": 100.0, "cost_price": 6.0,
+                           "since_date": "2026-09-15", "updated_at": FAKE_NOW},
+             "sh.601398": USER["sh.601398"]}
+    posts, state_path = _wire(monkeypatch, tmp_path, user=user2, rows=rows)
+    assert pa.run(force=True, state_path=state_path) == 0
+    assert len(posts) == 1, posts
+    c2 = posts[0]["json"]["content"]
+    assert "加仓线 第二轮第 1 档" in c2
+    assert "建议补至第二轮第 2 档，2 手" in c2
+    assert "多轮理论 2.0 手 / 现持 1.0 手" in c2
 
 
 def test_run_second_round_first_position_requires_timing(monkeypatch, tmp_path):
-    """v8.2.0 补（Joel 2026-11-13 二次定案）：二次建仓（再武装后新一轮首仓线
-    k=0 触线）→ 须当前时机门（实时分位 ≤ price_pctile_max=40）通过才提醒，
-    且文案是「二次建仓，N 手」（建仓口径），不是「加仓」；轮内加仓档（k≥1）
-    不受约束（见上方 k=1 用例）。"""
+    """v8.2.0 补（Joel 2026-11-13 二次定案，v8.2.3 保留）：二次建仓（再武装后
+    新一轮首仓线 k=0 触线）→ 须当前时机门（实时分位 ≤ price_pctile_max=40）
+    通过才提醒，文案是「二次建仓，N 手」（建仓口径），不是「加仓」；轮内加仓
+    档（k≥1）不受约束（见上方 k=1 用例）。"""
     rows = {**ROWS, "sh.601728": {**ROWS["sh.601728"],
-                                  "k_level": 0, "shares_since": 0.0}}
+                                  "k_level": 0, "shares_since": 0.0,
+                                  "round_marks": [], "buys": []}}
     user = {"sh.601728": {"shares": 100.0, "cost_price": 6.0, "updated_at": FAKE_NOW},
             "sh.601398": USER["sh.601398"]}
     # 时机未过（实时分位 79.1% > 40）→ 不推
@@ -277,7 +333,7 @@ def test_run_second_round_first_position_requires_timing(monkeypatch, tmp_path):
     content = posts[0]["json"]["content"]
     assert "再武装·二次建仓" in content
     assert "二次建仓，1 手" in content
-    assert "策略理论累计" not in content  # since=0 → 无差值文案
+    assert "多轮理论" not in content  # 无轮次信息 → 无理论文案
 
 
 def test_run_push_failure_pending_saved_and_retries(monkeypatch, tmp_path):

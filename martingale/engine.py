@@ -379,6 +379,13 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
     div_by_year: Dict[int, float] = {}
     n_buys = 0
     n_rounds = 0
+    # v8.2.3 轮次时间线（显示专用，Joel 2026-11-23 轮次口径定案）：
+    # [(date, "first_buy"|"rearm")] 按时间序。rearm 仅记 **k≥1 的再武装**
+    # （终结一轮的再武装）——空仓等待期的再武装（bounce 模式 k=0 反弹 /
+    # newhigh 模式创新高）只更新周期高低点、不终结轮次，不记 mark（n_rearms
+    # 计数保持原语义不变）。用途：Web 按用户建仓日判定「第几轮」（首轮=
+    # 有持仓的第一个轮次窗口）+ 轮窗口起点起累计理论手数。决策零改动。
+    round_marks: List[Tuple[str, str]] = []
     first_buy_i = -1
     last_buy_i = -1
     min_unreal_pct = 0.0
@@ -481,6 +488,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                     low_since_high = sprice
                 if sprice >= low_since_high * (1.0 + p.rearm_pct):
                     n_rearms += 1
+                    if k_level >= 1:
+                        # v8.2.3：k≥1 = 轮内再武装（终结本轮）→ 记轮次 mark
+                        round_marks.append((str(dates[i])[:10], "rearm"))
                     entry_high = sprice
                     low_since_high = sprice
                     k_level = 0
@@ -488,6 +498,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         elif sprice > entry_high:
             if in_pos:
                 n_rearms += 1
+                # v8.2.3：同上——仅轮内（k≥1）新高再武装终结轮次
+                if k_level >= 1:
+                    round_marks.append((str(dates[i])[:10], "rearm"))
             entry_high = sprice
             k_level = 0
             round_anchor = 0.0  # v8.1.0：同上
@@ -590,6 +603,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                 if first_of_round:
                     in_pos = True
                     n_rounds += 1
+                    # v8.2.3：本轮首笔 = 轮次时间线锚点（第 1 轮窗口起点；
+                    # 后续轮窗口已由前一轮 rearm mark 开启，此 mark 落在其内）
+                    round_marks.append((str(dates[i])[:10], "first_buy"))
                     if first_buy_i < 0:
                         first_buy_i = i
                 # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
@@ -653,6 +669,9 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         "k_level": int(k_level),
         # v8.1.0：本轮首仓价 P0（加仓锚点；0 = 本轮首仓未建立 → 下一触发线 = 首仓线）
         "round_anchor": float(round_anchor),
+        # v8.2.3：轮次时间线（显示专用；[(date, "first_buy"|"rearm")]，rearm
+        # 仅 k≥1 轮内再武装）——Web 轮次编号/理论手数累计起点用
+        "round_marks": [list(m) for m in round_marks],
         # 下一触发价位（状态机直接投影；k_level * add_step >= 1 时无正触发价 → None）
         "next_add_price": (
             (float(round_anchor * (1.0 - k_level * p.add_step))
@@ -804,6 +823,8 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
             "low_since_high": float(state["low_since_high"]),
             # v8.1.0：本轮首仓价 P0（加仓锚点，hfq 口径；0 = 本轮首仓未建立）
             "round_anchor": float(state["round_anchor"]),
+            # v8.2.3：轮次时间线（显示专用；详见 run_stock 内注释）
+            "round_marks": [list(m) for m in state.get("round_marks", [])],
             # 触发价原始口径（_raw）：引擎的 next_add/next_rearm 基于 hfq 信号价，
             # 而 last_price 是原始收盘——直接比较会因复权因子（分红股 F 可达数十倍）
             # 产生假信号。raw = hfq / F，F = sig[-1]/exec_c[-1]（最新 bar 复权因子）。

@@ -62,13 +62,12 @@ const sigStocks = computed(() => sigData.value?.stocks || []);
 // 当前信号 = active（现价在区内）+ touched（v7.0.20：今日已触线、现价回出——
 // 盘中达成过信号就保留到当日，次日行情日滚动后自动移出、移入历史段）。
 // 入段条件（两次定案叠加）：
-// - 11-13：active 价格态行须有真实信号（action 非空）——无动作的（时机未过 /
-//   持仓已够且今日未触线）价格态不入段；
+// - 11-13：active 价格态行须有真实信号（action 非空）——无动作的（时机未
+//   过）价格态不入段；v8.2.3（Joel 2026-11-23 轮次口径）：v8.2.0「持仓已
+//   够→不提醒」抑制已退役，持仓触线必提醒，动作列空因只剩「时机未过」；
 // - **11-23（Joel：「进入当前信号区的信号应保留到下个交易日」）：touched
 //   行 = 价格今日真实触到线（信号区进入事实），action 为空也保留到当日，
-//   动作列显示原因（持仓已够 / 时机未过）**——山煤 11-23 实案：触线 + 按
-//   提醒买入后账本=理论，11-13 规则下「持仓已够」把信号行吃掉，看不到今日
-//   触线事实。
+//   动作列显示原因（时机未过）**。
 const sigActive = computed(() => sigStocks.value.filter(
   (s) => (s.status === "active" || s.status === "touched")
          && (s.action != null || s.status === "touched")));
@@ -111,6 +110,13 @@ function levelLabel(level, firstOfRound) {
   if (firstOfRound && level === 0) return "首仓";
   return "第" + ((level ?? 0) + 1) + "档";
 }
+// v8.2.3 轮次口径（Joel 2026-11-23）：用户相对轮次号 → 前缀（「首轮/第二
+// 轮/…/第N轮」；null/无数据 → 空串不加前缀）
+function roundNoLabel(n) {
+  if (!n || n <= 0) return "";
+  const c = ["一", "二", "三", "四", "五", "六", "七", "八", "九"];
+  return n <= 9 ? (n === 1 ? "首轮" : c[n - 1] + "轮") : "第" + n + "轮";
+}
 function fmtWan(v) {
   if (v === null || v === undefined) return "—";
   return (v / 10000).toFixed(1);
@@ -128,7 +134,9 @@ function timingText(s) {
   return s.timing_reasons || "—";
 }
 function actionText(s) {
-  if (!s.action) return s.held ? (s.timing_ok === false ? "时机未过" : "持仓已够") : "时机未过";
+  // v8.2.3：「持仓已够」抑制已退役（v8.2.0 差值口径）——持仓触线必提醒，
+  // action 为空只剩「时机未过」（k=0 二次建仓位时机门 / 非持仓时机门）
+  if (!s.action) return "时机未过";
   if (s.held) {
     // v8.2.0 补：首档触线 = 建仓（再武装后新一轮 = 二次建仓），不是「加仓」
     if (s.new_round) return s.in_pos ? "二次建仓" : "建仓";
@@ -142,8 +150,12 @@ const sigShown = computed(() => {
     return sigActive.value.map((s) => ({ ...s,
       status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
-      level_label: s.new_round ? (s.in_pos ? "再武装·建仓（第1档）" : "建仓（第1档）")
-        : (s.held && s.in_pos ? `第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档` : "首仓（第1档）"),
+      // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
+      level_label: s.new_round ? (s.in_pos
+        ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）` : "建仓（第1档）")
+        : (s.held && s.in_pos
+           ? `${roundNoLabel(s.round_no)}第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档`
+           : "首仓（第1档）"),
       lots_s: s.suggested_lots == null ? "—" : `${s.suggested_lots} 手`,
       amount_w: s.suggested_lots != null && s.price
         ? fmtWan(s.suggested_lots * 100 * s.price) : "—",
@@ -162,10 +174,12 @@ const sigShown = computed(() => {
       // v8.2.0 补（Joel 2026-11-21）：下一档手数 = API next_lots（单点原值，
       // 不受时机门/持仓已够门控——临近时机线的 k=0 行也显示首仓手数）
       lots_s: s.next_lots == null ? "—" : `${s.next_lots} 手`,
-      // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓
+      // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓；
+      // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
       level_label: (s.held && s.in_pos)
-        ? (s.k_level === 0 ? "再武装·建仓（第1档）"
-           : "第" + ((s.k_level ?? 0) + 1) + "档")
+        ? (s.k_level === 0
+           ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）`
+           : `${roundNoLabel(s.round_no)}第` + ((s.k_level ?? 0) + 1) + "档")
         : "首仓（第1档）",
       bt_s: btText(s), timing_s: timingText(s) }));
   }
@@ -206,15 +220,18 @@ const MY_COLS = [
   ["ts_code", "代码"], ["name", "名称"],
   // v8.2.0 补（Joel 2026-11-20 全局格式统一）：价格 2 位 / 百分比 1 位 / 股数手数整数
   ["shares", "股数", true, fmtInt], ["cost_price", "成本价", true, fmtPrice], ["last_price", "最新价", true, fmtPrice],
-  // v8.2.0 累计差值口径（Joel 2026-11-13）：理论=状态机累计手数、实际=账本手数、
-  // 差值=max(0,理论−实际)；湖中无数据的股为 "—"。实时新档触发的补差见顶部信号条。
-  ["theory_lots", "策略理论(手)", true, fmtInt], ["actual_lots", "实际(手)", true, fmtInt],
+  // v8.2.3 轮次口径（Joel 2026-11-23）：理论 = 用户首轮窗口起点起策略累计
+  // （多轮总理论值，仅展示）；实际 = 账本手数；差值 = max(0,理论−实际)；
+  // 湖中无数据的股为 "—"。建议量恒为本档手数（顶部信号条），不随差值补差。
+  ["theory_lots", "多轮理论(手)", true, fmtInt], ["actual_lots", "实际(手)", true, fmtInt],
   ["gap_lots", "差值(手)", true, fmtInt],
   ["market_value", "持仓市值", true, fmtMoney], ["pnl", "浮动盈亏", true, fmtMoney], ["pnl_pct", "盈亏%", true, fmtPct],
-  ["k_level", "策略档", true],
+  // v8.2.3：策略档 = 用户相对轮次前缀 + 当前档位（首轮第4档；无数据 → 裸档位）
+  ["k_level", "策略档", true,
+   (v, r) => (v == null ? "—" : roundNoLabel(r.round_no) + "第" + v + "档")],
   // v8.2.0 补（Joel 2026-11-19）：触发线语义标签——k≥1 加仓线标「加仓」、
-  // k=0 首仓线标「首仓」（策略下一次建仓价）；「理论上不持有」的持仓股
-  // （建仓日起策略零买入）再武装价由后端置空 → 「—」。
+  // k=0 首仓线标「首仓」（策略下一次建仓价）。v8.2.3：再武装价恢复无条件
+  // 显示（v8.2.0「策略零买入仓隐藏」规则随旧差值口径退役）。
   ["next_add_price_raw", "下次触发价", true,
    (v, r) => (v == null ? "—" : fmtPrice(v) + (r.line_kind === "add" ? " 加仓" : " 首仓"))],
   ["next_rearm_price_raw", "再武装价", true, fmtPrice],
@@ -354,7 +371,8 @@ const modalFieldRows = computed(() => {
   const rows = [
     ["ts_code", "代码"], ["in_pos", "策略持仓中"], ["strat_shares", "策略模拟股数"],
     ["since_date", "建仓日（顶部录入条填）"], ["strat_shares_since", "建仓日起策略股数"],
-    ["theory_lots", "策略理论(手)"], ["actual_lots", "实际(手)"], ["gap_lots", "差值(手)"],
+    ["round_no", "用户轮次"],
+    ["theory_lots", "多轮理论(手)"], ["actual_lots", "实际(手)"], ["gap_lots", "差值(手)"],
     ["k_level", "当前档位 k"],
   ];
   if (r.line_kind === "first" && r.timing_line_raw != null) {
@@ -364,7 +382,7 @@ const modalFieldRows = computed(() => {
   } else {
     rows.push(["next_add_price_raw", "下一触发价（首仓/加仓）"]);
   }
-  rows.push(["next_rearm_price_raw", "再武装触发价（策略零买入不显示）"]);
+  rows.push(["next_rearm_price_raw", "再武装触发价"]);
   rows.push(["last_price", "最新价"], ["end_date", "数据截至"]);
   return rows;
 });
@@ -376,7 +394,7 @@ const saveErr = ref("");
 const D_PRICE_KEYS = new Set(["first_price_line_raw", "timing_line_raw", "next_add_price_raw",
   "next_rearm_price_raw", "last_price"]);
 const D_INT_KEYS = new Set(["strat_shares", "strat_shares_since", "theory_lots",
-  "actual_lots", "gap_lots", "k_level"]);
+  "actual_lots", "gap_lots", "k_level", "round_no"]);
 function fmtField(k, v) {
   if (v === null || v === undefined || v === "") return "—";
   if (D_PRICE_KEYS.has(k)) return fmtPrice(v);
@@ -572,7 +590,7 @@ function pnlColor(v) {
         首仓线按<b>双条件</b>判定（① 价破价线 且 ② 5 年分位≤40%），
         显示两条件线的较低者（标「首仓」，点行看两条组成线）；
         加仓线（标「加仓」）= 纯价格条件；
-        「理论上不持有」的持仓股（建仓日起策略零买入）再武装价不显示。
+        v8.2.3：再武装价恢复无条件显示（旧「策略零买入仓隐藏」规则退役）。
       </p>
       <div class="add-bar">
         <div class="code-sug-wrap">
@@ -589,7 +607,7 @@ function pnlColor(v) {
         </div>
         <input v-model="add.shares" class="inp num" placeholder="股数" @keyup.enter="addNew" />
         <input v-model="add.cost" class="inp num" placeholder="成本价" @keyup.enter="addNew" />
-        <input v-model="add.since" class="inp num" type="date" title="建仓日（可选；理论持仓锚点，默认今天）"
+        <input v-model="add.since" class="inp num" type="date" title="建仓日（可选；首轮/轮次判定锚点，默认今天）"
                @keyup.enter="addNew" />
         <button class="primary-btn" @click="addNew">保存</button>
         <span v-if="addMsg" class="msg-ok">{{ addMsg }}</span>
@@ -611,13 +629,17 @@ function pnlColor(v) {
         </span>
         <b>{{ s.name }} <span class="mono">{{ s.ts_code }}</span></b>
         <span>现价 {{ fmtPrice(s.price) }} ≤ 触发价 {{ fmtPrice(s.next_add_price) }}</span>
-        <span>{{ s.new_round ? (s.in_pos ? "再武装·首仓（第 1 档）" : "首仓（第 1 档）")
-          : (s.action === "buy" ? "首仓（第 1 档）" : `第 ${s.k_level} 档 → 第 ${s.next_level} 档`) }}</span>
+        <!-- v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀） -->
+        <span>{{ s.new_round ? (s.in_pos
+          ? `再武装·首仓（${roundNoLabel(s.round_no)}第 1 档）` : "首仓（第 1 档）")
+          : (s.action === "buy" ? "首仓（第 1 档）"
+             : `${roundNoLabel(s.round_no)}第 ${s.k_level} 档 → 第 ${s.next_level} 档`) }}</span>
         <span v-if="s.suggested_lots != null">
-          建议{{ s.new_round ? "建仓" : (s.action === "buy" ? "买入" : "补") }}
+          建议{{ s.new_round ? (s.in_pos ? roundNoLabel(s.round_no) + "建仓" : "建仓")
+            : (s.action === "buy" ? "买入" : "补至" + roundNoLabel(s.round_no) + "第 " + s.next_level + " 档") }}
           <b>{{ fmtInt(s.suggested_lots) }} 手</b>
           <span v-if="s.theory_lots != null" class="muted small">
-            （理论累计 {{ fmtInt(s.theory_lots) }} 手 / 现持 {{ fmtInt(s.actual_lots) }} 手）
+            （多轮理论 {{ fmtInt(s.theory_lots) }} 手 / 现持 {{ fmtInt(s.actual_lots) }} 手）
           </span>
           <span v-if="s.price" class="muted small">≈ ¥{{ ((s.suggested_lots * 100 * s.price) / 10000).toFixed(1) }}万</span>
         </span>

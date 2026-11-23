@@ -162,7 +162,8 @@ def run(dry_run: bool = False) -> int:
     }
     for _attempt in range(_LAKE_RETRY_ATTEMPTS):
         try:
-            _sp2, _up2, con, pool = _load_pool_ctx()
+            # v8.2.3 修（随 v8.2.1 五元组同步）：(sp, up, tp, con, pool)
+            _sp2, _up2, _tp2, con, pool = _load_pool_ctx()
             try:
                 universe = sorted(set(pool.codes) | set(user.keys()))
                 rows = state_rows(_sp2, con, universe, include_buys=True,

@@ -65,7 +65,7 @@ def _ins(path, *rows):
 def _fake_ctx(pool_codes):
     pool = types.SimpleNamespace(codes=pool_codes)
     con = types.SimpleNamespace(close=lambda: None)
-    return (object(), object(), con, pool)
+    return (object(), object(), object(), con, pool)  # 五元组，随 v8.2.1 同步
 
 
 def _patch_run_deps(monkeypatch, spot_result, pool_codes=("c1",)):

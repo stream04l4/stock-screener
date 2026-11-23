@@ -79,7 +79,8 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 持仓二次建仓位·分位 76.8% 远离时机线 → 两区均不展示）。
 // v8.2.0 补（Joel 2026-11-23：进入信号区的信号保留到下个交易日）：
 // touched（今日已触线）行 action 为空也保留在当前信号段（云南铜业：持仓
-// 触线+已按提醒买入 → 持仓已够 → 动作列显示「持仓已够」）。
+// k=0 二次建仓位触线 + 时机门未过 → action=null → 动作列「时机未过」；
+// v8.2.3：「持仓已够」抑制已退役，touched 无动作只剩时机门未过一种）。
 // 「即将进入」三分类：① 持仓 in_pos k≥1（未再武装·轮内加仓档）= 临近
 // 加仓线 5%（无时机门）；② 未建仓（非持仓）/ ③ 持仓 k=0（已再武装未二次
 // 建仓）= 临近时机线 10% 以内（40%<分位≤50%）且价格已在区或距线 ≤5%
@@ -116,15 +117,17 @@ const SIG = {
       day_low: 9.96, distance_pct: 2.0,
       action: "add", suggested_lots: 2, n_history: 0, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 12.3, bt_n_buys: 5 },
-    // v8.2.0 补（Joel 2026-11-23 定案，山煤实案）：持仓 k≥1 盘中触线（touched）
-    // 但已按提醒买入 → 持仓已够（action=null）→ 仍保留在「当前信号」段至
-    // 次日（信号事实保留），动作列 = 「持仓已够」
-    { ts_code: "sh.600362", name: "云南铜业", held: true, in_pos: true, k_level: 1,
+    // v8.2.3（Joel 2026-11-23 轮次口径，山煤实案更新）：持仓 k=0（再武装·
+    // 二次建仓位）盘中触线（touched）但时机门未过（分位 62.3%>40%）→
+    // action=null → 仍保留在「当前信号」段至次日（信号事实保留），
+    // 动作列 = 「时机未过」（v8.2.0「持仓已够」抑制已退役）
+    { ts_code: "sh.600362", name: "云南铜业", held: true, in_pos: true, k_level: 0,
       price: 18.2, next_add_price_raw: 18.0, status: "touched", touched: true,
       day_low: 17.9, distance_pct: 1.1,
       action: null, suggested_lots: null, next_lots: 4, n_history: 1,
-      end_date: "2026-11-06", timing_ok: null, timing_reasons: null,
-      held_sufficient: true, theory_lots: 6, actual_lots: 6, gap_lots: 0,
+      end_date: "2026-11-06", timing_ok: false,
+      timing_reasons: "✗ 5年分位 62.3%（需≤40%）",
+      new_round: true, round_no: null,
       bt_pnl_pct: null, bt_n_buys: null },
     // 非持仓 + 模拟已建仓（in_pos=true）+ 时机 ✗✗：不入当前信号段
     //（v7.0.23 时机门；触碰记录走历史）
@@ -355,7 +358,7 @@ describe("MyPositionsTab · 渲染", () => {
     w.unmount();
   });
 
-  it("v8.2.0 补：触发线首仓/加仓标签 + 策略零买入再武装隐藏", async () => {
+  it("v8.2.0 补→v8.2.3：触发线首仓/加仓标签 + 再武装价无条件显示", async () => {
     const FIX = {
       ...JSON.parse(JSON.stringify(MY)),
       n: 2,
@@ -388,9 +391,10 @@ describe("MyPositionsTab · 渲染", () => {
     // 首仓线标「首仓」、加仓线标「加仓」（价格 2 位小数，全局格式统一）
     expect(w.text()).toContain("13.59 首仓");
     expect(w.text()).toContain("4.65 加仓");
-    // 策略零买入（shares_since=0）→ 再武装价隐藏（null → 「—」占位，无 13.0755）
+    // v8.2.3：再武装价恢复无条件显示（v8.2.0「策略零买入仓隐藏」规则退役）——
+    // 湖中该字段本就为 null → 「—」占位（无 13.0755 系数据本身缺失）
     expect(w.text()).not.toContain("13.0755");
-    // 策略有轮次 → 再武装价照显（价格 2 位小数，全局格式统一）
+    // 有再武装价的股照显（价格 2 位小数，全局格式统一）
     expect(w.text()).toContain("5.69");
     w.unmount();
   });
@@ -526,6 +530,24 @@ describe("MyPositionsTab · 策略应用 + 加仓信号（v7.0.4）", () => {
     await flushPromises();
     expect(w.find(".signal-banner").exists()).toBe(false);
     expect(w.text()).not.toContain("🔔 加仓");
+    w.unmount();
+  });
+
+  it("v8.2.3 轮次口径：信号条/策略档列轮次前缀 + 多轮理论文案", async () => {
+    // round_no=1（用户首轮）+ 多轮理论 20 手 / 现持 12 手（仅展示）
+    const pos = JSON.parse(JSON.stringify(MY_SIGNAL.positions[0]));
+    pos.round_no = 1; pos.theory_lots = 20; pos.actual_lots = 12; pos.gap_lots = 8;
+    const sig = JSON.parse(JSON.stringify(MY_SIGNAL.signals[0]));
+    sig.round_no = 1; sig.theory_lots = 20; sig.actual_lots = 12;
+    mockApi({ ...MY_SIGNAL, positions: [pos], signals: [sig] });
+    const w = mk();
+    await flushPromises();
+    // 信号条：档位带「首轮」前缀 + 建议补至首轮第 1 档 + 多轮理论文案
+    expect(w.text()).toContain("首轮第 0 档 → 第 1 档");
+    expect(w.text()).toContain("补至首轮第 1 档");
+    expect(w.text()).toContain("多轮理论 20 手 / 现持 12 手");
+    // 表格策略档列：首轮第0档（无 round_no 的股仍裸档位）
+    expect(w.text()).toContain("首轮第0档");
     w.unmount();
   });
 
@@ -929,7 +951,7 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
     // 分段计数（当前 = active 显示 3 + touched 2【含 v8.2.0 补 11-23：touched
-    // 持仓已够行云南铜业】；active 价格态 5 只中非持仓时机未过 2 只被 v7.0.23
+    // 时机未过行云南铜业】；active 价格态 5 只中非持仓时机未过 2 只被 v7.0.23
     // 时机门滤出）；即将进入 = 价格临区 4 只：
     // 长江电力（持仓）+ 交通银行（分位 33.5%≤50%）+ 山煤国际（v7.0.31 C 案：
     // 分位 45% 未过 40% 门但 ≤50% 放宽带）+ 中国石化（v8.2.0 补：价已在区但
@@ -952,12 +974,12 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("日内低");
     expect(w.text()).toContain("9.96");
     expect(w.text()).toContain("已触线");
-    // v8.2.0 补（11-23 定案）：touched + 持仓已够（action=null）也保留在
-    // 当前信号段至次日——云南铜业行存在且动作列显示「持仓已够」
+    // v8.2.3：touched + 时机未过（action=null）也保留在当前信号段至次日——
+    // 云南铜业行存在且动作列显示「时机未过」（v8.2.0「持仓已够」退役）
     expect(w.text()).toContain("云南铜业");
     const ynRow = w.findAll("tbody tr").find((tr) => tr.text().includes("云南铜业"));
     expect(ynRow).toBeTruthy();
-    expect(ynRow.text()).toContain("持仓已够");
+    expect(ynRow.text()).toContain("时机未过");
     expect(ynRow.text()).toContain("已触回");
     // v7.0.23 首仓双条件：非持仓 + 时机✓ + 价破首仓线（大秦：in_pos=true
     // 模拟已建仓也走首仓线）→ 入当前信号段；时机 ✗✗ 的（江苏银行/紫金矿业）
