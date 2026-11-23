@@ -76,7 +76,12 @@ def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
             if r.status_code in (429, 500, 502, 503, 504):
                 raise EmBatchError(f"HTTP {r.status_code}（限频/网关抖动）")
             r.raise_for_status()
-            return r.json()
+            d = r.json()
+            # datacenter 接口 HTTP 200 也可能业务失败（如 columns 含不存在字段 →
+            # success=false + 错误 message）；不检查会静默返回 0 行（2026-11-23 实锤）。
+            if isinstance(d, dict) and d.get("success") is False:
+                raise EmBatchError(f"东财业务失败 code={d.get('code')}: {d.get('message')}")
+            return d
         except Exception as exc:  # noqa: BLE001 - 重试后抛
             last = exc
             if i < 2:
@@ -341,9 +346,7 @@ def fetch_ex_events(trade_date: str) -> List[Dict[str, Any]]:
         d = _get_json(_DATACENTER, {
             "sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "1",
             "pageSize": 500, "pageNumber": page, "reportName": "RPT_SHAREBONUS_DET",
-            "columns": "SECURITY_CODE,EX_DIVIDEND_DATE,IMPL_PLAN_NOTICE_DATE,REPORT_DATE,"
-                       "PRETAX_BONUS_RMB,BONUS_RATIO,IT_RATIO,ALLOT_RATIO,"
-                       "IMPL_PLAN_PROFILE,ASSIGN_PROGRESS",
+            "columns": "ALL",
             "source": "WEB", "client": "WEB", "filter": filter_s,
         })
         result = d.get("result") or {}
@@ -377,9 +380,7 @@ def fetch_ex_events_range(start_date: str, end_date: str) -> List[Dict[str, Any]
             "pageSize": 500,
             "pageNumber": page,
             "reportName": "RPT_SHAREBONUS_DET",
-            "columns": "SECURITY_CODE,EX_DIVIDEND_DATE,IMPL_PLAN_NOTICE_DATE,REPORT_DATE,"
-                       "PRETAX_BONUS_RMB,BONUS_RATIO,IT_RATIO,ALLOT_RATIO,"
-                       "IMPL_PLAN_PROFILE,ASSIGN_PROGRESS",
+            "columns": "ALL",
             "source": "WEB",
             "client": "WEB",
             "filter": filter_s,
