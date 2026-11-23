@@ -77,6 +77,9 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // v8.2.0 补（Joel 2026-11-13 分区定案 + 三分类规整）：
 // 「当前信号」= 有真实信号（action 非空）——无信号不入段（中粮糖业：
 // 持仓二次建仓位·分位 76.8% 远离时机线 → 两区均不展示）。
+// v8.2.0 补（Joel 2026-11-23：进入信号区的信号保留到下个交易日）：
+// touched（今日已触线）行 action 为空也保留在当前信号段（云南铜业：持仓
+// 触线+已按提醒买入 → 持仓已够 → 动作列显示「持仓已够」）。
 // 「即将进入」三分类：① 持仓 in_pos k≥1（未再武装·轮内加仓档）= 临近
 // 加仓线 5%（无时机门）；② 未建仓（非持仓）/ ③ 持仓 k=0（已再武装未二次
 // 建仓）= 临近时机线 10% 以内（40%<分位≤50%）且价格已在区或距线 ≤5%
@@ -86,7 +89,7 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   spot_preselect_pct: 10, spot_fetched: 9,
-  price_source: "spot", spot_time: "20261107093000", n_stocks: 10,
+  price_source: "spot", spot_time: "20261107093000", n_stocks: 11,
   history_window_days: 90,
   stocks: [
     { ts_code: "sh.601088", name: "中国神华", held: true, in_pos: true, k_level: 1,
@@ -113,6 +116,16 @@ const SIG = {
       day_low: 9.96, distance_pct: 2.0,
       action: "add", suggested_lots: 2, n_history: 0, end_date: "2026-11-06",
       timing_ok: null, timing_reasons: null, bt_pnl_pct: 12.3, bt_n_buys: 5 },
+    // v8.2.0 补（Joel 2026-11-23 定案，山煤实案）：持仓 k≥1 盘中触线（touched）
+    // 但已按提醒买入 → 持仓已够（action=null）→ 仍保留在「当前信号」段至
+    // 次日（信号事实保留），动作列 = 「持仓已够」
+    { ts_code: "sh.600362", name: "云南铜业", held: true, in_pos: true, k_level: 1,
+      price: 18.2, next_add_price_raw: 18.0, status: "touched", touched: true,
+      day_low: 17.9, distance_pct: 1.1,
+      action: null, suggested_lots: null, next_lots: 4, n_history: 1,
+      end_date: "2026-11-06", timing_ok: null, timing_reasons: null,
+      held_sufficient: true, theory_lots: 6, actual_lots: 6, gap_lots: 0,
+      bt_pnl_pct: null, bt_n_buys: null },
     // 非持仓 + 模拟已建仓（in_pos=true）+ 时机 ✗✗：不入当前信号段
     //（v7.0.23 时机门；触碰记录走历史）
     { ts_code: "sh.601899", name: "紫金矿业", held: false, in_pos: true, k_level: 2,
@@ -210,7 +223,7 @@ const SIG = {
     { ts_code: "sh.600900", name: "长江电力", held: true, date: "2026-10-11",
       price: 29.0, amount: 29000, level: 0, first_of_round: true, pushed: false, lots: 1 },
   ],
-  totals: { n_stocks: 10, n_active: 5, n_touched: 1, n_approaching: 4, n_idle: 0,
+  totals: { n_stocks: 11, n_active: 5, n_touched: 2, n_approaching: 4, n_idle: 0,
             n_no_data: 0, n_active_held: 1, n_active_unheld: 4, n_history: 4 },
 };
 const SIG_EMPTY = { as_of: null, strategy: "current", lake_locked: false, approach_pct: 5,
@@ -915,13 +928,14 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
-    // 分段计数（当前 = active 显示 3 + touched 1；active 价格态 5 只中非持仓
-    // 时机未过 2 只被 v7.0.23 时机门滤出）；即将进入 = 价格临区 4 只：
+    // 分段计数（当前 = active 显示 3 + touched 2【含 v8.2.0 补 11-23：touched
+    // 持仓已够行云南铜业】；active 价格态 5 只中非持仓时机未过 2 只被 v7.0.23
+    // 时机门滤出）；即将进入 = 价格临区 4 只：
     // 长江电力（持仓）+ 交通银行（分位 33.5%≤50%）+ 山煤国际（v7.0.31 C 案：
     // 分位 45% 未过 40% 门但 ≤50% 放宽带）+ 中国石化（v8.2.0 补：价已在区但
     // 分位临近时机线 45% ∈ (40%,50%]）；中国海油（85.7%）与中粮糖业
     // （76.8%，远离时机线）被滤出
-    expect(w.text()).toContain("当前信号（4）");
+    expect(w.text()).toContain("当前信号（5）");
     expect(w.text()).toContain("即将进入（4）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
@@ -938,6 +952,13 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("日内低");
     expect(w.text()).toContain("9.96");
     expect(w.text()).toContain("已触线");
+    // v8.2.0 补（11-23 定案）：touched + 持仓已够（action=null）也保留在
+    // 当前信号段至次日——云南铜业行存在且动作列显示「持仓已够」
+    expect(w.text()).toContain("云南铜业");
+    const ynRow = w.findAll("tbody tr").find((tr) => tr.text().includes("云南铜业"));
+    expect(ynRow).toBeTruthy();
+    expect(ynRow.text()).toContain("持仓已够");
+    expect(ynRow.text()).toContain("已触回");
     // v7.0.23 首仓双条件：非持仓 + 时机✓ + 价破首仓线（大秦：in_pos=true
     // 模拟已建仓也走首仓线）→ 入当前信号段；时机 ✗✗ 的（江苏银行/紫金矿业）
     // 价格态 active 也不入段（首仓缺时机门不成信号）
