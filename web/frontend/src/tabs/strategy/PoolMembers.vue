@@ -63,6 +63,9 @@ const COLS = [
   ["bt_price_pnl", "价差盈亏", true, fmt2],
   ["ttm_yield_pct", "股息率%", true, fmtPct2],
   ["price_latest", "最新价", true, fmt2],
+  // v8.2.1（Joel 2026-11-23：「股票池里添加一列5年价格分位」）：
+  // 服务端已 round 2（0-100，同 selection_timing 口径）→ 裸显示，null → —
+  ["pctile_window", "5年分位", true],
   ["total_mv", "总市值(亿)", true, fmt2],
   ["status", "状态"],
 ];

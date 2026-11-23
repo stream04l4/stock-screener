@@ -1033,7 +1033,7 @@ def _load_pool_ctx(cfg_path: Optional[str] = None):
     from martingale.selection import build_candidate_pool, load_manual_pool
 
     try:
-        sp, up, _tp = mload(cfg_path or str(CONFIG_PATH))
+        sp, up, tp = mload(cfg_path or str(CONFIG_PATH))
     except Exception as exc:  # noqa: BLE001 - ConfigError → 400
         raise HTTPException(status_code=400, detail=f"策略配置错误: {exc}")
     con = connect_readonly(None)
@@ -1043,7 +1043,7 @@ def _load_pool_ctx(cfg_path: Optional[str] = None):
     except Exception as exc:  # noqa: BLE001
         con.close()
         raise HTTPException(status_code=500, detail=f"候选池构建失败: {exc}")
-    return sp, up, con, pool
+    return sp, up, tp, con, pool
 
 
 @app.get("/api/pool")
@@ -1058,7 +1058,7 @@ def get_pool() -> Dict[str, Any]:
     """
     from martingale.selection import _bt_split, load_backtest_map
 
-    _sp, _up, con, pool = _load_pool_ctx()
+    _sp, _up, tp, con, pool = _load_pool_ctx()
     try:
         # 展示全集 = 基础池 + 不在基础池的候选（手动池可含池外码）
         base_members = list(pool.base_members or [])
@@ -1083,6 +1083,22 @@ def get_pool() -> Dict[str, Any]:
         display.sort(key=lambda m: (0, cand_pos[m.ts_code])
                      if m.ts_code in cand_pos
                      else (1, base_pos.get(m.ts_code, 1 << 30)))
+        # v8.2.1（Joel 2026-11-23：「股票池里添加一列5年价格分位」）：全池 5 年
+        # qfq 分位——与 refresh_timing 完全同口径（_qfq_window_and_factor 加载
+        # 近 price_window_years 年 qfq 收盘，末 bar qfq 收盘在窗口内的分位，
+        # round 2）；<2 bars（新股/空窗）→ None → 前端显示 —。
+        from martingale.timing import _qfq_window_and_factor
+        _series, _fac, _rebase, _latest = _qfq_window_and_factor(
+            con, [m.ts_code for m in display], tp)
+        pctile_map: Dict[str, Optional[float]] = {}
+        for m in display:
+            ks = _series.get(m.ts_code)
+            if ks and len(ks) >= 2:
+                _last = ks[-1]
+                pctile_map[m.ts_code] = round(
+                    sum(1 for x in ks if x <= _last) / len(ks) * 100.0, 2)
+            else:
+                pctile_map[m.ts_code] = None
         # 手动标记以候选成员为准（基础池内的手动股 base_member 不携带 is_manual，
         # 从候选成员合并；池外手动股本就在 pool.members 中，标记一致）
         manual_flag = {m.ts_code: bool(m.is_manual) for m in pool.members}
@@ -1125,6 +1141,8 @@ def get_pool() -> Dict[str, Any]:
                                          if ps_ is not None else None)),
                 "price_latest": (m.price_latest if m.price_latest is not None
                                  else price_map.get(m.ts_code)),
+                # v8.2.1：5 年价格分位（0-100，同 selection_timing.pctile_window）
+                "pctile_window": pctile_map.get(m.ts_code),
                 "is_manual": is_manual,
                 "is_candidate": m.ts_code in cand_pos,
             })
@@ -1271,7 +1289,7 @@ def get_positions(as_of: Optional[str] = None) -> Dict[str, Any]:
     """
     if as_of is not None and not _DATE_RE.fullmatch(str(as_of)):
         raise HTTPException(status_code=400, detail="as_of 应为 YYYY-MM-DD")
-    _sp, _up, con, pool = _load_pool_ctx()
+    _sp, _up, _tp, con, pool = _load_pool_ctx()
     t0 = time.time()
     try:
         # now=参照日：回放（as_of 指定）→ as_of 当日口径（不套其后的除权修正）；
@@ -1381,7 +1399,7 @@ def _state_projection(need_since: bool = False) -> Dict[str, Any]:
             u = u if isinstance(u, dict) else {}
             since_map[c] = str(u.get("since_date") or "")[:10] or _today
         try:
-            _sp, _up, con, pool = _load_pool_ctx()
+            _sp, _up, _tp, con, pool = _load_pool_ctx()
         except (LakeLocked, LakeMissing, LakeInvalidFile):
             return {"sp": None, "pool_codes": [],
                     "universe": sorted(user.keys()), "rows": {}, "rows_since": {},

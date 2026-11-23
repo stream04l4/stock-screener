@@ -315,7 +315,9 @@ def test_get_pool_funnel_and_members():
             # v8.0.11：分红/上涨占比拆解字段
             "bt_div_pool", "bt_price_pnl", "bt_div_share", "bt_price_share",
             # v8.0.12：累计分红（余额口径的互补展示）
-            "bt_dividends"} <= set(m0.keys())
+            "bt_dividends",
+            # v8.2.1：5 年价格分位（0-100 或 None，同 selection_timing 口径）
+            "pctile_window"} <= set(m0.keys())
     # v8.0.11：候选成员（G7 通过 = 总盈亏>0）占比应齐全且和≈100%（差手续费）
     for m in out["members"]:
         if not m["is_candidate"] or m["is_manual"]:
