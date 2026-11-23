@@ -306,9 +306,12 @@ def test_refresh_selection_writes_table(monkeypatch, tmp_path):
                     pnl_pct=0.18, min_unreal_pct=-0.12, last_status="open"),
     }
     monkeypatch.setattr(sel, "load", lambda con, codes=None, start=None, end=None:
-                        ({}, {"a.1": (dates, np.array([1.0, 2.0]), np.array([1.0, 2.0]))}, {}))
+                        ({}, {"a.1": (dates, np.array([1.0, 2.0]),
+                                       np.array([1.0, 2.0]),
+                                       np.array([1.0, 2.0]),
+                                       np.array([1.0, 2.0]))}, {}))
     monkeypatch.setattr(sel, "run_stock",
-                        lambda c, d, s, e, dv, sp, verbose=False, first_ok=None:
+                        lambda c, d, s, e, dv, sp, verbose=False, **kw:
                         (stats[c], {}, np.array([1.0, 1.0]), np.array([1.0, 1.0]),
                          np.array([1, 1]), []))
 

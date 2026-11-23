@@ -32,7 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from martingale.config import load_config  # noqa: E402
 from martingale.data import connect_readonly, default_db_path  # noqa: E402
-from martingale.engine import first_ok_series, load, run_stock  # noqa: E402
+from martingale.engine import load, run_stock  # noqa: E402
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "f6_baseline"
 START, END = "2016-01-04", "2026-10-21"
@@ -84,13 +84,21 @@ def _fixture_buys(code):
 
 def _run(cfg, loaded, code):
     sp, _up, tp = cfg
-    dates, sig, exec_c = loaded[0][code]
-    # v8.1.0：生产口径 = 首仓双条件（① 回撤线 + ② 5 年分位 PIT）
-    ok = first_ok_series(dates, sig, tp.price_window_years, tp.price_pctile_max)
+    dates, sig, exec_c, sig_low, sig_open = loaded[0][code]
+    # v8.2.x：生产口径 = 盘中挂单触线买（low 触发、挂单撮合价成交：
+    # 渐进触线按档位价、跳空低开按开盘价）+ 首仓双条件（① 触线 + ②
+    # 分位门窗口止于前一交易日，gate_ctx = 切片前扩展段数组 → 早期 bar
+    # 分位窗口完整）
     i0 = int(np.searchsorted(dates, np.datetime64(START)))
-    dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
-    stat, *_ , buys = run_stock(code, dates, sig, exec_c, loaded[1].get(code), sp,
-                                verbose=False, first_ok=ok)
+    ctx = (dates, sig, i0)
+    (dates, sig, exec_c, sig_low,
+     sig_open) = (dates[i0:], sig[i0:], exec_c[i0:], sig_low[i0:],
+                 sig_open[i0:])
+    stat, *_, buys = run_stock(
+        code, dates, sig, exec_c, loaded[1].get(code), sp, verbose=False,
+        low_sig=sig_low, open_sig=sig_open,
+        first_gate=(tp.price_window_years, tp.price_pctile_max, 60),
+        gate_ctx=ctx)
     return stat, buys
 
 

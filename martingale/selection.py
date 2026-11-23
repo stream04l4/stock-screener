@@ -39,7 +39,7 @@ import duckdb
 import numpy as np
 
 from .config import StrategyParams, TimingParams, UniverseParams
-from .engine import first_ok_series, load, run_stock
+from .engine import load, run_stock
 from .universe import Member, PoolResult, build_pool
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -140,18 +140,23 @@ def refresh_selection(con, sp: StrategyParams, up: UniverseParams,
         series = data.get(c)
         if not series or len(series[0]) < 2:
             continue  # 无足够数据 → 不写行（G7 fail-closed 不入选）
-        dates, sig, exec_c = series
-        ok = None
+        dates, sig, exec_c, sig_low, sig_open = series
+        # v8.2.x 对齐实操：low 触线买 + 分位门窗口上下文（切片前扩展段，
+        # 早期 bar 的 N 年分位窗口仍完整）
+        ctx = None
         if tp is not None:
-            ok = first_ok_series(dates, sig, tp.price_window_years,
-                                 tp.price_pctile_max)
             i0 = int(np.searchsorted(dates, np.datetime64(start)))
-            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            ctx = (dates, sig, i0)
+            dates, sig, exec_c, sig_low, sig_open = (
+                dates[i0:], sig[i0:], exec_c[i0:], sig_low[i0:], sig_open[i0:])
             if len(dates) < 2:
                 continue  # 仅扩展段有数据而主窗口停牌/断更 → 不写行（fail-closed）
+        gate = ((tp.price_window_years, tp.price_pctile_max, 60)
+                if tp is not None else None)
         stat, _state, _v, _cst, _f, _buys = run_stock(
             c, dates, sig, exec_c, divs.get(c), sp, verbose=verbose,
-            first_ok=ok)
+            low_sig=sig_low, open_sig=sig_open,
+            first_gate=gate, gate_ctx=ctx)
         pnl = _nan_to_none(stat["total_pnl"])
         pct = _nan_to_none(stat["pnl_pct"])
         n_buys = int(stat["n_buys"] or 0)

@@ -39,7 +39,8 @@ from .config import StrategyParams, TimingParams
 # 档线比较 epsilon（与参考一致：浮点噪声防护，1e-9 远小于任何真实价差）
 _EPS = 1e-9
 
-StockSeries = Tuple[np.ndarray, np.ndarray, np.ndarray]  # (dates[ns], sig, exec_c)
+StockSeries = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                    np.ndarray]  # (dates[ns], sig, exec_c, sig_low, sig_open)
 
 
 def _to_ns(d) -> np.datetime64:
@@ -54,11 +55,16 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
 
     返回 (names, data, divs)：
     - names: {ts_code: name}
-    - data:  {ts_code: (dates: datetime64[ns], sig: 后复权收盘, exec_c: 原始收盘)}
+    - data:  {ts_code: (dates: datetime64[ns], sig: 后复权收盘,
+      exec_c: 原始收盘, sig_low: 后复权最低价, sig_open: 后复权开盘价)}
     - divs:  {ts_code: {datetime64[ns]: (cash_dps, stk_div)}}
 
     WHERE 与参考 load() 逐条一致：k.close IS NOT NULL AND k.close > 0 AND
     h.close IS NOT NULL AND h.close > 0 [+日期窗口 +codes]。
+
+    sig_low/sig_open（v8.2.x 对齐实操）：kline_daily_hfq.low/open（原始
+    low/open×af）。历史/合成行缺失（NULL/0）→ 回退为 hfq 收盘价（等价旧
+    收盘口径，测试合成湖只插 close 时行为不变）。
     """
     where_h: List[str] = ["h.close IS NOT NULL", "h.close > 0"]
     params: List[str] = []
@@ -75,8 +81,15 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
         where_h.append(f"h.ts_code IN ({fmt})")
         params.extend(codes)
 
+    # low 列探测：生产湖 kline_daily_hfq 视图含 low/open；最小合成测试湖
+    # （仅 ts_code/date/close）无 low/open 列 → 回退 h.close（= 旧收盘口径，
+    # 测试行为逐位不变）。DESCRIBE 对表/视图均有效。
+    _cols = {r[0] for r in con.execute("DESCRIBE kline_daily_hfq").fetchall()}
+    _low_expr = "h.low" if "low" in _cols else "h.close"
+    _open_expr = "h.open" if "open" in _cols else "h.close"
     sql = f"""
-        SELECT h.ts_code, h.date, h.close AS sig_close, k.close AS exec_close
+        SELECT h.ts_code, h.date, h.close AS sig_close, k.close AS exec_close,
+               {_low_expr} AS sig_low, {_open_expr} AS sig_open
         FROM kline_daily_hfq h
         JOIN kline_daily k USING (ts_code, date)
         WHERE k.close IS NOT NULL AND k.close > 0 AND {' AND '.join(where_h)}
@@ -92,10 +105,19 @@ def load(con, codes: Optional[Sequence[str]] = None, start: Optional[str] = None
     per: Dict[str, StockSeries] = {}
     for c, g in df.groupby("ts_code", sort=False):
         dates = g["date"].to_numpy(dtype="datetime64[ns]")
+        sig_close = g["sig_close"].to_numpy(dtype=np.float64)
+        # low/open 缺失（历史 NULL / 合成数据只插 close）→ 回退收盘价 = 旧收盘口径
+        sig_low = g["sig_low"].to_numpy(dtype=np.float64)
+        sig_low = np.where(np.isnan(sig_low) | (sig_low <= 0), sig_close, sig_low)
+        sig_open = g["sig_open"].to_numpy(dtype=np.float64)
+        sig_open = np.where(np.isnan(sig_open) | (sig_open <= 0), sig_close,
+                            sig_open)
         per[str(c)] = (
             dates,
-            g["sig_close"].to_numpy(dtype=np.float64),
+            sig_close,
             g["exec_close"].to_numpy(dtype=np.float64),
+            sig_low,
+            sig_open,
         )
 
     div_where = "ex_date IS NOT NULL"
@@ -177,6 +199,34 @@ def first_ok_series(dates: np.ndarray, sig: np.ndarray, window_years: int,
     return out
 
 
+def _first_touch_ok(g_dates: np.ndarray, g_sig: np.ndarray, g_dts,
+                    off: int, i: int, level: float,
+                    w_years: int, pct_max: float, min_bars: int) -> bool:
+    """v8.2.x 对齐实操：盘中触线买的首仓时机门（PIT，零前视）。
+
+    语义 = 实盘「当前时间点股价」（Joel 2026-11-23 定案）：触线那一刻的
+    价格是否处于近 N 年收盘 ≤pct 分位区。
+    - 判定时刻 = bar i **盘中**触线瞬间——当日收盘未知，分位窗口**只用到
+      前一交易日收盘**（窗口 = [date_i − N 年, date_i)，**不含 bar i**）；
+    - 排序目标 = **实际成交价**（挂单撮合价 = min(open, 线价)，调用方
+      传入；open 无效退化为线价）——渐进触线时 = 线价（挂单价），跳空
+      低开时 = 开盘价；
+    - 窗口 bar 数 < min_bars → False（fail-closed，与 first_ok_series 一致）。
+    g_* = 分位上下文（可能是切片前的扩展段数组，off = 主序列起点对应
+    g_dates 的下标）；level 参数 = 目标价，必须与 g_sig 同口径（hfq）。
+    """
+    idx = off + i
+    d = g_dts[idx]
+    try:
+        sd = d.replace(year=d.year - w_years)
+    except ValueError:  # 2/29
+        sd = d.replace(year=d.year - w_years, day=28)
+    lo = int(np.searchsorted(g_dates, np.datetime64(sd)))
+    if idx - lo < min_bars:
+        return False
+    return float((g_sig[lo:idx] <= level).mean()) * 100.0 <= float(pct_max)
+
+
 
 def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
                     du_arr: np.ndarray, ext_by_year: Dict[int, float],
@@ -223,7 +273,11 @@ def _annual_summary(dates: np.ndarray, v_arr: np.ndarray, cd_arr: np.ndarray,
 def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarray,
               exmap: Optional[Dict], p: StrategyParams, verbose: bool = True,
               trade_mask: Optional[np.ndarray] = None,
-              first_ok: Optional[np.ndarray] = None):
+              first_ok: Optional[np.ndarray] = None,
+              low_sig: Optional[np.ndarray] = None,
+              open_sig: Optional[np.ndarray] = None,
+              first_gate: Optional[Tuple[int, float, int]] = None,
+              gate_ctx: Optional[Tuple[np.ndarray, np.ndarray, int]] = None):
     """单股状态机（high-ladder 唯一分支；不卖、不封顶、无熔断）。
 
     :param verbose: True 时逐条打印隐含除权推导（CLI 行为，与参考脚本一致）；
@@ -241,6 +295,35 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         关闭（旧单条件语义，仅单元测试/兼容路径用；生产全路径必传）。
         加仓档（k≥1）无分位条件——锚点 = 本轮首仓信号价 P0（v8.1.0 起，
         原为轮高 H）：sprice ≤ P0×(1−k×add_step) 买 k+1 手。
+    :param low_sig: v8.2.x 对齐实操（Joel 2026-11-23 定案）——hfq 最低价
+        序列（与 dates 等长，load() 第 4 元）。**生产路径必传**；传入后
+        买入口径切换为「盘中挂单」：
+        - 触发 = 当日 low 触及档位线（首仓线 H×(1−first_drawdown) /
+          加仓线 P0×(1−k×add_step)），而非收盘跌破——对齐实盘「提前按
+          理论加仓价挂单、盘中触及即成交」；
+        - 成交价 = **挂单撮合价**（原始口径 = fill_h×exec_c/sig，按 bar
+          复权比换算）：渐进触线按档位价（挂单价）成交；跳空低开
+          （open < 线价）按开盘价成交（A 股撮合规则：限价单以更优价
+          成交）——open_sig 缺省/无效时退化为纯档位价；
+        - 首仓 P0（加仓锚点）= 首仓**实际成交价**（档位价或更低开盘价）；
+        - 首仓时机门改 **on-demand**：触线当日收盘未知，分位窗口只用到
+          前一交易日（_first_touch_ok，零前视），目标 = 触线时刻实际
+          成交价 min(open, 线)（= 实盘「当前时间点股价」）；first_ok
+          数组参数被忽略；
+        - 再武装/entry_high 仍按收盘价推进（bar 级近似：当日收盘创新高
+          则当日轮高含当日收盘，文档化近似，与实盘页面线价一致）。
+        None = 旧收盘口径（收盘跌破才买、成交按收盘价）——仅单元测试/
+        f6 旧基线兼容路径，生产全路径必传 low_sig。
+    :param open_sig: v8.2.x（仅 low_sig 路径生效）——hfq 开盘价序列
+        （load() 第 5 元）；跳空低开时按开盘价成交。None = 纯档位价成交。
+    :param first_gate: v8.2.x（仅 low_sig 路径生效）——首仓时机门参数
+        (window_years, pct_max, min_bars)；None = 门关闭（仅价格触线）。
+        生产路径传 timing 段 (price_window_years, price_pctile_max, 60)。
+    :param gate_ctx: v8.2.x（仅 low_sig + first_gate 路径生效）——分位窗口
+        上下文 (dates_full, sig_full, offset)：回测/选股把 load 起点前移
+        N 年再切回原窗口时，传入**切片前的扩展段数组**与切点下标，使
+        切片后早期 bar 的分位窗口仍有完整 N 年历史（None = 用自身
+        dates/sig、offset=0；state_rows 等无切片路径传 None）。
 
     返回 (stat, state, v_arr, c_arr, flag, buys)：
     - stat: 与参考实现 per_stock.csv 字段**逐位对齐**的统计（pnl_pct/min_unreal_pct
@@ -359,6 +442,21 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                     print(f"[除权推导] {str(dates[i])[:10]} "
                           f"补记现金分红 {inferred_cash:.3f} 元/股")
 
+    # v8.2.x 对齐实操：盘中触线买（low_sig 路径）的门上下文预计算
+    # （gate_ctx=None → 用自身 dates/sig、offset=0；state_rows 无切片路径）
+    _touch = low_sig is not None
+    _g_dates = _g_sig = _g_dts = None
+    _g_off = 0
+    _w_years, _pct_max, _min_bars = 0, 0.0, 60  # 门关闭时不被引用（仅占位）
+    if _touch and first_gate is not None:
+        _w_years, _pct_max, _min_bars = first_gate
+        if gate_ctx is not None:
+            _g_dates, _g_sig, _g_off = gate_ctx
+            _g_dts = _g_dates.astype("datetime64[D]").astype(object)
+        else:
+            _g_dates, _g_sig = dates, sig
+            _g_dts = dates.astype("datetime64[D]").astype(object)
+
     for i in range(n):
         sprice = float(sig[i])
         price = float(exec_c[i])
@@ -398,31 +496,81 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
         # k_level 不推进：出池期间跌穿的档位不消费，回池后当日即按现价补买
         # （「暂停」语义；entry_high/再武装在上方第 2 步照常，不受影响）
         if trade_mask is None or trade_mask[i]:
-            # —— 档位判定（v8.1.0，Joel 2026-11-12 定案）——
-            # 本轮首仓（k=0）= **双条件**：① 回撤线 sprice ≤ H×(1−first_drawdown)
-            #   且 ② N 年分位 ≤ price_pctile_max（first_ok，PIT）——任何一轮
-            #   （含再武装后的第二轮）同一口径，保证长期低位且在下行通道才买；
-            #   首仓后 P0 = sprice（本轮首仓信号价，hfq）成为加仓锚点。
-            # 加仓档（k≥1）：sprice ≤ P0×(1−k×add_step) 买 k+1 手（跳空可一日
-            #   穿多档）；加仓无分位条件（越跌越买只认 P0 相对跌幅）。
-            # 首仓与加仓同日不可能并存：首仓 bar 上 P0=sprice > P0×(1−step)。
-            pending: List[Tuple[int, int]] = []
-            if k_level == 0:
-                level = entry_high * (1.0 - p.first_drawdown)
-                if sprice <= level + _EPS and (first_ok is None or bool(first_ok[i])):
-                    pending.append((0, p.first_lots))
-                    k_level = 1
-                    round_anchor = sprice  # P0（加仓锚点）
-            while k_level >= 1:
-                level = round_anchor * (1.0 - k_level * p.add_step)
-                if sprice > level + _EPS:
-                    break
-                pending.append((k_level, p.first_lots + k_level * p.add_lots_step))
-                k_level += 1
-            for k_lv, n_lots in pending:
+            # —— 档位判定（v8.1.0，Joel 2026-11-12 定案；v8.2.x 对齐实操，
+            #    Joel 2026-11-23 定案）——
+            # 本轮首仓（k=0）= **双条件**：① 回撤线 且 ② 分位门（PIT）。
+            # 加仓档（k≥1）：line = P0×(1−k×add_step) 触线买 k+1 手（跳空可
+            #   一日穿多档）；加仓无分位条件（越跌越买只认 P0 相对跌幅）。
+            # 首仓与加仓同日不可能并存：首仓 bar 上 P0=level > P0×(1−step)。
+            # 口径分叉（low_sig 是否传入）：
+            # - **low_sig 路径（生产，对齐实操挂单）**：触发 = 当日 low 触线
+            #   （挂单）；成交价 = 挂单撮合价：渐进触线按档位价，跳空低开
+            #   （open<线）按开盘价（A 股撮合：限价单以更优价成交）；首仓
+            #   P0 = 实际成交价；分位门 = _first_touch_ok（窗口止于前一
+            #   交易日收盘，零前视，目标价 = 实际成交价 min(open,线)）；
+            # - **legacy 路径（收盘口径，仅单测/旧基线）**：触发 = 收盘跌破
+            #   线，成交按当日原始收盘，P0 = 触线日收盘，分位门 = first_ok[i]
+            #   （含当日的预计算分位）。数值逐位 = v8.1.x 行为（f6 兼容）。
+            pending: List[Tuple[int, int, float]] = []
+            if _touch:
+                low_i = float(low_sig[i])
+                # 挂单撮合（hfq）：open 有效且低于线价 → 开盘价成交，否则
+                # 档位价（挂单价）成交
+                o = (float(open_sig[i])
+                     if open_sig is not None
+                     and open_sig[i] == open_sig[i] and open_sig[i] > 0
+                     else None)
+
+                def _fill_h(level_h: float) -> float:
+                    return min(o, level_h) if o is not None else level_h
+
+                if k_level == 0:
+                    level = entry_high * (1.0 - p.first_drawdown)
+                    if low_i <= level + _EPS:
+                        # 分位门目标 = **实际成交价**（挂单撮合价：渐进触线=线价，
+                        # 跳空低开=开盘价）——对齐实盘「当前时间点股价」语义：
+                        # 触线那一刻的价（= 成交的价）是否在近 N 年 ≤pct 分位区。
+                        # open 无效 → 退化为线价。
+                        target_h = _fill_h(level)
+                        okg = True
+                        if _g_dates is not None:
+                            okg = _first_touch_ok(
+                                _g_dates, _g_sig, _g_dts, _g_off, i, target_h,
+                                _w_years, _pct_max, _min_bars)
+                        if okg:
+                            fill_h = _fill_h(level)
+                            pending.append(
+                                (0, p.first_lots, fill_h * price / sprice))
+                            k_level = 1
+                            round_anchor = fill_h  # P0 = 首仓实际成交价
+                while k_level >= 1:
+                    level = round_anchor * (1.0 - k_level * p.add_step)
+                    if low_i > level + _EPS:
+                        break
+                    pending.append(
+                        (k_level, p.first_lots + k_level * p.add_lots_step,
+                         _fill_h(level) * price / sprice))
+                    k_level += 1
+            else:
+                if k_level == 0:
+                    level = entry_high * (1.0 - p.first_drawdown)
+                    if sprice <= level + _EPS and (
+                            first_ok is None or bool(first_ok[i])):
+                        pending.append((0, p.first_lots, price))
+                        k_level = 1
+                        round_anchor = sprice  # P0（加仓锚点）
+                while k_level >= 1:
+                    level = round_anchor * (1.0 - k_level * p.add_step)
+                    if sprice > level + _EPS:
+                        break
+                    pending.append(
+                        (k_level, p.first_lots + k_level * p.add_lots_step,
+                         price))
+                    k_level += 1
+            for k_lv, n_lots, px in pending:
                 first_of_round = (k_lv == 0)  # v8.1.0：本轮首笔（含第二轮首仓）
                 buy_shares = float(n_lots * p.lot_size)
-                buy_amt = buy_shares * price * (1.0 + comm)  # 现金支出（含 3bps 佣金）
+                buy_amt = buy_shares * px * (1.0 + comm)  # 现金支出（含 3bps 佣金）
                 # v7.0.36：分红余额优先出资，缺口外部（Joel 2026-11-10 定案）——
                 # 买入决策不看出资（状态机零改动，buy 时间表与 v7.0.35 逐位一致），
                 # 仅出资归属/净值口径变化：外部净投入 = Σcost − 分红出资
@@ -447,7 +595,7 @@ def run_stock(ts_code: str, dates: np.ndarray, sig: np.ndarray, exec_c: np.ndarr
                 # k = 本笔触发的档下标（买入前值）；first_of_round 供 Web 历史信号
                 # 区分「首仓/本轮重启首档」与「加仓第 k+1 档」（v7.0.19）；
                 # n_lots = 本笔手数（v7.0.28 手数口径，Web 历史信号展示用）
-                buys.append((str(dates[i]), round(float(price), 3), float(buy_amt),
+                buys.append((str(dates[i]), round(float(px), 3), float(buy_amt),
                              int(k_lv), bool(first_of_round), int(n_lots)))
         val = shares * price + cash_div  # cash_div = 分红余额（v7.0.36）
         # v7.0.36：浮亏口径 = 净值(市值+分红余额) − 外部净投入，对外部出资的回报
@@ -628,18 +776,19 @@ def state_rows(sp: StrategyParams, con, codes, end: Optional[str] = None,
     rows: Dict[str, Dict[str, Any]] = {}
     # 除权日实时口径修正（now=参照日；None → 回测/回放路径，零修正）
     rebase = pending_exrights_factor(con, codes, now, end=end) if now is not None else None
+    # v8.2.x 对齐实操：首仓时机门参数（timing 段；tp=None → 门关闭，旧单条件）
+    gate = ((tp.price_window_years, tp.price_pctile_max, 60)
+            if tp is not None else None)
     for c in codes:
         series = data.get(c)
         if not series or len(series[0]) < 2:
             continue
-        dates, sig, exec_c = series
-        # v8.1.0：首仓双条件②（N 年分位，PIT；first_ok_series 与页面口径一致）
-        first_ok = (first_ok_series(dates, sig, tp.price_window_years,
-                                    tp.price_pctile_max)
-                    if tp is not None else None)
+        dates, sig, exec_c, sig_low, sig_open = series
+        # v8.2.x：生产口径 = 盘中挂单触线买（low 触发、挂单撮合价成交、
+        # 分位门窗口止于前一交易日）；回测/页面/推送同一状态机同一路径，防漂移。
         _stat, state, _v, _c, _f, _buys = run_stock(
             c, dates, sig, exec_c, divs.get(c), sp, verbose=False,
-            first_ok=first_ok)
+            low_sig=sig_low, open_sig=sig_open, first_gate=gate)
         rows[c] = {
             "ts_code": c,
             "name": names.get(c, ""),

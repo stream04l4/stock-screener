@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from .config import TimingParams
-from .engine import aggregate_into, extend_start, first_ok_series, load, run_stock
+from .engine import aggregate_into, extend_start, load, run_stock
 from .report import write_outputs
 from .universe import build_pool_asof
 
@@ -65,19 +65,22 @@ def _rolling_g7(con, sp, codes: List[str], end_d: str,
         series = data.get(c)
         if not series:
             continue
-        d, s, e = series
+        d, s, e, l, o = series
         if len(d) < 2:
             continue
-        ok = None
+        ctx = None
         if tp is not None:
-            ok = first_ok_series(d, s, tp.price_window_years,
-                                 tp.price_pctile_max)
             i0 = int(np.searchsorted(d, np.datetime64(start_win)))
-            d, s, e, ok = d[i0:], s[i0:], e[i0:], ok[i0:]
+            ctx = (d, s, i0)
+            d, s, e, l, o = d[i0:], s[i0:], e[i0:], l[i0:], o[i0:]
             if len(d) < 2:
                 continue
         stat, _state, _v, _cc, _fl, _buys = run_stock(
-            c, d, s, e, divs.get(c), sp, verbose=False, first_ok=ok)
+            c, d, s, e, divs.get(c), sp, verbose=False,
+            low_sig=l, open_sig=o,
+            first_gate=((tp.price_window_years, tp.price_pctile_max, 60)
+                        if tp is not None else None),
+            gate_ctx=ctx)
         out[c] = stat
     return out
 
@@ -286,17 +289,17 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
         series = data.get(c)
         if not series:
             continue
-        d, s, e = series
+        d, s, e, l, o = series
         if len(d) < 2:
             continue
-        ok = (first_ok_series(d, s, tp.price_window_years,
-                              tp.price_pctile_max)
-              if tp is not None else None)
+        ctx = None
         i0 = int(np.searchsorted(d, np.datetime64(start)))
-        d2, s2, e2 = d[i0:], s[i0:], e[i0:]
+        if tp is not None:
+            ctx = (d, s, i0)
+        d2, s2, e2, l2, o2 = d[i0:], s[i0:], e[i0:], l[i0:], o[i0:]
         if len(d2) < 2:
             continue
-        prepared[c] = (d2, s2, e2, ok[i0:] if ok is not None else None)
+        prepared[c] = (d2, s2, e2, l2, o2, ctx)
     codes = [c for c in union if c in prepared]
     if not codes:
         print("no data")
@@ -315,11 +318,14 @@ def run_dynamic_pool_backtest(con, sp, up, start: str, end: str, out_dir: str,
     bench_rets = []
     total = len(codes)
     for i, c in enumerate(codes, start=1):
-        dates, sig, exec_c, ok = prepared[c]
+        dates, sig, exec_c, sig_low, sig_open, ctx = prepared[c]
         mask = build_code_mask(c, dates, rdates, schedule)
         stat, _state, v_arr, c_arr, flag, buys = run_stock(
             c, dates, sig, exec_c, divs.get(c), sp, verbose=False,
-            trade_mask=mask, first_ok=ok)
+            trade_mask=mask, low_sig=sig_low, open_sig=sig_open,
+            first_gate=((tp.price_window_years, tp.price_pctile_max, 60)
+                        if tp is not None else None),
+            gate_ctx=ctx)
         row = dict(stat)
         row["name"] = names.get(c, "")
         # 池履历（重算粒度 = 月）

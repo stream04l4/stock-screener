@@ -25,7 +25,7 @@ import numpy as np
 from . import __version__
 from .config import ConfigError, load_config
 from .data import connect_readonly, default_db_path
-from .engine import aggregate_into, extend_start, first_ok_series, load, run_stock
+from .engine import aggregate_into, extend_start, load, run_stock
 from .report import write_outputs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -92,23 +92,26 @@ def _cmd_backtest(args) -> int:
         con.close()
 
     codes = sorted(codes)
-    # v8.1.0：分位门（PIT）+ 切回原窗口（扩展段只喂分位窗口，不进回测日历）
-    prepared: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    # v8.2.x 对齐实操：low 触线买 + 分位门窗口上下文（扩展段数组，切片后
+    # 早期 bar 的 N 年分位窗口仍完整；与生产页面同口径 PIT）
+    gate = (tp.price_window_years, tp.price_pctile_max, 60)
+    prepared: Dict[str, tuple] = {}
     for c in codes:
         series = data.get(c)
         if not series:
             continue
-        dates, sig, exec_c = series
+        dates, sig, exec_c, sig_low, sig_open = series
         if len(dates) < 2:
             continue
-        ok = first_ok_series(dates, sig, tp.price_window_years,
-                             tp.price_pctile_max)
+        ctx = None
         if args.start:
             i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
-            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            ctx = (dates, sig, i0)
+            dates, sig, exec_c, sig_low, sig_open = (
+                dates[i0:], sig[i0:], exec_c[i0:], sig_low[i0:], sig_open[i0:])
             if len(dates) < 2:
                 continue
-        prepared[c] = (dates, sig, exec_c, ok)
+        prepared[c] = (dates, sig, exec_c, sig_low, sig_open, ctx)
     codes = [c for c in codes if c in prepared]
     if not codes:
         print("no data")
@@ -124,9 +127,11 @@ def _cmd_backtest(args) -> int:
     bench_rets = []
     total = len(codes)
     for i, c in enumerate(codes, start=1):
-        dates, sig, exec_c, ok = prepared[c]
+        dates, sig, exec_c, sig_low, sig_open, ctx = prepared[c]
         stat, state, v_arr, c_arr, flag, buys = run_stock(
-            c, dates, sig, exec_c, divs.get(c), sp, first_ok=ok)
+            c, dates, sig, exec_c, divs.get(c), sp,
+            low_sig=sig_low, open_sig=sig_open,
+            first_gate=gate, gate_ctx=ctx)
         row = dict(stat)
         row["name"] = names.get(c, "")
         rows.append(row)
@@ -174,17 +179,22 @@ def _cmd_status(args) -> int:
     states = []
     total = len(codes)
     for i, c in enumerate(codes, start=1):
-        dates, sig, exec_c = data[c]
-        # v8.1.0：首仓双条件②（5 年分位，PIT）+ 切回原窗口
-        ok = first_ok_series(dates, sig, tp.price_window_years,
-                             tp.price_pctile_max)
+        dates, sig, exec_c, sig_low, sig_open = data[c]
+        # v8.2.x 对齐实操：low 触线买 + 分位门窗口上下文（切回原窗口）
+        ctx = None
         if args.start:
             i0 = int(np.searchsorted(dates, np.datetime64(args.start)))
-            dates, sig, exec_c, ok = dates[i0:], sig[i0:], exec_c[i0:], ok[i0:]
+            ctx = (dates, sig, i0)
+            dates, sig, exec_c, sig_low, sig_open = (
+                dates[i0:], sig[i0:], exec_c[i0:], sig_low[i0:], sig_open[i0:])
             if len(dates) < 2:
                 continue
-        _, state, *_ = run_stock(c, dates, sig, exec_c, divs.get(c), sp,
-                                 first_ok=ok)
+        _, state, *_ = run_stock(
+            c, dates, sig, exec_c, divs.get(c), sp,
+            low_sig=sig_low, open_sig=sig_open,
+            first_gate=(tp.price_window_years,
+                        tp.price_pctile_max, 60),
+            gate_ctx=ctx)
         state["name"] = names.get(c, "")
         states.append(state)
         print(f"[PROGRESS] stage=st done={i} total={total}", flush=True)

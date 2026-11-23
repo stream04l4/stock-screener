@@ -521,3 +521,145 @@ def test_extend_start_calendar_years():
     assert extend_start("2023-01-01", 0) == "2023-01-01"  # 0 年前移 = 原样
     # 非闰年 2/28 前移 → 2/28
     assert extend_start("2023-02-28", 2) == "2021-02-28"
+
+
+# ---------------------------------------------------------------------------
+# v8.2.x 对齐实操：盘中触线买（low 触发、档位价成交、零前视分位门）
+# ---------------------------------------------------------------------------
+
+def _run_touch(p, sig, low, exec_c=None, dates=None, first_gate=None,
+               gate_ctx=None, exmap=None):
+    """low_sig 路径运行器（生产口径）。low 与 sig 等长；af 默认 1（exec_c=sig）。"""
+    n = len(sig)
+    d = dates if dates is not None else _dates(
+        *[f"2020-01-{i + 1:02d}" if i < 28 else f"2020-02-{i - 27:02d}"
+          for i in range(n)])
+    sig = np.asarray(sig, dtype=float)
+    exec_c = np.asarray(exec_c, dtype=float) if exec_c is not None else sig
+    return run_stock("test.000001", d, sig, exec_c, exmap, p, verbose=False,
+                     low_sig=np.asarray(low, dtype=float),
+                     first_gate=first_gate, gate_ctx=gate_ctx)
+
+
+def test_touch_buy_when_close_above_line():
+    """盘中触线：收盘未破线但当日 low 触线 → 成交（对齐实盘挂单）。
+    H=100，首仓线=85。bar2 收盘 90（>85，旧收盘口径不买）但 low=84（≤85 触线）
+    → 按档位价 85 成交，P0=85。legacy（无 low_sig）同数据 → 不买（对照）。"""
+    p = _params(rearm_mode="newhigh")
+    stat, state, *_, buys = _run_touch(
+        p, [100.0, 100.0, 90.0, 90.0], [100.0, 100.0, 84.0, 90.0])
+    assert stat["n_buys"] == 1
+    assert buys[0][1] == pytest.approx(85.0)      # 档位价成交（非 low 84 / 收盘 90）
+    assert state["round_anchor"] == pytest.approx(85.0)  # P0 = 首仓线价
+    assert state["k_level"] == 1
+    # legacy 对照：同一 sig，收盘口径 bar2 收盘 90 > 85 → 不买
+    stat_legacy, *_ = _run(p, [100.0, 100.0, 90.0, 90.0])
+    assert stat_legacy["n_buys"] == 0
+
+
+def test_touch_gap_down_fills_at_line_not_low():
+    """跳空低开：low 深破线也按**档位价**成交（不取更优的 low）。
+    H=100，首仓线=85。bar2 收盘 80 / low 70 → 首仓按 85 成交；加仓 P0=85：
+    k1 线=80.75（low 70≤→ 买 2 手 @80.75）、k2 线=76.5（买 3 @76.5）、
+    k3 线=72.25（买 4 @72.25）、k4 线=68（low 70>68 停）。"""
+    p = _params(rearm_mode="newhigh")
+    stat, state, *_, buys = _run_touch(p, [100.0, 100.0, 80.0],
+                                       [100.0, 100.0, 70.0])
+    assert stat["n_buys"] == 4
+    # 成交价 = 各档位线价（逐档），绝非 low(70) 或 close(80)
+    assert [b[1] for b in buys] == pytest.approx(
+        [85.0, 85.0 * 0.95, 85.0 * 0.90, 85.0 * 0.85])
+    assert [b[5] for b in buys] == [1, 2, 3, 4]
+    assert state["round_anchor"] == pytest.approx(85.0)
+    assert state["k_level"] == 4
+
+
+def test_touch_first_gate_window_excludes_current_bar():
+    """零前视：首仓分位门窗口**不含触线当日**（当日收盘未知）。
+    pct_max=0 为判据——窗口内任何一根 ≤ line 的 bar 都会让 pctile>0 → 门失败。
+    bars0-4 收盘 100（均 > line=85），bar5 收盘 80 / low 80 触线：
+    - 正确（窗口 bars0-4，不含 bar5）：0/5 ≤ line → pctile=0 ≤ 0 → 门过 → 买；
+    - 若错误含 bar5 收盘(80≤85)：1/6 → 16.7% > 0 → 门失败。
+    断言 n_buys==2 证明走的是零前视口径。"""
+    p = _params(rearm_mode="newhigh")
+    dates = _dates(*[f"2020-01-{i + 1:02d}" for i in range(6)])
+    stat, state, *_, buys = _run_touch(
+        p, [100.0] * 5 + [80.0], [100.0] * 5 + [80.0],
+        dates=dates, first_gate=(1, 0, 3))  # window=1y, pct_max=0, min_bars=3
+    assert stat["n_buys"] == 2
+    assert buys[0][1] == pytest.approx(85.0)
+    assert buys[1][1] == pytest.approx(85.0 * 0.95)
+
+
+def test_touch_first_gate_fail_closed_short_window():
+    """分位门窗口 bar 数 < min_bars → fail-closed（触线也不买）。
+    仅 2 根 bar，min_bars=3 → bar1 触线但窗口不足 → 不买。"""
+    p = _params(rearm_mode="newhigh")
+    stat, *_ = _run_touch(p, [100.0, 80.0], [100.0, 80.0],
+                          first_gate=(1, 0, 3))
+    assert stat["n_buys"] == 0
+    assert stat["last_status"] == "never"
+
+
+def test_touch_gap_open_fills_at_open():
+    """跳空低开：open < 线价 → 限价单按**开盘价**成交（A 股撮合：以更优价
+    成交），P0 = 开盘价。bar2: open=78 < 线 85, low=76, close=79 →
+    首仓 @78；加仓 P0=78: k1 线=74.1（low 76>74.1 停）。"""
+    p = _params(rearm_mode="newhigh")
+    stat, state, *_, buys = _run_touch(
+        p, [100.0, 100.0, 79.0], [100.0, 100.0, 76.0])
+    # _run_touch 不传 open_sig → 退化为纯档位价（对照）
+    assert buys[0][1] == pytest.approx(85.0)
+    # 传 open_sig：open=78 < 85 → 按开盘价成交
+    n = 3
+    d = _dates(*[f"2020-01-{i + 1:02d}" for i in range(n)])
+    sig = np.array([100.0, 100.0, 79.0])
+    st, stt, *_, bu = run_stock(
+        "t.1", d, sig, sig.copy(), None, p, verbose=False,
+        low_sig=np.array([100.0, 100.0, 76.0]),
+        open_sig=np.array([100.0, 100.0, 78.0]))
+    assert st["n_buys"] == 1
+    assert bu[0][1] == pytest.approx(78.0)       # 开盘价成交
+    assert stt["round_anchor"] == pytest.approx(78.0)  # P0 = 实际成交价
+
+
+def test_touch_first_gate_target_is_fill_price():
+    """D 语义（Joel 2026-11-23 定案）：门目标 = 触线时刻**实际成交价**
+    min(open, 线)，而非线价。「当前时间点股价」= 成交那一刻的价。
+    bars: 0) close=100 立 H → 线 85；1) close=low=84 触线但窗口 1 根
+    < min_bars=2 fail-closed（不买，收盘 84<线 记入历史）；2) close=86
+    V 型收回线上（不触）；3) open=80 / close=low=84 再触线，窗口 {100,84,86}：
+    - 目标=线 85（A）：1/3=33% > pct_max=0 → 拒；
+    - 目标=成交价 80（D，open<线）：0/3=0% ≤ 0 → 过，@80 开盘价成交。
+    无 open_sig（退化 A 行为）→ 拒。区分 D 与 A 的关键测试。"""
+    p = _params(rearm_mode="newhigh")
+    dates = _dates(*[f"2020-01-{i + 1:02d}" for i in range(4)])
+    sig = np.array([100.0, 84.0, 86.0, 84.0])
+    low = np.array([100.0, 84.0, 86.0, 84.0])
+    stA, *_ = run_stock("t.a", dates, sig, sig.copy(), None, p, verbose=False,
+                        low_sig=low, first_gate=(1, 0, 2))
+    assert stA["n_buys"] == 0                      # 线价目标 33% > 0 → 拒
+    st, stt, *_, bu = run_stock(
+        "t.d", dates, sig, sig.copy(), None, p, verbose=False,
+        low_sig=low, open_sig=np.array([100.0, 84.0, 86.0, 80.0]),
+        first_gate=(1, 0, 2))
+    assert st["n_buys"] == 1                       # 成交价目标 0% ≤ 0 → 买
+    assert bu[0][1] == pytest.approx(80.0)         # 开盘价成交
+    assert stt["round_anchor"] == pytest.approx(80.0)
+
+
+def test_first_touch_ok_offset_uses_ctx_window():
+    """_first_touch_ok 直接单测：offset 指向切片前扩展段，窗口取 ctx 数组
+    [lo, off+i)（不含当前 bar）。ctx 8 根（g_sig[6]=80 低 bar，其余 100），
+    主序列 = ctx[2:]（off=2，6 根，与生产切片语义一致）：
+    - off=2, i=2 → idx=4，窗口 ctx[0:4]（100×4，均>85）→ pctile=0 ≤ 0 → True；
+    - off=2, i=5 → idx=7，窗口 ctx[0:7] 含 bar6 的 80（≤85）→ 1/7>0 → False
+      （证明窗口切片上界 = 当前 bar 下标，不含当日；且能吃到切片前扩展段）。"""
+    from martingale.engine import _first_touch_ok
+    cd = _dates(*[f"2020-01-{i + 1:02d}" for i in range(8)])
+    g_sig = np.array([100.0] * 6 + [80.0, 100.0])
+    g_dts = cd.astype("datetime64[D]").astype(object)
+    assert _first_touch_ok(cd, g_sig, g_dts, off=2, i=2, level=85.0,
+                           w_years=1, pct_max=0, min_bars=3) is True
+    assert _first_touch_ok(cd, g_sig, g_dts, off=2, i=5, level=85.0,
+                           w_years=1, pct_max=0, min_bars=3) is False
