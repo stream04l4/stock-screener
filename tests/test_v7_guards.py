@@ -60,7 +60,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # 值禁写湖、NULL 洞禁写），lake/ 有意变更，基线前移。
 # A股系统审查修复（e088705）：数据湖防断崖/T4增量落库/分页去重/并发RO只读/
 # 因子分位与Beta日期对齐/成交量单位统一/断网不毒化，lake/ 有意变更，基线前移。
-BASELINE = "e088705"   # fix(stock): A股系统全量审查修复（lake/ 有意变更基线前移）
+# T4 分红增量补齐（ac72f7b）：em_batch_ingest.py 新增 fetch_ex_events_range 与
+# tushare 低频交叉校验及批量事务 load_ex_events，lake/ 有意变更，基线前移。
+BASELINE = "0cf9ec5"   # fix(lake): 根除暴跌日幻影盖章并补齐 T4 区间分红增量与校验
 
 
 def _git(*args) -> str:
