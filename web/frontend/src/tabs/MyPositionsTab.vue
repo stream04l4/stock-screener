@@ -84,6 +84,8 @@ const sigActive = computed(() => sigStocks.value.filter(
 //    同 ② 的时机口径（临近时机线 10% 以内）——v7.0.22 旧「持仓 approaching
 //    恒展示」随 k=0 时机门废除（k=0 是双条件信号，时机远离时展示 = 噪音）。
 // 分位缺失（无时机数据 fail-closed）→ ②③ 不入段。
+// **Joel 2026-11-23 复核拍板：②③ 两路入口均保留**——价格带路（临近线
+// 5%）与「价格已在区 + 分位 40~50% 临近时机线」路并存，现状不动。
 const sigApproach = computed(() => {
   const maxPct = Number(sigData.value?.price_pctile_max ?? 40);
   const nearPct = maxPct + 10;
