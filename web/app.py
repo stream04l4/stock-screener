@@ -1048,15 +1048,50 @@ def _load_pool_ctx(cfg_path: Optional[str] = None):
 
 @app.get("/api/pool")
 def get_pool() -> Dict[str, Any]:
-    """候选池：漏斗计数 + 成员（含十年回测/股息率/价格/手动标记；同步 ~1s）。
+    """股票池全集：基础池 81 全部展示，今日候选浅绿置顶（v8.2.0 补，Joel
+    2026-11-23：「基础池一直在，其中若干只轮番上阵候选」）。
 
+    漏斗计数同旧；members 每行多 is_candidate（今日候选标记，前端高亮+置顶
+    由服务端排序完成：候选在前保持候选池序，非候选按基础池序）。
     候选池 ≠ 买入信号：入选只代表进入策略候选；买不买看价格是否到策略触发线
     （「我的持仓」页信号 / 微信提醒，同口径）。
     """
+    from martingale.selection import _bt_split, load_backtest_map
+
     _sp, _up, con, pool = _load_pool_ctx()
     try:
-        members = [
-            {
+        # 展示全集 = 基础池 + 不在基础池的候选（手动池可含池外码）
+        base_members = list(pool.base_members or [])
+        if not base_members:  # 防御：旧路径/注入 base 缺省 → 仅候选可见
+            base_members = list(pool.members)
+        base_codes = {m.ts_code for m in base_members}
+        display = base_members + [m for m in pool.members
+                                  if m.ts_code not in base_codes]
+        # 最新收盘价（全展示集；与 build_candidate_pool 同口径：各股最近
+        # 交易日且距全局最新 ≤30 天，避免停牌股误杀）
+        con.execute("""
+            SELECT k.ts_code, k.close FROM kline_daily k
+            JOIN (SELECT ts_code, MAX(date) AS md FROM kline_daily GROUP BY ts_code) x
+              ON k.ts_code = x.ts_code AND k.date = x.md
+            WHERE k.date >= (SELECT MAX(date) - INTERVAL 30 DAY FROM kline_daily)
+        """)
+        price_map = {str(c): float(cl) for c, cl in con.fetchall()
+                     if cl is not None}
+        bt = load_backtest_map(con)
+        cand_pos = {c: i for i, c in enumerate(pool.codes)}
+        base_pos = {m.ts_code: i for i, m in enumerate(base_members)}
+        display.sort(key=lambda m: (0, cand_pos[m.ts_code])
+                     if m.ts_code in cand_pos
+                     else (1, base_pos.get(m.ts_code, 1 << 30)))
+        # 手动标记以候选成员为准（基础池内的手动股 base_member 不携带 is_manual，
+        # 从候选成员合并；池外手动股本就在 pool.members 中，标记一致）
+        manual_flag = {m.ts_code: bool(m.is_manual) for m in pool.members}
+        members = []
+        for m in display:
+            b = bt.get(m.ts_code)
+            dp_, pp_, ds_, ps_ = _bt_split(b)
+            is_manual = bool(m.is_manual) or manual_flag.get(m.ts_code, False)
+            members.append({
                 "ts_code": m.ts_code,
                 "name": m.name,
                 "industry_csric2": m.industry_csric2,
@@ -1066,27 +1101,40 @@ def get_pool() -> Dict[str, Any]:
                 "n_bars": m.n_bars,
                 "list_date": m.list_date,
                 "bt_pnl_pct": (round(m.bt_pnl_pct * 100.0, 2)
-                               if m.bt_pnl_pct is not None else None),
-                "bt_n_buys": m.bt_n_buys,
+                               if m.bt_pnl_pct is not None
+                               else (round(float(b["pnl_pct"]) * 100.0, 2)
+                                     if b is not None
+                                     and b.get("pnl_pct") is not None else None)),
+                "bt_n_buys": (m.bt_n_buys if m.bt_n_buys is not None
+                              else (int(b["n_buys"] or 0)
+                                    if b is not None else None)),
                 # v8.0.11：分红/上涨占比拆解（百分数口径，同 bt_pnl_pct；
                 # None = 总盈亏≤0 或旧预计算表无该列 → 前端显示 —）
-                "bt_div_pool": m.bt_div_pool,
-                "bt_price_pnl": m.bt_price_pnl,
-                "bt_dividends": m.bt_dividends,  # v8.0.12 累计分红（元，原值）
+                "bt_div_pool": m.bt_div_pool if m.bt_div_pool is not None else dp_,
+                "bt_price_pnl": m.bt_price_pnl if m.bt_price_pnl is not None else pp_,
+                "bt_dividends": (m.bt_dividends if m.bt_dividends is not None
+                                 else (float(b["dividends"]) if b is not None
+                                       and b.get("dividends") is not None else None)),
                 "bt_div_share": (round(m.bt_div_share * 100.0, 2)
-                                 if m.bt_div_share is not None else None),
+                                 if m.bt_div_share is not None
+                                 else (round(ds_ * 100.0, 2)
+                                       if ds_ is not None else None)),
                 "bt_price_share": (round(m.bt_price_share * 100.0, 2)
-                                   if m.bt_price_share is not None else None),
-                "price_latest": m.price_latest,
-                "is_manual": m.is_manual,
-            }
-            for m in pool.members
-        ]
+                                   if m.bt_price_share is not None
+                                   else (round(ps_ * 100.0, 2)
+                                         if ps_ is not None else None)),
+                "price_latest": (m.price_latest if m.price_latest is not None
+                                 else price_map.get(m.ts_code)),
+                "is_manual": is_manual,
+                "is_candidate": m.ts_code in cand_pos,
+            })
     finally:
         con.close()
     return {
         "funnel": pool.funnel,
         "n_members": len(members),
+        "n_base": len(base_members),
+        "n_candidates": len(pool.members),
         "members": members,
     }
 

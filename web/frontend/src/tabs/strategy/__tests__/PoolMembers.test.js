@@ -27,10 +27,13 @@ const PoolMembers = (await import("../PoolMembers.vue")).default;
 
 // 服务端 bt_*_share 已是百分数数值（44.04 = 44.04%）；
 // 全精度金额（2165.50348228）由展示层截断。
+// v8.2.0 补：n_base/n_candidates + is_candidate（今日候选浅绿置顶）。
 const POOL = {
   funnel: { total: 5000, whitelist: 5000, soe: 2200, mv: 420, listing: 400,
-            div: 320, backtest: 170, yield: 70, price: 70, final: 70, manual: 0 },
-  n_members: 2,
+            div: 320, backtest: 170, yield: 70, price: 70, final: 70, manual: 1 },
+  n_members: 3,
+  n_base: 2,
+  n_candidates: 1,
   members: [
     { ts_code: "sh.601088", name: "中国神华", industry_csric2: "B06",
       soe_basis: "国有股性质", total_mv: 2165.50348228, ttm_yield_pct: 7.752,
@@ -39,14 +42,21 @@ const POOL = {
       bt_div_pool: 17101.019641512157, bt_price_pnl: 58924.06479999999,
       bt_dividends: 96239.777,   // v8.0.12 累计分红（≈余额+再投）
       bt_div_share: 22.49, bt_price_share: 77.51,
-      price_latest: 24.35678, is_manual: false },
+      price_latest: 24.35678, is_manual: false, is_candidate: true },
     { ts_code: "sz.000651", name: "格力电器", industry_csric2: "C38",
       soe_basis: "手动添加", total_mv: 2165.5, ttm_yield_pct: 7.75,
       n_bars: 2500, list_date: "1996-11-18",
       bt_pnl_pct: null, bt_n_buys: null,
       bt_div_pool: null, bt_price_pnl: null, bt_dividends: null,
       bt_div_share: null, bt_price_share: null,   // 手动/不可拆 → —
-      price_latest: 37.1437, is_manual: true },
+      price_latest: 37.1437, is_manual: true, is_candidate: false },
+    { ts_code: "sh.600900", name: "长江电力", industry_csric2: "D44",
+      soe_basis: "国有股性质", total_mv: 6800.0, ttm_yield_pct: 3.1,
+      n_bars: 2600, list_date: "2003-11-18",
+      bt_pnl_pct: -5.2, bt_n_buys: 1,
+      bt_div_pool: null, bt_price_pnl: null, bt_dividends: null,
+      bt_div_share: null, bt_price_share: null,
+      price_latest: 28.11, is_manual: false, is_candidate: false },
   ],
 };
 
@@ -94,6 +104,30 @@ describe("PoolMembers · 分红占比/上涨占比 + 小数收敛（v8.0.11）",
     const t = w.text();
     expect(t).toContain("格力电器");
     expect(t).toContain("—");   // 手动股占比/分红余额/价差盈亏列
+    w.unmount();
+  });
+
+  it("v8.2.0 补：基础池全集 + 候选浅绿置顶（Joel：基础池一直在，轮番上阵候选）", async () => {
+    const w = mk();
+    await flushPromises();
+    const t = w.text();
+    // 标题：基础池 81 全集 + 今日候选数（mock: n_base=2, n_candidates=1）
+    expect(t).toContain("股票池（2）· 今日候选（1）");
+    // 3 行全部展示（候选 1 + 手动 1 + 基础池 1）
+    expect(t).toContain("中国神华");
+    expect(t).toContain("格力电器");
+    expect(t).toContain("长江电力");
+    // 状态列：候选 / 手动 / 基础池
+    expect(t).toContain("候选");
+    expect(t).toContain("手动");
+    expect(t).toContain("基础池");
+    // 候选行（神华）带 row-candidate；其余不带
+    const trs = w.findAll("tbody tr");
+    expect(trs.length).toBe(3);
+    expect(trs[0].classes()).toContain("row-candidate");  // 服务端已置顶
+    expect(trs[0].text()).toContain("中国神华");
+    expect(trs[1].classes()).not.toContain("row-candidate");
+    expect(trs[2].classes()).not.toContain("row-candidate");
     w.unmount();
   });
 });

@@ -294,34 +294,40 @@ def test_validate_strategy_v7013_timing():
 @pytest.mark.skipif(not HAS_LAKE, reason="生产湖不存在")
 def test_get_pool_funnel_and_members():
     out = wapp.get_pool()
-    # v7.0.12：候选池 = 基础 5 条件 ∩ 十年回测为正 ∩ 股息率≥3% ∩ 价格 3~100 元 ∪ 手动
-    # （2026-10-24 生产首跑 = 59 只；留漂移余量；**v8.1.2 央企收紧门默认开后
-    #   生产 ≈30 只，守卫下调至 15**）
-    assert out["n_members"] >= 15
+    # v8.2.0 补（Joel 2026-11-23）：/api/pool 展示全集 = 基础池 + 池外候选；
+    #   今日候选置顶（候选池序），n_base=基础池数，n_candidates=候选数。
+    # （v7.0.12 起候选 = 基础 ∩ 十年回测≥门槛 ∩ 股息率 ∩ 价格区间 ∪ 手动；
+    #   v8.1.2 央企门默认开后候选 ≈18 只，基础池 = 81）
+    assert out["n_base"] >= 15          # 基础池（81）
+    assert out["n_candidates"] >= 1
+    assert out["n_members"] >= out["n_base"]
     f = out["funnel"]
     keys = ["total", "whitelist", "soe", "mv", "listing", "div",
             "backtest", "yield", "price", "final", "manual"]
     assert all(k in f for k in keys)
-    assert f["final"] == out["n_members"]
+    assert f["final"] == out["n_candidates"]
     assert f["backtest"] >= f["yield"] >= f["price"]  # 漏斗逐级收窄
     assert f["final"] >= f["price"]  # final = 自动 + 纯手动
     assert isinstance(out["members"], list) and out["members"]
     m0 = out["members"][0]
     assert {"ts_code", "name", "total_mv", "bt_pnl_pct", "ttm_yield_pct",
-            "price_latest", "is_manual",
+            "price_latest", "is_manual", "is_candidate",
             # v8.0.11：分红/上涨占比拆解字段
             "bt_div_pool", "bt_price_pnl", "bt_div_share", "bt_price_share",
             # v8.0.12：累计分红（余额口径的互补展示）
             "bt_dividends"} <= set(m0.keys())
-    # v8.0.11：池内成员（G7 通过 = 总盈亏>0）占比应齐全且和≈100%（差手续费）
+    # v8.0.11：候选成员（G7 通过 = 总盈亏>0）占比应齐全且和≈100%（差手续费）
     for m in out["members"]:
-        if m["is_manual"]:
+        if not m["is_candidate"] or m["is_manual"]:
             continue
         if m["bt_div_share"] is not None and m["bt_price_share"] is not None:
             assert 0.0 < m["bt_div_share"] + m["bt_price_share"] <= 100.5
-    # 排序契约：自动成员按十年回测收益降序（无值殿后）
-    auto = [m["bt_pnl_pct"] for m in out["members"] if not m["is_manual"]]
-    with_val = [x for x in auto if x is not None]
+    # 排序契约（v8.2.0 补）：候选置顶且候选内自动成员按十年回测降序
+    cands = [m for m in out["members"] if m["is_candidate"]]
+    assert len(cands) == f["final"]
+    assert out["members"][:len(cands)] == cands   # 候选全部在前（置顶）
+    auto_c = [m["bt_pnl_pct"] for m in cands if not m["is_manual"]]
+    with_val = [x for x in auto_c if x is not None]
     assert with_val == sorted(with_val, reverse=True)
 
 

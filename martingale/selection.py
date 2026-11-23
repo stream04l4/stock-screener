@@ -385,7 +385,10 @@ def build_candidate_pool(con, up: UniverseParams,
         "final": len(members),
         "manual": len(manual_members),
     })
-    return PoolResult(funnel=funnel, members=members)
+    # v8.2.0 补：携带完整基础池（Web 股票池卡片展示全集+候选高亮；
+    # 手动成员若不在基础池，由 Web 层按 members 补列）
+    return PoolResult(funnel=funnel, members=members,
+                      base_members=list(base.members))
 
 
 # ---------------------------------------------------------------------------

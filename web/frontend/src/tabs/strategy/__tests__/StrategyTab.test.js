@@ -92,15 +92,17 @@ function mockApi() {
         funnel: { total: 100, whitelist: 40, soe: 30, mv: 20, listing: 12, div: 5,
                   backtest: 2, yield: 2, price: 1, final: 2, manual: 1 },
         n_members: 2,
+        n_base: 2,          // v8.2.0 补
+        n_candidates: 2,    // v8.2.0 补
         members: [
           { ts_code: "sh.601088", name: "中国神华", industry_csric2: "B06",
             soe_basis: "x", total_mv: 10000, ttm_yield_pct: 3.8, n_bars: 2400,
             list_date: "2007-10-19", bt_pnl_pct: 218.5, bt_n_buys: 5,
-            price_latest: 50.2, is_manual: false },
+            price_latest: 50.2, is_manual: false, is_candidate: true },
           { ts_code: "sh.600900", name: "长江电力", industry_csric2: "D44",
             soe_basis: "手动添加", total_mv: 7000, ttm_yield_pct: 3.5, n_bars: 2400,
             list_date: "2003-11-18", bt_pnl_pct: 90.0, bt_n_buys: 3,
-            price_latest: 28.0, is_manual: true },
+            price_latest: 28.0, is_manual: true, is_candidate: true },
         ],
       };
     }
@@ -181,8 +183,9 @@ describe("v7 · 21 字段页渲染（strategy 7 + universe 11 + timing 3；name 
     expect(groups[1].text()).toContain("时机成熟");   // push_eligible 徽标
     expect(groups[1].text()).toContain("加持仓");
     expect(groups[1].text()).toContain("2026-10-23");
-    // v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条）
-    expect(groups[2].text()).toContain("候选股票");
+    // v7.0.12：股票池卡片 = 候选池（成员全列表 + 手动池录入条）；
+    // v8.2.0 补：标题改「股票池（N）· 今日候选（N）」（基础池全集+候选高亮置顶）
+    expect(groups[2].text()).toContain("今日候选");
     expect(groups[2].text()).toContain("中国神华");   // 自动成员
     expect(groups[2].text()).toContain("长江电力");   // 手动成员
     expect(groups[2].text()).toContain("手动添加");

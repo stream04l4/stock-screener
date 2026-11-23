@@ -1,8 +1,10 @@
-// 候选股票池成员列表（v7.0.12，策略页签「股票池」卡片内）。
-// - 数据：GET /api/pool（候选池 = 基础池 ∩ 十年回测≥门槛 ∩ 股息率≥门槛
-//   ∩ 价格区间 ∪ 手动池；读预计算表 O(1)，服务端已按 10 年回测降序）。
-// - 展示全部候选股（v8.0.8 起 = 全行业高息央国企，控股强度门保证无伪国企）；
-//   SimpleTable 自带搜索 + 点表头排序。
+// 股票池全集列表（v8.2.0 补，Joel 2026-11-23：「基础池一直在，其中若干只
+// 轮番上阵候选」）。
+// - 数据：GET /api/pool —— 展示全集 = 基础池（81）全部 + 不在基础池的候选
+//   （手动池可含池外码）；服务端已排序：今日候选在前（候选池序 = 10 年回测
+//   降序），非候选按基础池序；每行 is_candidate = 今日候选（G7~G9∪手动）。
+// - 候选行浅绿高亮置顶；基础池行常规底色。
+// - 展示全部成员；SimpleTable 自带搜索 + 点表头排序。
 // - 候选池 ≠ 买入信号：入选 ≠ 该买；买不买看价格是否到策略触发线
 //   （「我的持仓」页信号 / 微信提醒，同一口径）。
 // - 手动添加/移除后 ManualPoolBar 会 invalidate("pool") 刷新本表。
@@ -37,7 +39,13 @@ const funnelLine = computed(() => {
 
 const rows = computed(() => {
   const ms = (data.value && data.value.members) || [];
-  return ms.map((m) => ({ ...m, src: m.is_manual ? "手动" : "自动" }));
+  return ms.map((m) => ({
+    ...m,
+    // v8.2.0 补：状态列（替代旧「来源」手动/自动二分）
+    status: m.is_candidate
+      ? (m.is_manual ? "候选·手动" : "候选")
+      : (m.is_manual ? "手动" : "基础池"),
+  }));
 });
 
 const COLS = [
@@ -56,26 +64,27 @@ const COLS = [
   ["ttm_yield_pct", "股息率%", true, fmtPct2],
   ["price_latest", "最新价", true, fmt2],
   ["total_mv", "总市值(亿)", true, fmt2],
-  ["src", "来源"],
+  ["status", "状态"],
 ];
 </script>
 
 <template>
   <div class="pm">
     <div class="pm-head">
-      <span class="pm-title">候选股票（{{ data ? data.n_members : "…" }}）</span>
+      <span class="pm-title">股票池（{{ data ? data.n_base : "…" }}）· 今日候选（{{ data ? data.n_candidates : "…" }}）</span>
       <span v-if="loading" class="pm-muted">加载中…</span>
       <span v-if="funnelLine" class="pm-funnel">{{ funnelLine }}</span>
     </div>
     <p class="pm-note">
-      入选 ≠ 买入信号：是否买入看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。
+      列表展示全部基础池，今日候选（浅绿行）置顶；候选 ≠ 买入信号——是否买入看价格是否到策略触发线（「我的持仓」页信号 / 微信提醒）。
     </p>
-    <p v-if="error" class="pm-err">候选池加载失败：{{ error }}</p>
+    <p v-if="error" class="pm-err">股票池加载失败：{{ error }}</p>
     <SimpleTable
       v-else
       :rows="rows"
       :cols="COLS"
-      empty="（候选池为空——等待每日选股预计算，或下方手动添加）"
+      :row-class="(r) => (r.is_candidate ? 'row-candidate' : '')"
+      empty="（基础池为空——等待每日选股预计算，或下方手动添加）"
     />
   </div>
 </template>
@@ -88,4 +97,8 @@ const COLS = [
 .pm-funnel { color: var(--muted); font-size: 12px; }
 .pm-note { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
 .pm-err { color: var(--bad); font-size: 13px; margin: 6px 0; }
+/* v8.2.0 补：今日候选行浅绿高亮（:deep 穿透 SimpleTable 作用域） */
+.pm :deep(tr.row-candidate) { background: #eefaf0; }
+.pm :deep(tr.row-candidate td) { border-top-color: #d3f0da; }
+.pm :deep(tr.row-candidate):hover { background: #e2f6e6; }
 </style>

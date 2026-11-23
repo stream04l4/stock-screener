@@ -64,6 +64,10 @@ class Member:
 class PoolResult:
     funnel: Dict[str, int]      # total/whitelist/soe/mv/listing/div/final
     members: List[Member] = field(default_factory=list)
+    # v8.2.0 补（Joel 2026-11-23）：完整基础池成员（build_candidate_pool 填充；
+    # 直接 build_pool 的路径为空）。Web「股票池」卡片展示基础池全集 +
+    # 其中今日候选高亮置顶，避免「候选池不含基础池」的观感。
+    base_members: List[Member] = field(default_factory=list)
 
     @property
     def codes(self) -> List[str]:

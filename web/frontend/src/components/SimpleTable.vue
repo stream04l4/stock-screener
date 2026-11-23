@@ -8,6 +8,8 @@ const props = defineProps({
   rows: { type: Array, default: () => [] },
   cols: { type: Array, required: true }, // [[key, label, isNum?], ...]
   empty: { type: String, default: "（无数据）" },
+  // v8.2.0 补：行级 class（字符串常量或 (row) => string）——如候选池高亮。
+  rowClass: { type: [String, Function], default: "" },
 });
 const emit = defineEmits(["row-click"]);
 
@@ -87,7 +89,9 @@ function onRowClick(r) {
           <tr v-if="!filtered.length">
             <td :colspan="cols.length" class="muted">{{ empty }}</td>
           </tr>
-          <tr v-for="(r, i) in filtered" :key="i" class="clickable" @click="onRowClick(r)">
+          <tr v-for="(r, i) in filtered" :key="i" class="clickable"
+              :class="typeof props.rowClass === 'function' ? props.rowClass(r) : props.rowClass"
+              @click="onRowClick(r)">
             <td v-for="[key, , isNum] in cols" :key="key" :class="{ num: !!isNum }">{{ cell(r, key) }}</td>
           </tr>
         </tbody>
