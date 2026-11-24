@@ -74,19 +74,18 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 时机未过【紫金矿业：不入段】）/ 1 touched（持仓盘中触碰已触回）/
 // 3 即将进入价格带（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1
 // 【不入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
-// v8.2.0 补（Joel 2026-11-13 分区定案 + 三分类规整）：
-// 「当前信号」= 有真实信号（action 非空）——无信号不入段（中粮糖业：
-// 持仓二次建仓位·分位 76.8% 远离时机线 → 两区均不展示）。
-// v8.2.0 补（Joel 2026-11-23：进入信号区的信号保留到下个交易日）：
-// touched（今日已触线）行 action 为空也保留在当前信号段（云南铜业：持仓
-// k=0 二次建仓位触线 + 时机门未过 → action=null → 动作列「时机未过」；
-// v8.2.3：「持仓已够」抑制已退役，touched 无动作只剩时机门未过一种）。
-// 「即将进入」三分类：① 持仓 in_pos k≥1（未再武装·轮内加仓档）= 临近
-// 加仓线 5%（无时机门）；② 未建仓（非持仓）/ ③ 持仓 k=0（已再武装未二次
-// 建仓）= 临近时机线 10% 以内（40%<分位≤50%）且价格已在区或距线 ≤5%
-// ——中国石化（45% 已在区，标「临近时机线」）/ 长江电力（k=0 临区 + 38%
-// 已过门只等价）入段；国电电力（k=0 临区但 76.8% 远离时机线）/ 中国海油
-// （85.7%）不入段。
+// v8.2.5（Joel 2026-11-24 定案，分区重规整）：
+// 「当前信号」= 需要下单的信号 = **微信推送信号**（action 非空：到线且
+// 时机门全过）。11-23「touched 保留到当日」作废——触线但时机未过不入段
+// （云南铜业 → 潜力信号区）。
+// 「潜力信号」（原「即将进入」）满足任一即入段：① 价格距触发线 ≤5%
+// （绝对距离，含已破线）② 5年分位 ≤50%（无下界，含已过门 ≤40%）；与
+// 「当前」互斥。fixture 分布：
+// - ① 入段：云南铜业（+1.1% touched）/ 紫金矿业（-2.7%）/ 中国海油（+2.5%）/
+//   山煤国际（+2.1%）/ 国电电力（+2.1%）/ 长江电力（+2.0%）
+// - ② 入段：中国石化（45%；价 -5.6% 带外）
+// - ①② 入段：山煤国际（45%）/ 长江电力（38% 已过门）
+// - 不入段：江苏银行（-5.9% 带外 + 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   spot_preselect_pct: 10, spot_fetched: 9,
@@ -146,19 +145,21 @@ const SIG = {
       action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
       timing_ok: true, timing_reasons: "✓ 5年分位 19.1%（需≤40%） · ✓ 股息率 4.58%（需≥4.5%）",
       bt_pnl_pct: 120.4, bt_n_buys: 7 },
+    // v8.2.5：未到线（价在线上方 +2.0%）→ action 必为 null（旧 fixture 的
+    // action:"add" 与 status=approaching 矛盾，已修正）
     { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
       price: 28.56, next_add_price_raw: 28.0, status: "approaching", touched: false,
       day_low: 27.9, distance_pct: 2.0,
-      action: "add", suggested_lots: 1, next_lots: 1, n_history: 1, end_date: "2026-11-06",
+      action: null, suggested_lots: null, next_lots: 1, n_history: 1, end_date: "2026-11-06",
       timing_ok: true, timing_pctile: 38.0,
       timing_reasons: "✓ 5年分位 38.0%（需≤40%）",
       bt_pnl_pct: 30.1, bt_n_buys: 3 },
-    // v7.0.22 时机门入「即将进入」段：非持仓 + 时机达标 + 价格临区 → 展示
-    //（临区跌破即产生真实买入信号）
+    // v8.2.5：非持仓 + 时机达标（33.5%）+ 价格临区（+2.0% 未到线 →
+    // action 必为 null，旧 fixture 的 "buy" 已修正）→ 潜力段 ①+②
     { ts_code: "sh.601328", name: "交通银行", held: false, in_pos: false, k_level: 0,
       price: 7.55, next_add_price_raw: 7.40, status: "approaching", touched: false,
       day_low: 7.5, distance_pct: 2.0,
-      action: "buy", suggested_lots: 1, next_lots: null, n_history: 0,
+      action: null, suggested_lots: null, next_lots: null, n_history: 0,
       end_date: "2026-11-06",
       timing_ok: true, timing_pctile: 33.5,
       timing_reasons: "✓ 5年分位 33.5%（需≤40%） · ✓ 股息率 5.02%（需≥4.5%）",
@@ -946,19 +947,18 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 卡片标题 + 覆盖说明 + 价源标注
     expect(w.text()).toContain("📡 策略信号");
     expect(w.text()).toContain("股票池 ∪ 我的持仓");
-    expect(w.text()).toContain("5% 以内"); // approach_pct（v7.0.30 3→5）
+    expect(w.text()).toContain("距触发线 ≤ 5%"); // approach_pct（v7.0.30 3→5）
+    expect(w.text()).toContain("微信推送信号"); // v8.2.5：当前 = 要下单/要推的信号
     expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
-    // 分段计数（当前 = active 显示 3 + touched 2【含 v8.2.0 补 11-23：touched
-    // 时机未过行云南铜业】；active 价格态 5 只中非持仓时机未过 2 只被 v7.0.23
-    // 时机门滤出）；即将进入 = 价格临区 4 只：
-    // 长江电力（持仓）+ 交通银行（分位 33.5%≤50%）+ 山煤国际（v7.0.31 C 案：
-    // 分位 45% 未过 40% 门但 ≤50% 放宽带）+ 中国石化（v8.2.0 补：价已在区但
-    // 分位临近时机线 45% ∈ (40%,50%]）；中国海油（85.7%）与中粮糖业
-    // （76.8%，远离时机线）被滤出
-    expect(w.text()).toContain("当前信号（5）");
-    expect(w.text()).toContain("即将进入（4）");
+    // 分段计数（v8.2.5）：当前 = action 非空 4 只（神华/核电加仓 + 移动/大秦
+    // 首仓；长江电力/交通银行未到线 → action=null → 潜力段）；潜力 = ①距线
+    // ≤5% 或 ②分位≤50%：云南铜业/紫金矿业/长江电力/交通银行/中国海油/山煤
+    // 国际/国电电力（①）+ 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外
+    // + 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）不入
+    expect(w.text()).toContain("当前信号（4）");
+    expect(w.text()).toContain("潜力信号（8）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
     expect(w.text()).toContain("● 持仓");
@@ -969,22 +969,14 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("1 手");
     expect(w.text()).toContain("0.8");
     expect(w.text()).toContain("0.7");
-    // 盘中触碰（v7.0.20）：已触回标注 + 日内低列（保留到当日，次日移入历史）
+    // 盘中触碰：已触回标注 + 日内低列（核电行；v8.2.5 后仍属当前段——
+    // 它的触线是真信号 action=add）
     expect(w.text()).toContain("· 已触回");
     expect(w.text()).toContain("日内低");
     expect(w.text()).toContain("9.96");
-    expect(w.text()).toContain("已触线");
-    // v8.2.3：touched + 时机未过（action=null）也保留在当前信号段至次日——
-    // 云南铜业行存在且动作列显示「时机未过」（v8.2.0「持仓已够」退役）
-    expect(w.text()).toContain("云南铜业");
-    const ynRow = w.findAll("tbody tr").find((tr) => tr.text().includes("云南铜业"));
-    expect(ynRow).toBeTruthy();
-    expect(ynRow.text()).toContain("时机未过");
-    expect(ynRow.text()).toContain("已触回");
-    // v8.2.4（Joel 2026-11-24 海油实案）：无动作行档位列用「线」说法——
-    // 读起来是「哪条线」而非「提示建仓」的信号
-    expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
-    expect(ynRow.text()).not.toContain("再武装·建仓（第1档）");
+    // v8.2.5：touched 但时机未过（云南铜业 action=null）不再入当前段——
+    // 只在潜力信号段展示（见「潜力信号」用例）
+    expect(w.text()).not.toContain("云南铜业");
     // v7.0.23 首仓双条件：非持仓 + 时机✓ + 价破首仓线（大秦：in_pos=true
     // 模拟已建仓也走首仓线）→ 入当前信号段；时机 ✗✗ 的（江苏银行/紫金矿业）
     // 价格态 active 也不入段（首仓缺时机门不成信号）
@@ -1006,36 +998,52 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     w.unmount();
   });
 
-  it("切「即将进入」显示距触发%；切「历史信号」按日期降序 + 档位标签（首仓/第N档）", async () => {
+  it("切「潜力信号」显示距触发%（带符号）；切「历史信号」按日期降序 + 档位标签", async () => {
     mockApi(MY, [], SIG);
     const w = mk();
     await flushPromises();
     const segBtns = () => w.findAll(".sig-seg button");
-    await segBtns()[1].trigger("click"); // 即将进入
+    await segBtns()[1].trigger("click"); // 潜力信号（v8.2.5 原「即将进入」）
     await flushPromises();
-    expect(w.text()).toContain("2.0%"); // 距触发 distance_pct
-    expect(w.text()).toContain("长江电力"); // 持仓 approaching 股在表内
-    // v7.0.22 时机门：非持仓 + 时机达标（交通银行 33.5%）展示
+    expect(w.text()).toContain("+2.0%"); // 距触发带符号：线上方（长江/交通）
+    expect(w.text()).toContain("长江电力"); // 持仓 approaching 股在表内（①+②）
+    // v8.2.5 ②路：非持仓 + 分位 33.5% ≤50%（含已过门）+ ①距线 2.0% → 入段
     expect(w.text()).toContain("交通银行");
-    // v7.0.31 C 案（山煤国际实例）：分位 45% 未过 40% 门但 ≤50% 放宽带 →
-    // 展示并标「未过」；分位 85.7% 超放宽带 → 不入段
+    // ①②双路：山煤国际（+2.1% & 45%≤50）
     expect(w.text()).toContain("山煤国际");
     expect(w.text()).toContain("✗ 5年分位 45.0%（需≤40%）");
-    expect(w.text()).not.toContain("中国海油");
-    // v8.2.0 补（Joel 2026-11-13）：价格已在区但无信号、分位 45% ∈ (40%,50%]
-    // = 临近时机线 → 入段标「临近时机线」，档位 = 再武装·建仓线（第1档）
-    // （v8.2.4：无动作行档位用「线」说法，不读成建仓信号；持仓 in_pos k=0
-    // = 新一轮首仓）；中粮糖业 76.8% 远离时机线 → 不入段
+    // v8.2.5（Joel 2026-11-24 海油实案）：时机再远（85.7%），价格距线
+    // 2.5% ≤5% 也入潜力段——时机明细在「时机」列可见
+    expect(w.text()).toContain("中国海油");
+    const hyRow = w.findAll("tbody tr").find((tr) => tr.text().includes("中国海油"));
+    expect(hyRow).toBeTruthy();
+    expect(hyRow.text()).toContain("+2.5%");
+    expect(hyRow.text()).toContain("✗ 5年分位 85.7%（需≤40%）");
+    expect(hyRow.text()).toContain("首仓线（第1档）"); // v8.2.4 线说法
+    // ②路单入（价 -5.6% 带外）：中国石化 45% ≤50；档位 = 再武装·建仓线（第1档）
+    // （v8.2.4：无动作行档位用「线」说法；持仓 in_pos k=0 = 新一轮首仓）
     expect(w.text()).toContain("中国石化");
-    expect(w.text()).toContain("临近时机线");
+    expect(w.text()).toContain("-5.6%");
     expect(w.text()).toContain("再武装·建仓线（第1档）");
-    expect(w.text()).not.toContain("中粮糖业");
-    // 三分类 ③ 反例：持仓 k=0 价格临区但分位 76.8% 远离时机线 → 不入段
-    expect(w.text()).not.toContain("国电电力");
-    // v8.2.0 补（Joel 2026-11-21）：「下一档手数」列——next_lots 单点原值
-    //（时机未过的山煤/石化也显示首仓手数；交通银行 next_lots=null → —）
+    expect(w.text()).not.toContain("中粮糖业"); // -12.2% 带外 + 76.8%>50
+    // v8.2.5 ①路：国电电力 +2.1% 入段（旧三分类下 76.8% 远离时机线被滤出）
+    expect(w.text()).toContain("国电电力");
+    // v8.2.5（11-23 touched 保留定案作废）：云南铜业 触线+时机未过 → 从当前
+    // 段移入潜力段（①+1.1%），已触回标保留
+    expect(w.text()).toContain("云南铜业");
+    const ynRow = w.findAll("tbody tr").find((tr) => tr.text().includes("云南铜业"));
+    expect(ynRow).toBeTruthy();
+    expect(ynRow.text()).toContain("已触回");
+    expect(ynRow.text()).toContain("+1.1%");
+    expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
+    expect(ynRow.text()).toContain("✗ 5年分位 62.3%（需≤40%）");
+    // 边界：江苏银行 -5.9%（超 5% 带）+ 62.3%>50 → 不入段
+    expect(w.text()).not.toContain("江苏银行");
+    // 「下一档手数」列——next_lots 单点原值（时机未过的山煤/石化也显示首仓
+    // 手数；云南铜业 4 手；交通银行 next_lots=null → —）
     expect(w.text()).toContain("下一档手数");
     expect(w.text()).toContain("1 手");
+    expect(w.text()).toContain("4 手");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // 历史日期降序：2026-11-02 在前，2026-10-11 在后

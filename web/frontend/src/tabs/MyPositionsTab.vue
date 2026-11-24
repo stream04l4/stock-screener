@@ -47,7 +47,7 @@ function refresh() {
 }
 
 // ---------------------------------------------------------------------------
-// 策略信号中心（v7.0.19）：当前信号 / 即将进入信号区 / 历史信号 + 持仓·非持仓
+// 策略信号中心（v7.0.19；v8.2.5：当前=微信推送信号区 / 潜力信号区 / 历史）
 // 数据 = /api/strategy_signals（股票池 ∪ 我的持仓，口径与 /api/my_positions 同一
 // 定义点）；策略固定 = 当前策略（v7.0.29）；分段切换（active/approaching/history）。
 // ---------------------------------------------------------------------------
@@ -59,47 +59,29 @@ const { data: sigData, loading: sigLoading, error: sigError } =
 
 const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
 const sigStocks = computed(() => sigData.value?.stocks || []);
-// 当前信号 = active（现价在区内）+ touched（v7.0.20：今日已触线、现价回出——
-// 盘中达成过信号就保留到当日，次日行情日滚动后自动移出、移入历史段）。
-// 入段条件（两次定案叠加）：
-// - 11-13：active 价格态行须有真实信号（action 非空）——无动作的（时机未
-//   过）价格态不入段；v8.2.3（Joel 2026-11-23 轮次口径）：v8.2.0「持仓已
-//   够→不提醒」抑制已退役，持仓触线必提醒，动作列空因只剩「时机未过」；
-// - **11-23（Joel：「进入当前信号区的信号应保留到下个交易日」）：touched
-//   行 = 价格今日真实触到线（信号区进入事实），action 为空也保留到当日，
-//   动作列显示原因（时机未过）**。
-const sigActive = computed(() => sigStocks.value.filter(
-  (s) => (s.status === "active" || s.status === "touched")
-         && (s.action != null || s.status === "touched")));
-// 即将进入（v8.2.0 补，Joel 2026-11-13 三分类定案「重新规整」）——按股票
-// 状态分类给入口条件：
-// ① **已建仓·未再武装**（持仓 in_pos 且 k≥1，轮内加仓档，无时机门）：
-//    **临近加仓线 5% 以内**（status=approaching 价格带）→ 入段；
-// ② **未建仓**（非持仓股）：双条件信号（首仓线 + 时机门）→ **临近时机线
-//    10% 以内**（40% &lt; 5年分位 ≤50%，与 v7.0.31 C 案同一展示带）且价格
-//    已在区（active/touched，action=null 即时机未过）或临近首仓线 5%
-//    （approaching，分位 ≤50% 含已过门只等价到线）→ 入段；价远（idle）不入；
-// ③ **已建仓·已再武装·未二次建仓**（持仓 k=0，二次建仓位，须时机门）：
-//    同 ② 的时机口径（临近时机线 10% 以内）——v7.0.22 旧「持仓 approaching
-//    恒展示」随 k=0 时机门废除（k=0 是双条件信号，时机远离时展示 = 噪音）。
-// 分位缺失（无时机数据 fail-closed）→ ②③ 不入段。
-// **Joel 2026-11-23 复核拍板：②③ 两路入口均保留**——价格带路（临近线
-// 5%）与「价格已在区 + 分位 40~50% 临近时机线」路并存，现状不动。
+// **v8.2.5（Joel 2026-11-24 定案）：当前信号区 = 需要下单的信号 = 微信推送
+// 信号**——入区唯一条件 action 非空（价格到线 且 时机门全过：持仓加仓 /
+// 二次建仓 + 非持仓首仓，即当天推送窗口会推微信的那批）。旧「touched 保留
+// 到当日」（11-23 定案）作废——触线但时机未过不再入本段（去潜力信号段）。
+const sigActive = computed(() => sigStocks.value.filter((s) => s.action != null));
+// **潜力信号区**（v8.2.5 改名「即将进入」，Joel 2026-11-24 定案）——满足
+// 任一即入段：
+// ① 价格距触发线 ≤ approach_pct%（绝对距离；非持仓/持仓 k=0 = 首仓线，
+//    持仓 k≥1 = 下一加仓线；含「已破线但时机未过」的 touched 行）；
+// ② 5年分位 ≤ 50%（price_pctile_max + 10，**无下界**——含已过门的 ≤40%，
+//    「门过了等价格」的潜力股也显示；如分位 20% 距线再远也入段）。
+// 与当前信号段**互斥**：action 非空（微信推送信号）只展示在「当前」。
+// 分位缺失（无时机数据 fail-closed）→ 仅 ① 路可入。
 const sigApproach = computed(() => {
-  const maxPct = Number(sigData.value?.price_pctile_max ?? 40);
-  const nearPct = maxPct + 10;
+  const band = Number(sigData.value?.approach_pct ?? 5);
+  const pctCap = Number(sigData.value?.price_pctile_max ?? 40) + 10; // 50%
   return sigStocks.value.filter((s) => {
-    if (s.held_sufficient) return false;
+    if (s.action != null) return false; // 当前信号段优先
+    const dist = s.distance_pct;
+    const nearLine = dist != null && Math.abs(dist) <= band;
     const pct = s.timing_pctile;
-    const hasPct = typeof pct === "number";
-    const inZone = s.status === "active" || s.status === "touched";
-    const nearLine = s.status === "approaching";
-    // ① 持仓轮内加仓档（k≥1）：无时机限制，临近加仓线 5% 即入段
-    if (s.held && s.in_pos && (s.k_level ?? 0) > 0) return nearLine;
-    // ② 非持仓（未建仓）/ ③ 持仓 k=0（再武装未二次建仓）：临近时机线 +10%
-    if (nearLine) return hasPct && pct <= nearPct;
-    if (inZone) return s.action == null && hasPct && pct > maxPct && pct <= nearPct;
-    return false;
+    const nearPct = typeof pct === "number" && pct <= pctCap;
+    return nearLine || nearPct;
   });
 });
 const sigHistoryAll = computed(() => sigData.value?.history || []);
@@ -174,13 +156,13 @@ const sigShown = computed(() => {
   }
   if (sigSel.value === "approaching") {
     return sigApproach.value.map((s) => ({ ...s,
-      // 仅 ②（价已在区、无信号）行标「临近时机线」；① 价格临区行原样
-      //（approaching 的 held k=0 也可能 action=null——门未过，属「价未到位」
-      // 而非「临近时机线」，不打标）
+      // v8.2.5：入段条件（距线≤5% / 分位≤50%）由「距触发」「时机」列直接
+      // 可见，状态列只标 持仓/非持仓/已触回
       status_tag: (s.held ? "● 持仓" : "○ 非持仓")
-        + (((s.status === "active" || s.status === "touched") && s.action == null)
-           ? " · 临近时机线" : ""),
-      distance_s: (s.distance_pct ?? 0).toFixed(1) + "%",
+        + (s.touched ? " · 已触回" : ""),
+      // 带符号：+ = 线上方（临近），− = 已破线（含时机未过）
+      distance_s: (s.distance_pct != null
+        ? (s.distance_pct >= 0 ? "+" : "") + s.distance_pct.toFixed(1) : "—") + "%",
       // v8.2.0 补（Joel 2026-11-21）：下一档手数 = API next_lots（单点原值，
       // 不受时机门/持仓已够门控——临近时机线的 k=0 行也显示首仓手数）
       lots_s: s.next_lots == null ? "—" : `${s.next_lots} 手`,
@@ -682,23 +664,21 @@ function pnlColor(v) {
       </template>
     </div>
 
-    <!-- 策略信号中心（v7.0.19）：当前信号 / 即将进入 / 历史信号 + 持仓·非持仓 -->
+    <!-- 策略信号中心（v7.0.19；v8.2.5 改名：当前=微信推送信号 / 潜力信号 / 历史） -->
     <div class="card">
       <h3>📡 策略信号（当前策略）</h3>
       <p class="muted small">
         股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
-        {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号区 = 下一档触发价 ·
-        「当前」= 现价在区内 或 今日已触线；今日真实触线（「已触回」）的信号
-        保留到当日、次日移入历史——持仓已够/时机未过（无动作）也展示，动作列
-        标原因；未触线的价格态行须为真实信号（持仓加仓/二次建仓 + 非持仓买入
-        首仓，均过时机门）·
-        「即将进入」三分类（v8.2.0 补）：已建仓·未再武装（轮内加仓档）=
-        临近加仓线 {{ sigData?.approach_pct ?? 5 }}% 以内；未建仓 / 已再武装
-        未二次建仓（k=0）= 临近时机线 10% 以内（40% &lt; 5 年分位 ≤50%）且
-        价格已在区或距线 ≤{{ sigData?.approach_pct ?? 5 }}%（标「临近时机线」，
-        见「时机」列）·「下一档手数」= 触发价到线将买的手数（首仓/二次建仓 =
+        {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号线 = 下一档触发价 ·
+        「当前」= 需要下单的信号 = **微信推送信号**（价格到线 且 时机门全过：
+        持仓加仓/二次建仓 + 非持仓首仓）·
+        「潜力信号」（v8.2.5）满足任一即入段：① 价格距触发线 ≤
+        {{ sigData?.approach_pct ?? 5 }}%（绝对距离，含已破线但时机未过——「距触发」列
+        带符号：+ 线上方 / − 已破线）② 5年分位 ≤50%（含已过门的 ≤40%，
+        「门过了等价格」也显示；见「时机」列）；与「当前」互斥（达推送条件
+        的只展示在「当前」）·
+        「下一档手数」= 触发价到线将买的手数（首仓/二次建仓 =
         首仓手数，加仓档 = 首仓 + 档×步长；不受时机门影响）
-        ·「已触回」= 盘中摸到后反弹，保留到当日、次日移入历史（触碰记录见历史信号）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
         · 10年回测 = 策略十年回放
@@ -712,7 +692,7 @@ function pnlColor(v) {
       </div>
       <div class="sig-seg">
         <button :class="{ on: sigSel === 'active' }" @click="sigSel = 'active'">当前信号（{{ sigActive.length }}）</button>
-        <button :class="{ on: sigSel === 'approaching' }" @click="sigSel = 'approaching'">即将进入（{{ sigApproach.length }}）</button>
+        <button :class="{ on: sigSel === 'approaching' }" @click="sigSel = 'approaching'">潜力信号（{{ sigApproach.length }}）</button>
         <button :class="{ on: sigSel === 'history' }" @click="sigSel = 'history'">历史信号（{{ sigHistoryAll.length }}）</button>
       </div>
       <p v-if="sigLoading && !sigData" class="placeholder">加载中…</p>
