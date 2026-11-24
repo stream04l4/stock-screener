@@ -2749,11 +2749,26 @@ if _lake_router is None:
 if DIST_DIR.exists():
     assets_dir = DIST_DIR / "assets"
     if assets_dir.exists():
-        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+        class _ImmutableAssets(StaticFiles):
+            """v8.2.8：内容 hash 资产文件名每次构建都变 → 可安全永久缓存。
+            旧 bundle 靠 hash 天然失效，浏览器不会拿旧 CSS 套新 index.html。"""
+
+            def file_response(self, full_path, stat_result, scope, status_code=200):
+                resp = super().file_response(full_path, stat_result, scope, status_code)
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                return resp
+
+        app.mount("/assets", _ImmutableAssets(directory=str(assets_dir)), name="assets")
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(str(DIST_DIR / "index.html"))
+        # v8.2.8：index.html 必须 no-cache（总是回源 revalidate，秒级拿到新构建）。
+        # 之前无 Cache-Control 头 → 浏览器启发式缓存旧 index.html →
+        # 部署后仍加载旧 bundle（表头 12/13px 混杂等「样式忽大忽小」根因）。
+        return FileResponse(
+            str(DIST_DIR / "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
 
 if __name__ == "__main__":
