@@ -112,6 +112,12 @@ function levelLabel(level, firstOfRound) {
 }
 // v8.2.3 轮次口径（Joel 2026-11-23）：用户相对轮次号 → 前缀（「首轮/第二
 // 轮/…/第N轮」；null/无数据 → 空串不加前缀）
+// v8.2.4（Joel 2026-11-24）：无动作行（时机未过/价未到位，action=null）档位
+// 列用「线」说法（首仓线/建仓线）——避免被读成「提示首仓/建仓」的信号；
+// 有真实动作的行保留动作词（首仓/建仓/第N档）
+function lineNotation(label) {
+  return label.replace("首仓", "首仓线").replace("建仓", "建仓线");
+}
 function roundNoLabel(n) {
   if (!n || n <= 0) return "";
   const c = ["一", "二", "三", "四", "五", "六", "七", "八", "九"];
@@ -151,11 +157,15 @@ const sigShown = computed(() => {
       status_tag: (s.held ? "● 持仓" : "○ 非持仓") + (s.touched ? " · 已触回" : ""),
       action_label: actionText(s),
       // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
-      level_label: s.new_round ? (s.in_pos
-        ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）` : "建仓（第1档）")
-        : (s.held && s.in_pos
-           ? `${roundNoLabel(s.round_no)}第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档`
-           : "首仓（第1档）"),
+      // v8.2.4：无动作行（时机未过）档位用「线」说法，不读成信号
+      level_label: (() => {
+        const lbl = s.new_round ? (s.in_pos
+          ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）` : "建仓（第1档）")
+          : (s.held && s.in_pos
+             ? `${roundNoLabel(s.round_no)}第${s.k_level ?? 0}档→第${(s.k_level ?? 0) + 1}档`
+             : "首仓（第1档）");
+        return s.action == null ? lineNotation(lbl) : lbl;
+      })(),
       lots_s: s.suggested_lots == null ? "—" : `${s.suggested_lots} 手`,
       amount_w: s.suggested_lots != null && s.price
         ? fmtWan(s.suggested_lots * 100 * s.price) : "—",
@@ -176,11 +186,12 @@ const sigShown = computed(() => {
       lots_s: s.next_lots == null ? "—" : `${s.next_lots} 手`,
       // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓；
       // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
-      level_label: (s.held && s.in_pos)
+      // v8.2.4：该段行 action 恒 null → 档位一律「线」说法
+      level_label: lineNotation((s.held && s.in_pos)
         ? (s.k_level === 0
            ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）`
            : `${roundNoLabel(s.round_no)}第` + ((s.k_level ?? 0) + 1) + "档")
-        : "首仓（第1档）",
+        : "首仓（第1档）"),
       bt_s: btText(s), timing_s: timingText(s) }));
   }
   return sigHistory.value.map((h) => ({ ...h,

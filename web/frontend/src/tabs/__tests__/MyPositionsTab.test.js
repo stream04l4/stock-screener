@@ -981,6 +981,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(ynRow).toBeTruthy();
     expect(ynRow.text()).toContain("时机未过");
     expect(ynRow.text()).toContain("已触回");
+    // v8.2.4（Joel 2026-11-24 海油实案）：无动作行档位列用「线」说法——
+    // 读起来是「哪条线」而非「提示建仓」的信号
+    expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
+    expect(ynRow.text()).not.toContain("再武装·建仓（第1档）");
     // v7.0.23 首仓双条件：非持仓 + 时机✓ + 价破首仓线（大秦：in_pos=true
     // 模拟已建仓也走首仓线）→ 入当前信号段；时机 ✗✗ 的（江苏银行/紫金矿业）
     // 价格态 active 也不入段（首仓缺时机门不成信号）
@@ -1019,11 +1023,12 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("✗ 5年分位 45.0%（需≤40%）");
     expect(w.text()).not.toContain("中国海油");
     // v8.2.0 补（Joel 2026-11-13）：价格已在区但无信号、分位 45% ∈ (40%,50%]
-    // = 临近时机线 → 入段标「临近时机线」，档位 = 再武装·建仓（第1档）
-    // （持仓 in_pos k=0 = 新一轮首仓）；中粮糖业 76.8% 远离时机线 → 不入段
+    // = 临近时机线 → 入段标「临近时机线」，档位 = 再武装·建仓线（第1档）
+    // （v8.2.4：无动作行档位用「线」说法，不读成建仓信号；持仓 in_pos k=0
+    // = 新一轮首仓）；中粮糖业 76.8% 远离时机线 → 不入段
     expect(w.text()).toContain("中国石化");
     expect(w.text()).toContain("临近时机线");
-    expect(w.text()).toContain("再武装·建仓（第1档）");
+    expect(w.text()).toContain("再武装·建仓线（第1档）");
     expect(w.text()).not.toContain("中粮糖业");
     // 三分类 ③ 反例：持仓 k=0 价格临区但分位 76.8% 远离时机线 → 不入段
     expect(w.text()).not.toContain("国电电力");
