@@ -98,6 +98,10 @@ function sigRowClass(row) {
   if (row.status === "approaching") return "sig-row-near";
   return "";
 }
+// v8.2.5c（Joel 2026-11-24）：分段计数「当前信号（N/M）」——N = 真正触发
+// （浅红行：active 价已破线 / touched 盘中已触回弹）个数，M = 当前段总行数。
+const sigHitCount = computed(() => sigActive.value.filter(
+  (s) => s.status === "active" || s.status === "touched").length);
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 
@@ -684,7 +688,8 @@ function pnlColor(v) {
       <p class="muted small">
         股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
         {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号线 = 下一档触发价 ·
-        「当前」= 信号区（action 非空）：**浅红行 = 真正触发**（价格已破线 /
+        「当前」= 信号区（action 非空），计数 **N/M**：N = 真正触发的个数
+        （浅红行），M = 总行数：**浅红行 = 真正触发**（价格已破线 /
         盘中已触线回弹，微信推送信号 = 其中时机门全过的行）；**浅灰行 =
         即将触发**（价格距触发线 ≤5%，到线即推）·
         「潜力信号」（v8.2.5）满足任一即入段：① 价格距触发线 ≤
@@ -706,7 +711,7 @@ function pnlColor(v) {
         ⏳ 数据湖正被灌数进程占用——策略参考暂不可用（仅列账本代码）；灌数结束后刷新。
       </div>
       <div class="sig-seg">
-        <button :class="{ on: sigSel === 'active' }" @click="sigSel = 'active'">当前信号（{{ sigActive.length }}）</button>
+        <button :class="{ on: sigSel === 'active' }" @click="sigSel = 'active'">当前信号（{{ sigHitCount }}/{{ sigActive.length }}）</button>
         <button :class="{ on: sigSel === 'approaching' }" @click="sigSel = 'approaching'">潜力信号（{{ sigApproach.length }}）</button>
         <button :class="{ on: sigSel === 'history' }" @click="sigSel = 'history'">历史信号（{{ sigHistoryAll.length }}）</button>
       </div>

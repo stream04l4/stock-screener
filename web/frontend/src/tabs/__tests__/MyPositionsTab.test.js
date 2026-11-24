@@ -967,13 +967,14 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
-    // 分段计数（v8.2.5 + v8.2.5b）：当前 = action 非空 5 只（神华/核电加仓
+    // 分段计数（v8.2.5 + v8.2.5b/c）：当前 = action 非空 5 只（神华/核电加仓
     // + 移动/大秦/中信特钢首仓——中信特钢 approaching 未到线，classify
-    // 预告 action，行着色浅灰）；潜力 = ①距线 ≤5% 或 ②分位≤50%：云南
-    // 铜业/紫金矿业/长江电力/交通银行/中国海油/山煤国际/国电电力（①）+
-    // 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外 + 62.3%>50）/
-    // 中粮糖业（-12.2% + 76.8%）不入
-    expect(w.text()).toContain("当前信号（5）");
+    // 预告 action，行着色浅灰）→ 计数 4/5（4 = 真正触发浅红行：神华/移动
+    // active + 核电 touched + 大秦 active；5 = 总行数）；潜力 = ①距线 ≤5%
+    // 或 ②分位≤50%：云南铜业/紫金矿业/长江电力/交通银行/中国海油/山煤国际/
+    // 国电电力（①）+ 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外 +
+    // 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）不入
+    expect(w.text()).toContain("当前信号（4/5）");
     expect(w.text()).toContain("潜力信号（8）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
