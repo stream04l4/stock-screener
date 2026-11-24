@@ -25,11 +25,13 @@
   --good-bright: #4ade80;      /* Toast 成功亮色（深色底上） */
   --bad-bright: #f87171;       /* Toast 失败亮色（深色底上） */
   --good-deep: #0f5c2e;        /* 绿色系按压（登录/按钮 hover 深色，原散落 #0f5c2e） */
-  --warn-soft: var(--warn-soft);        /* 徽章·运行/待处理 琥珀软底（原散落 ×4） */
-  --warn-ink: var(--warn-ink);         /* 徽章·琥珀深字 */
-  --warn-line: var(--warn-line);        /* 徽章·琥珀描边 */
-  --good-ink: var(--good-ink);         /* 徽章·成功深字（原散落 ×3） */
-  --good-line: var(--good-line);        /* 徽章·成功描边 */
+  /* v8.2.6 修复（v8.2.0 abb49c0 收编时误写成自引用 → 计算值为空 →
+     琥珀徽章无底无边、msg-ok 无绿边等 10 处样式失效；此处补回原散落 hex） */
+  --warn-soft: #fef3c7;          /* 徽章·运行/待处理 琥珀软底（原散落 ×4：.bdg-ma/.badge.blocked_quota/.lake-st-lagging/.lake-backfill） */
+  --warn-ink: #92400e;           /* 徽章·琥珀深字 */
+  --warn-line: #fde68a;          /* 徽章·琥珀描边 */
+  --good-ink: #166534;           /* 徽章·成功深字（原散落 ×3：.msg-ok/.badge.done/.bdg-div） */
+  --good-line: #bbf7d0;          /* 徽章·成功描边 */
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 * { box-sizing: border-box; }
@@ -598,7 +600,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 .sig-seg { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
 .sig-seg button {
   padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line);
-  background: var(--panel); color: var(--text); font-size: 13px; cursor: pointer;
+  background: var(--panel); color: var(--ink); font-size: 13px; cursor: pointer;
 }
 .sig-seg button:hover { border-color: var(--accent); color: var(--accent); }
 .sig-seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
