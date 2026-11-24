@@ -13,6 +13,11 @@ import { inTradingWindow } from "../live/tradingWindow.js";
 import { useTaskStore } from "../stores/taskStore.js";
 import SimpleTable from "../components/SimpleTable.vue";
 import Modal from "../components/Modal.vue";
+// v8.2.5e（Joel 2026-11-24：「策略信号区也像股票池一样，点击弹出个股信息弹窗」）：
+// 复用 StockPanoramaCard（湖页签/股票池同件：日K candlestick + 基础/估值/
+// 因子/分红/季报/前十大股东；自取 /api/lake/stock + /api/lake/kline TTL60s；
+// 关闭 → v-if 卸载 → 图表 dispose + 订阅自动丢弃）。
+import StockPanoramaCard from "./lake/StockPanoramaCard.vue";
 import { fmtPrice, fmtPct, fmtInt, fmtMoney } from "../utils/fmt.js";
 
 const store = useTaskStore();
@@ -52,6 +57,12 @@ function refresh() {
 // 定义点）；策略固定 = 当前策略（v7.0.29）；分段切换（active/approaching/history）。
 // ---------------------------------------------------------------------------
 const sigSel = ref("active"); // active | approaching | history
+// v8.2.5e：策略信号行点击 → 个股全景弹窗（股票池同件 StockPanoramaCard）。
+// null = 关闭；保留整行供标题展示 name+ts_code。
+const sigModalRow = ref(null);
+const sigModalTitle = computed(() => (sigModalRow.value
+  ? `${sigModalRow.value.name || ""} ${sigModalRow.value.ts_code} · 个股全景`
+  : ""));
 const { data: sigData, loading: sigLoading, error: sigError } =
   useLiveQuery("strategy_signals",
                gatedFetch("strategy_signals", "/api/strategy_signals"),
@@ -704,6 +715,7 @@ function pnlColor(v) {
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天**微信推送过的真实触发信号**
         （未推送的状态机回放记录不显示）
+        · 点击行 → 个股全景弹窗（日K线 + 基础信息，与股票池同件）
         · 10年回测 = 策略十年回放
         <span v-if="sigData?.price_source === 'spot'">
           · 价源：实时行情{{ sigData.spot_time ? " " + sigData.spot_time : "" }}</span>
@@ -721,18 +733,25 @@ function pnlColor(v) {
       <p v-if="sigLoading && !sigData" class="placeholder">加载中…</p>
       <p v-else-if="sigError && !sigData" class="msg-err">加载失败: {{ sigError.message }}</p>
       <template v-else-if="sigData">
+        <!-- v8.2.5e：行点击 → 个股全景弹窗（股票池同件） -->
         <SimpleTable v-if="sigSel !== 'history'" :rows="sigShown"
                      :cols="sigSel === 'active' ? SIG_ACTIVE_COLS : SIG_APPROACH_COLS"
                      :row-class="sigRowClass"
-                     empty="（无）" />
+                     empty="（无）" @row-click="(r) => (sigModalRow = r)" />
         <template v-else>
-          <SimpleTable :rows="sigShown" :cols="SIG_HISTORY_COLS" empty="（历史无触发）" />
+          <SimpleTable :rows="sigShown" :cols="SIG_HISTORY_COLS" empty="（历史无触发）"
+                       @row-click="(r) => (sigModalRow = r)" />
           <p v-if="sigHistoryAll.length > SIG_HISTORY_CAP" class="muted small">
             仅显示最近 {{ SIG_HISTORY_CAP }} 条
           </p>
         </template>
       </template>
     </div>
+
+    <!-- v8.2.5e：策略信号行点击弹窗——个股全景（K线 + 基础信息，股票池/湖页签同件） -->
+    <Modal :open="!!sigModalRow" :title="sigModalTitle" @close="sigModalRow = null">
+      <StockPanoramaCard v-if="sigModalRow" :code="sigModalRow.ts_code" />
+    </Modal>
 
     <!-- 行点击弹层：策略参考 + 编辑 + 交易登记 + 交易历史 + 回测逐笔 -->
     <Modal :open="!!modalRow" :title="(modalRow && modalRow.name) || '持仓详情'"

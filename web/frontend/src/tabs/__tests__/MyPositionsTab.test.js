@@ -313,6 +313,14 @@ function mockApi(my, trades = [], signals = SIG_EMPTY) {
       };
       return { q, results: SUG[q] || [] };
     }
+    if (path.startsWith("/api/lake/")) {
+      // v8.2.5e：信号行点击弹窗（StockPanoramaCard）取 /api/lake/stock +
+      // /api/lake/kline——测试返回 404 → 卡片走「数据湖无此股（T1 未灌入）」
+      // 占位分支（不挂 ECharts/canvas）。
+      const e = new Error("not found in lake");
+      e.status = 404;
+      throw e;
+    }
     throw new Error("unmocked: " + path);
   });
 }
@@ -1103,6 +1111,26 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     const w = mk();
     await flushPromises();
     expect(w.text()).toContain("数据湖正被灌数进程占用");
+    w.unmount();
+  });
+
+  it("v8.2.5e：信号行点击 → 个股全景弹窗（股票池同件；关闭即卸载）", async () => {
+    mockApi(MY, [], SIG);
+    const w = mk();
+    await flushPromises();
+    // 当前信号段点「中国神华」行（限定策略信号卡片内，避开持仓表同名行）
+    const card = w.findAll(".card").find((c) => c.text().includes("策略信号"));
+    const row = card.findAll("tbody tr").find((tr) => tr.text().includes("中国神华"));
+    await row.trigger("click");
+    await flushPromises();
+    // 弹窗标题 = name + ts_code + 「· 个股全景」（与股票池同一文案）
+    expect(w.text()).toContain("中国神华 sh.601088 · 个股全景");
+    // 全景卡已挂载：测试里 /api/lake/stock 404 → 占位分支（不挂 ECharts）
+    expect(w.text()).toContain("数据湖无此股（T1 未灌入）");
+    // 关闭（✕）→ 弹窗与全景卡卸载
+    await w.find(".modal .mini-btn").trigger("click");
+    await flushPromises();
+    expect(w.text()).not.toContain("· 个股全景");
     w.unmount();
   });
 });
