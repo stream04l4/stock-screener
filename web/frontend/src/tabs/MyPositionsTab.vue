@@ -102,7 +102,11 @@ function sigRowClass(row) {
 // （浅红行：active 价已破线 / touched 盘中已触回弹）个数，M = 当前段总行数。
 const sigHitCount = computed(() => sigActive.value.filter(
   (s) => s.status === "active" || s.status === "touched").length);
-const sigHistoryAll = computed(() => sigData.value?.history || []);
+// v8.2.5d（Joel 2026-11-24）：历史信号只显示**微信推送过的真实触发信号**
+// （pushed=true = 该档点位提醒已推微信）；状态机回放中未推送的记录（含
+// 未推送的触碰事件）不展示。
+const sigHistoryAll = computed(() =>
+  (sigData.value?.history || []).filter((h) => h.pushed));
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 
 // 档位标签：策略首笔（k=0 且本轮首买）=「首仓」，其余 =「第 N 档」（N=k+1）
@@ -198,8 +202,7 @@ const sigShown = computed(() => {
     status_tag: h.held ? "● 持仓" : "○ 非持仓",
     level_label: levelLabel(h.level, h.first_of_round),
     lots_s: h.lots == null ? "—" : `${h.lots} 手`,
-    amount_w: fmtWan(h.amount),
-    pushed_s: h.pushed ? "✓ 已推" : "—"}));
+    amount_w: fmtWan(h.amount)}));
 });
 const SIG_ACTIVE_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
@@ -221,7 +224,6 @@ const SIG_HISTORY_COLS = [
   ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["level_label", "档位"], ["price", "触发价", true, fmtPrice],
   ["lots_s", "手数"], ["amount_w", "金额(万)", true],
-  ["pushed_s", "微信推送"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -700,7 +702,8 @@ function pnlColor(v) {
         「下一档手数」= 触发价到线将买的手数（首仓/二次建仓 =
         首仓手数，加仓档 = 首仓 + 档×步长；不受时机门影响）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
-        · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天（「微信推送」= 该档已推过点位提醒）
+        · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天**微信推送过的真实触发信号**
+        （未推送的状态机回放记录不显示）
         · 10年回测 = 策略十年回放
         <span v-if="sigData?.price_source === 'spot'">
           · 价源：实时行情{{ sigData.spot_time ? " " + sigData.spot_time : "" }}</span>

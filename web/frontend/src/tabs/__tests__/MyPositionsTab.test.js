@@ -73,7 +73,8 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 时机未过【江苏银行：不入当前信号段，v7.0.23 时机门】+ 非持仓模拟已建仓
 // 时机未过【紫金矿业：不入段】）/ 1 touched（持仓盘中触碰已触回）/
 // 3 即将进入价格带（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1
-// 【不入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
+// 【不入段】）/ 4 历史（v8.2.5d：前端仅显示 pushed=true 的 1 条——微信推送
+// 过的真实触发信号；含 1 条未推送触碰事件，被滤出）
 // v8.2.5（Joel 2026-11-24 定案，分区重规整）+ v8.2.5b 行着色：
 // 「当前信号」= 信号区（action 非空）。classify_signal 对 approaching
 // 也返回 action 预告 → 未到线行也在本段，位置不变、行着色区分：浅红
@@ -976,7 +977,7 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）不入
     expect(w.text()).toContain("当前信号（4/5）");
     expect(w.text()).toContain("潜力信号（8）");
-    expect(w.text()).toContain("历史信号（4）");
+    expect(w.text()).toContain("历史信号（1）"); // v8.2.5d：仅微信推送过的记录
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
     expect(w.text()).toContain("● 持仓");
     expect(w.text()).toContain("○ 非持仓");
@@ -1084,18 +1085,15 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("4 手");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
-    // 历史日期降序：2026-11-02 在前，2026-10-11 在后
-    const idx1102 = w.text().indexOf("2026-11-02");
-    const idx1011 = w.text().indexOf("2026-10-11");
-    expect(idx1102).toBeGreaterThanOrEqual(0);
-    expect(idx1011).toBeGreaterThanOrEqual(idx1102);
-    // 档位标签：首仓（first_of_round && level=0）+ 第2档（level=1）
-    expect(w.text()).toContain("首仓");
+    // v8.2.5d（Joel 2026-11-24）：历史只显示微信推送过的真实触发信号
+    // （pushed=true）——fixture 4 条中仅神华 2026-11-02 已推；未推送的
+    // 核电触碰事件 / 神华 10-20 首仓 / 长江 10-11 首仓 不显示
+    expect(w.text()).toContain("历史信号（1）");
+    // 档位标签：第2档（level=1，first_of_round=false）
     expect(w.text()).toContain("第2档");
-    // 微信推送标记：第1档 2026-11-02 已推 ✓，其余 —
-    expect(w.text()).toContain("✓ 已推");
-    // 触碰事件行（source=touch，收盘 job 落盘次日移入历史）
-    expect(w.text()).toContain("中国核电");
+    // 未推送的触碰事件行（中国核电 source=touch, pushed=false）被滤出
+    expect(w.text()).not.toContain("中国核电");
+    expect(w.text()).not.toContain("2026-10-11");
     w.unmount();
   });
 
