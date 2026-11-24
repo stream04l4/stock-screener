@@ -118,7 +118,8 @@ const COLS = [
 .pm-note { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
 .pm-err { color: var(--bad); font-size: 13px; margin: 6px 0; }
 /* v8.2.0 补：今日候选行浅绿高亮（:deep 穿透 SimpleTable 作用域） */
-.pm :deep(tr.row-candidate) { background: #eefaf0; }
-.pm :deep(tr.row-candidate td) { border-top-color: #d3f0da; }
-.pm :deep(tr.row-candidate):hover { background: #e2f6e6; }
+.pm :deep(tr.row-candidate) { background: var(--good-soft); }
+.pm :deep(tr.row-candidate td) { border-top-color: var(--good-line); }
+/* v8.2.7：hover 用令牌 color-mix 加深（原裸 hex #e2f6e6 收编） */
+.pm :deep(tr.row-candidate):hover { background: color-mix(in srgb, var(--good-soft) 85%, var(--good)); }
 </style>

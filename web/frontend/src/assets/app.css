@@ -32,6 +32,8 @@
   --warn-line: #fde68a;          /* 徽章·琥珀描边 */
   --good-ink: #166534;           /* 徽章·成功深字（原散落 ×3：.msg-ok/.badge.done/.bdg-div） */
   --good-line: #bbf7d0;          /* 徽章·成功描边 */
+  /* v8.2.7（Joel 2026-11-24 风格归一）：顶栏/深底灰字散落 ×3 收编 */
+  --topbar-muted: #98a2b3;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 * { box-sizing: border-box; }
@@ -55,7 +57,7 @@ body {
   display: flex; align-items: baseline; min-width: 0;
 }
 .brand .sub {
-  font-size: 12px; font-weight: 400; color: #98a2b3; margin-left: 8px;
+  font-size: 12px; font-weight: 400; color: var(--topbar-muted); margin-left: 8px;
   flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .tabs { display: flex; gap: 6px; }
@@ -65,7 +67,7 @@ body {
 }
 .tab:hover { background: #1d2a44; color: #fff; }
 .tab.active { background: var(--accent); color: #fff; font-weight: 600; }
-.global-status { margin-left: auto; font-size: 12px; color: #98a2b3; }
+.global-status { margin-left: auto; font-size: 12px; color: var(--topbar-muted); }
 
 main { max-width: 1400px; margin: 0 auto; padding: 18px 22px 40px; }
 .tab-panel { display: none; }
@@ -171,7 +173,7 @@ table.data tbody tr.sig-row-near { background: var(--bg-soft); }
 .pager { display: flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 13px; }
 .pager button {
   border: 1px solid var(--line); background: var(--panel); border-radius: 6px;
-  padding: 4px 10px; cursor: pointer;
+  padding: 4px 10px; cursor: pointer; font-size: 13px;
 }
 .pager button:disabled { opacity: .4; cursor: default; }
 .pager button.cur { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -351,7 +353,7 @@ tr.clickable { cursor: pointer; }
   background: var(--warn-soft); color: var(--warn-ink); border: 1px solid var(--warn-line);
   padding: 12px 14px; border-radius: 9px; margin-bottom: 14px;
 }
-.lake-backfill-head { font-size: 15px; font-weight: 700; }
+.lake-backfill-head { font-size: 14px; font-weight: 700; }
 /* v6.1.2 P2-A：琥珀块总进度行（done/total 合计 + 进度条 + 预计剩余） */
 .lake-backfill-total { display: flex; align-items: center; gap: 8px; margin: 8px 0 10px; }
 .lake-backfill-total-track { flex: 1; max-width: 420px; height: 9px; margin: 0; }
@@ -443,7 +445,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 /* 区间切换按钮组：复用 .mini-btn 视觉语言，选中态用 accent 高亮 */
 .lake-kline-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; flex-wrap: wrap; }
 .lake-kline-range { border: 1px solid var(--line); background: var(--panel); color: var(--muted);
-  border-radius: 6px; cursor: pointer; padding: 2px 10px; font-size: 12px; }
+  border-radius: 6px; cursor: pointer; padding: 2px 10px; font-size: 13px; }
 .lake-kline-range:hover { color: var(--accent); border-color: var(--accent); }
 .lake-kline-range.cur { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 /* v6.1.2 P1-A：复权三态切换（区间按钮组旁）——分隔符 + 降级提示小字 */
@@ -472,7 +474,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 }
 .lake-kline-tip .tt-date { font-weight: 700; margin-bottom: 2px; }
 .lake-kline-tip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
-.lake-kline-tip .tt-k { color: #98a2b3; }
+.lake-kline-tip .tt-k { color: var(--topbar-muted); }
 .lake-kline-tip .tt-v { font-family: var(--mono); }
 /* 空态/错误态占位（与页面既有 .placeholder 一致，不白屏） */
 .lake-kline-empty { padding: 46px 0; text-align: center; color: var(--muted); font-size: 13px; }
@@ -589,7 +591,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 .signal-row:first-of-type { border-top: none; }
 .signal-row b { font-size: 14px; }
 .signal-tag {
-  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
   font-size: 12px; font-weight: 700; white-space: nowrap;
 }
 .tag-buy { background: #ffe0b2; color: #e65100; }   /* 买入·首仓：橙 */
@@ -608,7 +610,7 @@ tr.lake-row-muted .badge { opacity: .85; }
 /* ---------- v7.0.17 实盘交易历史（我的持仓弹层） ---------- */
 .trade-hist { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; table-layout: fixed; }
 .trade-hist th, .trade-hist td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
-.trade-hist thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.trade-hist thead th { background: var(--bg-soft); color: var(--ink); font-weight: 600; }
 .trade-hist td.num, .trade-hist th.num { text-align: right; font-family: var(--mono); }
 .trade-hist tbody tr:hover { background: var(--accent-soft); }
 /* v8.2.0 列对齐（Joel 2026-11-13）：固定布局 + 两表日期列同宽，
@@ -621,10 +623,10 @@ tr.lake-row-muted .badge { opacity: .85; }
 
 /* ---------- v8.2.0 手动加仓时间线（我的持仓弹层，自动记录） ---------- */
 .buys-timeline { margin: 10px 0 4px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: 8px; }
-.buys-timeline h4 { margin: 0 0 4px; font-size: 13px; }
+.buys-timeline h4 { margin: 0 0 4px; font-size: 14px; }
 .buys-tbl { border-collapse: collapse; width: 100%; font-size: 13px; table-layout: fixed; }
 .buys-tbl th, .buys-tbl td { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
-.buys-tbl thead th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.buys-tbl thead th { background: var(--bg-soft); color: var(--ink); font-weight: 600; }
 .buys-tbl td.num, .buys-tbl th.num { text-align: right; font-family: var(--mono); }
 
 /* ---------- v7.0.37 回测页统一排版（Joel 2026-11-10「字体之类的统一排版」） ----------

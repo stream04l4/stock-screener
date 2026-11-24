@@ -132,12 +132,12 @@ function fmt(v, suffix = "") {
 .ts-push { background: rgba(20, 120, 60, 0.07); }
 .ts-badge {
   display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 11px;
-  color: #fff; background: var(--good); border-radius: 8px; vertical-align: 1px;
+  color: #fff; background: var(--good); border-radius: 999px; vertical-align: 1px;
 }
 .ts-reasons { font-size: 12px; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
 .ts-op { min-width: 0; overflow-wrap: anywhere; }
 .ts-btn {
-  font-size: 12px; padding: 2px 10px; border: 1px solid var(--line);
+  font-size: 13px; padding: 2px 10px; border: 1px solid var(--line);
   border-radius: 6px; background: var(--panel); cursor: pointer; white-space: nowrap;
 }
 .ts-btn:hover:not(:disabled) { border-color: var(--good); color: var(--good); }

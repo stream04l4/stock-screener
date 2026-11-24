@@ -179,7 +179,7 @@ const entries = computed(() => {
   margin-top: 12px; padding: 10px 12px;
   border-top: 1px dashed var(--line);
 }
-.mpb-head { font-size: 13px; color: var(--ink); margin-bottom: 8px; }
+.mpb-head { font-size: 14px; color: var(--ink); margin-bottom: 8px; }
 .mpb-muted { color: var(--muted); font-size: 12px; }
 .mpb-row { display: flex; align-items: center; gap: 8px; }
 .mpb-wrap { position: relative; }
@@ -192,7 +192,7 @@ const entries = computed(() => {
   max-height: 240px; overflow: auto;
 }
 .mpb-sug li { padding: 6px 12px; font-size: 13px; cursor: pointer; }
-.mpb-sug li.hi, .mpb-sug li:hover { background: var(--bg-soft); }
+.mpb-sug li.hi, .mpb-sug li:hover { background: var(--accent-soft); }
 .mpb-ind { color: var(--muted); margin-left: 8px; font-size: 12px; }
 .mpb-btn { padding: 4px 14px; }
 .mpb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -205,6 +205,6 @@ const entries = computed(() => {
 .mpb-name { color: var(--ink); }
 .mpb-x {
   border: none; background: none; cursor: pointer; color: var(--bad);
-  font-size: 14px; line-height: 1; padding: 0 2px;
+  font-size: 12px; line-height: 1; padding: 0 2px;
 }
 </style>

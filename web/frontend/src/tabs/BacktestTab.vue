@@ -487,7 +487,7 @@ onMounted(loadHistory);
 <style scoped>
 /* v8.2.0 补（Joel 2026-11-13）：回测窗口快捷按钮（近 20/10/5 年） */
 .bt-quick {
-  padding: 3px 10px; font-size: 12px; border: 1px solid var(--line); border-radius: 6px;
+  padding: 3px 10px; font-size: 13px; border: 1px solid var(--line); border-radius: 6px;
   background: var(--panel); color: var(--ink); cursor: pointer; white-space: nowrap;
 }
 .bt-quick:hover:not(:disabled) { border-color: var(--muted); background: var(--bg-soft); }
@@ -503,6 +503,6 @@ onMounted(loadHistory);
   max-height: 240px; overflow: auto;
 }
 .bt-codes-sug li { padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
-.bt-codes-sug li.hi, .bt-codes-sug li:hover { background: var(--bg-soft); }
+.bt-codes-sug li.hi, .bt-codes-sug li:hover { background: var(--accent-soft); }
 .bt-codes-ind { color: var(--muted); margin-left: 8px; font-size: 12px; }
 </style>
