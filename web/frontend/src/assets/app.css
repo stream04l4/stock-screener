@@ -150,6 +150,11 @@ table.data thead th:hover { background: var(--bg-soft); }
 table.data thead th .sort-arrow { color: var(--accent); font-size: 11px; margin-left: 3px; }
 table.data tbody tr:hover { background: var(--accent-soft); }
 table.data td.num, table.data th.num { text-align: right; font-family: var(--mono); }
+/* v8.2.5b（Joel 2026-11-24）：策略信号行着色——浅红 = 真正触发
+   （价已破线 active / 盘中已触回弹 touched），浅灰 = 即将触发（approaching）。
+   用于 /api/strategy_signals 的「当前」「潜力信号」两段表格。 */
+table.data tbody tr.sig-row-hit { background: var(--bad-soft); }
+table.data tbody tr.sig-row-near { background: var(--bg-soft); }
 .tag-pass { color: var(--good); font-weight: 600; }
 /* NOTE-2：占位符「—」对比度需 ≥3.0:1（白底）；#b3bac7 仅 1.95，加深到 var(--muted)（≈4.76） */
 .tag-fail { color: var(--muted); }

@@ -59,10 +59,14 @@ const { data: sigData, loading: sigLoading, error: sigError } =
 
 const SIG_HISTORY_CAP = 200; // 历史信号展示上限（全量仍在 API 里，前端截断）
 const sigStocks = computed(() => sigData.value?.stocks || []);
-// **v8.2.5（Joel 2026-11-24 定案）：当前信号区 = 需要下单的信号 = 微信推送
-// 信号**——入区唯一条件 action 非空（价格到线 且 时机门全过：持仓加仓 /
-// 二次建仓 + 非持仓首仓，即当天推送窗口会推微信的那批）。旧「touched 保留
-// 到当日」（11-23 定案）作废——触线但时机未过不再入本段（去潜力信号段）。
+// **v8.2.5（Joel 2026-11-24 定案）+ v8.2.5b 行着色：当前信号区 = 信号区**——
+// 入区条件 action 非空。注意 classify_signal 对 approaching（距线 ≤5% 未到
+// 线）也返回 action（「到线将执行的动作」预告），故本段含「已触发」与
+// 「即将触发」两类行——位置不变、以行着色区分（sigRowClass）：浅红 = 真正
+// 触发（active 价已破线 / touched 盘中已触回弹），浅灰 = 即将触发
+// （approaching 价在线上方 5% 内）。微信推送信号 = 浅红行（价格到线 且
+// 时机门全过）。旧「touched 保留到当日」（11-23 定案）作废——触线但时机
+// 未过（action 空）不入本段（去潜力信号段）。
 const sigActive = computed(() => sigStocks.value.filter((s) => s.action != null));
 // **潜力信号区**（v8.2.5 改名「即将进入」，Joel 2026-11-24 定案）——满足
 // 任一即入段：
@@ -84,6 +88,16 @@ const sigApproach = computed(() => {
     return nearLine || nearPct;
   });
 });
+// **v8.2.5b 行着色（Joel 2026-11-24 定案）**：「当前」「潜力信号」段位置
+// 不变，以行底色区分触发状态——浅红（sig-row-hit）= 真正触发（价已破线
+// active / 盘中已触回弹 touched）；浅灰（sig-row-near）= 即将触发（价在
+// 线上方 5% 内 approaching）。classify_signal 对 approaching 也返回
+// action 预告，不靠入区条件区分，故须着色。
+function sigRowClass(row) {
+  if (row.status === "active" || row.status === "touched") return "sig-row-hit";
+  if (row.status === "approaching") return "sig-row-near";
+  return "";
+}
 const sigHistoryAll = computed(() => sigData.value?.history || []);
 const sigHistory = computed(() => sigHistoryAll.value.slice(0, SIG_HISTORY_CAP));
 
@@ -670,8 +684,9 @@ function pnlColor(v) {
       <p class="muted small">
         股票池 ∪ 我的持仓（实时价覆盖 = 持仓 ∪ 湖最后收盘距触发线 ≤
         {{ sigData?.spot_preselect_pct ?? 10 }}%，其余用最新收盘）· 信号线 = 下一档触发价 ·
-        「当前」= 需要下单的信号 = **微信推送信号**（价格到线 且 时机门全过：
-        持仓加仓/二次建仓 + 非持仓首仓）·
+        「当前」= 信号区（action 非空）：**浅红行 = 真正触发**（价格已破线 /
+        盘中已触线回弹，微信推送信号 = 其中时机门全过的行）；**浅灰行 =
+        即将触发**（价格距触发线 ≤5%，到线即推）·
         「潜力信号」（v8.2.5）满足任一即入段：① 价格距触发线 ≤
         {{ sigData?.approach_pct ?? 5 }}%（绝对距离，含已破线但时机未过——「距触发」列
         带符号：+ 线上方 / − 已破线）② 5年分位 ≤50%（含已过门的 ≤40%，
@@ -700,6 +715,7 @@ function pnlColor(v) {
       <template v-else-if="sigData">
         <SimpleTable v-if="sigSel !== 'history'" :rows="sigShown"
                      :cols="sigSel === 'active' ? SIG_ACTIVE_COLS : SIG_APPROACH_COLS"
+                     :row-class="sigRowClass"
                      empty="（无）" />
         <template v-else>
           <SimpleTable :rows="sigShown" :cols="SIG_HISTORY_COLS" empty="（历史无触发）" />

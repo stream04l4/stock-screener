@@ -74,10 +74,13 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 时机未过【紫金矿业：不入段】）/ 1 touched（持仓盘中触碰已触回）/
 // 3 即将进入价格带（v7.0.22：持仓 1 + 非持仓时机过 1 + 非持仓时机未过 1
 // 【不入段】）/ 4 历史（含微信推送标记 + 1 条触碰事件）
-// v8.2.5（Joel 2026-11-24 定案，分区重规整）：
-// 「当前信号」= 需要下单的信号 = **微信推送信号**（action 非空：到线且
-// 时机门全过）。11-23「touched 保留到当日」作废——触线但时机未过不入段
-// （云南铜业 → 潜力信号区）。
+// v8.2.5（Joel 2026-11-24 定案，分区重规整）+ v8.2.5b 行着色：
+// 「当前信号」= 信号区（action 非空）。classify_signal 对 approaching
+// 也返回 action 预告 → 未到线行也在本段，位置不变、行着色区分：浅红
+// sig-row-hit = 真正触发（active/touched，其中时机门全过 = 微信推送
+// 信号），浅灰 sig-row-near = 即将触发（approaching）。fixture 中信特钢
+// （+2.01% approaching + action=buy）即浅灰行实案。11-23「touched 保留
+// 到当日」作废——触线但时机未过（action 空）不入段（云南铜业 → 潜力段）。
 // 「潜力信号」（原「即将进入」）满足任一即入段：① 价格距触发线 ≤5%
 // （绝对距离，含已破线）② 5年分位 ≤50%（无下界，含已过门 ≤40%）；与
 // 「当前」互斥。fixture 分布：
@@ -89,7 +92,7 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   spot_preselect_pct: 10, spot_fetched: 9,
-  price_source: "spot", spot_time: "20261107093000", n_stocks: 11,
+  price_source: "spot", spot_time: "20261107093000", n_stocks: 12,
   history_window_days: 90,
   stocks: [
     { ts_code: "sh.601088", name: "中国神华", held: true, in_pos: true, k_level: 1,
@@ -145,6 +148,18 @@ const SIG = {
       action: "buy", suggested_lots: 1, n_history: 0, end_date: "2026-11-06",
       timing_ok: true, timing_reasons: "✓ 5年分位 19.1%（需≤40%） · ✓ 股息率 4.58%（需≥4.5%）",
       bt_pnl_pct: 120.4, bt_n_buys: 7 },
+    // v8.2.5b（中信特钢实案，Joel 2026-11-24）：非持仓 + in_pos=true（策略
+    // 已建仓）+ 价未到线（+2.01% approaching）→ classify_signal 对
+    // approaching 也返回 action 预告（「买入·首仓 2 手」到线执行）→ 仍入
+    // 「当前」段（Joel：位置不变）但标浅灰「即将触发」sig-row-near；真正
+    // 触发行（active/touched）标浅红 sig-row-hit——着色即区分
+    { ts_code: "sz.000708", name: "中信特钢", held: false, in_pos: true, k_level: 1,
+      price: 12.60, next_add_price_raw: 12.3519, status: "approaching", touched: false,
+      day_low: 12.46, distance_pct: 2.01,
+      action: "buy", suggested_lots: 2, n_history: 0, end_date: "2026-11-23",
+      timing_ok: true, timing_pctile: 33.2,
+      timing_reasons: "✓ 5年分位 33.2%（实时，需≤40%）",
+      bt_pnl_pct: 31.05, bt_n_buys: 19 },
     // v8.2.5：未到线（价在线上方 +2.0%）→ action 必为 null（旧 fixture 的
     // action:"add" 与 status=approaching 矛盾，已修正）
     { ts_code: "sh.600900", name: "长江电力", held: true, in_pos: true, k_level: 0,
@@ -952,12 +967,13 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
     expect(w.text()).toContain("实时行情"); // price_source=spot
-    // 分段计数（v8.2.5）：当前 = action 非空 4 只（神华/核电加仓 + 移动/大秦
-    // 首仓；长江电力/交通银行未到线 → action=null → 潜力段）；潜力 = ①距线
-    // ≤5% 或 ②分位≤50%：云南铜业/紫金矿业/长江电力/交通银行/中国海油/山煤
-    // 国际/国电电力（①）+ 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外
-    // + 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）不入
-    expect(w.text()).toContain("当前信号（4）");
+    // 分段计数（v8.2.5 + v8.2.5b）：当前 = action 非空 5 只（神华/核电加仓
+    // + 移动/大秦/中信特钢首仓——中信特钢 approaching 未到线，classify
+    // 预告 action，行着色浅灰）；潜力 = ①距线 ≤5% 或 ②分位≤50%：云南
+    // 铜业/紫金矿业/长江电力/交通银行/中国海油/山煤国际/国电电力（①）+
+    // 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外 + 62.3%>50）/
+    // 中粮糖业（-12.2% + 76.8%）不入
+    expect(w.text()).toContain("当前信号（5）");
     expect(w.text()).toContain("潜力信号（8）");
     expect(w.text()).toContain("历史信号（4）");
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
@@ -991,6 +1007,19 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).not.toContain("中国石化");
     // 时机门：逐条件 ✓/✓ 明细（无总判定前缀——全 ✓ 即过、任一 ✗ 即未过）
     expect(w.text()).toContain("✓ 5年分位 21.9%（需≤40%） · ✓ 股息率 4.59%（需≥4.5%）");
+    // v8.2.5b 行着色（Joel 2026-11-24）：真正触发行浅红 / 即将触发行浅灰，
+    // 位置不变仅底色区分（限定信号卡片内——「我的持仓」表同名单行无此 class）
+    const sigCard = w.findAll(".card").find((c) => c.text().includes("策略信号"));
+    const actRows = sigCard.findAll("tbody tr");
+    const rowOf = (nm) => actRows.find((tr) => tr.text().includes(nm));
+    expect(rowOf("中国神华").classes()).toContain("sig-row-hit"); // active 价已破线
+    expect(rowOf("中国移动").classes()).toContain("sig-row-hit"); // active
+    expect(rowOf("中国核电").classes()).toContain("sig-row-hit"); // touched 盘中已触回弹
+    expect(rowOf("大秦铁路").classes()).toContain("sig-row-hit"); // active
+    expect(rowOf("中信特钢").classes()).toContain("sig-row-near"); // approaching 未到线
+    expect(rowOf("中信特钢").classes()).not.toContain("sig-row-hit");
+    expect(rowOf("中信特钢").text()).toContain("买入·首仓");
+    expect(rowOf("中信特钢").text()).toContain("2 手");
     // 十年回测列：+88.5% · 6档（持仓神华）/ 无回测 → —
     expect(w.text()).toContain("+88.5% · 6档");
     expect(w.text()).toContain("+45.2% · 4档");
@@ -1037,6 +1066,14 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(ynRow.text()).toContain("+1.1%");
     expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
     expect(ynRow.text()).toContain("✗ 5年分位 62.3%（需≤40%）");
+    // v8.2.5b：潜力段同口径着色——云南铜业 touched（真触过线）浅红；
+    // 长江电力 approaching（未到线）浅灰（限定信号卡片内）
+    const potCard = w.findAll(".card").find((c) => c.text().includes("策略信号"));
+    const potRows = potCard.findAll("tbody tr");
+    const potRowOf = (nm) => potRows.find((tr) => tr.text().includes(nm));
+    expect(potRowOf("云南铜业").classes()).toContain("sig-row-hit");
+    expect(potRowOf("长江电力").classes()).toContain("sig-row-near");
+    expect(potRowOf("中国海油").classes()).toContain("sig-row-near");
     // 边界：江苏银行 -5.9%（超 5% 带）+ 62.3%>50 → 不入段
     expect(w.text()).not.toContain("江苏银行");
     // 「下一档手数」列——next_lots 单点原值（时机未过的山煤/石化也显示首仓
