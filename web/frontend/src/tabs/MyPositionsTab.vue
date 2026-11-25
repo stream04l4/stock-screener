@@ -79,26 +79,75 @@ const sigStocks = computed(() => sigData.value?.stocks || []);
 // 时机门全过）。旧「touched 保留到当日」（11-23 定案）作废——触线但时机
 // 未过（action 空）不入本段（去潜力信号段）。
 const sigActive = computed(() => sigStocks.value.filter((s) => s.action != null));
-// **潜力信号区**（v8.2.5 改名「即将进入」，Joel 2026-11-24 定案）——满足
-// 任一即入段：
-// ① 价格距触发线 ≤ approach_pct%（绝对距离；非持仓/持仓 k=0 = 首仓线，
-//    持仓 k≥1 = 下一加仓线；含「已破线但时机未过」的 touched 行）；
-// ② 5年分位 ≤ 50%（price_pctile_max + 10，**无下界**——含已过门的 ≤40%，
-//    「门过了等价格」的潜力股也显示；如分位 20% 距线再远也入段）。
-// 与当前信号段**互斥**：action 非空（微信推送信号）只展示在「当前」。
+// **潜力信号区**（v8.2.5 改名；v8.2.9 重定案，Joel 2026-11-25 定案）——满足
+// 任一即入段（与当前信号段互斥：action 非空只展示在「当前」）：
+// ① 价格路（k 分支）：
+//    - k=0（首仓线）：距本轮高点 H 回撤 ≥ (first_dd − approach) 个百分点
+//      （H = 首仓线/(1−first_dd)；首仓线本身在 H 的 −first_dd 处，故入口 ≈
+//      「首仓线上方 approach% 带」，线下方无界——深跌已破线仍显示）；
+//    - k≥1（加仓轮）：距下一档线 ≤ approach%（带符号、下方无界）。
+// ② 5年分位 ≤ 50%（price_pctile_max + 10，**无下界**——含已过门的 ≤40%）。
 // 分位缺失（无时机数据 fail-closed）→ 仅 ① 路可入。
 const sigApproach = computed(() => {
   const band = Number(sigData.value?.approach_pct ?? 5);
   const pctCap = Number(sigData.value?.price_pctile_max ?? 40) + 10; // 50%
+  const fdPct = Number(sigData.value?.first_drawdown_pct ?? 15);
+  const entryDd = fdPct - band; // 首仓路入区回撤 = 首仓线上移 approach 个点到 H 基准
   return sigStocks.value.filter((s) => {
     if (s.action != null) return false; // 当前信号段优先
-    const dist = s.distance_pct;
-    const nearLine = dist != null && Math.abs(dist) <= band;
     const pct = s.timing_pctile;
     const nearPct = typeof pct === "number" && pct <= pctCap;
-    return nearLine || nearPct;
+    if (nearPct) return true;
+    const dist = s.distance_pct;
+    const k = Number(s.k_level ?? 0);
+    if (k === 0) {
+      // H = 首仓线/(1−first_dd)；回撤 ≥ entryDd% 入区（线下方无界）
+      const line = s.next_add_price_raw;
+      if (line == null || s.price == null || fdPct >= 100) return false;
+      const H = line / (1 - fdPct / 100);
+      return (1 - s.price / H) * 100 >= entryDd;
+    }
+    // k≥1：距下一档线 ≤band（带符号；已破线任意深度留在区内）
+    return dist != null && dist <= band;
   });
 });
+// v8.2.9（Joel 2026-11-25）：潜力区手数 = **逐档明细**——从档位基准往下每破
+// 一档记一档（第 j 档 = first_lots + j×add_lots_step 手）：
+// - k=0：基准 = 本轮高点 H，档线 L_j = H×(1−first_dd−j×add_step)（−15/−20/
+//   −25/… 阶梯）；
+// - k≥1：基准 = 加仓锚 P0（下一档线/(1−k×add_step)，v8.1.0 口径），从**当前
+//   k 的下一档**继续数（已触过的档不计——引擎已执行/已展示）。
+// 返回触档手数数组（未触档 = []）；参数缺失/无价 → null（前端「—」）。
+function potLotsCascade(s) {
+  const d = sigData.value;
+  if (!d || s.price == null || s.next_add_price_raw == null) return null;
+  const fd = (Number(d.first_drawdown_pct ?? 15) || 15) / 100;
+  const ast = (Number(d.add_step_pct ?? 5) || 5) / 100;
+  const fl = Number(d.first_lots ?? 2);
+  const als = Number(d.add_lots_step ?? 2);
+  const k = Number(s.k_level ?? 0);
+  const line = s.next_add_price_raw;
+  const out = [];
+  // 闭区间容差：价恰在档线 = 触档（与后端触发语义一致）；1e-9 相对容差消
+  // 浮点边界误判（如 H=8.5/0.85 的 −20% 档线 8.0）
+  const EPS = 1e-9;
+  if (k === 0) {
+    const H = line / (1 - fd); // 本轮高点
+    for (let j = 0; ; j++) {
+      const L = H * (1 - fd - j * ast);
+      if (L <= 0) break;
+      if (s.price <= L * (1 + EPS)) out.push(fl + j * als); else break;
+    }
+  } else {
+    const P0 = line / (1 - k * ast); // 加仓锚（下一档线 = P0×(1−k×ast)）
+    for (let j = k; ; j++) {
+      const L = P0 * (1 - j * ast);
+      if (L <= 0) break;
+      if (s.price <= L * (1 + EPS)) out.push(fl + j * als); else break;
+    }
+  }
+  return out;
+}
 // **v8.2.5b 行着色（Joel 2026-11-24 定案）**：「当前」「潜力信号」段位置
 // 不变，以行底色区分触发状态——浅红（sig-row-hit）= 真正触发（价已破线
 // active / 盘中已触回弹 touched）；浅灰（sig-row-near）= 即将触发（价在
@@ -189,16 +238,21 @@ const sigShown = computed(() => {
   }
   if (sigSel.value === "approaching") {
     return sigApproach.value.map((s) => ({ ...s,
-      // v8.2.5：入段条件（距线≤5% / 分位≤50%）由「距触发」「时机」列直接
+      // v8.2.9：入段条件（回撤分档 / 分位≤50%）由「距触发」「时机」列直接
       // 可见，状态列只标 持仓/非持仓/已触回
       status_tag: (s.held ? "● 持仓" : "○ 非持仓")
         + (s.touched ? " · 已触回" : ""),
       // 带符号：+ = 线上方（临近），− = 已破线（含时机未过）
       distance_s: (s.distance_pct != null
         ? (s.distance_pct >= 0 ? "+" : "") + s.distance_pct.toFixed(1) : "—") + "%",
-      // v8.2.0 补（Joel 2026-11-21）：下一档手数 = API next_lots（单点原值，
-      // 不受时机门/持仓已够门控——临近时机线的 k=0 行也显示首仓手数）
-      lots_s: s.next_lots == null ? "—" : `${s.next_lots} 手`,
+      // v8.2.9（Joel 2026-11-25）：逐档明细——从档位基准每破一档记一档
+      // （「2+4+6=12 手」；单档 =「2 手」；未触档 = 纯潜力股「—」）
+      lots_s: (() => {
+        const c = potLotsCascade(s);
+        if (!c || c.length === 0) return "—";
+        if (c.length === 1) return `${c[0]} 手`;
+        return c.join("+") + "=" + c.reduce((a, b) => a + b, 0) + " 手";
+      })(),
       // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓；
       // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
       // v8.2.4：该段行 action 恒 null → 档位一律「线」说法
@@ -227,8 +281,8 @@ const SIG_APPROACH_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true, fmtPrice], ["next_add_price_raw", "触发价", true, fmtPrice],
   ["distance_s", "距触发", true], ["level_label", "档位"],
-  // v8.2.0 补（Joel 2026-11-21）：下一档到线将买的手数（整数，格式三规则）
-  ["lots_s", "下一档手数"],
+  // v8.2.9（Joel 2026-11-25）：逐档明细（旧「下一档手数」= 单档 next_lots 退役）
+  ["lots_s", "逐档手数"],
   ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
 ];
 const SIG_HISTORY_COLS = [
@@ -705,13 +759,16 @@ function pnlColor(v) {
         （浅红行），M = 总行数：**浅红行 = 真正触发**（价格已破线 /
         盘中已触线回弹，微信推送信号 = 其中时机门全过的行）；**浅灰行 =
         即将触发**（价格距触发线 ≤5%，到线即推）·
-        「潜力信号」（v8.2.5）满足任一即入段：① 价格距触发线 ≤
-        {{ sigData?.approach_pct ?? 5 }}%（绝对距离，含已破线但时机未过——「距触发」列
-        带符号：+ 线上方 / − 已破线）② 5年分位 ≤50%（含已过门的 ≤40%，
+        「潜力信号」（v8.2.9）满足任一即入段：① 距本轮高点回撤 ≥
+        {{ (sigData?.first_drawdown_pct ?? 15) - (sigData?.approach_pct ?? 5) }}%
+        （首仓线路；线下方无界，深跌已破线仍显示）或加仓轮距下一档线 ≤
+        {{ sigData?.approach_pct ?? 5 }}%（带符号——「距触发」列
+        + 线上方 / − 已破线）② 5年分位 ≤50%（含已过门的 ≤40%，
         「门过了等价格」也显示；见「时机」列）；与「当前」互斥（达推送条件
         的只展示在「当前」）·
-        「下一档手数」= 触发价到线将买的手数（首仓/二次建仓 =
-        首仓手数，加仓档 = 首仓 + 档×步长；不受时机门影响）
+        「逐档手数」= 逐档明细：从本轮高点（加仓轮 = 加仓锚、自当前 k 下
+        一档起）每破一档记一档（「2+4+6=12 手」；未触档的纯潜力股 =「—」；
+        时机门未过故全留在本段）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天**微信推送过的真实触发信号**
         （未推送的状态机回放记录不显示）

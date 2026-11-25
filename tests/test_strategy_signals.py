@@ -52,7 +52,7 @@ from martingale.signals import (  # noqa: E402
 from martingale.data import LakeLocked  # noqa: E402
 
 SP = SimpleNamespace(name="drawdown_martingale", lot_size=100, first_lots=1,
-                     add_lots_step=1)  # v7.0.28 手数口径
+                     add_lots_step=1, first_drawdown=0.15, add_step=0.05)  # v7.0.28 手数口径；v8.2.9 档位参数
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +509,9 @@ def test_strategy_signals_main_contract(monkeypatch, tmp_path):
     assert out["strategy"] == "current"
     assert out["lake_locked"] is False
     assert out["approach_pct"] == DEFAULT_APPROACH_PCT == 5.0
+    # v8.2.9：档位参数随响应下发（前端潜力区逐档明细单点读，禁前端硬编码）
+    assert out["first_drawdown_pct"] == 15.0 and out["add_step_pct"] == 5.0
+    assert out["first_lots"] == 1 and out["add_lots_step"] == 1
     assert out["history_window_days"] == 90
     assert out["price_source"] == "spot"
     assert out["as_of"] == "2026-11-06"

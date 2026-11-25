@@ -2147,6 +2147,12 @@ def get_strategy_signals() -> Dict[str, Any]:
         "price_pctile_max": tp_obj.price_pctile_max,
         "lake_locked": lake_locked,
         "approach_pct": tp_obj.approach_pct,
+        # v8.2.9：档位参数随响应下发（前端潜力区「回撤分档手数」单点读 API，
+        # 不在前端硬编码策略阈值）；湖锁降级时 sp 缺失 → null（前端 ?? 兜底）
+        "first_drawdown_pct": sp_obj.first_drawdown * 100 if sp_obj else None,
+        "add_step_pct": sp_obj.add_step * 100 if sp_obj else None,
+        "first_lots": sp_obj.first_lots if sp_obj else None,
+        "add_lots_step": sp_obj.add_lots_step if sp_obj else None,
         "spot_preselect_pct": tp_obj.spot_preselect_pct,
         "price_source": price_source,
         "spot_time": spot_time,

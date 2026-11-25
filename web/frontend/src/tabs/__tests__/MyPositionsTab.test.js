@@ -82,16 +82,26 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // 信号），浅灰 sig-row-near = 即将触发（approaching）。fixture 中信特钢
 // （+2.01% approaching + action=buy）即浅灰行实案。11-23「touched 保留
 // 到当日」作废——触线但时机未过（action 空）不入段（云南铜业 → 潜力段）。
-// 「潜力信号」（原「即将进入」）满足任一即入段：① 价格距触发线 ≤5%
-// （绝对距离，含已破线）② 5年分位 ≤50%（无下界，含已过门 ≤40%）；与
-// 「当前」互斥。fixture 分布：
-// - ① 入段：云南铜业（+1.1% touched）/ 紫金矿业（-2.7%）/ 中国海油（+2.5%）/
-//   山煤国际（+2.1%）/ 国电电力（+2.1%）/ 长江电力（+2.0%）
-// - ② 入段：中国石化（45%；价 -5.6% 带外）
-// - ①② 入段：山煤国际（45%）/ 长江电力（38% 已过门）
-// - 不入段：江苏银行（-5.9% 带外 + 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）
+// 「潜力信号」（原「即将进入」）v8.2.9 重定案（Joel 2026-11-25）满足任一
+// 即入段：① 价格路——k=0 距本轮高点 H 回撤 ≥(first_dd−approach)=10%（线下方
+// 无界，深破线仍显示；H=首仓线/0.85）；k≥1 距下一档线 ≤5%（带符号）②
+// 5年分位 ≤50%（无下界，含已过门 ≤40%）；与「当前」互斥。
+// 手数 = 逐档明细（每破一档记 first_lots+j×add_lots_step）：k=0 自 H 的
+// −15/−20/−25… 阶梯数；k≥1 自加仓锚 P0 的当前 k 下一档继续。fixture 分布：
+// - ① k=0 回撤入段：中国海油（dd 12.9%）/ 国电电力（13.2%）/ 云南铜业
+//   （14.0% touched，现价线上方→未触档「—」）/ 山煤国际（16.8%）/ 中国石化
+//   （19.7%）/ 江苏银行（20.0% 深破线）/ 中粮糖业（25.3% 深破线）
+// - ① k≥1 距线入段：紫金矿业（-2.7%）
+// - ② 分位入段：长江电力（38% 已过门）/ 交通银行（33.5%）
+// - ①②双入：山煤国际（45%）/ 长江电力 / 中国石化（45%）
+// - 不入段：无（fixture 12 只中 6 只在「当前」段 action 非空）
+// 逐档手数：中粮 2+4+6=12（H=15.99，价 11.94 破 −15/−20/−25 三档）/ 江苏
+// 2+4=6（价恰在 −20% 线 8.0）/ 紫金 6（k=2 自下一档 j=2）/ 山煤 2 / 石化 2 /
+// 海油·国电·长江·交通·云南铜 —（未触档纯潜力股）
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
+  // v8.2.9：档位参数随响应下发（前端逐档明细单点读，与生产 config 一致）
+  first_drawdown_pct: 15, add_step_pct: 5, first_lots: 2, add_lots_step: 2,
   spot_preselect_pct: 10, spot_fetched: 9,
   price_source: "spot", spot_time: "20261107093000", n_stocks: 12,
   history_window_days: 90,
@@ -971,7 +981,8 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 卡片标题 + 覆盖说明 + 价源标注
     expect(w.text()).toContain("📡 策略信号");
     expect(w.text()).toContain("股票池 ∪ 我的持仓");
-    expect(w.text()).toContain("距触发线 ≤ 5%"); // approach_pct（v7.0.30 3→5）
+    expect(w.text()).toContain("距本轮高点回撤 ≥ 10%"); // v8.2.9 潜力①（first_dd 15 − approach 5）
+    expect(w.text()).toContain("价格距触发线 ≤5%"); // 当前段浅灰 approaching 带
     expect(w.text()).toContain("微信推送信号"); // v8.2.5：当前 = 要下单/要推的信号
     expect(w.text()).toContain("其余用最新收盘"); // spot_preselect_pct 实时取价覆盖说明
     expect(w.text()).toContain("近 90 天"); // history_window_days
@@ -979,12 +990,13 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     // 分段计数（v8.2.5 + v8.2.5b/c）：当前 = action 非空 5 只（神华/核电加仓
     // + 移动/大秦/中信特钢首仓——中信特钢 approaching 未到线，classify
     // 预告 action，行着色浅灰）→ 计数 4/5（4 = 真正触发浅红行：神华/移动
-    // active + 核电 touched + 大秦 active；5 = 总行数）；潜力 = ①距线 ≤5%
-    // 或 ②分位≤50%：云南铜业/紫金矿业/长江电力/交通银行/中国海油/山煤国际/
-    // 国电电力（①）+ 中国石化（②，45%）= 8 只；江苏银行（-5.9% 带外 +
-    // 62.3%>50）/ 中粮糖业（-12.2% + 76.8%）不入
+    // active + 核电 touched + 大秦 active；5 = 总行数）；潜力 v8.2.9 =
+    // ①k=0 距高回撤 ≥10% / k≥1 距线 ≤5% 或 ②分位≤50%：海油 12.9%·国电 13.2%·
+    // 云南铜 14.0%·山煤 16.8%·石化 19.7%·江苏 20.0%·中粮 25.3%（① k=0）+
+    // 紫金 −2.7%（① k≥1）+ 长江 38%·交通 33.5%（②）= 10 只（江苏/中粮 =
+    // 深破线，新口径线下方无界入区）
     expect(w.text()).toContain("当前信号（4/5）");
-    expect(w.text()).toContain("潜力信号（8）");
+    expect(w.text()).toContain("潜力信号（10）");
     expect(w.text()).toContain("历史信号（1）"); // v8.2.5d：仅微信推送过的记录
     // 默认 active：持仓加仓（2 手 → 参考 0.8 万）+ 非持仓首仓（1 手 → 0.7 万）
     expect(w.text()).toContain("● 持仓");
@@ -1064,11 +1076,19 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("中国石化");
     expect(w.text()).toContain("-5.6%");
     expect(w.text()).toContain("再武装·建仓线（第1档）");
-    expect(w.text()).not.toContain("中粮糖业"); // -12.2% 带外 + 76.8%>50
+    // v8.2.9（中粮糖业实案，本次重定案动机）：深破线（距高回撤 25.3% ≥10%，
+    // 线下方无界）+ 76.8%>50 → ① 路入区；逐档 = 2+4+6=12 手（H≈15.99，
+    // 价 11.94 破 −15/−20/−25 三档，第 4 档线 11.19 未破）
+    expect(w.text()).toContain("中粮糖业");
+    const zlRow = w.findAll("tbody tr").find((tr) => tr.text().includes("中粮糖业"));
+    expect(zlRow).toBeTruthy();
+    expect(zlRow.text()).toContain("-12.2%");
+    expect(zlRow.text()).toContain("2+4+6=12 手");
+    expect(zlRow.text()).toContain("✗ 实时 5年分位 76.8%（需≤40%，池外现算）");
     // v8.2.5 ①路：国电电力 +2.1% 入段（旧三分类下 76.8% 远离时机线被滤出）
     expect(w.text()).toContain("国电电力");
     // v8.2.5（11-23 touched 保留定案作废）：云南铜业 触线+时机未过 → 从当前
-    // 段移入潜力段（①+1.1%），已触回标保留
+    // 段移入潜力段（v8.2.9 ① = 距高回撤 14.0% ≥10%）；已触回标保留
     expect(w.text()).toContain("云南铜业");
     const ynRow = w.findAll("tbody tr").find((tr) => tr.text().includes("云南铜业"));
     expect(ynRow).toBeTruthy();
@@ -1076,6 +1096,8 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(ynRow.text()).toContain("+1.1%");
     expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
     expect(ynRow.text()).toContain("✗ 5年分位 62.3%（需≤40%）");
+    // v8.2.9：现价 18.2 线上方（盘中触 17.9 已回弹）→ 按现价未触档，逐档「—」
+    expect(ynRow.text()).not.toContain("手");
     // v8.2.5b：潜力段同口径着色——云南铜业 touched（真触过线）浅红；
     // 长江电力 approaching（未到线）浅灰（限定信号卡片内）
     const potCard = w.findAll(".card").find((c) => c.text().includes("策略信号"));
@@ -1084,13 +1106,22 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(potRowOf("云南铜业").classes()).toContain("sig-row-hit");
     expect(potRowOf("长江电力").classes()).toContain("sig-row-near");
     expect(potRowOf("中国海油").classes()).toContain("sig-row-near");
-    // 边界：江苏银行 -5.9%（超 5% 带）+ 62.3%>50 → 不入段
-    expect(w.text()).not.toContain("江苏银行");
-    // 「下一档手数」列——next_lots 单点原值（时机未过的山煤/石化也显示首仓
-    // 手数；云南铜业 4 手；交通银行 next_lots=null → —）
-    expect(w.text()).toContain("下一档手数");
-    expect(w.text()).toContain("1 手");
-    expect(w.text()).toContain("4 手");
+    // v8.2.9（江苏银行实案）：深破线（距高回撤 20.0% ≥10%，线下方无界）不再
+    // 被旧「绝对值 5% 带外」滤出；价 8.0 恰在 −20% 档线（H=8.5/0.85=10.0）
+    // → 逐档 2+4=6 手
+    expect(w.text()).toContain("江苏银行");
+    const jsRow = w.findAll("tbody tr").find((tr) => tr.text().includes("江苏银行"));
+    expect(jsRow).toBeTruthy();
+    expect(jsRow.text()).toContain("-5.9%");
+    expect(jsRow.text()).toContain("2+4=6 手");
+    // v8.2.9「逐档手数」列——逐档明细（替代旧 next_lots 单点原值）：
+    // 紫金 6（k=2 自下一档 j=2 起数，已触档 2 档不计）/ 山煤·石化 2（单档）/
+    // 海油·国电·长江·交通·云南铜 —（未触档纯潜力股）
+    expect(w.text()).toContain("逐档手数");
+    expect(w.text()).toContain("2+4+6=12 手");
+    expect(w.text()).toContain("2+4=6 手");
+    const zjRow = w.findAll("tbody tr").find((tr) => tr.text().includes("紫金矿业"));
+    expect(zjRow.text()).toContain("6 手");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // v8.2.5d（Joel 2026-11-24）：历史只显示微信推送过的真实触发信号

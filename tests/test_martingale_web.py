@@ -1312,7 +1312,8 @@ def test_state_projection_cache_shared_and_invalidation(tmp_positions_file, monk
 
     calls = {"rows": 0, "ctx": 0}
     sp_stub = type("SP", (), {"lot_size": 100, "first_lots": 2,
-                              "add_lots_step": 2, "add_step": 0.05})()
+                              "add_lots_step": 2, "add_step": 0.05,
+                              "first_drawdown": 0.15})()  # v8.2.9 档位参数
     pool_stub = _FakePool(["sh.600000"])
 
     def fake_ctx(cfg_path=None):
