@@ -49,7 +49,7 @@ def lake_env(tmp_path, monkeypatch):
     con.execute("INSERT INTO selection_backtest_10y VALUES ('sh.600546', '2026-11-11'),"
                 " ('sz.000001', '2026-11-11')")
     con.execute("INSERT INTO kline_daily VALUES "
-                "('sh.600546', '2026-11-11', 11.00, 100000000.0, 'tushare'),"
+                "('sh.600546', '2026-11-11', 11.00, 100000000.0, 'em_batch'),"
                 "('sz.000001', '2026-11-11', 11.86, 200000000.0, 'tencent')")
     # T3 湖当日行
     con.execute("INSERT INTO valuation_daily VALUES "

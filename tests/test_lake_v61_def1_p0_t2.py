@@ -164,6 +164,19 @@ def _by_source(con, code):
         [code]).fetchall()}
 
 
+# 2026-11-26 修日期腐化：硬编码 2026-09-14/15 在 2026-11-24 起落出 (days+30=70)
+# 天回看窗口（window_start=today-70）→ 多源路径窗口过滤后空窗抛错/legacy 无锚点
+# 填充取不到湖内锚点 → 两个用例失效。改用「运行日-N 天」相对日期（恒在窗口内）；
+# 窗口外旧行仍用固定远史日期（2025-01-02，永远在窗口外）。
+def _d(n: int) -> str:
+    import datetime as _dt
+
+    return (_dt.date.today() - _dt.timedelta(days=n)).isoformat()
+
+
+D0, D1 = _d(45), _d(44)   # 在 70 天窗口内（days=40 → window_start=today-70）
+
+
 # ===========================================================================
 # 1) p0 T2 多源：已 history-done 股 → 新日期行 source=sina、amount/adj 非 NULL
 #    + 不降级（窗口外旧行不重写 + 对照未覆盖股零退化）
@@ -176,12 +189,12 @@ def test_p0_t2_multisource_sina_no_degradation(tmp_path, monkeypatch):
     # history 已写入：sh.601398（窗口内 2 行 + 窗口外旧行）；sz.000001 对照（未覆盖）
     _seed_sina_rows(con, "sh.601398", [
         ("2025-01-02", 10.0, 1_000_000.0, 2.0, None),   # 窗口外旧行（不应被重写）
-        ("2026-09-14", 10.0, 1_000_000.0, 2.5, None),
-        ("2026-09-15", 10.2, 1_020_000.0, 2.5, None),
+        (D0, 10.0, 1_000_000.0, 2.5, None),
+        (D1, 10.2, 1_020_000.0, 2.5, None),
     ])
     _seed_sina_rows(con, "sz.000001", [
-        ("2026-09-14", 11.0, 2_000_000.0, 3.0, None),
-        ("2026-09-15", 11.1, 2_100_000.0, 3.0, None),
+        (D0, 11.0, 2_000_000.0, 3.0, None),
+        (D1, 11.1, 2_100_000.0, 3.0, None),
     ])
     con.close()
 
@@ -190,17 +203,17 @@ def test_p0_t2_multisource_sina_no_degradation(tmp_path, monkeypatch):
         "ohlcv": [
             {"date": "2025-01-02", "open": 9.0, "high": 9.6, "low": 8.8,
              "close": 10.0, "volume": 900_000, "amount": 900_000.0},   # 窗口外
-            {"date": "2026-09-14", "open": 10.0, "high": 11.0, "low": 9.5,
+            {"date": D0, "open": 10.0, "high": 11.0, "low": 9.5,
              "close": 10.0, "volume": 1_000_000, "amount": 1_000_000.0},
-            {"date": "2026-09-15", "open": 10.1, "high": 10.8, "low": 9.9,
+            {"date": D1, "open": 10.1, "high": 10.8, "low": 9.9,
              "close": 10.2, "volume": 1_020_000, "amount": 1_020_000.0},
         ],
-        "adj_factor": {"2026-09-14": 2.5},
+        "adj_factor": {D0: 2.5},
     })
     # tdx 验证源：与 sina 一致 → conflict=NULL（不阻断）
     tdx = MockAdapter("tdx", 3, kline={
         "ohlcv": [dict(r) for r in sina._kline["ohlcv"]],
-        "adj_factor": {"2026-09-14": 2.5}})
+        "adj_factor": {D0: 2.5}})
     _run_p0_t2(monkeypatch, tmp_path, db, days=40, codes=["sh.601398"],
                registry={"sina": sina, "tdx": tdx})
 
@@ -211,13 +224,13 @@ def test_p0_t2_multisource_sina_no_degradation(tmp_path, monkeypatch):
             "SELECT date, close, amount, adj_factor, source, conflict_src FROM kline_daily "
             "WHERE ts_code='sh.601398' ORDER BY date").fetchall()}
         assert _by_source(con, "sh.601398") == {"sina": 3}, f"应全为 sina: {rows}"
-        for d in ("2026-09-14", "2026-09-15"):
+        for d in (D0, D1):
             r = rows[d]
             assert r[4] == "sina", f"新日期行 source 应为 sina: {r}"
             assert r[2] is not None, f"amount 应非 NULL: {r}"
             assert r[3] is not None, f"adj_factor 应非 NULL（前向填充）: {r}"
-        # adj 前向填充：09-14/09-15 = 2.5
-        assert rows["2026-09-14"][3] == 2.5 and rows["2026-09-15"][3] == 2.5
+        # adj 前向填充：D0/D1 = 2.5
+        assert rows[D0][3] == 2.5 and rows[D1][3] == 2.5
         # 窗口化：sina 全史返回的 2025-01-02 行**不得**重写（保留原 amount=1e6/af=2.0）
         old = rows["2025-01-02"]
         assert old[2] == 1_000_000.0 and old[3] == 2.0, f"窗口外旧行被重写: {old}"
@@ -242,29 +255,29 @@ def test_p0_t2_conflict_written_then_cleared(tmp_path, monkeypatch):
 
     con = lconn.open(db)
     _seed_sina_rows(con, "sh.601398", [
-        ("2026-09-14", 10.0, 1_000_000.0, 2.5, None),
-        ("2026-09-15", 10.2, 1_020_000.0, 2.5, None),
+        (D0, 10.0, 1_000_000.0, 2.5, None),
+        (D1, 10.2, 1_020_000.0, 2.5, None),
     ])
     con.close()
 
     sina = MockAdapter("sina", 0, kline={
         "ohlcv": [
-            {"date": "2026-09-14", "open": 10.0, "high": 11.0, "low": 9.5,
+            {"date": D0, "open": 10.0, "high": 11.0, "low": 9.5,
              "close": 10.0, "volume": 1_000_000, "amount": 1_000_000.0},
-            {"date": "2026-09-15", "open": 10.1, "high": 10.8, "low": 9.9,
+            {"date": D1, "open": 10.1, "high": 10.8, "low": 9.9,
              "close": 10.2, "volume": 1_020_000, "amount": 1_020_000.0},
         ],
-        "adj_factor": {"2026-09-14": 2.5}})
+        "adj_factor": {D0: 2.5}})
 
     # ---- Run A：tdx close 差 6%（10.0 vs 10.6）>0.5% → conflict_src 写摘要 ----
     tdx_conf = MockAdapter("tdx", 3, kline={
         "ohlcv": [
-            {"date": "2026-09-14", "open": 10.0, "high": 11.0, "low": 9.5,
+            {"date": D0, "open": 10.0, "high": 11.0, "low": 9.5,
              "close": 10.6, "volume": 1_000_000, "amount": 1_000_000.0},
-            {"date": "2026-09-15", "open": 10.1, "high": 10.8, "low": 9.9,
+            {"date": D1, "open": 10.1, "high": 10.8, "low": 9.9,
              "close": 10.2, "volume": 1_020_000, "amount": 1_020_000.0},
         ],
-        "adj_factor": {"2026-09-14": 2.5}})
+        "adj_factor": {D0: 2.5}})
     _run_p0_t2(monkeypatch, tmp_path, db, days=40, codes=["sh.601398"],
                registry={"sina": sina, "tdx": tdx_conf})
 
@@ -277,7 +290,7 @@ def test_p0_t2_conflict_written_then_cleared(tmp_path, monkeypatch):
     # ---- Run B：tdx 与 sina 一致 → REPLACE 后 conflict_src=NULL（无陈旧残留）----
     tdx_ok = MockAdapter("tdx", 3, kline={
         "ohlcv": [dict(r) for r in sina._kline["ohlcv"]],
-        "adj_factor": {"2026-09-14": 2.5}})
+        "adj_factor": {D0: 2.5}})
     # days=41 → 新 done 键（同参重跑会被 is_done 跳过，无法验证清除）
     _run_p0_t2(monkeypatch, tmp_path, db, days=41, codes=["sh.601398"],
                registry={"sina": sina, "tdx": tdx_ok})
@@ -303,7 +316,7 @@ def test_p0_t2_all_sources_down_not_done(tmp_path, monkeypatch):
     from lake import conn as lconn
 
     con = lconn.open(db)
-    _seed_sina_rows(con, "sh.601398", [("2026-09-14", 10.0, 1_000_000.0, 2.5, None)])
+    _seed_sina_rows(con, "sh.601398", [(D0, 10.0, 1_000_000.0, 2.5, None)])
     con.close()
 
     def boom(ts, start=None, end=None):
@@ -333,13 +346,13 @@ def test_p0_t2_all_sources_down_not_done(tmp_path, monkeypatch):
 def test_p0_t2_legacy_fallback_zero_regression(tmp_path, monkeypatch):
     """池空（LAKE_MULTISOURCE=0）→ 既有腾讯直连路径零回归：
     fetch_kline_ohlcv(n=days+30) + source=tencent、amount=NULL。
-    af=铁律无锚点填充（2026-11-20）：湖内已有 level 沿用（09-14 锚点
-    2.5 权威续写 + 09-15 level 沿用），不再留 NULL 洞。"""
+    af=铁律无锚点填充（2026-11-20）：湖内已有 level 沿用（D0 锚点
+    2.5 权威续写 + D1 level 沿用），不再留 NULL 洞。"""
     db = str(tmp_path / "def1_legacy.duckdb")
     from lake import conn as lconn
 
     con = lconn.open(db)
-    _seed_sina_rows(con, "sh.601398", [("2026-09-14", 10.0, 1_000_000.0, 2.5, None)])
+    _seed_sina_rows(con, "sh.601398", [(D0, 10.0, 1_000_000.0, 2.5, None)])
     con.close()
 
     import lake.ingest.tencent_ingest as ti
@@ -348,9 +361,9 @@ def test_p0_t2_legacy_fallback_zero_regression(tmp_path, monkeypatch):
 
     def fake_fetch_kline(client, ts_code, n):
         calls.append((ts_code, n))
-        return [{"date": "2026-09-14", "open": 10.0, "high": 11.0, "low": 9.5,
+        return [{"date": D0, "open": 10.0, "high": 11.0, "low": 9.5,
                  "close": 10.0, "volume": 10_000.0},   # volume=手（腾讯口径）
-                {"date": "2026-09-15", "open": 10.1, "high": 10.8, "low": 9.9,
+                {"date": D1, "open": 10.1, "high": 10.8, "low": 9.9,
                  "close": 10.2, "volume": 10_200.0}]
 
     monkeypatch.setattr(ti, "fetch_kline_ohlcv", fake_fetch_kline)
@@ -367,15 +380,15 @@ def test_p0_t2_legacy_fallback_zero_regression(tmp_path, monkeypatch):
             "SELECT date, close, volume, amount, adj_factor, source FROM kline_daily "
             "WHERE ts_code='sh.601398' ORDER BY date").fetchall()}
         # v6.0.x 行为：source=tencent、amount=NULL
-        assert rows["2026-09-14"][5] == "tencent" and rows["2026-09-15"][5] == "tencent"
-        assert rows["2026-09-14"][3] is None and rows["2026-09-15"][3] is None, \
+        assert rows[D0][5] == "tencent" and rows[D1][5] == "tencent"
+        assert rows[D0][3] is None and rows[D1][3] is None, \
             f"legacy 腾讯不提供 amount → NULL: {rows}"
-        # af 铁律（2026-11-20）：无锚点填充——09-14 湖内现值 2.5 权威，
-        # 09-15 沿用同 level（不再 NULL 洞）
-        assert rows["2026-09-14"][4] == 2.5 and rows["2026-09-15"][4] == 2.5, \
+        # af 铁律（2026-11-20）：无锚点填充——D0 湖内现值 2.5 权威，
+        # D1 沿用同 level（不再 NULL 洞）
+        assert rows[D0][4] == 2.5 and rows[D1][4] == 2.5, \
             f"无锚点填充沿用湖内 level: {rows}"
         # volume 手→股 ×100（Q8 既有行为）
-        assert rows["2026-09-14"][2] == 1_000_000 and rows["2026-09-15"][2] == 1_020_000
+        assert rows[D0][2] == 1_000_000 and rows[D1][2] == 1_020_000
     finally:
         con.close()
 

@@ -771,9 +771,9 @@ def test_o4_probe_default_all_and_bad_name_400(tmp_path, monkeypatch):
         wapi, "_probe_one_source",
         lambda name: (calls.append(name), {"available": False, "probed_at": None,
                                            "latency_ms": None, "detail": ""})[1])
-    d = wapi.sources_probe({})   # 缺省 = 全部 7 源（v1.1：4 灌数池 + 3 展示源）
+    d = wapi.sources_probe({})   # 缺省 = 全部 6 源（v1.1：4 灌数池 + 2 展示源）
     assert calls == ["sina", "tencent", "tdx", "adata_f10",
-                     "tushare", "eastmoney", "fuyao"]
+                     "eastmoney", "fuyao"]
     with pytest.raises(wapi.HTTPException) as ei:
         wapi.sources_probe({"names": ["sina", "nope"]})
     assert ei.value.status_code == 400
@@ -797,19 +797,6 @@ class _FakeResp:
 
     def __exit__(self, *a):
         return False
-
-
-def test_v11_probe_tushare_offline(monkeypatch):
-    """tushare：import 成功 + token 在场 → 可用（不调 API，省配额）；缺 token → false。"""
-    # 路径守卫：web_api.py 在 lake/ 下 → repo 根 .env（dirname 2 次，非 3 次）
-    assert wapi._env_path().endswith(os.path.join("stock-screener", ".env")), \
-        f"env_path 应指向 repo 根: {wapi._env_path()}"
-    monkeypatch.setattr(wapi, "_env_token", lambda k: "tok" if k == "TUSHARE_TOKEN" else None)
-    ok, detail = wapi._probe_tushare()
-    assert ok is True and "未调 API" in detail, (ok, detail)
-    monkeypatch.setattr(wapi, "_env_token", lambda k: None)
-    ok, detail = wapi._probe_tushare()
-    assert ok is False and "TUSHARE_TOKEN" in detail
 
 
 def test_v11_probe_eastmoney_offline(monkeypatch):

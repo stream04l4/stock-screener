@@ -1,5 +1,6 @@
 #!/bin/bash
-# 周频 T1 退市档刷新（v7.0.18：tushare stock_basic D 单调用，免费档 1 次/小时）
+# 周频 T1 退市档刷新（2026-11-26 起：东财 clist fs=m:0+s:3 单页取回；
+# 原 tushare stock_basic D 单调用随源弃用移除。退市日=湖内 K 线最后日期，无 K 线跳过）
 # 周日 11:30 UTC = 北京周日晚 19:30：无交易/无 lake-sync(1-5)/控制台静默。
 # 重试 10 次×60s：DuckDB 文件锁独占，若与 web 短连接撞锁则等下一轮（web 请求 <2s）。
 cd /home/ubuntu/stock-screener

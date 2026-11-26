@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""test_lake_em_batch —— 东财 push2/datacenter 全市场批量通道（tushare 替代）。
+"""test_lake_em_batch —— 东财 push2/datacenter 全市场批量通道（2026-11-26 tushare 弃用后=唯一主通道）。
 
 纪律（同 v708 契约）：全离线——tmp/in-memory 库 + monkeypatch 网络函数；
 绝不触碰 data/lake/ 生产库与真实东财接口。

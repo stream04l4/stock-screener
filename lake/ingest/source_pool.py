@@ -164,31 +164,19 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     ],
     # ---- v1.1（2026-11-10）新增三源（均非灌数池内 adapter：无 enabled 开关、
     # 不参与 conflict 裁决——AUTHORITY 不加键，晋主前不写入）----
-    "tushare": [
-        {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "备源(现主源)"},
-        # v1.1 修订（2026-11-10 review）：T2 每日增量主引擎漏登记。生产
-        # kline_daily 已有 4.7 万行 source=tushare（lake_backfill.py incremental
-        # 3 次批量=全市场 daily+adj_factor+daily_basic，≈2.5min/5500 股）；
-        # §9-② 要求「tushare 角色如实标注」——补 T2 主源+adj 推导。
-        {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "主源(每日全市场批量增量)"},
-        {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "主源·批量(观察期)"},
-        {"table": "valuation_daily", "table_cn": "T3 估值日线",
-         "field_group": "valuation", "role": "备源(全市场1调用/日)"},
-    ],
+    # tushare 2026-11-26 完全弃用（Joel 定案）→ 原三行注册移除；
+    # 其主源角色（T1/T2 批量/T3 批量/T2 adj 官方锚点）由 eastmoney 承接。
     "eastmoney": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "主源(观察期→晋主)"},
+         "field_group": "master", "role": "主源"},    # 2026-11-26 tushare 弃用晋主
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "主源(观察期→晋主)"},
+         "field_group": "ohlcv_amount", "role": "主源"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "主源·推导(观察期)"},   # raw÷后复权(fqt=2)
+         "field_group": "adj_factor", "role": "主源·推导"},   # 除权事件推导（配股 fail-closed）
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
-         "field_group": "valuation", "role": "交叉校验(观察期)"},     # 换手率=NULL 显式降级
+         "field_group": "valuation", "role": "主源(全市场批量)"},
         {"table": "dividend_events", "table_cn": "T4 分红事件",
-         "field_group": "dividend", "role": "主源(端点待验证)"},
+         "field_group": "dividend", "role": "主源"},    # RPT_SHAREBONUS_DET
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "交叉校验(待验证)"},
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",

@@ -584,8 +584,9 @@ def stock_kline(ts_code: str, days: Optional[str] = Query(default=None),
 def industries() -> Dict[str, Any]:
     """stock_master distinct industry_name（v7.0.18 粗分类口径）。
 
-    v7.0.18（Joel 2026-10-26 拍板）：BaoStock 移除后行业 = tushare **粗分类**
+    v7.0.18（Joel 2026-10-26 拍板）：BaoStock 移除后行业 = 数据商**粗分类**
     （如"电气设备""化学制药"，无 CSRC 代码前缀），``industry_csric2`` 不再维护。
+    （2026-11-26 tushare 弃用后 T1 主源=东财 clist，粗分类口径不变。）
     下拉改按 ``industry_name`` 去重：code=name=粗分类名（前端 MarketTable 以
     code 为筛选值，零前端改动）。库为空 → ``{"industries": []}``
     （前端保持"全部行业"占位 + 空态文案）。排序按 code 升序（稳定、可断言）。
@@ -824,8 +825,9 @@ _CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 confli
 # v6.3.5：conflict 股票数口径的 code 列（index_daily=index_code，其余=ts_code）——
 # 与 _TABLE_META code_col 同口径，防 COUNT(DISTINCT ts_code) 在 index_daily 报列不存在。
 _CONFLICT_CODE_COL = {t[0]: t[5] for t in _TABLE_META}
-_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10", "tushare", "eastmoney",
-                  "fuyao"]   # v1.1（2026-11-10）：4 灌数池源 + 3 观察期/备源展示源
+_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10", "eastmoney",
+                  "fuyao"]   # v1.1（2026-11-10）：4 灌数池源 + 展示源
+                             # （2026-11-26：tushare 展示源随弃用移除，Joel 定案）
 _STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
 
 
@@ -888,11 +890,12 @@ def _read_source_health():
 #
 # 设计纪律：
 # - **独立文件 source_health_sg.json**：灌数 driver 每次启动全量覆盖
-#   source_health.json（v7.0.35 起含 4 池源 + tushare/eastmoney/fuyao 3 展示源），
+#   source_health.json（v7.0.35 起含 4 池源 + eastmoney/fuyao 2 展示源；
+#   2026-11-26 tushare 展示源随弃用移除），
 #   若把 sg 记进取会被每日冲掉 → 分文件、仅 Web 探测写入，天然不受灌数影响。
 # - **一次 ssh 批量**：ssh oci 'python3 -s -' 跑 scripts/lake_probe_sg.py（SG 侧
 #   并行探活、纯 stdlib、无凭据、整体墙钟 25s）→ TSV 回传。不逐源开 7 条 ssh。
-# - **通道语义**：fuyao/tushare 在 SG 侧只做可达性（不附 key、不调配额 API）——
+# - **通道语义**：fuyao 在 SG 侧只做可达性（不附 key、不调配额 API）——
 #   key 留在 EU .env；"SG 通道可达"≠"SG 已鉴权"，detail 如实写明。
 # - **零影响红线**：sg 探测失败/超时/ssh 断 → 只记 sg 档不可达，本机档与
 #   /status 其余部分不受影响；探测是手动动作，无 cron 自动触发。
@@ -1012,13 +1015,10 @@ def _rate_limit_text(name: str, cfg: Dict[str, Any]) -> Optional[str]:
 
     灌数池 4 源：config ``{name}_min_interval_s`` 派生（1.0 → "≥1s/股"；
     未配置 → None，前端显示"无官方配额"）。
-    v1.1 新增 3 展示源（2026-11-10 实测口径，静态文案）：
-    - tushare：免费档硬配额（5 次/天 + stock_basic 1 次/时，超 ~24h 硬封）；
+    展示源静态文案（2026-11-10 实测口径；2026-11-26 tushare 条目随弃用移除）：
     - eastmoney：无硬限（连发 60+20 并发零 429/繁忙，20 并发 ≈12 req/s）；
     - fuyao：X-RateLimit-Limit=15（秒级窗口），日配额未观测（63 次/日未触底）。
     """
-    if name == "tushare":
-        return "免费档 5次/天·stock_basic 1次/时（超封~24h）"
     if name == "eastmoney":
         return "无硬限（2026-11-10 实测 20并发≈12 req/s）"
     if name == "fuyao":
@@ -1645,8 +1645,9 @@ def status() -> Dict[str, Any]:
 # v7.0.18：原 baostock Q6 真探测特例随渠道移除（4 源统一走 adapter.available()）。
 # ---------------------------------------------------------------------------
 _SOURCE_SWITCH_NAMES = ["sina", "tencent", "tdx", "adata_f10"]
-# v1.1：探测白名单=全部展示源（东财/Fuyao/tushare 有轻量探测分支，见
-# _probe_one_source）；开关白名单仍=4 灌数池源（strategy.yaml 无新源开关键）。
+# v1.1：探测白名单=全部展示源（东财/Fuyao 有轻量探测分支，见
+# _probe_one_source；2026-11-26 tushare 随弃用移除）；
+# 开关白名单仍=4 灌数池源（strategy.yaml 无新源开关键）。
 _PROBE_NAMES = list(_ADAPTER_NAMES)
 _PROBE_TIMEOUT_S = 15.0   # O4 超时纪律：每源最多 15s（hang 不能拖死请求）
 
@@ -1675,17 +1676,6 @@ def _env_token(key: str) -> Optional[str]:
     except OSError:
         return None
     return None
-
-
-def _probe_tushare() -> tuple:
-    """tushare 探测：**不调 API**（省免费档配额）——import 成功 + token 在场即可用。"""
-    try:
-        import tushare  # noqa: F401
-    except ImportError:
-        return False, "tushare 未安装"
-    if not _env_token("TUSHARE_TOKEN"):
-        return False, ".env 缺 TUSHARE_TOKEN"
-    return True, "已安装+token 在场（未调 API，省配额）"
 
 
 def _probe_eastmoney() -> tuple:
@@ -1733,17 +1723,15 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
 
     sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
     （首次触发 EU 自检；失败→False，不抛）。
-    v1.1：tushare（import+token，不调 API）/eastmoney（push2his 1 根）/
-    fuyao（龙虎榜 1 次）走轻量探测分支。
+    v1.1：eastmoney（push2his 1 根）/fuyao（龙虎榜 1 次）走轻量探测分支
+    （2026-11-26：tushare 探测随弃用移除）。
     """
     from .ingest import source_pool as sp
 
     now_s = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.monotonic()
     detail = ""
-    if name == "tushare":
-        ok, detail = _probe_tushare()
-    elif name == "eastmoney":
+    if name == "eastmoney":
         ok, detail = _probe_eastmoney()
     elif name == "fuyao":
         ok, detail = _probe_fuyao()

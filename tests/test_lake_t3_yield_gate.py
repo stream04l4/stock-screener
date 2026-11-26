@@ -72,7 +72,7 @@ def test_gate_carryforward_then_strict_fallback(lake):
     # c2：前 10 日无商业值，有 TTM 分红 → 严格派生（0.5/20×100=2.5）
     # c3：无息 → 保持 NULL
     _ins(lake,
-         t3=[("c1", D_PREV, 4.0, "tushare"),
+         t3=[("c1", D_PREV, 4.0, "em_batch"),
              ("c1", D, None, "em_batch"),
              ("c2", D, None, "em_batch"),
              ("c3", D, None, "em_batch")],
@@ -92,8 +92,8 @@ def test_gate_carryforward_then_strict_fallback(lake):
 def test_gate_no_trigger_when_null_rate_low(lake):
     # 4 行 2 NULL = 50%（不 >50%）→ 不触发，NULL 行保持
     _ins(lake,
-         t3=[("c1", D, 4.0, "tushare"), ("c2", D, None, "tushare"),
-             ("c3", D, 3.0, "tushare"), ("c4", D, None, "tushare")],
+         t3=[("c1", D, 4.0, "em_batch"), ("c2", D, None, "em_batch"),
+             ("c3", D, 3.0, "em_batch"), ("c4", D, None, "em_batch")],
          k2=[("c2", D, 10.0), ("c4", D, 10.0)])
     res = _t3_yield_gate(lake, D)
     assert res["ok"] is True
@@ -111,7 +111,7 @@ def test_gate_no_rows_noop(lake):
 def test_gate_suspended_no_close_stays_null(lake):
     # c1：前日有值，但当日无 close（停牌）→ 不结转保持 NULL
     _ins(lake,
-         t3=[("c1", D_PREV, 4.0, "tushare"), ("c1", D, None, "em_batch")],
+         t3=[("c1", D_PREV, 4.0, "em_batch"), ("c1", D, None, "em_batch")],
          k2=[("c1", D_PREV, 10.0)])
     _t3_yield_gate(lake, D)
     got = lake.execute(
@@ -123,7 +123,7 @@ def test_gate_suspended_no_close_stays_null(lake):
 def test_gate_carryforward_window_10d(lake):
     # 最近有值日 = D-12（超出 10 日窗口）且无分红 → 不结转保持 NULL
     _ins(lake,
-         t3=[("c1", "2026-11-05", 4.0, "tushare"), ("c1", D, None, "em_batch")],
+         t3=[("c1", "2026-11-05", 4.0, "em_batch"), ("c1", D, None, "em_batch")],
          k2=[("c1", "2026-11-05", 10.0), ("c1", D, 10.2)])
     _t3_yield_gate(lake, D)
     got = lake.execute(
@@ -164,7 +164,7 @@ def test_derive_yield_for_rows_unchanged(lake):
     # bd_static 路径语义不变：按 source 圈定，可覆盖同值重算
     _ins(lake,
          t3=[("c1", D, 9.9, "bd_static"), ("c2", D, None, "bd_static"),
-             ("c3", D, None, "tushare")],
+             ("c3", D, None, "em_batch")],
          k2=[("c1", D, 10.0), ("c2", D, 10.0), ("c3", D, 10.0)],
          div=[("c2", "2026-05-01", 0.3), ("c3", "2026-05-01", 0.3)])
     n = derive_yield_for_rows(lake)

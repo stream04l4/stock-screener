@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""test_lake_v708_batch —— v7.0.8：tushare 全市场单日批量（每日增量主轴）。
+"""test_lake_v708_batch —— v7.0.8：全市场单日批量（每日增量主轴）。
 
 背景：新浪逐只 K线+hfq + 腾讯逐只快照 ≈ 1.5 万次调用，sina 限速下每日增量
-9-10h（Joel 2026-10-22 投诉不可受）→ tushare trade_date 全市场单次取回
-（pro.daily / pro.adj_factor / pro.daily_basic，各 1 次/分钟，~2.5min）。
+9-10h（Joel 2026-10-22 投诉不可受）→ trade_date 全市场单次取回
+（v7.0.8 时代 tushare pro.daily/pro.adj_factor/pro.daily_basic 各 1 次/分钟；
+2026-11-26 tushare 弃用后改东财 clist 快照 1 次分页取回）→ 批量缓存 →
+逐只只补批量没覆盖的缺口。
 
 纪律（同 v614/v706 契约）：全离线——tmp 库 + tmp yaml + monkeypatch 路径；
-tushare 批量函数 fake 化（零真实网络）；绝不触碰 data/lake/ 生产库。
+EM 批量函数 fake 化（零真实网络）；绝不触碰 data/lake/ 生产库。
+原 tushare 单位换算/重试/限频单测 2026-11-26 随源码一并移除。
 """
 from __future__ import annotations
 
@@ -83,11 +86,12 @@ def _isolate(tmp_path, monkeypatch):
     _reg = dict(_sp._adapter_registry())
     _reg["adata_f10"] = _AdataDown()
     monkeypatch.setattr(_sp, "_REGISTRY", _reg)
-    # v7.0.33：本文件验证 **tushare 备源** 路径 → EM 主通道恒离线（fail → 备源）
+    # v7.0.33→2026-11-26：EM 是唯一批量通道（tushare 备源已移除）
+    # → fixture 让 EM 恒离线，验证失败回退逐只 legacy 路径
     import lake.ingest.em_batch_ingest as _emb
 
     def _emb_offline(allow_sg=True):
-        raise _emb.EmBatchError("test: EM offline（验证 tushare 备源路径）")
+        raise _emb.EmBatchError("test: EM offline（验证逐只 legacy 回退路径）")
 
     monkeypatch.setattr(_emb, "fetch_clist_snapshot", _emb_offline)
     yield
@@ -160,84 +164,9 @@ def _fake_tencent(monkeypatch, snap, idx_up_to=None):
     return counter
 
 
-def _fake_batch(monkeypatch, t2_rows=None, af_map=None, t3_rows=None,
-                t2_exc=None):
-    """fake tushare 批量三接口（计数；t2_exc → 批量失败路径）。"""
-    import lake.ingest.tushare_ingest as ti
-
-    counter = {"daily": 0, "af": 0, "basic": 0}
-
-    def fake_daily(trade_date):
-        counter["daily"] += 1
-        if t2_exc:
-            raise t2_exc
-        return list(t2_rows or [])
-
-    def fake_af(trade_date):
-        counter["af"] += 1
-        if t2_exc:
-            raise t2_exc
-        return dict(af_map or {})
-
-    def fake_basic(trade_date):
-        counter["basic"] += 1
-        if t2_exc:
-            raise t2_exc
-        return list(t3_rows or [])
-
-    monkeypatch.setattr(ti, "tushare_available", lambda: True)
-    monkeypatch.setattr(ti, "fetch_daily_batch", fake_daily)
-    monkeypatch.setattr(ti, "fetch_adj_factor_batch", fake_af)
-    monkeypatch.setattr(ti, "fetch_daily_basic_batch", fake_basic)
-    return counter
-
-
-# ---------------------------------------------------------------------------
-def test_batch_hit_writes_tushare_rows_zero_network(tmp_path, monkeypatch):
-    """批量命中 → tushare 行零网络落库（股/元/亿元换算 + source=tushare + af 填充）。"""
-    db = str(tmp_path / "b1.duckdb")
-    codes = ["sh.600001"]
-    _seed(db, codes)  # 缺口 = 09-18 单日
-    con = lconn.open(db)
-    snap = {c: {"total_mv_yi": 999.0, "float_mv_yi": 888.0, "pe_ttm": 99.0,
-                "pb": 9.0, "turnover": 9.0} for c in codes}
-    tc = _fake_tencent(monkeypatch, snap)
-    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
-                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
-                "preclose": 10.0, "pct_chg": 2.5,
-                "volume": 123456, "amount": 1000000.0}]   # 已换算：股/元
-    t3_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
-                "total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
-                "pb": 0.8, "turnover": 1.0, "ttm_yield_pct": 3.2}]
-    bs = _fake_batch(monkeypatch, t2_rows=t2_rows,
-                     af_map={"sh.600001": {"2026-09-18": 1.5}},
-                     t3_rows=t3_rows)
-    r = drv.run_incremental(con, db, codes, days=3)
-
-    # 批量三接口各恰 1 次；腾讯零调用（T2/T3 全命中缓存；T7 指数走 fake_kline）
-    assert bs == {"daily": 1, "af": 1, "basic": 1}, bs
-    assert tc["snapshot"] == 0, f"T3 应零腾讯调用: {tc}"
-    assert r.get("batch") and r["batch"]["date"] == FIXED_TODAY
-    assert r["batch"]["t2_codes"] == 1 and r["batch"]["t3_codes"] == 1
-
-    # T2：tushare 行落库（换算值原样 + af 填充 + pct_chg/preclose 入列）
-    row = con.execute(
-        'SELECT "close", volume, amount, pct_chg, preclose, adj_factor, source '
-        "FROM kline_daily WHERE ts_code='sh.600001' AND date='2026-09-18'"
-    ).fetchone()
-    assert row == (10.25, 123456, 1000000.0, 2.5, 10.0, 1.5, "tushare"), row
-    # T3：tushare daily_basic 落库（date=运行日，单位亿元）
-    vrow = con.execute(
-        "SELECT total_mv, pe_ttm, pb, turnover_pct, ttm_yield_pct, source "
-        "FROM valuation_daily WHERE ts_code='sh.600001' AND date='2026-09-18'"
-    ).fetchone()
-    assert vrow == (100.0, 5.0, 0.8, 1.0, 3.2, "tushare"), vrow
-    assert r["t2"]["processed"] == 1 and r["t3"]["processed"] == 1
-    con.close()
-
-
 def test_batch_failure_falls_back_legacy(tmp_path, monkeypatch):
-    """批量抛错 → stats 记痕 + 全量回退逐只 legacy（本例 fake 空窗口 → done 不写库）。"""
+    """EM 批量抛错 → stats 记痕 + 回退逐只 legacy（tushare 备源 2026-11-26 已移除；
+    本例 fake 空窗口 → done 不写库）。"""
     db = str(tmp_path / "b2.duckdb")
     codes = ["sh.600001"]
     _seed(db, codes)
@@ -245,9 +174,8 @@ def test_batch_failure_falls_back_legacy(tmp_path, monkeypatch):
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in codes}
     tc = _fake_tencent(monkeypatch, snap)
-    bs = _fake_batch(monkeypatch, t2_exc=RuntimeError("频率超限 x8"))
     r = drv.run_incremental(con, db, codes, days=3)
-    assert "batch" in r and "频率超限" in r["batch"]["failed"], r.get("batch")
+    assert "batch" in r and "EM offline" in r["batch"]["failed"], r.get("batch")
     # legacy 逐只路径被走到（腾讯 K线 fake 被调）；fake 空窗口 → 不写新 K线
     assert tc["kline"] >= 1, f"应走 legacy 逐只: {tc}"
     assert con.execute(
@@ -256,7 +184,7 @@ def test_batch_failure_falls_back_legacy(tmp_path, monkeypatch):
     # T3 无批量 → 走腾讯快照（stale 值，语义同 v7.0.7 前）
     assert con.execute(
         "SELECT source FROM valuation_daily WHERE ts_code='sh.600001' "
-        "AND date='2026-09-18'").fetchone()[0] != "tushare"
+        "AND date='2026-09-18'").fetchone()[0] not in ("tushare", "em_batch")
     assert r["t2"]["processed"] == 1 and r["t3"]["processed"] == 1
     con.close()
 
@@ -270,10 +198,9 @@ def test_batch_no_trade_day_marks_done_without_write(tmp_path, monkeypatch):
     # 节假日：腾讯快照仍是"当前时点"旧值（非空）→ legacy T3 照写（既有行为）
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in codes}
-    # v7.0.33：指数最新 bar=09-17（运行日 09-18 无 bar）→ ①.5 no_trade 短路
+    # 指数最新 bar=09-17（运行日 09-18 无 bar）→ ①.5 no_trade 短路
+    # （不取 EM 快照：no_trade 判定只看指数最新 bar vs 缺口众数）
     tc = _fake_tencent(monkeypatch, snap, idx_up_to="2026-09-17")
-    # 批量：daily 空；af 空；daily_basic 也空 → 但 no_trade 判定只看 daily+指数
-    bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
     r = drv.run_incremental(con, db, codes, days=3)
     assert r.get("batch", {}).get("no_trade") is True, r.get("batch")
     # 无新 K线（不写）；也不逐只 legacy（腾讯 K线只被 T7 指数调用，非股票）
@@ -286,8 +213,11 @@ def test_batch_no_trade_day_marks_done_without_write(tmp_path, monkeypatch):
 
 
 def test_batch_weekend_gap_refetches_index_latest_trade_day(tmp_path, monkeypatch):
-    """周一跑：众数缺口=周六（陈旧缺口）→ tushare 批量(周六)空、指数最新 bar=周一
-    → 按指数最新交易日重取批量（2026-10-24 修复：原逻辑回退逐只，周一要 2-4h）。"""
+    """周一跑：众数缺口=周六（陈旧缺口）→ EM 快照=指数最新交易日（周一）
+    → 按指数最新交易日重取批量（2026-10-24 修复：原逻辑回退逐只，周一要 2-4h；
+    2026-11-26 tushare 弃用后本测试改锚 EM 通道，refetch 判定语义不变）。"""
+    import lake.ingest.em_batch_ingest as emb
+
     db = str(tmp_path / "b5.duckdb")
     codes = ["sh.600001", "sh.600002"]
     monkeypatch.setattr(drv, "_today_beijing", lambda: "2026-09-21")  # 周一
@@ -298,10 +228,7 @@ def test_batch_weekend_gap_refetches_index_latest_trade_day(tmp_path, monkeypatc
     # 指数 sh000001：09-18 + 09-21（周一）两根 bar；股票 K线 fake 恒空
     import lake.ingest.tencent_ingest as tix
 
-    calls = {"kline": 0}
-
     def fake_kline(client, ts_code, n):
-        calls["kline"] += 1
         if ts_code == "sh000001":
             return [{"date": "2026-09-18", "open": 1, "high": 1, "low": 1,
                      "close": 1, "volume": 1},
@@ -318,30 +245,20 @@ def test_batch_weekend_gap_refetches_index_latest_trade_day(tmp_path, monkeypatc
     if ad is not None:
         monkeypatch.setattr(ad, "available", lambda: False)
 
-    # tushare daily：周六(09-19)空 → 重取周一(09-21)有数
-    daily_calls = []
-
-    def fake_daily(trade_date):
-        daily_calls.append(trade_date)
-        if trade_date == "2026-09-19":
-            return []
-        return [{"ts_code": c, "date": trade_date, "open": 10.1, "high": 10.3,
-                 "low": 10.0, "close": 10.25, "preclose": 10.0, "pct_chg": 2.5,
-                 "volume": 123456, "amount": 1000000.0} for c in codes]
-
-    import lake.ingest.tushare_ingest as ti
-    monkeypatch.setattr(ti, "tushare_available", lambda: True)
-    monkeypatch.setattr(ti, "fetch_daily_batch", fake_daily)
-    monkeypatch.setattr(ti, "fetch_adj_factor_batch", lambda d: {})
-    monkeypatch.setattr(ti, "fetch_daily_basic_batch", lambda d: [])
+    # 收盘后（非盘中 guard）；EM 快照=指数最新交易日（周一）
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 21, 21, 0))
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: [_em_snap_row(c) for c in codes])
+    monkeypatch.setattr(emb, "fetch_ex_events", lambda d: [])
 
     r = drv.run_incremental(con, db, codes, days=3)
     assert r.get("batch", {}).get("date") == "2026-09-21", r.get("batch")
-    assert daily_calls == ["2026-09-19", "2026-09-21"], daily_calls
-    # 周一 bar 落库（source=tushare），周六不写
+    assert r["batch"]["channel"] == "em" and r["batch"]["refetch"] is True
+    # 周一 bar 落库（source=em_batch），周六不写
     n = con.execute(
         "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-21' "
-        "AND source='tushare'").fetchone()[0]
+        "AND source='em_batch'").fetchone()[0]
     assert n == 2, n
     assert con.execute(
         "SELECT COUNT(*) FROM kline_daily WHERE date='2026-09-19'").fetchone()[0] == 0
@@ -350,7 +267,13 @@ def test_batch_weekend_gap_refetches_index_latest_trade_day(tmp_path, monkeypatc
 
 
 def test_multi_day_gap_code_falls_back_legacy(tmp_path, monkeypatch):
-    """多日缺口股（停牌）不在批量单日窗口 → 逐只 legacy 补整窗（批量只补单日股）。"""
+    """多日缺口股（停牌）不在批量单日窗口 → 逐只 legacy 补整窗（批量只补单日股）。
+
+    2026-11-26 tushare 弃用后：EM 快照只含单日缺口股 sh.600001；多日缺口股
+    sh.600002 的 T2/T3 全部走逐只 legacy（本例 T2 窗口 fake 空 → 无新行）。
+    """
+    import lake.ingest.em_batch_ingest as emb
+
     db = str(tmp_path / "b4.duckdb")
     fresh, halted = ["sh.600001"], ["sh.600002"]
     _seed(db, fresh + halted)
@@ -362,205 +285,26 @@ def test_multi_day_gap_code_falls_back_legacy(tmp_path, monkeypatch):
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in fresh + halted}
     tc = _fake_tencent(monkeypatch, snap)
-    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
-                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
-                "preclose": 10.0, "pct_chg": 2.5,
-                "volume": 123456, "amount": 1000000.0}]
-    bs = _fake_batch(monkeypatch, t2_rows=t2_rows,
-                     af_map={"sh.600001": {"2026-09-18": 1.5}},
-                     t3_rows=[{"ts_code": c, "date": "2026-09-18",
-                               "total_mv_yi": 100.0, "float_mv_yi": 80.0,
-                               "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0,
-                               "ttm_yield_pct": 3.2} for c in fresh + halted])
+    # 收盘后（非盘中 guard）；EM 快照只含单日缺口股 sh.600001
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 18, 21, 30))
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: [_em_snap_row("sh.600001")])
+    monkeypatch.setattr(emb, "fetch_ex_events", lambda d: [])
     r = drv.run_incremental(con, db, fresh + halted, days=3)
     assert r["batch"]["t2_codes"] == 1   # 批量只含单日缺口股
     # 单日缺口股：批量命中落库
     assert con.execute(
         "SELECT source FROM kline_daily WHERE ts_code='sh.600001' "
-        "AND date='2026-09-18'").fetchone()[0] == "tushare"
+        "AND date='2026-09-18'").fetchone()[0] == "em_batch"
     # 多日缺口股：legacy 空窗口（fake K线空）→ 无新行、不报错
     assert con.execute(
         "SELECT COUNT(*) FROM kline_daily WHERE ts_code='sh.600002' "
         "AND date='2026-09-18'").fetchone()[0] == 0
     assert r["t2"]["processed"] == 2
-    # T3 两只都在批量 t3 缓存 → 零腾讯快照
-    assert tc["snapshot"] == 0
+    # 多日缺口股 T3 不在 EM 快照 → 走腾讯快照（sh.600001 批量命中零快照）
+    assert tc["snapshot"] >= 1
     con.close()
-
-
-# ---------------------------------------------------------------------------
-def test_tushare_batch_unit_conversions(monkeypatch):
-    """tushare_ingest 批量接口单位换算（vol 手→股、amount 千元→元、mv 万→亿、代码）。"""
-    import pandas as pd
-    import lake.ingest.tushare_ingest as ti
-
-    class FakePro:
-        def daily(self, trade_date):
-            return pd.DataFrame([
-                {"ts_code": "601398.SH", "trade_date": "20260918", "open": 1,
-                 "high": 2, "low": 1, "close": 1.5, "pre_close": 1.4,
-                 "pct_chg": 7.14, "vol": 123.0, "amount": 4567.0},
-                {"ts_code": "430047.BJ", "trade_date": "20260918", "open": 1,
-                 "high": 2, "low": 1, "close": 3.0, "pre_close": 2.0,
-                 "pct_chg": 50.0, "vol": 1.0, "amount": 2.0},  # BJ → 丢弃
-            ])
-
-        def adj_factor(self, trade_date):
-            return pd.DataFrame([
-                {"ts_code": "601398.SH", "trade_date": "20260918",
-                 "adj_factor": 1.25},
-            ])
-
-        def daily_basic(self, trade_date):
-            return pd.DataFrame([
-                {"ts_code": "601398.SH", "trade_date": "20260918", "pe": 8.0,
-                 "pe_ttm": 8.5, "pb": 0.9, "total_mv": 123456000.0,
-                 "float_mv": 100000000.0, "turnover_rate": 0.3,
-                 "dv_ttm": 4.2},
-            ])
-
-    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
-    rows = ti.fetch_daily_batch("2026-09-18")
-    assert len(rows) == 1, rows          # BJ 丢弃
-    r = rows[0]
-    assert r["ts_code"] == "sh.601398"   # 代码转换
-    assert r["date"] == "2026-09-18"     # wire 格式 20260918 → 湖 YYYY-MM-DD
-    assert r["volume"] == 12300         # 手→股 ×100
-    assert r["amount"] == 4567000.0     # 千元→元 ×1000
-    assert r["pct_chg"] == 7.14 and r["preclose"] == 1.4
-    af = ti.fetch_adj_factor_batch("2026-09-18")
-    # af 键 = 湖日期格式（2026-10-24 事故前此处断言 wire 格式 "20260918"，
-    # 与 load_t2 按湖日期查 adj_map 的口径不一致 → 静默丢 af；一并固化修复）
-    assert af == {"sh.601398": {"2026-09-18": 1.25}}, af
-    b = ti.fetch_daily_basic_batch("2026-09-18")
-    assert b[0]["date"] == "2026-09-18"
-    assert b[0]["total_mv_yi"] == pytest.approx(12345.6)   # 万元→亿元 ÷10000
-    assert b[0]["float_mv_yi"] == pytest.approx(10000.0)
-    assert b[0]["pe_ttm"] == 8.5 and b[0]["turnover"] == 0.3
-    assert b[0]["ttm_yield_pct"] == 4.2
-
-
-def test_tushare_code_conversion_edge():
-    """_to_lake_code 边界：SH/SZ 转换；BJ/畸形 → None。"""
-    import lake.ingest.tushare_ingest as ti
-
-    assert ti._to_lake_code("601398.SH") == "sh.601398"
-    assert ti._to_lake_code("000001.SZ") == "sz.000001"
-    assert ti._to_lake_code("430047.BJ") is None
-    assert ti._to_lake_code("000001") is None
-    assert ti._to_lake_code("") is None
-
-
-def test_batch_call_retries_on_none(monkeypatch):
-    """tushare API code!=0 返回 None（不抛异常，实测 adj_factor 瞬时错误）
-    → _batch_call 退避重试，绝不把 None 当空市场。"""
-    import pandas as pd
-    import lake.ingest.tushare_ingest as ti
-
-    calls = {"n": 0}
-
-    class FakePro:
-        def adj_factor(self, trade_date):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return None   # 首次瞬时错误
-            return pd.DataFrame([
-                {"ts_code": "601398.SH", "trade_date": "20260918",
-                 "adj_factor": 1.25},
-            ])
-
-    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
-    import time as _real_time
-
-    # _batch_call 内 `import time as _time` 走全局 time 模块 → patch 全局 sleep
-    monkeypatch.setattr(_real_time, "sleep", lambda s: None)
-    rows = ti.fetch_adj_factor_batch("2026-09-18")
-    assert calls["n"] == 2, f"应重试一次: {calls}"
-    assert rows == {"sh.601398": {"2026-09-18": 1.25}}, rows
-
-
-def test_batch_call_quota_penalty_fails_fast(monkeypatch):
-    """配额耗尽（实测免费档 adj_factor/daily_basic 5 次/天 → 惩罚 1 次/小时）
-    → 立即抛错不重试（重试无意义，最多 1 次/时）→ 上层回退逐只 legacy。"""
-    import lake.ingest.tushare_ingest as ti
-
-    calls = {"n": 0}
-    sleeps = []
-
-    class FakePro:
-        def daily(self, trade_date):
-            calls["n"] += 1
-            raise Exception("抱歉，您访问接口(daily)频率超限(5次/天)，"
-                            "具体频次详情：https://tushare.pro/document/1?doc_id=108")
-
-    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
-    import time as _real_time
-
-    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
-    try:
-        ti.fetch_daily_batch("2026-09-18")
-        raise AssertionError("配额惩罚态应立即抛错")
-    except RuntimeError as exc:
-        assert "配额耗尽" in str(exc), str(exc)
-    assert calls["n"] == 1, f"不得重试: {calls}"
-    assert sleeps == [], f"不得退避等待: {sleeps}"
-
-
-def test_batch_call_hourly_limit_waits_62min_then_recovers(monkeypatch):
-    """"N 次/小时"限频=可等待（2026-11-15 实锤：adj_factor 免费档 1 次/小时）
-    → 等 62min 重试一次；恢复即成功，不触发 legacy 回退。"""
-    import pandas as pd
-    import lake.ingest.tushare_ingest as ti
-
-    calls = {"n": 0}
-    sleeps = []
-
-    class FakePro:
-        def adj_factor(self, trade_date):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise Exception("抱歉，您访问接口(adj_factor)频率超限(1次/小时)，"
-                                "具体频次详情：https://tushare.pro/document/1?doc_id=108")
-            return pd.DataFrame([
-                {"ts_code": "601398.SH", "trade_date": "20260918",
-                 "adj_factor": 1.25},
-            ])
-
-    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
-    import time as _real_time
-
-    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
-    rows = ti.fetch_adj_factor_batch("2026-09-18")
-    assert calls["n"] == 2, f"限频后应重试一次: {calls}"
-    assert sum(sleeps) == 62 * 60 and all(0 < s <= 5 for s in sleeps), f"应分段等满 62min: {sleeps[:5]}"
-    assert rows == {"sh.601398": {"2026-09-18": 1.25}}, rows
-
-
-def test_batch_call_hourly_limit_persistent_fails_after_wait(monkeypatch):
-    """等 62min 后二次命中小时限频 → 判配额耗尽抛错（交上层回退 legacy），
-    不无限等待。"""
-    import lake.ingest.tushare_ingest as ti
-
-    calls = {"n": 0}
-    sleeps = []
-
-    class FakePro:
-        def adj_factor(self, trade_date):
-            calls["n"] += 1
-            raise Exception("抱歉，您访问接口(adj_factor)频率超限(1次/小时)，"
-                            "具体频次详情：https://tushare.pro/document/1?doc_id=108")
-
-    monkeypatch.setattr(ti, "_pro", lambda: FakePro())
-    import time as _real_time
-
-    monkeypatch.setattr(_real_time, "sleep", lambda s: sleeps.append(s))
-    try:
-        ti.fetch_adj_factor_batch("2026-09-18")
-        raise AssertionError("持续限频应判配额耗尽")
-    except RuntimeError as exc:
-        assert "配额耗尽" in str(exc), str(exc)
-    assert calls["n"] == 2, f"应恰好重试一次: {calls}"
-    assert sum(sleeps) == 62 * 60 and all(0 < s <= 5 for s in sleeps), f"只应分段等一次 62min: {sleeps[:5]}"
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +365,7 @@ def test_precheck_all_up_to_date_early_exit(tmp_path, monkeypatch):
     ad = sp.get_adapter("tdx")
     if ad is not None:
         monkeypatch.setattr(ad, "available", lambda: False)
-    _fake_batch(monkeypatch, t2_rows=[])          # 09-18 批量空 → no_trade 判定
+    # 预检早退路径不触发批量（fixture 的 EM 离线 guard 仍在，防误调真实网络）
 
     r = drv.run_incremental(con, db, codes, days=3)
     assert r["precheck"]["data_date"] == "2026-09-17", r["precheck"]
@@ -670,7 +414,7 @@ def test_precheck_partial_only_sweeps_missing(tmp_path, monkeypatch):
     ad = sp.get_adapter("tdx")
     if ad is not None:
         monkeypatch.setattr(ad, "available", lambda: False)
-    _fake_batch(monkeypatch, t2_rows=[])
+    # T2 齐 → 无 K线缺口 → EM 批量不触发（fixture 的 EM 离线 guard 仍在）
 
     r = drv.run_incremental(con, db, codes, days=3)
     assert r["precheck"]["t2"] is True and r["precheck"]["t3"] is False
@@ -716,7 +460,7 @@ def _t9_setup(tmp_path, monkeypatch, drop_codes_t3=("sh.600002",)):
     ad = sp.get_adapter("tdx")
     if ad is not None:
         monkeypatch.setattr(ad, "available", lambda: False)
-    _fake_batch(monkeypatch, t2_rows=[])
+    # T2 齐 → 无 K线缺口 → EM 批量不触发（fixture 的 EM 离线 guard 仍在）
     return db, codes, con
 
 
@@ -792,8 +536,9 @@ def _em_snap_row(ts_code="sh.600001"):
             "pe_ttm": 5.0, "pb": 0.8}
 
 
-def test_em_batch_primary_channel_zero_tushare(tmp_path, monkeypatch):
-    """EM 主通道命中 → 行落库 source=em_batch + af 本地推导 + tushare 零调用。"""
+def test_em_batch_primary_channel(tmp_path, monkeypatch):
+    """EM 主通道命中 → 行落库 source=em_batch + af 本地推导（tushare 2026-11-26 已弃用，
+    无备源概念）。"""
     import lake.ingest.em_batch_ingest as emb
 
     db = str(tmp_path / "em1.duckdb")
@@ -813,12 +558,10 @@ def test_em_batch_primary_channel_zero_tushare(tmp_path, monkeypatch):
                         lambda d: [{"ts_code": "sh.600001", "ex_date": d,
                                     "cash": 0.2, "bonus": 0.0,
                                     "has_allot": False}])
-    bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
     r = drv.run_incremental(con, db, codes, days=3)
 
-    # 批量走 EM：channel=em、tushare 三接口零调用
+    # 批量走 EM：channel=em（tushare 2026-11-26 已弃用，无备源概念）
     assert r["batch"]["channel"] == "em", r.get("batch")
-    assert bs == {"daily": 0, "af": 0, "basic": 0}, bs
     assert r["batch"]["n_events"] == 1
     # T2：em_batch 行落库
     row = con.execute(
@@ -890,7 +633,6 @@ def test_refetch_batch_cannot_cover_pre_batch_trading_gap(tmp_path, monkeypatch)
     monkeypatch.setattr(emb, "fetch_clist_snapshot",
                         lambda allow_sg=True: [_em_snap_row()])
     monkeypatch.setattr(emb, "fetch_ex_events", lambda d: [])
-    bs = _fake_batch(monkeypatch, t2_rows=[], af_map={}, t3_rows=[])
     r = drv.run_incremental(con, db, codes, days=3)
 
     assert r["batch"]["channel"] == "em" and r["batch"]["date"] == "2026-09-21"
@@ -905,7 +647,10 @@ def test_refetch_batch_cannot_cover_pre_batch_trading_gap(tmp_path, monkeypatch)
 
 
 def test_em_intraday_guard_skips_batch(tmp_path, monkeypatch):
-    """盘中（北京<15:05 且快照=今日）→ EM 拒用 → 回退 tushare（备源）。"""
+    """盘中（北京<15:05 且指数 bar=今日）→ EM 拒用 → 逐只 legacy（无备源）。
+
+    2026-11-26 tushare 弃用后：EM 拒用不再有备源，T2 走腾讯逐只 K线。
+    """
     import lake.ingest.em_batch_ingest as emb
 
     db = str(tmp_path / "em2.duckdb")
@@ -920,23 +665,25 @@ def test_em_intraday_guard_skips_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(emb, "fetch_clist_snapshot",
                         lambda allow_sg=True: (_ for _ in ()).throw(
                             AssertionError("盘中不应取 EM 快照")))
-    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
-                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
-                "preclose": 10.0, "pct_chg": 2.5,
-                "volume": 123456, "amount": 1000000.0}]
-    bs = _fake_batch(monkeypatch, t2_rows=t2_rows,
-                     af_map={"sh.600001": {"2026-09-18": 1.5}},
-                     t3_rows=[{"ts_code": "sh.600001", "date": "2026-09-18",
-                               "total_mv_yi": 100.0, "float_mv_yi": 80.0,
-                               "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0,
-                               "ttm_yield_pct": 3.2}])
+    # 逐只 legacy T2 路径：腾讯 K线给 09-18 bar（EM 拒用后由它接管）
+    import lake.ingest.tencent_ingest as tix
+
+    def fake_kline(client, ts_code, n):
+        if ts_code == "sh000001":
+            return [{"date": "2026-09-18", "close": 1.0}]
+        if ts_code == "sh.600001":
+            return [{"date": "2026-09-18", "open": 10.1, "high": 10.3,
+                     "low": 10.0, "close": 10.2, "volume": 1000}]
+        return []
+
+    monkeypatch.setattr(tix, "fetch_kline_ohlcv", fake_kline)
     r = drv.run_incremental(con, db, codes, days=3)
-    # EM 盘中拒用（batch failed 记痕含 em:）→ tushare 备源接管
-    assert r["batch"]["channel"] == "tushare", r.get("batch")
-    assert bs["daily"] == 1
-    assert con.execute(
+    # EM 盘中拒用（batch failed 记痕含 em: 前缀）→ 逐只 legacy 接管
+    assert "em:" in r["batch"]["failed"], r.get("batch")
+    row = con.execute(
         "SELECT source FROM kline_daily WHERE ts_code='sh.600001' "
-        "AND date='2026-09-18'").fetchone()[0] == "tushare"
+        "AND date='2026-09-18'").fetchone()
+    assert row is not None and row[0] != "em_batch", row   # 逐只落库，非批量行
     con.close()
 
 
@@ -944,31 +691,31 @@ def test_em_intraday_guard_skips_batch(tmp_path, monkeypatch):
 # v7.0.34 af 铁律（2026-11-20 山煤国际事故）：同一参数同一源
 # ---------------------------------------------------------------------------
 def test_batch_hit_af_missing_no_anchor_fill(tmp_path, monkeypatch):
-    """批量命中但 af 批量空返回（限频/空 df）→ 无锚点填充沿用湖内 level，
-    绝不写 NULL 洞（NULL 行隔断 af_rebase 检测对 → 护栏失明，山煤事故实锤）。"""
+    """EM 命中但无除权事件 → af 沿用湖内 level（1.0），绝不写 NULL 洞
+    （NULL 行隔断 af_rebase 检测对 → 护栏失明，山煤事故实锤；
+    tushare 备源 2026-11-26 已移除，无备源概念）。"""
+    import lake.ingest.em_batch_ingest as emb
+
     db = str(tmp_path / "b6.duckdb")
     codes = ["sh.600001"]
     _seed(db, codes)   # 历史 af 恒 1.0
     con = lconn.open(db)
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in codes}
-    tc = _fake_tencent(monkeypatch, snap)
-    t2_rows = [{"ts_code": "sh.600001", "date": "2026-09-18",
-                "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.25,
-                "preclose": 10.0, "pct_chg": 2.5,
-                "volume": 123456, "amount": 1000000.0}]
-    _fake_batch(monkeypatch, t2_rows=t2_rows, af_map={},   # af 批量空返回
-                t3_rows=[{"ts_code": c, "date": "2026-09-18",
-                          "total_mv_yi": 100.0, "float_mv_yi": 80.0,
-                          "pe_ttm": 5.0, "pb": 0.8, "turnover": 1.0,
-                          "ttm_yield_pct": 3.2} for c in codes])
+    _fake_tencent(monkeypatch, snap)
+    monkeypatch.setattr(drv, "_now_beijing_dt",
+                        lambda: dt.datetime(2026, 9, 18, 21, 30))
+    monkeypatch.setattr(emb, "fetch_clist_snapshot",
+                        lambda allow_sg=True: [_em_snap_row()])
+    # 无除权事件 → derive_af_batch 沿用前一日 level（09-17 播种 af=1.0）
+    monkeypatch.setattr(emb, "fetch_ex_events", lambda d: [])
     r = drv.run_incremental(con, db, codes, days=3)
-    assert r["batch"]["date"] == FIXED_TODAY
+    assert r["batch"]["channel"] == "em", r.get("batch")
     row = con.execute(
         "SELECT adj_factor, source FROM kline_daily "
         "WHERE ts_code='sh.600001' AND date='2026-09-18'").fetchone()
-    # af = 湖内 level 1.0（无锚点填充），非 NULL
-    assert row == (1.0, "tushare"), row
+    # af = 湖内 level 1.0（沿用），非 NULL
+    assert row == (1.0, "em_batch"), row
     con.close()
 
 
@@ -984,7 +731,7 @@ def test_per_ticker_sina_derived_af_not_written(tmp_path, monkeypatch):
     snap = {c: {"total_mv_yi": 100.0, "float_mv_yi": 80.0, "pe_ttm": 5.0,
                 "pb": 0.8, "turnover": 1.0} for c in codes}
     _fake_tencent(monkeypatch, snap)
-    _fake_batch(monkeypatch, t2_exc=RuntimeError("频率超限 x8"))  # 批量失败→逐只
+    # EM 批量失败 → 逐只（fixture 的 EM 离线 guard：被调即抛 EmBatchError）
     import lake.ingest.source_pool as sp
     sina = sp.get_adapter("sina")
 

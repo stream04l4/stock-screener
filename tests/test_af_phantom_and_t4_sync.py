@@ -176,12 +176,12 @@ def test_find_spurious_jumps_no_300k_truncation_and_phantom_unstamp(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. 缺陷 B：区间分红抓取、事务落库、tushare 交叉校验、run_t4_sync 与日同步顺序
+# 3. 缺陷 B：区间分红抓取、事务落库、run_t4_sync 与日同步顺序
+#    （2026-11-26：tushare 交叉校验随弃用移除，conflict_src 恒 NULL）
 # ---------------------------------------------------------------------------
 
-def test_em_fetch_range_load_and_tushare_crosscheck(monkeypatch, tmp_path):
+def test_em_fetch_range_load(monkeypatch, tmp_path):
     from lake.ingest import em_batch_ingest as emb
-    from lake.ingest import tushare_ingest as ti
     import scripts.lake_backfill as drv
 
     pages = [
@@ -225,14 +225,6 @@ def test_em_fetch_range_load_and_tushare_crosscheck(monkeypatch, tmp_path):
             "INSERT INTO dividend_events (ts_code, ex_date, period, cash_dps, stk_div, source) "
             "VALUES ('sh.600001', '2026-10-23', '2025', 0.2, 0.0, 'em_local_static')"
         )
-        # tushare 返回分歧（601998 故意差值大以便测 conflict_src 标记；300873 一致）
-        monkeypatch.setattr(ti, "tushare_available", lambda: True)
-        monkeypatch.setattr(
-            ti, "fetch_dividend",
-            lambda code: ([{"ex_date": "20261110", "div_cash_before_tax": 0.25}]
-                          if code == "601998.SH"
-                          else [{"ex_date": "20261112", "div_cash_before_tax": 0.10}]),
-        )
 
         res = drv.run_t4_sync(con, db_path, end_date="2026-11-23", lookback_days=14)
         # 自动从 2026-10-23 - 14d = 2026-10-09 开始抓
@@ -240,10 +232,8 @@ def test_em_fetch_range_load_and_tushare_crosscheck(monkeypatch, tmp_path):
         assert "(EX_DIVIDEND_DATE>='2026-10-09')(EX_DIVIDEND_DATE<='2026-11-23')" == captured[0]["filter"]
         assert res["fetched"] == 2 and res["written"] == 2
         assert res["max_ex_date"] == "2026-11-12"
-        assert res["cross_check"]["checked"] == 2
-        assert len(res["cross_check"]["mismatches"]) == 1
 
-        # 校验落库每股口径 + ann_date + conflict_src
+        # 校验落库每股口径 + ann_date + conflict_src（2026-11-26 交叉校验移除后恒 NULL）
         r_300873 = con.execute(
             "SELECT cash_dps, stk_div, CAST(ann_date AS VARCHAR), period, conflict_src "
             "FROM dividend_events WHERE ts_code='sz.300873'"
@@ -253,12 +243,11 @@ def test_em_fetch_range_load_and_tushare_crosscheck(monkeypatch, tmp_path):
         r_601998 = con.execute(
             "SELECT cash_dps, conflict_src FROM dividend_events WHERE ts_code='sh.601998'"
         ).fetchone()
-        assert r_601998[0] == pytest.approx(0.18)
-        assert "tushare:0.2500" in str(r_601998[1])
+        assert r_601998 == (pytest.approx(0.18), None)
 
         # t4-sync 参数可正常解析
-        args = drv.build_parser().parse_args(["t4-sync", "--lookback-days", "7", "--no-cross-check"])
-        assert args.cmd == "t4-sync" and args.lookback_days == 7 and args.no_cross_check is True
+        args = drv.build_parser().parse_args(["t4-sync", "--lookback-days", "7"])
+        assert args.cmd == "t4-sync" and args.lookback_days == 7
     finally:
         con.close()
 
@@ -336,7 +325,7 @@ def test_repair_af_and_dividends_end_to_end(tmp_path):
     # ① Dry-run：完全不改库，且可检出 sz.301219 与 sz.300873
     rc_dry = rep.main([
         "--db", db_path, "--events-json", str(ev_file),
-        "--skip-tushare", "--skip-recompute", "--report-out", report_dry,
+        "--skip-recompute", "--report-out", report_dry,
     ])
     assert rc_dry == 0
     con_ro = duckdb.connect(db_path, read_only=True)
@@ -349,7 +338,7 @@ def test_repair_af_and_dividends_end_to_end(tmp_path):
     # ② Apply：全量修复 + 生成备份 + 验收清零
     rc_app = rep.main([
         "--db", db_path, "--apply", "--events-json", str(ev_file),
-        "--skip-tushare", "--skip-recompute", "--report-out", report_apply,
+        "--skip-recompute", "--report-out", report_apply,
     ])
     assert rc_app == 0
     assert any(p.name.startswith("lake.duckdb.bak_") for p in tmp_path.iterdir())

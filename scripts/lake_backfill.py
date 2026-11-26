@@ -5,9 +5,9 @@
 P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary 打印，
 **全部抓取/限速/幂等逻辑复用现有 ingest + BackfillRunner**（不重写）：
 
-- T1 stock_master     ← tushare stock_basic（v7.0.18：BaoStock 移除后改 tushare
-                        主源，L+D 状态 ~2 次调用、65s 间隔限频；行业=粗分类，
-                        industry_csric2 不再维护；name/is_st 由腾讯快照补）
+- T1 stock_master     ← 东财 clist 快照（2026-11-26：tushare 弃用切换；行业=东财粗分类，
+                        industry_csric2 不再维护；name/is_st 由腾讯快照补；退市档
+                        EM 退市板 m:0 s:3 低频 t1-delist）
 - T4 dividend_events  ← em_dividend_ingest.load_dividends（cache/em_dividend_all.csv
                         静态导入全史，**零网络**）
 - T7 index_daily      ← tencent_ingest.fetch_kline_ohlcv + load_t7（4 指数 × N 天）
@@ -173,8 +173,8 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
     - env ``LAKE_MULTISOURCE=0``（测试隔离门）→ 跳过，零网络（与 _run_bs_probe /
       resolve_source 同口径；conftest autouse 默认置位 → 离线单测不触网）。
     - 探测对象 = AUTHORITY 的外部源（v7.0.18 后=sina/tencent/tdx/adata_f10）+
-      展示源 tushare/eastmoney/fuyao（v7.0.35，Joel 指出：本机态每日自动刷新；
-      实现单点=lake/web_api 轻量探测分支，tushare 不调 API 零额度）；
+      展示源 eastmoney/fuyao（v7.0.35，Joel 指出：本机态每日自动刷新；
+      实现单点=lake/web_api 轻量探测分支；2026-11-26 tushare 展示源随弃用移除）；
       ``local`` 是本地推导（静态 csv/factors 派生），无网络可达性概念，不进健康度。
     - 各 adapter ``available()`` 记 latency_ms：首次调用触发 EU 自检（网络探测），
       失败→False 自动跳过该源（不 crash、不阻塞灌数启动——单源异常只记 false）。
@@ -220,15 +220,14 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
             adapters[name] = {"available": False, "probed_at": now_s,
                               "latency_ms": int((time.monotonic() - t0) * 1000)}
 
-    # v7.0.35（2026-11-20 Joel 指出）：展示源 tushare/eastmoney/fuyao 随灌数启动
-    # 同探——此前 source_health.json 只含 4 池源，三源本机态恒显「未探测」，
-    # 只有手动点【探测】才刷新。实现单点=lake/web_api 的三个轻量探测分支：
-    # tushare **不调 API**（import+token 在场，零额度消耗）、eastmoney/fuyao
+    # v7.0.35（2026-11-20 Joel 指出）：展示源 eastmoney/fuyao 随灌数启动
+    # 同探——此前 source_health.json 只含 4 池源，两源本机态恒显「未探测」，
+    # 只有手动点【探测】才刷新。实现单点=lake/web_api 的轻量探测分支：
     # 各 1 次免费轻量调用（push2his 1 根 / 龙虎榜 1 次），异常→false 不阻断灌数。
+    # 2026-11-26：tushare 弃用（Joel 定案）→ 原第三探 _probe_tushare 移除。
     try:
-        from lake.web_api import _probe_eastmoney, _probe_fuyao, _probe_tushare
-        for name, fn in (("tushare", _probe_tushare),
-                         ("eastmoney", _probe_eastmoney),
+        from lake.web_api import _probe_eastmoney, _probe_fuyao
+        for name, fn in (("eastmoney", _probe_eastmoney),
                          ("fuyao", _probe_fuyao)):
             t0 = time.monotonic()
             try:
@@ -271,69 +270,70 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# T1 stock_master（v7.0.18：tushare stock_basic ~2 次 + 腾讯快照补 name/is_st）
+# T1 stock_master（2026-11-26：东财 clist 主档 + 腾讯快照补 name/is_st）
 # ---------------------------------------------------------------------------
-def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
-    """T1：tushare stock_basic 全市场主档 + 行业粗分类（~2 次 API 调用）。
+def _board(ts_code: str) -> str:
+    """代码前缀 → 板块（68→科创、30→创业、其余→主板；北交所不在 clist fs 内）。"""
+    code6 = ts_code.split(".")[1]
+    if code6.startswith("68"):
+        return "科创"
+    if code6.startswith("30"):
+        return "创业"
+    return "主板"
 
-    **v7.0.18（Joel 2026-10-26 拍板）**：BaoStock 渠道完全移除（每日配额过紧 +
-    经常故障）。股票全集/上市退市日/板块/行业改 tushare ``stock_basic``：
-    - **1 次调用**（免费档实测限频 1 次/**小时**——2026-10-26 实测 65s 间隔的
-      第 2 次调用即被限流拒绝）：``list_status='L'``（在市：ts_code/name/
-      industry/market/list_date）。退市档（D）低频独立刷新：``t1-delist``
-      子命令（单 D 调用，建议每周；delist_date 其余时间沿用 stock_master 旧值）。
-    - **universe = sh/sz 沪深两市**（market ∈ 主板/创业板/科创板）——与既有
-      5556 行口径一致；北交所（tushare L 状态含 ~353 只）排除。
-    - 行业 = **粗分类**（如"电气设备""化学制药"，tushare industry 字段）；
-      ``industry_csric2`` 置 NULL（证监会细分类不再维护，页面行业下拉/筛选
-      改走 industry_name，见 web_api /industries 与 /market 过滤）。
-    - board 由代码前缀推导（与旧 _board 口径一致：68→科创、30→创业、其余→主板）。
-    - name 先落 tushare 值，随后腾讯快照批量覆盖补 name/is_st（tushare 无 ST
-      标记，is_st 判定仍按 v5 口径：名称含 ST）。失败不阻断 T1 主体。
+
+def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
+    """T1：东财 clist 快照全市场主档（2026-11-26 tushare 弃用切换，Joel 定案）。
+
+    **2026-11-26（Joel 定案：tushare 完全弃用）**：T1 主源由 tushare
+    ``stock_basic`` 切东财 clist 快照（与每日批量主通道同接口、同出口链路
+    EU→SG；56 页 ~1-2 分钟）：
+    - **universe = 沪深主板+科创+创业**（clist fs 口径 5564 股；北交所/B 股
+      天然不在 fs 内——与 v7.0.18 tushare market 过滤同 universe）；
+    - code/name/list_date/industry 取 EM 值（industry=东财行业，粗分类口径，
+      ``industry_csric2`` 置 NULL 不再维护——v7.0.18 同）；
+    - board 由代码前缀推导（68→科创、30→创业、其余→主板）；
+    - prev_map 六列保全（industry_csric2/delist_date/is_st/st_since/soe_flag/
+      soe_basis）——delist_date 沿用 stock_master 现存值（退市股不在 clist，
+      负名单由 t1-delist 低频刷新；新上市股无旧行 → NULL，正确）；
+    - name 带 XD/DR/XR 前缀（除息日）跳过覆盖（v7.0.18.3 同守卫）；
+    - 随后腾讯快照批量覆盖补 name/is_st（is_st=名称含 ST，v5 口径）；
+      失败不阻断 T1 主体。
     """
-    from lake.ingest import tushare_ingest as ti
+    from lake.ingest import em_batch_ingest as emb
     from lake.ingest.common import DATA_VERSION, clean_date, now_ts, upsert
 
-    if not ti.tushare_available():
-        raise RuntimeError("tushare 不可用（T1 主源）：uv pip install tushare + .env TUSHARE_TOKEN")
-    pro = ti._pro()
-
-    # v7.0.18.1 限频实测修正：stock_basic 免费档 = 1 次/小时（非 1 次/分钟）→
-    # T1 主档只发 1 次 L 调用；退市档 D 拆独立低频子命令 t1-delist（见下方
-    # run_t1_delist），delist_date 沿用 stock_master 现存值（下方读回后原样
-    # 写回——新上市股无旧行 → NULL，正确）。
-    df_l = pro.stock_basic(exchange="", list_status="L",
-                           fields="ts_code,name,industry,market,list_date")
-    if df_l is None or getattr(df_l, "empty", False):
-        raise RuntimeError("tushare stock_basic(L) 返回空（限频/接口异常）")
+    snap = emb.fetch_clist_snapshot()   # EU→SG 出口链内置；双失败抛 EmBatchError
     # 读回既有扩展列，防止全行 upsert 把已人工/历史写入的字段覆盖为 NULL
     prev_map = {
         r[0]: r[1:] for r in con.execute(
             "SELECT ts_code, industry_csric2, delist_date, is_st, st_since, "
             "soe_flag, soe_basis FROM stock_master").fetchall()
     }
-    _MARKET_BOARD = {"主板": "主板", "创业板": "创业", "科创板": "科创"}
     rows = []
-    for r in df_l.itertuples(index=False):
-        if r.market not in _MARKET_BOARD:   # 排除北交所（universe=沪深，口径不变）
+    skipped_xd = 0
+    for x in snap:
+        ts = x.get("ts_code")
+        if not ts:
             continue
-        ts = ti._to_lake_code(r.ts_code)
-        if ts is None:
-            continue  # 双保险（market 过滤已排除北交所；BJ 等湖不覆盖）
-        ind = (str(r.industry).strip() or None) if getattr(r, "industry", None) else None
+        name = str(x.get("name") or "")
+        if re.match(r"^(XD|DR|XR)", name):
+            skipped_xd += 1
+            continue   # 除息日临时名不覆盖（v7.0.18.3 同守卫）
+        ind = (str(x.get("industry")).strip() or None) if x.get("industry") else None
         p_ind2, p_delist, p_st, p_st_since, p_soe_f, p_soe_b = prev_map.get(
             ts, (None, None, None, None, None, None))
         rows.append([
             ts,
-            str(r.name),            # name：腾讯快照随后覆盖（v5 口径）
-            p_ind2,                 # 保留既有行业二级码
-            ind,                    # industry_name：tushare 粗分类（如"电气设备"）
-            clean_date(getattr(r, "list_date")),
-            p_delist,
-            _MARKET_BOARD[r.market],
-            p_st,                   # 保留既有 ST 态（腾讯快照随后更新）
+            name,                 # EM 名（腾讯快照随后覆盖；v5 口径）
+            p_ind2,               # 保留既有行业二级码
+            ind,                  # industry_name：东财行业（粗分类）
+            clean_date(x.get("list_date")),
+            p_delist,             # 退市日沿用（退市股不在 clist，此处恒非退市）
+            _board(ts),
+            1 if "ST" in name.upper() else 0,
             p_st_since, p_soe_f, p_soe_b,
-            "tushare", now_ts(), DATA_VERSION,
+            "em_clist", now_ts(), DATA_VERSION,
         ])
     n = upsert(con, "stock_master", [
         "ts_code", "name", "industry_csric2", "industry_name", "list_date",
@@ -375,47 +375,59 @@ def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
         "table": "stock_master",
         "rows_written": n,
         "name_isst_enriched": enriched,
-        "tushare_calls_this_step": 1,
-        "note": "tushare stock_basic：list_date/board/industry(粗分类)；delist_date "
-                "沿用旧值（D 档由 t1-delist 低频刷新，免费档 1 次/小时）；"
-                "name/is_st 由腾讯快照补；industry_csric2 不再维护（粗分类口径，"
-                "v7.0.18 BaoStock 移除）；soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
+        "em_calls_this_step": 1,
+        "note": "东财 clist：code/name/list_date/industry(东财行业)；delist_date "
+                "沿用旧值（退市负名单由 t1-delist 低频刷新，EM 退市板 m:0 s:3）；"
+                "name/is_st 由腾讯快照补；industry_csric2 不再维护（粗分类口径）；"
+                "soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
     }
 
 
 def run_t1_delist(con) -> Dict[str, Any]:
-    """T1 退市档刷新（CLI 子命令 ``t1-delist``）：单次 tushare ``stock_basic D``。
+    """T1 退市档刷新（CLI 子命令 ``t1-delist``）：东财退市板负名单
+    （2026-11-26 tushare D 档弃用切换，Joel 定案）。
 
-    **为什么独立低频**：免费档 stock_basic 实测 1 次/小时（2026-10-26），
-    T1 主档（L）与退市档（D）同跑必限流 → 拆开。退市事件低频（日均 <1 只）→
-    建议每周跑一次；只 UPDATE 命中行的 delist_date + fetched_at，不碰其他
-    主档列（name/industry 等由 run_t1 的 L 全量 upsert 负责）。
+    口径（fetch_clist_delisted，fs=m:0 s:3 两网及退市板）：
+    - 退市板码 ∩ stock_master 现存行 → delist_date 仍 NULL 的补写；
+    - 退市日 = 湖内 K 线最后日期（= 该股最后交易日；接口无退市日期字段，
+      池剔除用途下早于官方退市安排终止日属保守口径，安全）；
+    - 已非 NULL 的 delist_date 不覆盖（历史正式值优先）；
+    - 老两网/退市 B 股码（sh.900xxx/sz.200xxx 等）不在 stock_master → 自然排除。
+    退市事件低频（日均 <1 只）→ 建议每周跑一次；只 UPDATE 命中行的
+    delist_date + fetched_at，不碰其他主档列（name/industry 等由 run_t1 负责）。
     """
-    from lake.ingest import tushare_ingest as ti
-    from lake.ingest.common import clean_date, now_ts
+    from lake.ingest import em_batch_ingest as emb
+    from lake.ingest.common import clean_date, now_ts, to_ts_code
 
-    if not ti.tushare_available():
-        raise RuntimeError("tushare 不可用（T1 主源）：uv pip install tushare + .env TUSHARE_TOKEN")
-    pro = ti._pro()
-    df_d = pro.stock_basic(exchange="", list_status="D",
-                           fields="ts_code,delist_date")
+    codes6 = emb.fetch_clist_delisted()   # EU→SG 出口链内置；双失败抛 EmBatchError
     n = 0
-    for r in df_d.itertuples(index=False):
-        # 必须转湖格式（tushare 601398.SH → 湖 sh.601398），否则 WHERE ts_code=?
-        # 用原生格式永不命中湖内行（delist_updated 恒 0）——与 run_t1 同一纪律。
-        ts = ti._to_lake_code(r.ts_code)
+    skipped_no_kline = 0
+    for c6 in codes6:
+        ts = to_ts_code(c6)   # 601398→sh.601398 / 000001→sz.000001 / 900xxx→sh.900xxx
         if not ts:
-            continue  # 北交所等 universe 外 → 不插入
-        cur = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code=?",
-                          [ts]).fetchone()[0]
+            continue
+        cur, last_k = con.execute(
+            "SELECT (SELECT COUNT(*) FROM stock_master WHERE ts_code=?), "
+            "(SELECT MAX(date) FROM kline_daily WHERE ts_code=?)", [ts, ts]).fetchone()
         if not cur:
-            continue   # 库里没有 → 不插入
+            continue   # 库里没有 → 不插入（非 A 股退市码 / universe 外）
+        if last_k is None:
+            skipped_no_kline += 1
+            log.warning("t1-delist: %s 在退市板但湖内无 K 线 → 跳过（不造日期）", ts)
+            continue
+        has_date = con.execute(
+            "SELECT COUNT(*) FROM stock_master WHERE ts_code=? AND delist_date IS NOT NULL",
+            [ts]).fetchone()[0]
+        if has_date:
+            continue   # 历史正式退市日优先，不覆盖
         con.execute("UPDATE stock_master SET delist_date=?, fetched_at=? WHERE ts_code=?",
-                    [clean_date(getattr(r, "delist_date")), now_ts(), ts])
+                    [clean_date(str(last_k)), now_ts(), ts])
         n += 1
     return {"table": "stock_master", "delist_updated": n,
-            "tushare_calls_this_step": 1,
-            "note": "退市档 D 低频刷新（每周）；只更新命中行的 delist_date"}
+            "em_delisted_codes": len(codes6),
+            "skipped_no_kline": skipped_no_kline,
+            "note": "退市板 m:0 s:3 负名单（每周）；退市日=湖内 K 线最后日期；"
+                    "只更新命中行 delist_date 仍 NULL 者"}
 
 
 # ---------------------------------------------------------------------------
@@ -483,12 +495,13 @@ def run_t4(con, db_path: str, ts_codes: Optional[List[str]] = None) -> Dict[str,
 def run_t4_sync(con, db_path: str,
                 start_date: Optional[str] = None,
                 end_date: Optional[str] = None,
-                lookback_days: int = 14,
-                cross_check: bool = True) -> Dict[str, Any]:
-    """T4 分红事件增量同步（EM datacenter RPT_SHAREBONUS_DET 主通道 + tushare 低频抽样校验）。
+                lookback_days: int = 14) -> Dict[str, Any]:
+    """T4 分红事件增量同步（EM datacenter RPT_SHAREBONUS_DET 唯一主通道）。
 
     缺省 start_date 自动从湖内 MAX(ex_date <= end_date) 往前退 lookback_days（覆盖迟到修订，
     同时自动跨越任意停更缺口如 2026-10-23→11-23）；若表空则回溯近 365 日。
+    2026-11-26：tushare 弃用（Joel 定案）→ 原低频抽样交叉校验一并移除，
+    af 推导 fail-closed（配股抛错）+ 事件 5 元组去重为质量护栏。
     """
     from lake.ingest import em_batch_ingest as emb
 
@@ -509,11 +522,9 @@ def run_t4_sync(con, db_path: str,
 
     events = emb.fetch_ex_events_range(start_s, end_s)
     written = emb.load_ex_events(con, end_s, events) if events else 0
-    cc = (emb.cross_check_ex_events_tushare(con, events, max_sample=2)
-          if (cross_check and events) else {"checked": 0, "skipped": True, "mismatches": []})
     max_after = con.execute("SELECT MAX(ex_date) FROM dividend_events").fetchone()[0]
-    log.info("T4 分红增量 [%s..%s]: 抓取 %d 条，落库 %d 条，MAX(ex_date)=%s，tushare校验=%s",
-             start_s, end_s, len(events), written, max_after, cc)
+    log.info("T4 分红增量 [%s..%s]: 抓取 %d 条，落库 %d 条，MAX(ex_date)=%s",
+             start_s, end_s, len(events), written, max_after)
     return {
         "table": "dividend_events",
         "start_date": start_s,
@@ -521,7 +532,6 @@ def run_t4_sync(con, db_path: str,
         "fetched": len(events),
         "written": int(written),
         "max_ex_date": str(max_after)[:10] if max_after is not None else None,
-        "cross_check": cc,
         "elapsed_s": round(time.monotonic() - t0, 2),
     }
 
@@ -982,7 +992,7 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     health_res = _probe_all_adapters(db_path)
 
     if not skip_t1:
-        print("[p0] T1 stock_master（tushare stock_basic 单次 L 调用；退市档 D 走 t1-delist 低频）...")
+        print("[p0] T1 stock_master（东财 clist 快照；退市档走 t1-delist 低频）...")
         steps["t1"] = run_t1(con, db_path, quota_before)
     else:
         steps["t1"] = {"skipped": True}
@@ -1173,7 +1183,7 @@ def run_history(con, db_path: str, codes: Optional[List[str]],
                 close_map=_close_map) or None
         else:
             # 仅在完全无历史 K 线的新股首灌场景下允许以源推导值作为 bootstrap 锚点；
-            # 已有历史 K 线但 af 全 NULL 时严守单源铁律保持 None 等 tushare 补齐。
+            # 已有历史 K 线但 af 全 NULL 时严守单源铁律保持 None 等 EM 批量补齐。
             _has_any_kline = con.execute(
                 "SELECT 1 FROM kline_daily WHERE ts_code=? LIMIT 1", [code]).fetchone()
             if not _has_any_kline:
@@ -1850,7 +1860,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # 自动对齐（新段基准换算，幂等）+ warning 记痕。
     # 位置纪律：必须在本轮**任何写库之前**——本轮新写入行可能含当日换源新基准，
     # 由下一轮前置对齐统一收口（10 天窗口覆盖）；若放本轮尾部会反过来把刚写入的
-    # 原值行（tushare 批量/t2 落库 af 原样语义）再归一化，破坏"原值落库"契约
+    # 原值行（em_batch/t2 落库 af 原样语义）再归一化，破坏"原值落库"契约
     # （test_lake_v708_batch 2026-10-26 实锤）。失败不阻断增量（记痕，不静默）。
     try:
         from af_rebase import rebase_recent
@@ -1866,7 +1876,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     # ---- T2 kline_daily：每股最近缺口（date_max+1→今日；无行→近 250 日）----
     gap_starts: Dict[str, str] = {c: _kline_gap_start(con, c, 250) for c in codes}
 
-    # ---- 表级预检前置（零/极轻网络，先于东财/tushare 批量通道，节省宝贵限额）----
+    # ---- 表级预检前置（零/极轻网络，先于东财批量通道，节省宝贵限额）----
     _early_idx_dates: set = set()
     _early_idx_max: Optional[str] = None
     try:
@@ -1932,14 +1942,14 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     "ohlcv_sources": [a.name for a in ohlcv_srcs],
                     "adj_sources": [a.name for a in adj_srcs]}
 
-    # ---- v7.0.33：全市场单日批量（2026-11-15 Joel 拍板：tushare 全面取代）----
+    # ---- v7.0.33：全市场单日批量（2026-11-15 EM 拍板转正；2026-11-26 tushare
+    # 备源随弃用整段移除）----
     # 通道链：① 东财 clist 主源（快照只含**最近交易日**数据 → 触发条件=缺口众数
     # 日=指数最新交易日，或周末/节假日陈旧缺口（众数日前无其他交易日，refetch
-    # 语义同 v7.0.8）；多日缺口（停牌复牌/补跑）走逐只多源）② tushare 批量备源
-    # （双源验证期安全网，验证后移除）③ 逐只 legacy。
+    # 语义同 v7.0.8）；多日缺口（停牌复牌/补跑）走逐只多源）② 逐只 legacy。
     # EM 字段映射/单位/af 推导口径见 lake/ingest/em_batch_ingest.py（2026-11-15
     # 实锤：f17=open f15=high f16=low f18=preclose f5 手→股 f20 元→亿元；af=官方
-    # 除权参考价公式 5002 事件对照 tushare 验证；EU 直连 → SG 备用出口）。
+    # 除权参考价公式推导，配股 fail-closed；EU 直连 → SG 备用出口）。
     batch: Dict[str, Any] = {}
     if codes:
         from collections import Counter
@@ -1966,7 +1976,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                 elif _idx_max > _mode_date and not any(
                         _mode_date < _d < _idx_max for _d in _idx_dates):
                     # 周末/节假日运行：众数缺口=非交易日（如周六），快照=最近交易
-                    # 日（周五）且其间无交易日 → 快照覆盖缺口（同 tushare refetch）。
+                    # 日（周五）且其间无交易日 → 快照覆盖缺口（refetch 语义）。
                     _em_bdate, _em_refetch = _idx_max, True
                 if _em_bdate:
                     try:
@@ -2010,18 +2020,19 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                             _em_bdate, _em_refetch, len(_t2_rows), len(_t3_rows),
                             len(_events),
                             sum(1 for c in codes if c not in batch["t2"]))
-                    except Exception as exc:  # noqa: BLE001 - EM 失败 → tushare 备源
+                    except Exception as exc:  # noqa: BLE001 - EM 失败 → 逐只 legacy（2026-11-26 tushare 备源随弃用移除）
                         _batch_errs.append(f"em: {str(exc)[:120]}")
-                        log.warning("incremental 批量 (EM) 失败 → tushare 备源: %s", exc)
+                        log.warning("incremental 批量 (EM) 失败 → 回退逐只 legacy: %s", exc)
+                        batch = {"failed": " | ".join(_batch_errs)[:200]}
                 elif _idx_max < _mode_date or (
                         _idx_max > _mode_date and any(
                             _mode_date < _d < _idx_max for _d in _idx_dates)):
                     log.info(
                         "incremental 批量: 缺口众数 %s 与指数最新 %s 间有多日/倒挂"
-                        "（多日缺口）→ EM 快照不可覆盖，试 tushare 批量",
+                        "（多日缺口）→ EM 快照不可覆盖，回退逐只多源",
                         _mode_date, _idx_max)
             # —— ①.5 no_trade：指数最新 < 缺口众数（缺口都在最近交易日之后 → 无新
-            # 数据；同 v7.0.8 语义，但不再依赖 tushare 空返回判定）——
+            # 数据；同 v7.0.8 语义；no_trade 判定基于指数最新 bar）——
             if _idx_max is not None and _idx_max < _mode_date and not batch.get("date"):
                 batch = {"date": _mode_date, "no_trade": True,
                          "t2": {}, "af": {}, "t3": {},
@@ -2031,72 +2042,6 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                          "idx_dates": _idx_dates}
                 log.info("incremental 批量: %s 非交易日（指数最新 %s）→ 全缺口视为完成",
                          _mode_date, _idx_max)
-            # —— ② tushare 批量备源（双源验证期；验证后整段移除）——
-            if not batch.get("date") and _idx_max is not None:
-                try:
-                    from lake.ingest import tushare_ingest as ti
-                    if ti.tushare_available():
-                        t2b = ti.fetch_daily_batch(_mode_date)
-                        _refetched = False
-                        if not t2b:
-                            # 空 = 该日非交易日（或 API 异常）——用腾讯指数最新 bar 判定：
-                            # 2026-10-24 修复：众数缺口日可能是"陈旧缺口"（周末/长假后运行日
-                            # 的众数缺口=周六，周一跑时全市场 gap 都停在周六）→ 指数最新 bar
-                            # 才是真实交易日 → 按指数最新日重取批量（原逻辑直接回退逐只，
-                            # 周一要跑 2-4h；修复后走批量 ~15min）。
-                            # 指数最新 <= 缺口日 = 真休市（缺口后无任何交易日 → no_trade）。
-                            if _idx_max > _mode_date:
-                                t2b = ti.fetch_daily_batch(_idx_max)
-                                if not t2b:
-                                    raise RuntimeError(
-                                        "tushare 批量 %s 与 %s 均空（指数有 bar）"
-                                        "（API 异常？）→ 回退逐只 legacy"
-                                        % (_mode_date, _idx_max))
-                                log.info(
-                                    "incremental 批量: %s 非交易日 → 改取指数最新交易日 %s",
-                                    _mode_date, _idx_max)
-                                _mode_date = _idx_max
-                                _refetched = True
-                            elif _idx_max >= _mode_date:
-                                raise RuntimeError(
-                                    "tushare 批量 K线空但指数 sh000001 有 >= %s bar"
-                                    "（API 异常？）→ 回退逐只 legacy" % _mode_date)
-                            else:
-                                batch = {"date": _mode_date, "no_trade": True,
-                                         "t2": {}, "af": {}, "t3": {},
-                                         "t2_codes": 0, "t3_codes": 0,
-                                         # 指数 bar 日期供 v7.0.9 预检定 data_date
-                                         # （no_trade 场景 = 缺口日前最近交易日）
-                                         "refetch": False,
-                                         "channel": "tushare",
-                                         "idx_dates": _idx_dates}
-                                log.info("incremental 批量: %s 非交易日 → 全缺口视为完成",
-                                         _mode_date)
-                        if not batch.get("date") and not batch.get("no_trade"):
-                            _min_rows = int(lake_cfg().get("batch_min_rows", 3000) or 3000)
-                            if len(t2b) < _min_rows:
-                                raise RuntimeError(
-                                    f"tushare 批量行数异常 {len(t2b)}<{_min_rows}（API 漂移？）")
-                            afb = ti.fetch_adj_factor_batch(_mode_date)
-                            t3b = ti.fetch_daily_basic_batch(_mode_date)
-                            batch = {"date": _mode_date,
-                                     "t2": {r["ts_code"]: r for r in t2b},
-                                     "af": afb,
-                                     "t3": {r["ts_code"]: r for r in t3b},
-                                     "t2_codes": len(t2b), "t3_codes": len(t3b),
-                                     "channel": "tushare",
-                                     "refetch": _refetched,
-                                     "idx_dates": _idx_dates}
-                            log.info(
-                                "incremental 批量 (tushare %s): T2=%d T3=%d 股；"
-                                "逐只 fallback %d 股", _mode_date, len(t2b), len(t3b),
-                                sum(1 for c in codes if c not in batch["t2"]))
-                    else:
-                        log.info("incremental 批量跳过：tushare 未安装（走逐只）")
-                except Exception as exc:  # noqa: BLE001 - 批量失败 → 逐只 legacy
-                    _batch_errs.append(f"tushare: {str(exc)[:120]}")
-                    log.warning("incremental 批量 (tushare) 失败 → 回退逐只 legacy: %s", exc)
-                    batch = {"failed": " | ".join(_batch_errs)[:200]}
     if batch.get("date"):
         stats["batch"] = {"date": batch["date"], "t2_codes": batch.get("t2_codes"),
                           "t3_codes": batch.get("t3_codes"),
@@ -2152,7 +2097,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     def t2_worker(task: Task) -> None:
         code = task.ts_code
         start = gap_starts[code]
-        # v7.0.8：批量缓存命中 → 零网络落库（tushare 已换算为湖单位：股/元/亿元）。
+        # v7.0.8：批量缓存命中 → 零网络落库（em_batch 已换算为湖单位：股/元/亿元）。
         # 命中口径：缺口日=批量日（常态）；或重取场景（批量日=指数最新交易日 > 缺口日，
         # 且缺口区间内无其他交易日——指数 bar 为空）→ 批量单日行覆盖整个区间。
         # 非交易日（no_trade）且缺口=批量日 → 无新数据视为完成。
@@ -2176,8 +2121,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                 if _brow:
                     adj_map = batch.get("af", {}).get(code)
                     if not adj_map:
-                        # af 铁律（2026-11-20）：批量 af 缺失（tushare 批量限频/
-                        # 空返回）→ 无锚点填充（湖内 level 沿用+官方事件步长）；
+                        # af 铁律（2026-11-20）：批量 af 缺失（EM 除权事件缺失/
+                        # 限频）→ 无锚点填充（湖内 level 沿用+官方事件步长）；
                         # 不写 NULL 洞（NULL 行隔断 af_rebase LAG 检测对致护栏
                         # 失明，山煤国际事故实锤），不引入他源新锚点。
                         adj_map = no_anchor_af_range(
@@ -2185,9 +2130,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                             dates=[str(_brow["date"])[:10]]) or None
                     load_t2(con, code, [_brow],
                             adj_map=adj_map,
-                            # 来源标签随批量通道（v7.0.33 EM 主源；备源期 tushare）
-                            source="em_batch" if batch.get("channel") == "em"
-                            else "tushare",
+                            # 来源标签随批量通道（v7.0.33 EM 主源；2026-11-26 备源随 tushare 弃用移除）
+                            source="em_batch",
                             volume_is_shares=True)
                     return
                 if batch.get("no_trade"):
@@ -2243,10 +2187,11 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         if not kl:
             return   # 源正常但缺口内无新数据（节假日/未收盘）→ 视为完成
 
-        # adj_factor 铁律（2026-11-20）：湖内唯一新锚点源=tushare 官方 af
-        # （批量通道命中分支已写入）。逐只 fallback **不再取任何源私有推导值**
+        # adj_factor 铁律（2026-11-20，2026-11-26 锚点源随 tushare 弃用改 EM）：
+        # 湖内唯一新锚点=EM 除权事件推导（dividend_events 步长，批量通道命中
+        # 分支已写入）。逐只 fallback **不再取任何源私有推导值**
         # （sina/tdx hfq÷raw=源私有归一化，写湖即换源假断崖）——统一无锚点填充：
-        # 沿用湖内现有 level+官方除权步长；无 level→None（下次 tushare 批量补）。
+        # 沿用湖内现有 level+官方除权步长；无 level→None（下次 EM 批量补）。
         _close_map = {str(r["date"])[:10]: float(r["close"])
                       for r in kl if r.get("close") is not None and float(r["close"]) > 0}
         adj_map = no_anchor_af_range(
@@ -2284,7 +2229,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
     stats["t2"] = runner.run(t2_tasks, t2_worker)
 
     # ---- T3 valuation_daily：估值快照（date=今日；滞后多少补多少）----
-    # v7.0.8：批量命中股零网络（tushare daily_basic）；仅对批量未覆盖股保留
+    # v7.0.8：批量命中股零网络（EM daily_basic）；仅对批量未覆盖股保留
     # 腾讯逐只路径 + 前置一批探测（全空 = 网络/接口故障 → 抛错中止，不标 done，
     # 防"假完成"毒化；个别缺失 = 停牌/单批失败 → 该只跳过，次日新运行日键补）。
     # v7.0.9：已有 data_date/今日行且不在批量缓存的股跳过（非交易日快照值不变，
@@ -2319,7 +2264,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
         _bsnap = batch.get("t3", {}).get(task.ts_code)
         if _bsnap:
             load_t3(con, task.ts_code, _bsnap, str(_bsnap["date"]),
-                    source="em_batch" if batch.get("channel") == "em" else "tushare")
+                    source="em_batch")
             return
         code = task.ts_code
         if code not in _t3_snap_cache:
@@ -3513,20 +3458,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "t4-sync",
-        help="T4 dividend_events 区间增量同步（EM RPT_SHAREBONUS_DET 主通道 + tushare 低频抽样校验）")
+        help="T4 dividend_events 区间增量同步（EM RPT_SHAREBONUS_DET 唯一主通道；"
+             "2026-11-26 tushare 交叉校验随弃用移除）")
     sp.add_argument("--start-date", default=None,
                     help="起始除权日 YYYY-MM-DD（缺省从 MAX(ex_date)-14d 自动推算）")
     sp.add_argument("--end-date", default=None, help="结束除权日 YYYY-MM-DD（缺省=今日北京时间）")
     sp.add_argument("--lookback-days", type=int, default=14,
                     help="从库内 MAX(ex_date) 往前重叠回溯天数（默认 14）")
-    sp.add_argument("--no-cross-check", action="store_true", default=False,
-                    help="跳过 tushare 低频抽样交叉校验")
     sp.set_defaults(func=cmd_t4_sync)
 
     sp = sub.add_parser(
         "t1-delist",
-        help="v7.0.18：T1 退市档低频刷新（单次 tushare stock_basic D 调用，免费档 1 次/小时，"
-             "建议每周；只更新 stock_master 命中行的 delist_date）")
+        help="T1 退市档低频刷新（EM 退市板 m:0 s:3 负名单，2026-11-26 tushare D 档弃用切换；"
+             "退市日=湖内 K 线最后日期；建议每周；只更新 stock_master 命中行 delist_date 仍 NULL 者）")
     sp.set_defaults(func=cmd_t1_delist)
 
     sp = sub.add_parser(
@@ -3635,7 +3579,6 @@ def cmd_t4_sync(args, con, db_path: str) -> int:
         start_date=getattr(args, "start_date", None),
         end_date=getattr(args, "end_date", None),
         lookback_days=int(getattr(args, "lookback_days", 14) or 14),
-        cross_check=not bool(getattr(args, "no_cross_check", False)),
     )
     _print_summary("t4-sync", summary)
     return EXIT_OK

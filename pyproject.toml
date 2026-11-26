@@ -4,9 +4,9 @@ version = "7.0.0"
 description = "A股深回撤金字塔加仓策略（drawdown_martingale）：5 条件股票池 + 逐股状态机回测 + Web 查询/按需回测（数据源 = DuckDB 数据湖）"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    # v7.0.18：baostock 随渠道完全移除（Joel 2026-10-26 拍板）；tushare 升为 T1 主源
-    # （T2/T3 日增主源自 v7.0.8 起已在用，此处首次显式入依赖）
-    "tushare>=1.4",
+    # v7.0.18：baostock 随渠道完全移除（Joel 2026-10-26 拍板）；
+    # tushare 2026-11-26 完全弃用（Joel 定案）→ 依赖移除（原 T1 主源/T2·T3 批量，
+    # 现全部由东财 clist/datacenter 通道承接）
     "pandas>=2.0",
     "PyYAML>=6.0",
     "ruamel.yaml>=0.17",
@@ -15,7 +15,7 @@ dependencies = [
     # 对齐 lock 时被误清（web 服务/ T5 取数当场缺包）→ 全部显式化：
     "adata>=0.1",           # T5 季度基本面 F10（lake/ingest/adata_f10_adapter.py）
     "pypinyin>=0.51",        # Web 股票名拼音模糊搜索（web/app.py）
-    "python-dotenv>=1.0",    # .env 读 TUSHARE_TOKEN / PUSHPLUS_TOKEN
+    "python-dotenv>=1.0",    # .env 读 PUSHPLUS_TOKEN 等（TUSHARE_TOKEN 已随弃用封存）
 ]
 
 [project.optional-dependencies]

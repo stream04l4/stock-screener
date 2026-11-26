@@ -10,7 +10,7 @@
     v7.0.18 Joel 拍板——跨源对账能力放弃）；
   - F4 配额：QuotaGuard 到顶/边界行为（守卫迁 lake/ingest/common.py，泛化保留）。
 
-T1 主源=v7.0.18 起 tushare stock_basic（run_full 用例中 fake pro 零网络）。
+T1 主源=东财 clist 快照单次调用（2026-11-26 tushare 弃用后；run_full 用例 fake fetch_clist_snapshot 零网络）。
 """
 from __future__ import annotations
 
@@ -280,42 +280,9 @@ def test_run_t9_fetch_failure_uses_existing_csv_not_blocking(tmp_path, monkeypat
 # ===========================================================================
 # F1 t8/t9：full 模式轻量阶段前置（t8/t9 在 t5 之前；段标顺序）
 # ===========================================================================
-class _Row:
-    """fake DataFrame 行（itertuples 返回对象，属性按列名取）。"""
-
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-
-class _FakeDF:
-    """最小 DataFrame 替身：仅 itertuples(index=False)。"""
-
-    def __init__(self, rows):
-        self._rows = [_Row(**r) for r in rows]
-
-    def itertuples(self, index=False):
-        return iter(self._rows)
-
-
-class _FakePro:
-    """v7.0.18：T1 主源=tushare stock_basic——fake 零网络（L 状态含 1 只北交所验证排除）。
-
-    **ts_code 必须用 tushare 原生格式（600001.SH）**：真实 API 就是原生格式，
-    湖格式（sh.600001）由 run_t1 内 _to_lake_code 转换——fake 若直接给湖格式，
-    转换纪律就永远测不到（2026-10-26 生产 5224 行重复行事故的直接教训）。
-    """
-
-    def stock_basic(self, exchange="", list_status="L", fields=""):
-        if list_status == "L":
-            return _FakeDF([
-                {"ts_code": "600001.SH", "name": "股600001", "industry": "金融",
-                 "market": "主板", "list_date": "1999-01-01"},
-                {"ts_code": "000002.SZ", "name": "股000002", "industry": "农林牧渔",
-                 "market": "主板", "list_date": "1999-01-01"},
-                {"ts_code": "920001.BJ", "name": "北交所股", "industry": "其他",
-                 "market": "北交所", "list_date": "2021-01-01"},
-            ])
-        return _FakeDF([{"ts_code": "600001.SH", "delist_date": None}])
+def _em_snap(rows):
+    """构造 monkeypatch 用 clist 快照替身（返回固定归一化行列表）。"""
+    return lambda allow_sg=True: [dict(r) for r in rows]
 
 
 def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
@@ -326,13 +293,17 @@ def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
     _seed_master_kline(con, codes, n_days=30)
 
     # 复用 v616 的 fake 模式：t8/t9 用真实 run_t8/run_t9（零网络，本地），其余阶段 fake。
-    # v7.0.18：T1=tushare（fake pro）+ 腾讯快照补 name/is_st（fake）；T2 池空→腾讯全史。
-    import lake.ingest.tushare_ingest as tsi
+    # 2026-11-26：T1=东财 clist（fake fetch_clist_snapshot）+ 腾讯快照补 name/is_st（fake）。
+    import lake.ingest.em_batch_ingest as emb
     import lake.ingest.tencent_ingest as ti
     import screener.data.tencent as tmod
 
-    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
-    monkeypatch.setattr(tsi, "_pro", lambda: _FakePro())
+    monkeypatch.setattr(emb, "fetch_clist_snapshot", _em_snap([
+        {"ts_code": "sh.600001", "name": "股600001", "industry": "金融",
+         "list_date": "1999-01-01"},
+        {"ts_code": "sz.000002", "name": "股000002", "industry": "农林牧渔",
+         "list_date": "1999-01-01"},
+    ]))
     monkeypatch.setattr(ti, "fetch_snapshot",
                         lambda client, batch: {c: {"name": f"股{c[-6:]}"} for c in batch})
 
@@ -407,40 +378,36 @@ def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
 
 
 # ===========================================================================
-# T1（v7.0.18）：tushare stock_basic 单次 L 调用 + delist_date 沿用 + t1-delist
+# T1（2026-11-26 tushare 弃用切换）：东财 clist 快照单次调用 + delist_date 沿用
+#     + t1-delist 退市板（m:0 s:3）
 # ===========================================================================
-def test_t1_single_l_call_preserves_delist_and_coarse_industry(tmp_path, monkeypatch):
-    """v7.0.18.1：T1 主档只发 1 次 L 调用（D 档拆 t1-delist，免费档实测 1 次/小时）；
-    delist_date 沿用 stock_master 旧值；行业=粗分类（csric2 置 NULL）；北交所排除。"""
-    import lake.ingest.tushare_ingest as tsi
+def test_t1_clist_snapshot_preserves_delist_and_coarse_industry(tmp_path, monkeypatch):
+    """T1 主源=东财 clist（2026-11-26，Joel 定案）：单次快照调用；
+    delist_date 沿用 stock_master 旧值；行业=东财粗分类（csric2 置 NULL 不覆盖）；
+    北交所不在 clist fs 内（universe 天然排除）。"""
+    import lake.ingest.em_batch_ingest as emb
     import lake.ingest.tencent_ingest as ti
     import screener.data.tencent as tmod
 
     db = str(tmp_path / "t1x.duckdb")
     con = lconn.open(db)
-    # 预置 1 行（baostock 时代旧数据）：带 delist_date + 旧 csric2
+    # 预置 1 行（tushare 时代旧数据）：带 delist_date + 旧 csric2
     con.execute(
         "INSERT INTO stock_master (ts_code,name,industry_csric2,board,is_st,"
         "source,fetched_at,data_version,delist_date) VALUES "
         "('sz.000002','旧值','J66','主板',0,'t','2026-01-01 09:00:00','v6.1','2026-09-01')")
-    calls = []
+    snap_calls = []
 
-    class _P:
-        def stock_basic(self, exchange="", list_status="L", fields=""):
-            calls.append(list_status)
-            if list_status == "L":
-                return _FakeDF([
-                    {"ts_code": "600001.SH", "name": "股600001", "industry": "金融",
-                     "market": "主板", "list_date": "1999-01-01"},
-                    {"ts_code": "000002.SZ", "name": "股000002", "industry": "农林牧渔",
-                     "market": "主板", "list_date": "1999-01-01"},
-                    {"ts_code": "920001.BJ", "name": "北交所股", "industry": "其他",
-                     "market": "北交所", "list_date": "2021-01-01"},
-                ])
-            return _FakeDF([])
+    def fake_snap(allow_sg=True):
+        snap_calls.append(1)
+        return [
+            {"ts_code": "sh.600001", "name": "股600001", "industry": "金融",
+             "list_date": "1999-01-01"},
+            {"ts_code": "sz.000002", "name": "股000002", "industry": "农林牧渔",
+             "list_date": "1999-01-01"},
+        ]
 
-    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
-    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    monkeypatch.setattr(emb, "fetch_clist_snapshot", fake_snap)
     monkeypatch.setattr(ti, "fetch_snapshot", lambda c, b: {})   # 快照补 name/is_st no-op
 
     class _TC:
@@ -448,77 +415,99 @@ def test_t1_single_l_call_preserves_delist_and_coarse_industry(tmp_path, monkeyp
 
     monkeypatch.setattr(tmod, "TencentClient", _TC)
     res = drv.run_t1(con, db)
-    assert calls == ["L"], f"T1 应只发 1 次 L 调用（D 档已拆 t1-delist）: {calls}"
-    assert res["tushare_calls_this_step"] == 1
+    assert len(snap_calls) == 1, f"T1 应只发 1 次 clist 快照（退市档已拆 t1-delist）: {snap_calls}"
+    assert res["em_calls_this_step"] == 1
     row = con.execute(
         "SELECT industry_name, industry_csric2, CAST(delist_date AS VARCHAR), source "
         "FROM stock_master WHERE ts_code='sz.000002'").fetchone()
-    assert row == ("农林牧渔", "J66", "2026-09-01", "tushare"), \
+    assert row == ("农林牧渔", "J66", "2026-09-01", "em_clist"), \
         f"csric2 与 delist_date 均应沿用既有值（防 T1 同步清空证监会行业代码）: {row}"
     n_bj = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code='bj.920001'").fetchone()[0]
-    assert n_bj == 0, "北交所不得入 universe"
+    assert n_bj == 0, "北交所不得入 universe（clist fs 天然不含）"
     con.close()
 
 
 def test_t1_delist_updates_only_existing_rows(tmp_path, monkeypatch):
-    """t1-delist：D 调用只 UPDATE 命中行的 delist_date；universe 外 code 不插入。"""
-    import lake.ingest.tushare_ingest as tsi
+    """t1-delist（2026-11-26 切 EM 退市板）：只 UPDATE 命中行 delist_date 仍 NULL 者；
+    退市日=湖内 K 线最后日期；universe 外 code 不插入；无 K 线跳过不造日期。"""
+    import lake.ingest.em_batch_ingest as emb
 
     db = str(tmp_path / "t1d.duckdb")
     con = lconn.open(db)
     con.execute(
         "INSERT INTO stock_master (ts_code,name,industry_csric2,board,is_st,"
         "source,fetched_at,data_version) VALUES "
-        "('sz.000002','旧值','J66','主板',0,'t','2026-01-01 09:00:00','v6.1')")
+        "('sz.000002','旧值','J66','主板',0,'t','2026-01-01 09:00:00','v6.1'),"
+        "('sz.000001','无K线股','J66','主板',0,'t','2026-01-01 09:00:00','v6.1')")
+    # K 线最后日期 2026-10-09 → 000002 的退市日来源
+    con.execute(
+        "INSERT INTO kline_daily (ts_code,date,open,high,low,close,volume,amount,source) "
+        "VALUES ('sz.000002','2026-10-09',10,11,9,10,100,1000,'em_batch')")
 
-    class _P:
-        def stock_basic(self, exchange="", list_status="D", fields=""):
-            assert list_status == "D"
-            return _FakeDF([
-                {"ts_code": "000002.SZ", "delist_date": "2026-10-09"},
-                {"ts_code": "920999.BJ", "delist_date": "2026-10-09"},   # 不在库 → 跳过
-            ])
-
-    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
-    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    monkeypatch.setattr(emb, "fetch_clist_delisted", lambda allow_sg=True: [
+        "000002",     # 库内 + 有 K 线 → 补写
+        "000001",     # 库内 + 无 K 线 → 跳过不造日期
+        "920999",     # 北交所码不在 stock_master → 跳过
+    ])
     res = drv.run_t1_delist(con)
     assert res["delist_updated"] == 1, res
+    assert res["em_delisted_codes"] == 3
+    assert res["skipped_no_kline"] == 1
     got = con.execute(
         "SELECT delist_date FROM stock_master WHERE ts_code='sz.000002'").fetchone()[0]
-    assert str(got) == "2026-10-09", f"delist_date 应更新: {got}"
+    assert str(got) == "2026-10-09", f"delist_date 应=K线最后日期: {got}"
+    got2 = con.execute(
+        "SELECT delist_date FROM stock_master WHERE ts_code='sz.000001'").fetchone()[0]
+    assert got2 is None, f"无 K 线不得造退市日: {got2}"
     n = con.execute("SELECT COUNT(*) FROM stock_master").fetchone()[0]
-    assert n == 1, f"universe 外 code 不得插入: {n}"
+    assert n == 2, f"universe 外 code 不得插入: {n}"
     con.close()
 
 
 # ===========================================================================
-# v7.0.18.3（tester DEF-1/DEF-2/DEF-3）：边界函数加固 + 除息日 XD 名跳过
+# 边界函数（原 DEF-1/DEF-2，2026-11-26 tushare 弃用后改锚 EM 通道）
+#     + DEF-3 除息日 XD 名跳过
 # ===========================================================================
-def test_to_lake_code_rejects_malformed():
-    """DEF-1：数字段空/非 6 位/非数字 → None（脏码不得绕过边界入湖）。"""
-    from lake.ingest.tushare_ingest import _to_lake_code
-    assert _to_lake_code("601398.SH") == "sh.601398"
-    assert _to_lake_code("000002.SZ") == "sz.000002"
-    assert _to_lake_code(".SH") is None          # 数字段为空（tester 复现用例）
-    assert _to_lake_code("60139.SH") is None     # 5 位
-    assert _to_lake_code("6013981.SH") is None   # 7 位
-    assert _to_lake_code("60139a.SH") is None    # 非数字
-    assert _to_lake_code("920001.BJ") is None    # 北交所
-    assert _to_lake_code("601398sh") is None     # 无点分隔
+def test_em_code_boundary_discipline():
+    """东财侧代码纪律：_normalize_row 拒非沪深 A 码（EmBatchError，universe 纪律）；
+    to_ts_code 前缀补全（92 号段须先于沪市 9 判断）。"""
+    from lake.ingest.common import to_ts_code
+    from lake.ingest.em_batch_ingest import _normalize_row, EmBatchError
+
+    # 前缀补全：沪/深/创业板/科创板/北交所
+    assert to_ts_code("600001") == "sh.600001"
+    assert to_ts_code("000001") == "sz.000001"
+    assert to_ts_code("300750") == "sz.300750"
+    assert to_ts_code("688001") == "sh.688001"
+    assert to_ts_code("920001") == "bj.920001"
+    # 已是湖格式 → 原样
+    assert to_ts_code("sh.600001") == "sh.600001"
+    # _normalize_row：沪深 A 码（0/3/6 前缀）过；B 股/基金/债/北交所 → EmBatchError
+    assert _normalize_row({"f12": "600001", "f14": "x"})["ts_code"] == "sh.600001"
+    assert _normalize_row({"f12": "000001", "f14": "x"})["ts_code"] == "sz.000001"
+    assert _normalize_row({"f12": "300750", "f14": "x"})["ts_code"] == "sz.300750"
+    for bad in ("200011", "510300", "920001", "830001"):
+        try:
+            _normalize_row({"f12": bad, "f14": "x"})
+        except EmBatchError:
+            pass
+        else:
+            raise AssertionError(f"{bad} 应被 _normalize_row 拒绝")
 
 
-def test_ymd_handles_int_wire_date():
-    """DEF-2：int 型 wire 日期（pandas int64 列）须转横线格式。"""
-    from lake.ingest.tushare_ingest import _ymd
-    assert _ymd(20261023) == "2026-10-23"        # int（tester 复现用例）
-    assert _ymd("20261023") == "2026-10-23"      # str wire
-    assert _ymd("2026-10-23") == "2026-10-23"    # 已横线 → 原样
-    assert _ymd(" 20261023 ") == "2026-10-23"    # 带空白
+def test_ymd8_handles_int_wire_date():
+    """东财 wire 日期 YYYYMMDD（str/int）→ ISO（_ymd8 单点）。"""
+    from lake.ingest.em_batch_ingest import _ymd8
+    assert _ymd8(20261023) == "2026-10-23"        # int
+    assert _ymd8("20261023") == "2026-10-23"      # str wire
+    assert _ymd8("2026-10-23") == "2026-10-23"    # 已横线 → 原样
+    assert _ymd8(" 20261023 ") == "2026-10-23"    # 带空白
+    assert _ymd8(None) is None
 
 
 def test_t1_skips_exdividend_xd_names(tmp_path, monkeypatch):
     """DEF-3：除息日腾讯名带 XD/DR/XR 前缀（GBK 截断）→ 跳过覆盖，保留原名。"""
-    import lake.ingest.tushare_ingest as tsi
+    import lake.ingest.em_batch_ingest as emb
     import lake.ingest.tencent_ingest as ti
     import screener.data.tencent as tmod
 
@@ -528,15 +517,10 @@ def test_t1_skips_exdividend_xd_names(tmp_path, monkeypatch):
         "INSERT INTO stock_master (ts_code,name,board,is_st,source,fetched_at,data_version) "
         "VALUES ('sh.601088','中国神华','主板',0,'t','2026-01-01 09:00:00','v6.1')")
 
-    class _P:
-        def stock_basic(self, exchange="", list_status="L", fields=""):
-            return _FakeDF([
-                {"ts_code": "601088.SH", "name": "中国神华", "industry": "煤炭",
-                 "market": "主板", "list_date": "2007-10-09"},
-            ])
-
-    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
-    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    monkeypatch.setattr(emb, "fetch_clist_snapshot", _em_snap([
+        {"ts_code": "sh.601088", "name": "中国神华", "industry": "煤炭",
+         "list_date": "2007-10-09"},
+    ]))
     # 腾讯快照：除息日返回 XD 前缀截断名
     monkeypatch.setattr(ti, "fetch_snapshot",
                         lambda c, b: {"sh.601088": {"name": "XD中国神"}})
@@ -553,7 +537,7 @@ def test_t1_skips_exdividend_xd_names(tmp_path, monkeypatch):
 
 def test_t1_applies_clean_tencent_name(tmp_path, monkeypatch):
     """DEF-3 对照：非除息日（无 XD/DR/XR 前缀）的腾讯名正常覆盖补 ST 标记。"""
-    import lake.ingest.tushare_ingest as tsi
+    import lake.ingest.em_batch_ingest as emb
     import lake.ingest.tencent_ingest as ti
     import screener.data.tencent as tmod
 
@@ -563,15 +547,10 @@ def test_t1_applies_clean_tencent_name(tmp_path, monkeypatch):
         "INSERT INTO stock_master (ts_code,name,board,is_st,source,fetched_at,data_version) "
         "VALUES ('sz.000001','平安银行','主板',0,'t','2026-01-01 09:00:00','v6.1')")
 
-    class _P:
-        def stock_basic(self, exchange="", list_status="L", fields=""):
-            return _FakeDF([
-                {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行",
-                 "market": "主板", "list_date": "1991-04-03"},
-            ])
-
-    monkeypatch.setattr(tsi, "tushare_available", lambda: True)
-    monkeypatch.setattr(tsi, "_pro", lambda: _P())
+    monkeypatch.setattr(emb, "fetch_clist_snapshot", _em_snap([
+        {"ts_code": "sz.000001", "name": "平安银行", "industry": "银行",
+         "list_date": "1991-04-03"},
+    ]))
     monkeypatch.setattr(ti, "fetch_snapshot",
                         lambda c, b: {"sz.000001": {"name": "*ST测试"}})
 

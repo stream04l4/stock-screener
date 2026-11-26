@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""lake.ingest.em_batch_ingest —— 东财 push2/datacenter 全市场单日批量（tushare 替代主通道）。
+"""lake.ingest.em_batch_ingest —— 东财 push2/datacenter 全市场单日批量（唯一主通道）。
 
-Joel 2026-11-15 拍板：全面取代 tushare（每日增量 T2/T3 主通道 + T1 主档/退市 +
-af 本地推导），本模块是其取数层。全部接口 2026-11-15 实测验证（字段映射/单位/
+Joel 2026-11-15 拍板全面取代 tushare（每日增量 T2/T3 主通道 + T1 主档/退市 +
+af 本地推导）；2026-11-26 tushare 源完全弃用（数据清除 + 代码整删，Joel 定案），
+本模块为 lake 取数唯一主通道。全部接口 2026-11-15 实测验证（字段映射/单位/
 分页/限频见各函数 docstring 的实锤注记）。
 
 通道与数据面：
@@ -53,8 +54,12 @@ _SG_HOST = "oci"   # 新加坡备用出口（Joel 2026-11-15 提醒：EU push2 �
 _DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 _UT = "bd1d9ddb04089700cf9c27f6f7426281"
 # 沪深 A 股（沪主板 t:6 / 科创 t:80 / 深主板 t:2 / 创业 t:23）——无 B 股、无北交所
-# （universe 口径与 tushare market 过滤一致：沪深）。
+# （universe 口径 = 沪深主板+科创+创业）。
 _FS_A = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"
+# 两网及退市板（t1-delist 退市负名单源，Joel 2026-11-26 tushare D 档弃用切换；
+# 口径 = 东财退市股票列表页 quote.eastmoney.com/center/gridlist.html#delist_hs，
+# 该板含老两网/B股退市码 → 调用方须与 stock_master A 股码交叉过滤）。
+_FS_DELISTED = "m:0 s:3"
 _FIELDS = "f2,f3,f5,f6,f8,f12,f14,f15,f16,f17,f18,f20,f21,f26,f100,f115,f167"
 _PAGE_SIZE = 100
 _TIMEOUT_S = 30
@@ -133,6 +138,32 @@ def fetch_clist_snapshot(allow_sg: bool = True) -> List[Dict[str, Any]]:
     return rows
 
 
+def fetch_clist_delisted(allow_sg: bool = True) -> List[str]:
+    """两网及退市板代码列表（t1-delist 退市负名单源，2026-11-26 tushare D 档弃用切换）。
+
+    fs=m:0 s:3（东财退市股票列表页同口径）；该板含老两网/退市B股等非 A 股码，
+    调用方须与 stock_master A 股码交叉过滤。接口无退市日期字段 → 调用方退市日
+    取湖内 K 线最后日期（= 该股最后交易日，池剔除用途下早于官方退市安排终止日
+    属保守口径，安全）。出口链路与 fetch_clist_snapshot 相同（EU → SG）。
+
+    :return: 6 位代码字符串列表（未转湖格式）。
+    :raises EmBatchError: 接口异常 / 列表为空。
+    """
+    try:
+        rows_raw, total = _fetch_all_pages(_PUSH2_CLIST, fs=_FS_DELISTED, fields="f12")
+    except EmBatchError as exc:
+        if not allow_sg:
+            raise
+        log.warning("EU push2 退市板失败 → 切 SG 备用出口: %s", str(exc)[:120])
+        rows_raw, total = _fetch_all_pages_sg(fs=_FS_DELISTED, fields="f12")
+    codes = [str(r.get("f12") or "").strip() for r in rows_raw]
+    codes = [c for c in codes if c]
+    if not codes:
+        raise EmBatchError("东财退市板代码列表为空（接口异常？）")
+    log.info("东财退市板: %d 码（total=%s）", len(codes), total)
+    return codes
+
+
 def _normalize_row(x: Dict[str, Any]) -> Dict[str, Any]:
     """clist 原始行 → 湖契约行（仅沪深 A 股；停牌 '-' → None）。"""
     c6 = str(x.get("f12") or "").zfill(6)
@@ -162,7 +193,8 @@ def _normalize_row(x: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _fetch_all_pages(url: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+def _fetch_all_pages(url: str, fs: str = _FS_A,
+                     fields: str = _FIELDS) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     """EU 直连分页拉全（56 页；fid=f12 固定排序 + 按代码去重防翻页漏股）。"""
     rows_raw: List[Dict[str, Any]] = []
     seen_codes: Set[str] = set()
@@ -171,7 +203,7 @@ def _fetch_all_pages(url: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     while True:
         d = _get_json(url, {
             "pn": page, "pz": _PAGE_SIZE, "po": 0, "np": 1, "fid": "f12",
-            "ut": _UT, "fltt": 2, "invt": 2, "fs": _FS_A, "fields": _FIELDS,
+            "ut": _UT, "fltt": 2, "invt": 2, "fs": fs, "fields": fields,
         })
         data = d.get("data") or {}
         total = data.get("total")
@@ -196,8 +228,8 @@ def _fetch_all_pages(url: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     return rows_raw, total
 
 
-# SG 远程取数脚本（stdlib only；在 oci 上执行，push2delay 直连+固定排序+去重分页）
-_SG_FETCH_SCRIPT = r'''
+# SG 远程取数脚本模板（stdlib only；在 oci 上执行，push2delay 直连+固定排序+去重分页）
+_SG_FETCH_SCRIPT_TEMPLATE = r'''
 import json, time, urllib.parse, urllib.request
 URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 Q0 = {"pz": 100, "po": 0, "np": 1, "fid": "f12", "ut": "__UT__", "fltt": 2, "invt": 2,
@@ -236,20 +268,25 @@ while True:
     page += 1
     time.sleep(0.2)
 print(json.dumps({"total": total, "rows": out}))
-'''.replace("__UT__", _UT).replace("__FS__", _FS_A).replace("__FIELDS__", _FIELDS)
+'''
 
 
-def _fetch_all_pages_sg() -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """SG 备用出口：单次 ssh（远程 python3 拉全 56 页，JSON 回传）。
+def _fetch_all_pages_sg(fs: str = _FS_A,
+                        fields: str = _FIELDS) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """SG 备用出口：单次 ssh（远程 python3 分页拉全，JSON 回传）。
 
     凭据零依赖（EM 接口无鉴权；ssh 走本机 oci 别名密钥，BatchMode 防交互挂起）。
     """
     import subprocess
 
+    script = (_SG_FETCH_SCRIPT_TEMPLATE
+              .replace("__UT__", _UT)
+              .replace("__FS__", fs)
+              .replace("__FIELDS__", fields))
     r = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
          _SG_HOST, "python3", "-"],
-        input=_SG_FETCH_SCRIPT.encode("utf-8"),
+        input=script.encode("utf-8"),
         capture_output=True, timeout=1500)
     if r.returncode != 0:
         raise EmBatchError(
@@ -557,77 +594,6 @@ def load_ex_events(con, trade_date: str, events: List[Dict[str, Any]],
                 pass
         raise
     return len(all_rows)
-
-
-def cross_check_ex_events_tushare(con, events: List[Dict[str, Any]],
-                                  max_sample: int = 2) -> Dict[str, Any]:
-    """用 tushare dividend 对 EM 新增事件做低频抽样交叉校验（保护免费档限频）。
-
-    - max_sample 默认 2 只（取现金分红最大的样本）；
-    - tushare 不可用 / 限频 / 网络异常仅记 warning 返回，绝不阻断 EM 主通道。
-    """
-    if not events or max_sample <= 0:
-        return {"checked": 0, "skipped": True, "mismatches": []}
-    try:
-        from . import tushare_ingest as ti
-        if not ti.tushare_available():
-            return {"checked": 0, "skipped": True, "reason": "tushare_unavailable", "mismatches": []}
-    except Exception as exc:  # noqa: BLE001
-        return {"checked": 0, "skipped": True, "reason": str(exc)[:80], "mismatches": []}
-
-    # 按每股现金分红/事件强度降序选最多 max_sample 只互不重复的股票抽样核对
-    seen_codes: Set[str] = set()
-    samples: List[Dict[str, Any]] = []
-    for ev in sorted(events, key=lambda x: -(float(x.get("cash") or 0.0) + float(x.get("bonus") or 0.0))):
-        c = str(ev.get("ts_code") or "")
-        ex_d = str(ev.get("ex_date") or "")[:10]
-        if not c or not ex_d or "." not in c or c in seen_codes:
-            continue
-        seen_codes.add(c)
-        samples.append(ev)
-        if len(samples) >= max_sample:
-            break
-
-    checked = 0
-    mismatches: List[Dict[str, Any]] = []
-    cols = {str(r[1]).lower() for r in con.execute("PRAGMA table_info('dividend_events')").fetchall()}
-    has_conflict = "conflict_src" in cols
-    for ev in samples:
-        c = ev["ts_code"]
-        ex_d = str(ev["ex_date"])[:10]
-        mkt, num = c.split(".", 1)
-        ts_fmt = f"{num}.{mkt.upper()}"
-        try:
-            ts_rows = ti.fetch_dividend(ts_fmt)
-        except Exception as exc:  # noqa: BLE001 - 限频/缺token不阻断
-            log.warning("T4 tushare 交叉校验跳过 %s: %s", c, str(exc)[:100])
-            continue
-        checked += 1
-        # 查找匹配同一 ex_date 的 tushare 分红行
-        matched = [
-            r for r in (ts_rows or [])
-            if str(r.get("ex_date") or "").replace("-", "")[:8] == ex_d.replace("-", "")
-        ]
-        em_cash = float(ev.get("cash") or 0.0)
-        if not matched:
-            if em_cash > 0.0:
-                msg = f"tushare_missing:{ex_d}"
-                mismatches.append({"ts_code": c, "ex_date": ex_d, "em_cash": em_cash, "tushare_cash": None})
-                log.warning("T4 交叉校验分歧 %s %s: EM cash=%.4f, tushare 无该日记录", c, ex_d, em_cash)
-                if has_conflict:
-                    con.execute("UPDATE dividend_events SET conflict_src=? WHERE ts_code=? AND ex_date=?",
-                                [msg[:256], c, ex_d])
-            continue
-        ts_cash = sum(float(r.get("div_cash_before_tax") or 0.0) for r in matched)
-        tol = max(0.005, 0.02 * em_cash)
-        if abs(em_cash - ts_cash) > tol:
-            msg = f"em:{em_cash:.4f}|tushare:{ts_cash:.4f}"
-            mismatches.append({"ts_code": c, "ex_date": ex_d, "em_cash": em_cash, "tushare_cash": ts_cash})
-            log.warning("T4 交叉校验分歧 %s %s: %s", c, ex_d, msg)
-            if has_conflict:
-                con.execute("UPDATE dividend_events SET conflict_src=? WHERE ts_code=? AND ex_date=?",
-                            [msg[:256], c, ex_d])
-    return {"checked": checked, "skipped": False, "mismatches": mismatches}
 
 
 def active_code_set(snap: List[Dict[str, Any]]) -> Set[str]:

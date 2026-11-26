@@ -46,7 +46,6 @@ KEY_RESTORE_DIV_CODES = [
 KEY_BONUS_DISTORT_CODES = ["sz.300873", "sz.300857"]
 # 幻影盖章代表股（含基础池/候选池受影响股）
 KEY_PHANTOM_CODES = ["sz.301219", "sh.601857", "sh.600392", "sh.601995"]
-DEFAULT_TUSHARE_SAMPLES = ["sz.301219", "sh.601857", "sh.601998"]
 
 
 def _today_beijing() -> str:
@@ -114,59 +113,6 @@ def snapshot_state(con, focus_codes: Optional[List[str]] = None,
         "watchlist": watchlist,
         "focus_boundaries": boundaries,
     }
-
-
-def verify_tushare_samples(con, sample_codes: List[str],
-                           since_date: str = "2026-10-01",
-                           tol: float = af_rebase.DEFAULT_TOL) -> Dict[str, Any]:
-    """低频抽样对比湖内 adj_factor 相邻日比与 tushare 官方相邻日比（检查平坦性与除权一致性）。"""
-    try:
-        from lake.ingest import tushare_ingest as ti
-        if not ti.tushare_available():
-            return {"skipped": True, "reason": "tushare_unavailable", "samples": []}
-    except Exception as exc:  # noqa: BLE001
-        return {"skipped": True, "reason": str(exc)[:100], "samples": []}
-
-    results: List[Dict[str, Any]] = []
-    all_ok = True
-    for code in sample_codes:
-        if "." not in code:
-            continue
-        mkt, num = code.split(".", 1)
-        ts_fmt = f"{num}.{mkt.upper()}"
-        try:
-            ts_rows = ti.fetch_adj_factor(ts_fmt)
-        except Exception as exc:  # noqa: BLE001
-            results.append({"ts_code": code, "ok": None, "error": str(exc)[:100]})
-            continue
-        ts_map: Dict[str, float] = {}
-        for r in ts_rows or []:
-            d = str(r.get("trade_date") or "").strip()
-            if len(d) == 8 and d.isdigit():
-                d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
-            af = r.get("adj_factor")
-            if d >= since_date and af is not None and float(af) > 0:
-                ts_map[d[:10]] = float(af)
-        lake_rows = con.execute(
-            "SELECT CAST(date AS VARCHAR), adj_factor FROM kline_daily "
-            "WHERE ts_code=? AND date >= ? AND adj_factor IS NOT NULL AND adj_factor > 0 "
-            "ORDER BY date", [code, since_date]).fetchall()
-        lake_map = {str(d)[:10]: float(a) for d, a in lake_rows}
-        common = sorted(set(lake_map) & set(ts_map))
-        diffs: List[Dict[str, Any]] = []
-        for i in range(1, len(common)):
-            d0, d1 = common[i - 1], common[i]
-            l_mv = lake_map[d1] / lake_map[d0]
-            t_mv = ts_map[d1] / ts_map[d0]
-            if abs(math.log(l_mv / t_mv)) > tol:
-                diffs.append({"d0": d0, "d1": d1, "lake_move": round(l_mv, 6),
-                              "tushare_move": round(t_mv, 6)})
-        ok = (len(common) >= 2) and (len(diffs) == 0)
-        if not ok:
-            all_ok = False
-        results.append({"ts_code": code, "common_days": len(common),
-                        "ok": ok, "diffs": diffs[:5]})
-    return {"skipped": False, "all_ok": all_ok, "samples": results}
 
 
 def _recompute_selection_and_timing(con, config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -241,9 +187,7 @@ def run_repair(con, db_path: str, *,
                div_end: Optional[str] = None,
                phantom_since: str = "2026-01-01",
                events_json: Optional[str] = None,
-               skip_tushare: bool = False,
                skip_recompute: bool = False,
-               tushare_samples: Optional[List[str]] = None,
                config_path: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
     """执行完整修复与验收流（支持 dry-run 与离线 events_json 测试）。"""
     from lake.ingest import em_batch_ingest as emb
@@ -295,11 +239,8 @@ def run_repair(con, db_path: str, *,
     post_non_susp = [j for j in post_jumps if j["kind"] not in ("suspected", "unquantified_event")]
     post_phantoms = af_rebase.find_phantom_stamps(con, since_date=phantom_since)
 
-    # 5. 可选 tushare 官方对照抽样
-    ts_verify = ({"skipped": True, "samples": []} if skip_tushare
-                 else verify_tushare_samples(con, tushare_samples or DEFAULT_TUSHARE_SAMPLES))
-
-    # 6. 可选重算 selection / timing（仅 apply 后）
+    # 5. 可选重算 selection / timing（仅 apply 后）
+    # （2026-11-26：原 tushare 官方对照抽样随弃用整段移除）
     recompute = None
     if apply and not skip_recompute:
         recompute = _recompute_selection_and_timing(con, config_path=config_path)
@@ -318,7 +259,6 @@ def run_repair(con, db_path: str, *,
         "verify_non_suspected_after": len(post_non_susp),
         "verify_phantoms_after": len(post_phantoms["phantoms"]),
         "verify_distortions_after": len(post_phantoms["event_distortions"]),
-        "tushare_verify": ts_verify,
         "recompute": recompute,
     }
     report_md = _format_diff_report(before, after, summary)
@@ -337,7 +277,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--div-end", default=None, help="分红补齐结束日期（缺省=今日）")
     p.add_argument("--phantom-since", default="2026-01-01", help="幻影扫描起始日期")
     p.add_argument("--events-json", default=None, help="离线事件 JSON 路径（测试/离线环境用）")
-    p.add_argument("--skip-tushare", action="store_true", default=False, help="跳过 tushare 抽样校验")
     p.add_argument("--skip-recompute", action="store_true", default=False, help="跳过重算 selection/timing")
     p.add_argument("--report-out", default=None, help="报告输出路径（缺省写入 logs/）")
     args = p.parse_args(argv)
@@ -366,7 +305,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     div_end=args.div_end,
                     phantom_since=args.phantom_since,
                     events_json=args.events_json,
-                    skip_tushare=args.skip_tushare,
                     skip_recompute=args.skip_recompute,
                 )
             finally:
@@ -381,7 +319,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 div_end=args.div_end,
                 phantom_since=args.phantom_since,
                 events_json=args.events_json,
-                skip_tushare=args.skip_tushare,
                 skip_recompute=True,
             )
         finally:

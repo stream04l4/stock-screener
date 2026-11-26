@@ -5,11 +5,11 @@
 用法（由 lake/web_api.py 的 /sources/probe 端点驱动，也可手工跑）::
 
     ssh -o BatchMode=yes oci 'python3 -s -' < scripts/lake_probe_sg.py  sina,tencent,...
-    # 或本地： python3 scripts/lake_probe_sg.py            （缺省=全部 7 源）
+    # 或本地： python3 scripts/lake_probe_sg.py            （缺省=全部 6 源；2026-11-26 tushare 随弃用移除）
 
 **设计纪律（2026-11-10 v1.2，Joel 拍板：数据源状态标明本机可达+备用通道可达）**
 - **纯 stdlib**：SG（1C1G）无项目 venv，只依赖 python3 标准库。
-- **无凭据**：fuyao/tushare 只做**通道可达性**检查（不附 key、不调配额 API）——
+- **无凭据**：fuyao 只做**通道可达性**检查（不附 key、不调配额 API）——
   key 留在 EU 端 .env，"通道可达"≠"已鉴权"，语义在 detail 里写明。
 - **并行 + 硬超时**：每源一个线程（端点超时 8s），整体墙钟 25s；SG 弱机器上
   不串行拖长 ssh 会话。
@@ -36,7 +36,7 @@ import urllib.request
 #     quote    —— http 200 且 body>10B（行情快照真实返回，防空响应页）
 #     http200  —— http 200（报表类端点）
 #     http_any —— 任何 HTTP 响应=通道可达（401/403/404 都算网络路径通；
-#                fuyao 无 key、tushare 无 token 场景）
+#                fuyao 无 key 场景）
 #     em_rc0   —— 东财 JSON rc==0 且 klines 非空（真实数据，非错误页）
 TDX_HOSTS = ["180.153.18.170", "111.229.247.189", "120.76.152.87"]
 TDX_PORT = 7709
@@ -50,7 +50,6 @@ ENDPOINTS = {
                   "?type=RPT_F10_FINANCE_MAINFINADATA&sty=ALL"
                   "&filter=(SECUCODE%3D%22600546.SH%22)&p=1&ps=1"
                   "&source=WEB&client=WEB", {}, "http200"),
-    "tushare": ("https://api.tushare.pro/", {}, "http_any"),
     "eastmoney": ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
                   "?secid=1.600546&fields1=f1&fields2=f51,f53&klt=101"
                   "&fqt=1&lmt=1&end=20500101", {}, "em_rc0"),

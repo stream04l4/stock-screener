@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """test_af_no_anchor —— af 无锚点填充（铁律 2026-11-20：同一参数同一源）单元测试。
 
-背景：kline_daily.adj_factor 只允许一个规范锚点源（tushare 官方 af）。
+背景：kline_daily.adj_factor 只允许一个规范锚点源（EM 除权事件推导；
+2026-11-26 tushare 官方 af 随弃用退出，锚点角色由 dividend_events 步长承接）。
 批量 af 失败/缺失时的兜底=**无锚点填充**：沿用湖内现有 level + 已知除权
 事件的官方除权参考价步长 c0·(1+B)/(c0−C)；绝不引入他源私有归一化
 （sina/tdx hfq÷raw，2026-10-26 sh.600018 与 2026-11-20 山煤国际事故同根因），
@@ -50,7 +51,7 @@ def _approx(actual, expected):
 
 
 # ---------------------------------------------------------------------------
-# 1. 无事件缺口：逐日沿用前一日 level（与 tushare 停牌日 af 不变一致）
+# 1. 无事件缺口：逐日沿用前一日 level（与停牌日 af 不变一致）
 # ---------------------------------------------------------------------------
 def test_no_event_gap_forward_fills_level(con):
     add_kline(con, "sh.600001", [
@@ -110,11 +111,11 @@ def test_ambiguous_event_fail_closed(con):
 
 
 # ---------------------------------------------------------------------------
-# 5. 无历史 level（新股首日）→ fail-closed None（等 tushare 官方批量）
+# 5. 无历史 level（新股首日）→ fail-closed None（等 EM 批量补齐）
 # ---------------------------------------------------------------------------
 def test_no_history_returns_empty_or_none(con):
     add_kline(con, "sh.600005", [("2026-01-02", 10.0, None)])
-    # 有 K 线行但无历史 level → fail-closed None（等 tushare 官方批量）
+    # 有 K 线行但无历史 level → fail-closed None（等 EM 批量补齐）
     assert no_anchor(con, "sh.600005", "2026-01-02", "2026-01-02") == \
         {"2026-01-02": None}
     con.execute("DELETE FROM kline_daily")
