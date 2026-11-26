@@ -95,9 +95,12 @@ const MY_EMPTY = { as_of: null, n: 0, positions: [],
 // - ② 分位入段：长江电力（38% 已过门）/ 交通银行（33.5%）
 // - ①②双入：山煤国际（45%）/ 长江电力 / 中国石化（45%）
 // - 不入段：无（fixture 12 只中 6 只在「当前」段 action 非空）
-// 逐档手数：中粮 2+4+6=12（H=15.99，价 11.94 破 −15/−20/−25 三档）/ 江苏
-// 2+4=6（价恰在 −20% 线 8.0）/ 紫金 6（k=2 自下一档 j=2）/ 山煤 2 / 石化 2 /
-// 海油·国电·长江·交通·云南铜 —（未触档纯潜力股）
+// v8.2.10（Joel 2026-11-26）档位=下一理论档位 / 逐档手数=理论上已走过档数：
+// 江苏 第3档·2档（2+4=6 手，价恰在 −20% 线 8.0）/ 中粮 再武装·第4档·
+// 3档（2+4+6=12 手，H=15.99，价 11.94 破 −15/−20/−25 三档）/ 紫金
+// 第2档·1档（2 手，非持仓按首仓线基准）/ 山煤 第2档·1档（2 手）/ 石化
+// 再武装·第2档·1档（2 手）/ 海油·国电·长江·交通·云南铜 0 档（未走过纯
+// 潜力股，档位标签沿用「线」说法）
 const SIG = {
   as_of: "2026-11-06", strategy: "current", lake_locked: false, approach_pct: 5,
   // v8.2.9：档位参数随响应下发（前端逐档明细单点读，与生产 config 一致）
@@ -110,7 +113,11 @@ const SIG = {
       price: 40.0, next_add_price_raw: 42.07, status: "active", touched: false,
       day_low: 39.8, distance_pct: -4.9,
       action: "add", suggested_lots: 2, n_history: 2, end_date: "2026-11-06",
-      timing_ok: null, timing_reasons: null, bt_pnl_pct: 88.5, bt_n_buys: 6 },
+      // v8.2.10（Joel 2026-11-26）：持仓 k≥1 加仓档不受时机门约束，但后端
+      // 下发参考分位（无 ✓/✗ 门控措辞）→ 时机列展示（山煤实案动机）
+      timing_ok: null, timing_pctile: 28.5,
+      timing_reasons: "5年分位 28.5%（实时）",
+      bt_pnl_pct: 88.5, bt_n_buys: 6 },
     { ts_code: "sh.600941", name: "中国移动", held: false, in_pos: false, k_level: 0,
       price: 70.0, next_add_price_raw: 72.36, status: "active", touched: false,
       day_low: 69.5, distance_pct: -3.26,
@@ -1046,6 +1053,10 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("+88.5% · 6档");
     expect(w.text()).toContain("+45.2% · 4档");
     expect(w.text()).toContain("+120.4% · 7档"); // 大秦
+    // v8.2.10（Joel 2026-11-26，山煤实案）：持仓 k≥1 加仓行时机也展示
+    // （参考分位、无门控措辞；列头「时机(非持仓)」→「时机」）
+    expect(w.text()).toContain("5年分位 28.5%（实时）");
+    expect(rowOf("中国神华").text()).toContain("5年分位 28.5%（实时）");
     w.unmount();
   });
 
@@ -1071,19 +1082,25 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(hyRow.text()).toContain("+2.5%");
     expect(hyRow.text()).toContain("✗ 5年分位 85.7%（需≤40%）");
     expect(hyRow.text()).toContain("首仓线（第1档）"); // v8.2.4 线说法
-    // ②路单入（价 -5.6% 带外）：中国石化 45% ≤50；档位 = 再武装·建仓线（第1档）
-    // （v8.2.4：无动作行档位用「线」说法；持仓 in_pos k=0 = 新一轮首仓）
+    // ②路单入（价 -5.6% 带外）：中国石化 45% ≤50。v8.2.10：价 6.12 已破
+    // 首仓线 6.48（走过 1 档）→ 档位 = 下一理论档位「再武装·第2档」、
+    // 逐档 =「1 档（2 手）」（v8.2.4「线」说法仅 0 档已走过时保留）
     expect(w.text()).toContain("中国石化");
-    expect(w.text()).toContain("-5.6%");
-    expect(w.text()).toContain("再武装·建仓线（第1档）");
-    // v8.2.9（中粮糖业实案，本次重定案动机）：深破线（距高回撤 25.3% ≥10%，
-    // 线下方无界）+ 76.8%>50 → ① 路入区；逐档 = 2+4+6=12 手（H≈15.99，
-    // 价 11.94 破 −15/−20/−25 三档，第 4 档线 11.19 未破）
+    const shRow = w.findAll("tbody tr").find((tr) => tr.text().includes("中国石化"));
+    expect(shRow).toBeTruthy();
+    expect(shRow.text()).toContain("-5.6%");
+    expect(shRow.text()).toContain("再武装·第2档");
+    expect(shRow.text()).toContain("1 档（2 手）");
+    // v8.2.9 入区（深破线距高回撤 25.3% ≥10%，线下方无界）+ 76.8%>50 →
+    // ① 路入区。v8.2.10：逐档 = 3 档（2+4+6=12 手）（H≈15.99，价 11.94
+    // 破 −15/−20/−25 三档，第 4 档线 11.19 未破）；档位 = 下一理论档位
+    // = 第 4 档（持仓 in_pos k=0 带「再武装」前缀）
     expect(w.text()).toContain("中粮糖业");
     const zlRow = w.findAll("tbody tr").find((tr) => tr.text().includes("中粮糖业"));
     expect(zlRow).toBeTruthy();
     expect(zlRow.text()).toContain("-12.2%");
-    expect(zlRow.text()).toContain("2+4+6=12 手");
+    expect(zlRow.text()).toContain("3 档（2+4+6=12 手）");
+    expect(zlRow.text()).toContain("再武装·第4档");
     expect(zlRow.text()).toContain("✗ 实时 5年分位 76.8%（需≤40%，池外现算）");
     // v8.2.5 ①路：国电电力 +2.1% 入段（旧三分类下 76.8% 远离时机线被滤出）
     expect(w.text()).toContain("国电电力");
@@ -1096,7 +1113,8 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(ynRow.text()).toContain("+1.1%");
     expect(ynRow.text()).toContain("再武装·建仓线（第1档）");
     expect(ynRow.text()).toContain("✗ 5年分位 62.3%（需≤40%）");
-    // v8.2.9：现价 18.2 线上方（盘中触 17.9 已回弹）→ 按现价未触档，逐档「—」
+    // v8.2.10：现价 18.2 线上方（盘中触 17.9 已回弹）→ 按现价未走过任何
+    // 档，逐档「0 档」（旧「—」说法退役）
     expect(ynRow.text()).not.toContain("手");
     // v8.2.5b：潜力段同口径着色——云南铜业 touched（真触过线）浅红；
     // 长江电力 approaching（未到线）浅灰（限定信号卡片内）
@@ -1113,15 +1131,24 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     const jsRow = w.findAll("tbody tr").find((tr) => tr.text().includes("江苏银行"));
     expect(jsRow).toBeTruthy();
     expect(jsRow.text()).toContain("-5.9%");
-    expect(jsRow.text()).toContain("2+4=6 手");
-    // v8.2.9「逐档手数」列——逐档明细（替代旧 next_lots 单点原值）：
-    // 紫金 6（k=2 自下一档 j=2 起数，已触档 2 档不计）/ 山煤·石化 2（单档）/
-    // 海油·国电·长江·交通·云南铜 —（未触档纯潜力股）
+    // v8.2.10：逐档 = 理论上已走过档数 + 明细（2 档：−15% 首仓线 8.5 +
+    // −20% 线 8.0 恰在价上）；档位 = 下一理论档位 = 第3档
+    expect(jsRow.text()).toContain("2 档（2+4=6 手）");
+    expect(jsRow.text()).toContain("第3档");
+    // v8.2.10「逐档手数」列——理论上已走过档数 + 逐档明细
+    // （「N 档（2+4+…=合计 手）」；旧「裸明细 2+4+6=12 手」退役）：
+    // 江苏 2 档 / 中粮 3 档 / 紫金 1 档（非持仓按首仓线基准）/ 山煤·石化
+    // 1 档（单档）/ 海油·国电·长江·交通·云南铜 0 档（未走过纯潜力股）
     expect(w.text()).toContain("逐档手数");
-    expect(w.text()).toContain("2+4+6=12 手");
-    expect(w.text()).toContain("2+4=6 手");
+    expect(w.text()).toContain("3 档（2+4+6=12 手）");
+    expect(w.text()).toContain("2 档（2+4=6 手）");
     const zjRow = w.findAll("tbody tr").find((tr) => tr.text().includes("紫金矿业"));
-    expect(zjRow.text()).toContain("6 手");
+    expect(zjRow.text()).toContain("1 档（2 手）");
+    expect(zjRow.text()).toContain("第2档");
+    // v8.2.10：山煤国际 破首仓线（11.25）1 档 → 档位 = 下一理论档位 第2档
+    const smRow = w.findAll("tbody tr").find((tr) => tr.text().includes("山煤国际"));
+    expect(smRow.text()).toContain("1 档（2 手）");
+    expect(smRow.text()).toContain("第2档");
     await segBtns()[2].trigger("click"); // 历史信号
     await flushPromises();
     // v8.2.5d（Joel 2026-11-24）：历史只显示微信推送过的真实触发信号
@@ -1130,6 +1157,14 @@ describe("MyPositionsTab · 策略信号中心 (v7.0.19)", () => {
     expect(w.text()).toContain("历史信号（1）");
     // 档位标签：第2档（level=1，first_of_round=false）
     expect(w.text()).toContain("第2档");
+    // v8.2.10（Joel 2026-11-26）：恢复「微信推送」列（v8.2.5d 起缺失）——
+    // 历史区仅 pushed=true 行，列恒 ✓（保留审计可见性）
+    expect(w.text()).toContain("微信推送");
+    // 限定策略信号卡片内（避开持仓表同名行）
+    const sigCard2 = w.findAll(".card").find((c) => c.text().includes("策略信号"));
+    const histShRow = sigCard2.findAll("tbody tr").find((tr) => tr.text().includes("中国神华"));
+    expect(histShRow).toBeTruthy();
+    expect(histShRow.text()).toContain("✓");
     // 未推送的触碰事件行（中国核电 source=touch, pushed=false）被滤出
     expect(w.text()).not.toContain("中国核电");
     expect(w.text()).not.toContain("2026-10-11");

@@ -111,42 +111,70 @@ const sigApproach = computed(() => {
     return dist != null && dist <= band;
   });
 });
-// v8.2.9（Joel 2026-11-25）：潜力区手数 = **逐档明细**——从档位基准往下每破
-// 一档记一档（第 j 档 = first_lots + j×add_lots_step 手）：
-// - k=0：基准 = 本轮高点 H，档线 L_j = H×(1−first_dd−j×add_step)（−15/−20/
-//   −25/… 阶梯）；
-// - k≥1：基准 = 加仓锚 P0（下一档线/(1−k×add_step)，v8.1.0 口径），从**当前
-//   k 的下一档**继续数（已触过的档不计——引擎已执行/已展示）。
-// 返回触档手数数组（未触档 = []）；参数缺失/无价 → null（前端「—」）。
-function potLotsCascade(s) {
+// **v8.2.10（Joel 2026-11-26 重定案）**：潜力区「档位 = 下一理论档位、逐档
+// 手数 = 理论上已走过多少档」。potTierInfo 返回**理论上已走过的各档手数**
+// （按档序；长度 = 已走过档数）：
+// - 有效 k：持仓用 s.k_level，非持仓恒 0（非持仓触发线恒为首仓线，档位
+//   也按首仓线基准数——与展示口径一致）；
+// - k=0：基准 = 本轮高点 H = 首仓线/(1−first_dd)，档线 L_j = H×(1−
+//   first_dd−j×add_step)（−15/−20/−25/… 阶梯），自第 1 档起数；
+// - k≥1：本轮已执行 k 档（levels 0..k−1，第 j 档 = first_lots + j×
+//   add_lots_step 手）计入已走过，再从加仓锚 P0（下一档线/(1−k×add_step)）
+//   的当前 k 下一档继续数（现价深破已补触的档也计入）。
+// 参数缺失/无价 → null（前端「—」）。闭区间容差：价恰在档线 = 已走过
+// （与后端触发语义一致；1e-9 相对容差消浮点边界误判）。
+function potTierInfo(s) {
   const d = sigData.value;
   if (!d || s.price == null || s.next_add_price_raw == null) return null;
   const fd = (Number(d.first_drawdown_pct ?? 15) || 15) / 100;
   const ast = (Number(d.add_step_pct ?? 5) || 5) / 100;
   const fl = Number(d.first_lots ?? 2);
   const als = Number(d.add_lots_step ?? 2);
-  const k = Number(s.k_level ?? 0);
+  const k = s.held ? Number(s.k_level ?? 0) : 0;
   const line = s.next_add_price_raw;
-  const out = [];
-  // 闭区间容差：价恰在档线 = 触档（与后端触发语义一致）；1e-9 相对容差消
-  // 浮点边界误判（如 H=8.5/0.85 的 −20% 档线 8.0）
+  const passed = [];
   const EPS = 1e-9;
   if (k === 0) {
     const H = line / (1 - fd); // 本轮高点
     for (let j = 0; ; j++) {
       const L = H * (1 - fd - j * ast);
       if (L <= 0) break;
-      if (s.price <= L * (1 + EPS)) out.push(fl + j * als); else break;
+      if (s.price <= L * (1 + EPS)) passed.push(fl + j * als); else break;
     }
   } else {
+    for (let j = 0; j < k; j++) passed.push(fl + j * als); // 本轮已执行 k 档
     const P0 = line / (1 - k * ast); // 加仓锚（下一档线 = P0×(1−k×ast)）
     for (let j = k; ; j++) {
       const L = P0 * (1 - j * ast);
       if (L <= 0) break;
-      if (s.price <= L * (1 + EPS)) out.push(fl + j * als); else break;
+      if (s.price <= L * (1 + EPS)) passed.push(fl + j * als); else break;
     }
   }
-  return out;
+  return passed;
+}
+// v8.2.10：逐档手数列文案——「N档（逐档明细=合计 手）」；未走过 =「0 档」
+function potTierLotsText(s) {
+  const c = potTierInfo(s);
+  if (!c) return "—";
+  if (c.length === 0) return "0 档";
+  if (c.length === 1) return `1 档（${c[0]} 手）`;
+  return `${c.length} 档（${c.join("+")}=${c.reduce((a, b) => a + b, 0)} 手）`;
+}
+// v8.2.10：潜力区档位列 = **下一理论档位**（现价下方第一个档线）。
+// 0 档已走过时沿用旧标签（首仓线（第1档）/ 再武装·建仓线（第1档）——
+// v8.2.4「线」说法）；深破线时 = 第 N+1 档（持仓 in_pos 带轮次前缀）。
+function potTierLabel(s) {
+  const passed = potTierInfo(s);
+  if (!passed) return null; // 无价/缺参 → 旧标签兜底
+  if (passed.length === 0) return null; // 未走过 → 旧标签兜底
+  const n = passed.length + 1;
+  if (s.held && s.in_pos) {
+    if (Number(s.k_level ?? 0) === 0) {
+      return `${roundNoLabel(s.round_no) || ""}再武装·第${n}档`;
+    }
+    return `${roundNoLabel(s.round_no) || ""}第${n}档`;
+  }
+  return `第${n}档`;
 }
 // **v8.2.5b 行着色（Joel 2026-11-24 定案）**：「当前」「潜力信号」段位置
 // 不变，以行底色区分触发状态——浅红（sig-row-hit）= 真正触发（价已破线
@@ -198,9 +226,9 @@ function btText(s) {
   return sign + s.bt_pnl_pct + "% · " + (s.bt_n_buys ?? "—") + "档";
 }
 function timingText(s) {
-  // 持仓股轮内加仓档不受时机限制 → 「—」；首档（二次建仓）须过时机门 →
-  // timing_ok 有 true/false（v8.2.0 补）→ 展示分位明细；非持仓照旧
-  if (s.held && s.timing_ok === null && s.timing_ok !== false) return "—";
+  // v8.2.10（Joel 2026-11-26）：持仓也展示时机——后端对持仓 k≥1 加仓行下发
+  // 参考分位（无门控措辞，timing_ok=None），首档（二次建仓）下行门控明细
+  // （✓/✗）；无数据才「—」。旧「持仓恒—」逻辑退役。
   return s.timing_reasons || "—";
 }
 function actionText(s) {
@@ -245,27 +273,28 @@ const sigShown = computed(() => {
       // 带符号：+ = 线上方（临近），− = 已破线（含时机未过）
       distance_s: (s.distance_pct != null
         ? (s.distance_pct >= 0 ? "+" : "") + s.distance_pct.toFixed(1) : "—") + "%",
-      // v8.2.9（Joel 2026-11-25）：逐档明细——从档位基准每破一档记一档
-      // （「2+4+6=12 手」；单档 =「2 手」；未触档 = 纯潜力股「—」）
-      lots_s: (() => {
-        const c = potLotsCascade(s);
-        if (!c || c.length === 0) return "—";
-        if (c.length === 1) return `${c[0]} 手`;
-        return c.join("+") + "=" + c.reduce((a, b) => a + b, 0) + " 手";
+      // v8.2.10（Joel 2026-11-26）：逐档手数 = 理论上已走过档数 + 逐档明细
+      // （「3 档（2+4+6=12 手）」；未走过 =「0 档」）
+      lots_s: potTierLotsText(s),
+      // v8.2.10：档位 = 下一理论档位（现价下方第一个档线；0 档已走过时
+      // 沿用旧「线」说法标签）；v8.2.3：持仓行带用户相对轮次前缀
+      level_label: (() => {
+        const deep = potTierLabel(s);
+        if (deep) return deep;
+        return lineNotation((s.held && s.in_pos)
+          ? (s.k_level === 0
+             ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）`
+             : `${roundNoLabel(s.round_no)}第` + ((s.k_level ?? 0) + 1) + "档")
+          : "首仓（第1档）");
       })(),
-      // 持仓 in_pos 的 k=0 = 再武装后新一轮首仓（二次建仓位），非「第 1 档」加仓；
-      // v8.2.3：持仓行档位带用户相对轮次前缀（round_no null → 无前缀）
-      // v8.2.4：该段行 action 恒 null → 档位一律「线」说法
-      level_label: lineNotation((s.held && s.in_pos)
-        ? (s.k_level === 0
-           ? `再武装·建仓（${roundNoLabel(s.round_no) || ""}第1档）`
-           : `${roundNoLabel(s.round_no)}第` + ((s.k_level ?? 0) + 1) + "档")
-        : "首仓（第1档）"),
       bt_s: btText(s), timing_s: timingText(s) }));
   }
   return sigHistory.value.map((h) => ({ ...h,
     status_tag: h.held ? "● 持仓" : "○ 非持仓",
     level_label: levelLabel(h.level, h.first_of_round),
+    // v8.2.10（Joel 2026-11-26）：恢复「微信推送」列（v8.2.5d 只留过滤、
+    // 列被删）——历史区现仅 pushed=true 行，列恒 ✓（保留审计可见性）
+    pushed_s: h.pushed ? "✓" : "—",
     lots_s: h.lots == null ? "—" : `${h.lots} 手`,
     amount_w: fmtWan(h.amount)}));
 });
@@ -275,19 +304,23 @@ const SIG_ACTIVE_COLS = [
   ["day_low_s", "日内低", true],
   ["action_label", "动作"], ["level_label", "档位"], ["lots_s", "建议手数"],
   ["amount_w", "参考金额(万)", true],
-  ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
+  ["bt_s", "10年回测"], ["timing_s", "时机"],
 ];
 const SIG_APPROACH_COLS = [
   ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
   ["price", "现价", true, fmtPrice], ["next_add_price_raw", "触发价", true, fmtPrice],
   ["distance_s", "距触发", true], ["level_label", "档位"],
-  // v8.2.9（Joel 2026-11-25）：逐档明细（旧「下一档手数」= 单档 next_lots 退役）
+  // v8.2.10（Joel 2026-11-26）：= 理论上已走过档数 + 逐档明细（旧「逐档明细
+  // 2+4+6=12 手」格式退役；未走过 =「0 档」）
   ["lots_s", "逐档手数"],
-  ["bt_s", "10年回测"], ["timing_s", "时机(非持仓)"],
+  ["bt_s", "10年回测"], ["timing_s", "时机"],
 ];
 const SIG_HISTORY_COLS = [
   ["date", "日期"], ["ts_code", "代码"], ["name", "名称"], ["status_tag", "状态"],
-  ["level_label", "档位"], ["price", "触发价", true, fmtPrice],
+  ["level_label", "档位"],
+  // v8.2.10（Joel 2026-11-26）：恢复「微信推送」列（v8.2.5d 起缺失）
+  ["pushed_s", "微信推送"],
+  ["price", "触发价", true, fmtPrice],
   ["lots_s", "手数"], ["amount_w", "金额(万)", true],
 ];
 
@@ -766,9 +799,10 @@ function pnlColor(v) {
         + 线上方 / − 已破线）② 5年分位 ≤50%（含已过门的 ≤40%，
         「门过了等价格」也显示；见「时机」列）；与「当前」互斥（达推送条件
         的只展示在「当前」）·
-        「逐档手数」= 逐档明细：从本轮高点（加仓轮 = 加仓锚、自当前 k 下
-        一档起）每破一档记一档（「2+4+6=12 手」；未触档的纯潜力股 =「—」；
-        时机门未过故全留在本段）
+        「档位」= 下一理论档位（现价下方第一个档线；未破首档 =「首仓线
+        （第1档）」说法）·「逐档手数」= 理论上已走过档数 + 逐档明细
+        （「3 档（2+4+6=12 手）」；未走过 =「0 档」；加仓轮含本轮已执行
+        档；时机门未过故全留在本段）
         · 非持仓股买入信号须过选股时机（5年分位≤40%，见「时机」列）
         · 历史 = 近 {{ sigData?.history_window_days ?? 90 }} 天**微信推送过的真实触发信号**
         （未推送的状态机回放记录不显示）

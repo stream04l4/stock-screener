@@ -2008,6 +2008,22 @@ def get_strategy_signals() -> Dict[str, Any]:
                 timing_ok = bool((trow or {}).get("push_eligible"))
                 unheld_pctile = (trow or {}).get("pctile_window")
                 timing_reasons = _timing_breakdown(trow, tp_obj)
+        elif held and k > 0:
+            # v8.2.10（Joel 2026-11-26）：持仓轮内加仓档不受时机门约束
+            # （timing_ok 保持 None = 无门控），但分位仍展示作参考——
+            # 不带 ✓/✗ 门控措辞（加仓档无门可过/未过）。
+            lp = live_pct_map.get(c)
+            if lp is not None:
+                unheld_pctile = round(lp, 2)
+                timing_reasons = (f"{tp_obj.price_window_years}年分位 "
+                                  f"{lp:.1f}%（实时）")
+            else:
+                trow = tmap.get(c)
+                if trow is not None and trow.get("pctile_window") is not None:
+                    unheld_pctile = trow.get("pctile_window")
+                    timing_reasons = (f"{tp_obj.price_window_years}年分位 "
+                                      f"{trow.get('pctile_window'):.1f}%"
+                                      "（湖内快照）")
         action = cls["action"]
         suggested = cls["suggested_lots"]
         # v8.2.0 补：下一档手数 = 单点原值（下方各门控只改 suggested，
@@ -2082,8 +2098,9 @@ def get_strategy_signals() -> Dict[str, Any]:
             "actual_lots": (held_extra or {}).get("actual_lots"),
             "gap_lots": (held_extra or {}).get("gap_lots"),
             "timing_ok": timing_ok,
+            # v8.2.10：持仓 k≥1 加仓行也带分位参考值（无门控，仅展示）
             "timing_pctile": (held_first_pctile if held_first else
-                              (unheld_pctile if not held else None)),
+                              (unheld_pctile if (not held or k > 0) else None)),
             "timing_reasons": timing_reasons,
             "bt_pnl_pct": (round(bt["pnl_pct"] * 100.0, 2)
                            if bt.get("pnl_pct") is not None else None),
