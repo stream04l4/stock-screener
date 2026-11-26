@@ -25,7 +25,10 @@
   → 7f7b2ba（v7.0.21：af_rebase 由 lake/ 提升至仓库根共享模块（martingale CLI
   预对齐护栏需跨包调用；两包零 import 耦合不变），lake/ 有意变更，基线前移）
   → b1221da（v7.0.31：删除 v6.1 退役一次性迁移 migrate_conflict_col.py
-  （Joel 拍板；生产库早已补列，无再跑场景），lake/ 有意变更，基线前移）。
+  （Joel 拍板；生产库早已补列，无再跑场景），lake/ 有意变更，基线前移）
+  → 29fef9b（v8.2.11：tushare 完全弃用——tushare_ingest.py 整删、增量批量/
+  run_t1/run_t1_delist 切东财 clist 主源、备源链路全删，lake/ 有意变更，
+  基线前移；Joel 2026-11-25 拍板）。
 4) pyproject：version 7.0.0 + packages 三包。
 5) strategy.yaml schema 形状（9/5 键 + lake + datasource 三段齐全）。
 """
@@ -62,7 +65,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # 因子分位与Beta日期对齐/成交量单位统一/断网不毒化，lake/ 有意变更，基线前移。
 # T4 分红增量补齐（ac72f7b）：em_batch_ingest.py 新增 fetch_ex_events_range 与
 # tushare 低频交叉校验及批量事务 load_ex_events，lake/ 有意变更，基线前移。
-BASELINE = "a99e60d"   # fix(lake): EM 除权拉取 columns 坏字段致静默 0 行 → ALL + success 检查（2026-11-23 TL 实锤修复）
+# P2 tushare 完全弃用（29fef9b，v8.2.11，2026-11-26；Joel 2026-11-25 拍板）：
+# tushare_ingest.py 整删、增量批量/run_t1/run_t1_delist 切东财 clist 主源
+# （source=em_batch）、备源链路全删、eastmoney 晋主源，lake/ 有意变更，基线前移。
+BASELINE = "29fef9b"   # v8.2.11 P2 tushare 完全弃用：代码层全清（lake/ 有意变更，2026-11-26）
 
 
 def _git(*args) -> str:
