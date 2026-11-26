@@ -5,9 +5,10 @@
 P0 灌数。本脚本 = **driver 层**：只做参数解析 + 编排 + summary 打印，
 **全部抓取/限速/幂等逻辑复用现有 ingest + BackfillRunner**（不重写）：
 
-- T1 stock_master     ← 东财 clist 快照（2026-11-26：tushare 弃用切换；行业=东财粗分类，
-                        industry_csric2 不再维护；name/is_st 由腾讯快照补；退市档
-                        EM 退市板 m:0 s:3 低频 t1-delist）
+- T1 stock_master     ← sina 全市场快照主源（2026-11-27 Joel 定案；东财 clist 降备用；
+                        list_date/industry 存量保全，新股 list_date=湖内 K 线首日期；
+                        name/is_st 由腾讯快照补；退市档 t1-delist 低频
+                        （EM 退市板负名单 + K 线推导兜底））
 - T4 dividend_events  ← em_dividend_ingest.load_dividends（cache/em_dividend_all.csv
                         静态导入全史，**零网络**）
 - T7 index_daily      ← tencent_ingest.fetch_kline_ohlcv + load_t7（4 指数 × N 天）
@@ -270,10 +271,10 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# T1 stock_master（2026-11-26：东财 clist 主档 + 腾讯快照补 name/is_st）
+# T1 stock_master（2026-11-27：sina 全市场快照主源 + 东财 clist 备用 + 腾讯补 name/is_st）
 # ---------------------------------------------------------------------------
 def _board(ts_code: str) -> str:
-    """代码前缀 → 板块（68→科创、30→创业、其余→主板；北交所不在 clist fs 内）。"""
+    """代码前缀 → 板块（68→科创、30→创业、其余→主板；北交所不在湖 universe）。"""
     code6 = ts_code.split(".")[1]
     if code6.startswith("68"):
         return "科创"
@@ -282,59 +283,130 @@ def _board(ts_code: str) -> str:
     return "主板"
 
 
-def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
-    """T1：东财 clist 快照全市场主档（2026-11-26 tushare 弃用切换，Joel 定案）。
+def _fetch_sina_universe() -> List[Tuple[str, str]]:
+    """sina 全市场快照（akshare ``stock_zh_a_spot``，70 页 ~41s，2026-11-27 实测）。
 
-    **2026-11-26（Joel 定案：tushare 完全弃用）**：T1 主源由 tushare
-    ``stock_basic`` 切东财 clist 快照（与每日批量主通道同接口、同出口链路
-    EU→SG；56 页 ~1-2 分钟）：
-    - **universe = 沪深主板+科创+创业**（clist fs 口径 5564 股；北交所/B 股
-      天然不在 fs 内——与 v7.0.18 tushare market 过滤同 universe）；
-    - code/name/list_date/industry 取 EM 值（industry=东财行业，粗分类口径，
-      ``industry_csric2`` 置 NULL 不再维护——v7.0.18 同）；
+    :return: ``[(ts_code, name)]``，**仅沪深 A 股**（sh./sz.；北交所 bj 天然排除——
+        湖 universe 自 v7.0.18 起不含北交所，sina spot 含 357 只 BJ 股必须滤掉，
+        否则新股行会把 BJ 拉进 T2/T3 回填 universe）。
+    代码格式 sina='sh600000' → 湖 'sh.600000'。sina 端失败抛异常（由调用方降备源）。
+    """
+    import akshare as ak
+
+    df = ak.stock_zh_a_spot()
+    out: List[Tuple[str, str]] = []
+    for code, name in zip(df["代码"].astype(str), df["名称"].astype(str)):
+        pfx, num = code[:2], code[2:]
+        if pfx not in ("sh", "sz") or not num.isdigit():
+            continue   # 北交所 bj / 异常码 → 排除（universe 口径与 11-22 快照一致）
+        out.append((f"{pfx}.{num}", str(name).strip()))
+    return out
+
+
+def _fill_new_list_date(con, new_codes: List[str]) -> Dict[str, str]:
+    """新股 list_date 零网络推导：湖内 K 线首日期（= 首个交易日；与 tushare
+    list_date 口径一致）。无 K 线 → 缺省（NULL，下次 p0 湖内有 K 线后自愈）。"""
+    if not new_codes:
+        return {}
+    ph = ",".join("?" * len(new_codes))
+    return dict(con.execute(
+        f"SELECT ts_code, MIN(date) FROM kline_daily WHERE ts_code IN ({ph}) "
+        f"GROUP BY 1", new_codes).fetchall())
+
+
+def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
+    """T1：全市场主档快照（**2026-11-27 Joel 定案：sina 晋主，东财 clist 降备用**）。
+
+    主源 sina（``_fetch_sina_universe``：code/name/is_st，零 EM 依赖，EU 直连
+    稳定）；sina 异常 → 备用东财 clist 快照（原 11-26 路径原样保留，EU→SG
+    出口链内置）。tushare/baostock 已删（11-26 / v7.0.18），无第三源。
+
+    两源共用的字段纪律：
+    - **universe = 沪深主板+科创+创业**（北交所/B 股不在内）；
     - board 由代码前缀推导（68→科创、30→创业、其余→主板）；
-    - prev_map 六列保全（industry_csric2/delist_date/is_st/st_since/soe_flag/
-      soe_basis）——delist_date 沿用 stock_master 现存值（退市股不在 clist，
-      负名单由 t1-delist 低频刷新；新上市股无旧行 → NULL，正确）；
+    - prev_map 七列保全（list_date/industry_csric2/industry_name/delist_date/
+      st_since/soe_flag/soe_basis）——sina spot 无 list_date/industry 字段，
+      存量值必须随行保全；新股（无旧行）list_date 由湖内 K 线首日期零网络推导，
+      industry 置 NULL（待东财恢复后一次 clist 备用跑回填）；
+    - delist_date 沿用 stock_master 现存值（退市股不在任何实时快照名单，
+      负名单由 t1-delist 低频刷新）；
     - name 带 XD/DR/XR 前缀（除息日）跳过覆盖（v7.0.18.3 同守卫）；
     - 随后腾讯快照批量覆盖补 name/is_st（is_st=名称含 ST，v5 口径）；
       失败不阻断 T1 主体。
     """
-    from lake.ingest import em_batch_ingest as emb
     from lake.ingest.common import DATA_VERSION, clean_date, now_ts, upsert
 
-    snap = emb.fetch_clist_snapshot()   # EU→SG 出口链内置；双失败抛 EmBatchError
     # 读回既有扩展列，防止全行 upsert 把已人工/历史写入的字段覆盖为 NULL
     prev_map = {
         r[0]: r[1:] for r in con.execute(
-            "SELECT ts_code, industry_csric2, delist_date, is_st, st_since, "
-            "soe_flag, soe_basis FROM stock_master").fetchall()
+            "SELECT ts_code, list_date, industry_csric2, industry_name, "
+            "delist_date, st_since, soe_flag, soe_basis FROM stock_master"
+        ).fetchall()
     }
-    rows = []
+    rows: List[list] = []
     skipped_xd = 0
-    for x in snap:
-        ts = x.get("ts_code")
-        if not ts:
-            continue
-        name = str(x.get("name") or "")
-        if re.match(r"^(XD|DR|XR)", name):
-            skipped_xd += 1
-            continue   # 除息日临时名不覆盖（v7.0.18.3 同守卫）
-        ind = (str(x.get("industry")).strip() or None) if x.get("industry") else None
-        p_ind2, p_delist, p_st, p_st_since, p_soe_f, p_soe_b = prev_map.get(
-            ts, (None, None, None, None, None, None))
-        rows.append([
-            ts,
-            name,                 # EM 名（腾讯快照随后覆盖；v5 口径）
-            p_ind2,               # 保留既有行业二级码
-            ind,                  # industry_name：东财行业（粗分类）
-            clean_date(x.get("list_date")),
-            p_delist,             # 退市日沿用（退市股不在 clist，此处恒非退市）
-            _board(ts),
-            1 if "ST" in name.upper() else 0,
-            p_st_since, p_soe_f, p_soe_b,
-            "em_clist", now_ts(), DATA_VERSION,
-        ])
+    new_count = 0
+    src = "sina_spot"
+
+    try:
+        uni = _fetch_sina_universe()   # 主源
+    except Exception as exc:
+        log.warning("T1 sina 快照失败 → 降备源东财 clist: %s", exc)
+        uni = []
+
+    if uni:
+        for ts, name in uni:
+            if re.match(r"^(XD|DR|XR)", name):
+                skipped_xd += 1
+                continue   # 除息日临时名不覆盖（v7.0.18.3 同守卫）
+            p_list, p_ind2, p_ind, p_delist, p_st_since, p_soe_f, p_soe_b = prev_map.get(
+                ts, (None, None, None, None, None, None, None))
+            if ts not in prev_map:
+                new_count += 1
+            rows.append([
+                ts,
+                name,                 # sina 名（腾讯快照随后覆盖；v5 口径）
+                p_ind2,               # 保留既有行业二级码（sina 无此字段）
+                p_ind,                # 保留既有行业名（sina 无此字段；新股 NULL）
+                clean_date(p_list),
+                p_delist,             # 退市日沿用（退市股不在快照名单，此处恒非退市）
+                _board(ts),
+                1 if "ST" in name.upper() else 0,
+                p_st_since, p_soe_f, p_soe_b,
+                "sina_spot", now_ts(), DATA_VERSION,
+            ])
+        # 新股 list_date 零网络补齐（K 线首日期；湖内无 K 线的新股保持 NULL）
+        new_codes = [r[0] for r in rows if r[0] not in prev_map]
+        kd_list = _fill_new_list_date(con, new_codes)
+        for r in rows:
+            if r[4] is None and r[0] in kd_list:
+                r[4] = clean_date(kd_list[r[0]])
+    else:
+        # 备用：东财 clist（2026-11-26 路径原样保留；双出口失败抛 EmBatchError）
+        from lake.ingest import em_batch_ingest as emb
+
+        snap = emb.fetch_clist_snapshot()   # EU→SG 出口链内置
+        for x in snap:
+            ts = x.get("ts_code")
+            if not ts:
+                continue
+            name = str(x.get("name") or "")
+            if re.match(r"^(XD|DR|XR)", name):
+                skipped_xd += 1
+                continue
+            ind = (str(x.get("industry")).strip() or None) if x.get("industry") else None
+            p_list, p_ind2, p_ind, p_delist, p_st_since, p_soe_f, p_soe_b = prev_map.get(
+                ts, (None, None, None, None, None, None, None))
+            rows.append([
+                ts, name, p_ind2, ind, clean_date(x.get("list_date")),
+                p_delist, _board(ts), 1 if "ST" in name.upper() else 0,
+                p_st_since, p_soe_f, p_soe_b,
+                "em_clist", now_ts(), DATA_VERSION,
+            ])
+        new_count = sum(1 for r in rows if r[0] not in prev_map)
+        src = "em_clist"
+    if not rows:
+        raise RuntimeError("T1 双源（sina+em）均无有效名单 → 拒绝落盘（接口漂移）")
     n = upsert(con, "stock_master", [
         "ts_code", "name", "industry_csric2", "industry_name", "list_date",
         "delist_date", "board", "is_st", "st_since", "soe_flag", "soe_basis",
@@ -375,59 +447,104 @@ def run_t1(con, db_path: str, quota_before: int = 0) -> Dict[str, Any]:
         "table": "stock_master",
         "rows_written": n,
         "name_isst_enriched": enriched,
-        "em_calls_this_step": 1,
-        "note": "东财 clist：code/name/list_date/industry(东财行业)；delist_date "
-                "沿用旧值（退市负名单由 t1-delist 低频刷新，EM 退市板 m:0 s:3）；"
-                "name/is_st 由腾讯快照补；industry_csric2 不再维护（粗分类口径）；"
-                "soe_* 留 NULL（v5 规则依赖 T6，P2 补）",
+        "source_used": src,
+        "new_listings": new_count,
+        "em_calls_this_step": 1 if src == "em_clist" else 0,
+        "note": (f"主源 {src}（2026-11-27 Joel 定案 sina 晋主/EM 降备）："
+                 "code/name/is_st 实时快照；delist_date 沿用旧值（退市负名单由 "
+                 "t1-delist 低频刷新）；list_date/industry 存量保全（sina 无此字段，"
+                 "新股 list_date=湖内 K 线首日期，industry 待 EM 恢复回填）；"
+                 "name/is_st 由腾讯快照补；industry_csric2 不再维护（粗分类口径）；"
+                 "soe_* 留 NULL（v5 规则依赖 T6，P2 补）"),
     }
 
 
 def run_t1_delist(con) -> Dict[str, Any]:
     """T1 退市档刷新（CLI 子命令 ``t1-delist``）：东财退市板负名单
-    （2026-11-26 tushare D 档弃用切换，Joel 定案）。
+    （2026-11-26 tushare D 档弃用切换，Joel 定案）+ **K 线推导兜底**
+    （2026-11-27：EM 限频期退市板 502 时不再空转，Joel 拍板去 EM 依赖）。
 
-    口径（fetch_clist_delisted，fs=m:0 s:3 两网及退市板）：
+    主口径（fetch_clist_delisted，fs=m:0 s:3 两网及退市板）：
     - 退市板码 ∩ stock_master 现存行 → delist_date 仍 NULL 的补写；
     - 退市日 = 湖内 K 线最后日期（= 该股最后交易日；接口无退市日期字段，
       池剔除用途下早于官方退市安排终止日属保守口径，安全）；
     - 已非 NULL 的 delist_date 不覆盖（历史正式值优先）；
     - 老两网/退市 B 股码（sh.900xxx/sz.200xxx 等）不在 stock_master → 自然排除。
+
+    兜底口径（EM 退市板取数失败时）：stock_master 中 delist_date 仍 NULL 且
+    名称含「退」（交易所退市命名规范 X退）且湖内 K 线最后日期 < 今天-5 天
+    （有实际停牌证据，排除改名当日仍在交易的情形）→ 补写 K 线最后日期。
+    保守原则：无「退」字不猜（避免把长期停牌股误判退市）；其余情形等
+    EM 恢复后由主口径兜住。
+
     退市事件低频（日均 <1 只）→ 建议每周跑一次；只 UPDATE 命中行的
     delist_date + fetched_at，不碰其他主档列（name/industry 等由 run_t1 负责）。
     """
     from lake.ingest import em_batch_ingest as emb
     from lake.ingest.common import clean_date, now_ts, to_ts_code
 
-    codes6 = emb.fetch_clist_delisted()   # EU→SG 出口链内置；双失败抛 EmBatchError
-    n = 0
-    skipped_no_kline = 0
-    for c6 in codes6:
-        ts = to_ts_code(c6)   # 601398→sh.601398 / 000001→sz.000001 / 900xxx→sh.900xxx
-        if not ts:
-            continue
-        cur, last_k = con.execute(
-            "SELECT (SELECT COUNT(*) FROM stock_master WHERE ts_code=?), "
-            "(SELECT MAX(date) FROM kline_daily WHERE ts_code=?)", [ts, ts]).fetchone()
-        if not cur:
-            continue   # 库里没有 → 不插入（非 A 股退市码 / universe 外）
+    def _apply(ts: str, last_k) -> None:
+        """写一只：delist_date 仍 NULL 者补写 K 线最后日期（不造日期、不覆盖）。"""
+        nonlocal n, skipped_no_kline
         if last_k is None:
             skipped_no_kline += 1
-            log.warning("t1-delist: %s 在退市板但湖内无 K 线 → 跳过（不造日期）", ts)
-            continue
+            log.warning("t1-delist: %s 命中退市但湖内无 K 线 → 跳过（不造日期）", ts)
+            return
         has_date = con.execute(
             "SELECT COUNT(*) FROM stock_master WHERE ts_code=? AND delist_date IS NOT NULL",
             [ts]).fetchone()[0]
         if has_date:
-            continue   # 历史正式退市日优先，不覆盖
+            return   # 历史正式退市日优先，不覆盖
         con.execute("UPDATE stock_master SET delist_date=?, fetched_at=? WHERE ts_code=?",
                     [clean_date(str(last_k)), now_ts(), ts])
         n += 1
+
+    n = 0
+    skipped_no_kline = 0
+    mode = "em_delisted_board"
+    em_codes = 0
+    try:
+        codes6 = emb.fetch_clist_delisted()   # EU→SG 出口链内置；双失败抛 EmBatchError
+        for c6 in codes6:
+            ts = to_ts_code(c6)   # 601398→sh.601398 / 000001→sz.000001 / 900xxx→sh.900xxx
+            if not ts:
+                continue
+            cur, last_k = con.execute(
+                "SELECT (SELECT COUNT(*) FROM stock_master WHERE ts_code=?), "
+                "(SELECT MAX(date) FROM kline_daily WHERE ts_code=?)", [ts, ts]).fetchone()
+            if not cur:
+                continue   # 库里没有 → 不插入（非 A 股退市码 / universe 外）
+            _apply(ts, last_k)
+        em_codes = len(codes6)
+    except Exception as exc:
+        mode = "kline_derived_fallback"
+        log.warning("t1-delist: EM 退市板取数失败 → K 线推导兜底（名称含'退'+停牌证据）: %s", exc)
+        # 候选 = delist_date 仍 NULL + 名称含「退」（退市命名规范；无退字不猜，
+        # 避免把长期停牌股误判退市）
+        cands = con.execute(
+            "SELECT ts_code FROM stock_master "
+            "WHERE delist_date IS NULL AND name LIKE '%退%'").fetchall()
+        today = _dt.date.today()
+        for (ts,) in cands:
+            last_k = con.execute(
+                "SELECT MAX(date) FROM kline_daily WHERE ts_code=?", [ts]).fetchone()[0]
+            if last_k is None:
+                skipped_no_kline += 1
+                log.warning("t1-delist: %s 名称含'退'但湖内无 K 线 → 跳过（不造日期）", ts)
+                continue
+            if (today - _dt.date.fromisoformat(str(last_k))).days < 5:
+                log.info("t1-delist: %s 名称含'退'但 K 线仍在近 5 天（改名当日？）→ 不写", ts)
+                continue
+            _apply(ts, last_k)
     return {"table": "stock_master", "delist_updated": n,
-            "em_delisted_codes": len(codes6),
+            "em_delisted_codes": em_codes,
+            "mode": mode,
             "skipped_no_kline": skipped_no_kline,
-            "note": "退市板 m:0 s:3 负名单（每周）；退市日=湖内 K 线最后日期；"
-                    "只更新命中行 delist_date 仍 NULL 者"}
+            "note": ("退市板 m:0 s:3 负名单（每周）；退市日=湖内 K 线最后日期；"
+                     "只更新命中行 delist_date 仍 NULL 者；EM 失败时 K 线推导兜底"
+                     "（名称含'退'+停牌 ≥5 天）") if mode == "em_delisted_board"
+            else "EM 退市板不可用（502 限频）→ K 线推导兜底：delist_date NULL + "
+                 "名称含'退' + K 线最后日期 ≥5 天前；无'退'字不猜（停牌股不判退市）"}
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1109,7 @@ def run_p0(con, db_path: str, days: int, codes: Optional[List[str]],
     health_res = _probe_all_adapters(db_path)
 
     if not skip_t1:
-        print("[p0] T1 stock_master（东财 clist 快照；退市档走 t1-delist 低频）...")
+        print("[p0] T1 stock_master（sina 快照主源；东财 clist 备用；退市档走 t1-delist 低频）...")
         steps["t1"] = run_t1(con, db_path, quota_before)
     else:
         steps["t1"] = {"skipped": True}
@@ -3469,8 +3586,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "t1-delist",
-        help="T1 退市档低频刷新（EM 退市板 m:0 s:3 负名单，2026-11-26 tushare D 档弃用切换；"
-             "退市日=湖内 K 线最后日期；建议每周；只更新 stock_master 命中行 delist_date 仍 NULL 者）")
+        help="T1 退市档低频刷新（EM 退市板 m:0 s:3 负名单为主口径，2026-11-27 增 K 线推导兜底"
+             "（EM 502 时：名称含'退'+停牌 ≥5 天）；退市日=湖内 K 线最后日期；建议每周；"
+             "只更新 stock_master 命中行 delist_date 仍 NULL 者）")
     sp.set_defaults(func=cmd_t1_delist)
 
     sp = sub.add_parser(

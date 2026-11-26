@@ -141,10 +141,15 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
         # **不覆盖** F10 端点——T6 失败时新浪卡仍可能显示可达（两独立端点）。
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
          "field_group": "holders", "role": "主源"},
+        # v8.2.14（2026-11-27 Joel 定案）：T1 股票主档晋主——全市场快照
+        # stock_zh_a_spot（code/name/is_st；list_date/industry 存量保全，
+        # 新股 list_date=湖内 K 线首日期）；东财 clist 降备用。
+        {"table": "stock_master", "table_cn": "T1 股票主档",
+         "field_group": "master", "role": "主源(2026-11-27 晋主)"},
     ],
     "tencent": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "交叉校验(ST抽查)"},
+         "field_group": "master", "role": "name/is_st 补齐(v5 口径)"},
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
          "field_group": "valuation", "role": "主源"},
         {"table": "index_daily", "table_cn": "T7 指数日线",
@@ -168,7 +173,7 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     # 其主源角色（T1/T2 批量/T3 批量/T2 adj 官方锚点）由 eastmoney 承接。
     "eastmoney": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "主源"},    # 2026-11-26 tushare 弃用晋主
+         "field_group": "master", "role": "备用(2026-11-27 降备；sina 晋主)"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
          "field_group": "ohlcv_amount", "role": "主源"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
