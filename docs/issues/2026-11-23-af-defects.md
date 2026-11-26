@@ -2,7 +2,7 @@
 
 日期：2026-11-23 ｜ 仓库：stream04l4/stock-screener（main @ 9d1b44f）
 范围：A 股选股系统数据湖 `data/lake/lake.duckdb`（`kline_daily` 的 `adj_factor` 序列、`dividend_events` 表）
-状态：**未修复**，待审计处理。复算管线本身正确（pytest 867/867），原始行情与估值数据新鲜，问题仅在下述两处 af 数据层。
+状态：**已修复**（代码 `0cf9ec5` 2026-11-23 落地；数据层 P1 全量重建 2026-11-25/26 完成并验收，详见文末《修复与验收记录》）。复算管线本身正确（pytest 867/867），原始行情与估值数据新鲜，问题仅在下述两处 af 数据层——两处均已闭环。
 
 ---
 
@@ -86,3 +86,42 @@
 `af_rebase.py`（classify_boundary L62-84、修正逻辑 L184 附近）、`scripts/run_lake_sync_daily.sh`、
 `data/lake/lake.duckdb`（kline_daily / dividend_events / valuation_daily / selection_backtest_10y / selection_timing）、
 `data/user_positions.json`。
+
+---
+
+## 修复与验收记录（2026-11-25 ~ 11-26，TL）
+
+### 一、修复内容
+
+**缺陷 A（幻影盖章）**
+1. **代码**（`0cf9ec5`，2026-11-23 已合入 main）：`af_rebase.rebase_stock_af()` 中 suspected/unquantified_event 分支严禁以价格比 c0/c1 吸收——源 af 不动、仅记 suspected 告警，仅当 `verify_event_fn` 显式确认后按官方步长对齐；`repair_all_af()` 注释钉死"绝不可给 suspected 盖章"；新增 `find_phantom_stamps()` / `un_stamp_phantoms()`（af 比值=价格比即幻影，反盖章）与 `restore_flattened_events()`（0.5%~2% 小步被 4 位小数舍入抹平后的官方步长恢复）。
+2. **数据**（P1 全量重建，2026-11-25/26）：`scripts/af_rebuild.py` 以 tushare 官方锚点（弃用前的最后一次官方锚定）重建全湖 5224 只 af——af 恢复为 (kline_daily, dividend_events) 的纯函数：事件驱动（每事件按除权日前后 raw close 算官方步长，自 IPO 锚点前向累积），LEGACY_CUTOFF=2026-10-25 之前沿用旧 af（sina 推导、本身干净）。全史 0 NULL。随后 `un_stamp_phantoms`（1815 处反盖章）+ `restore_flattened_events` + `repair_all_af` 收尾。
+
+**缺陷 B（dividend_events 停更）**
+1. **代码**（`0cf9ec5` 已合入 main）：`run_lake_sync_daily.sh` 新增 step0「T4 分红增量」（`lake_backfill.py t4-sync`：EM 数据中心 RPT_SHAREBONUS_DET 主通道 + tushare 抽样校验，先于 kline 增量执行）；`lake_backfill.py incremental` 灌完 kline 后调 `af_rebase.rebase_recent(days=10)` → 事件表与 af 从此每日同步更新，根治"事件不刷新 → af 缺步长"链条。
+2. **数据**（2026-11-25）：`af_rebuild.py backfill-events` 一次性补齐 10-23~11-23 缺失的 170 条除权事件（EM 数据中心抓取，0 失败）；此后 t4-sync 接管每日增量。
+
+### 二、验收结果（2026-11-26 实测）
+
+| 验收项 | 结果 |
+| --- | --- |
+| find_phantom_stamps 2026 重扫（快照实测 11-26） | **phantoms 0 / event_distortions 0**（原 1815 处） |
+| find_spurious_jumps 全史重扫（快照实测 11-26，16.8M 行无截断） | **0**（全部 af 边界均有匹配除权事件且在容差内；无幻影、无未解释跳变） |
+| >2% 步长 9 只实测 af 边界比值 vs 官方 | 全部一致：沪银 1.0324(10-27)、云铝 1.0353(10-30)、爱慕 1.0233(11-05)、景津 1.0380(11-11)、长银 1.0207(11-13)、江国 1.0268(11-13)、桃李 1.0305(11-19)、渤海 1.0442(11-20)、中信银行 1.0217(11-20) |
+| 10送4 两只 | sz.300873 = **1.4138 = 官方** ✓；sz.300857 = 1.4016（除权日 04-22 在 LEGACY_CUTOFF=10-25 之前，按 P1 设计沿用 legacy af，与官方 1.4138 差 0.9%，设计内保留） |
+| af 单元/集成测试 | 27/27 通过（test_af_rebase / test_af_phantom_and_t4_sync / test_af_no_anchor / test_cli_af_guard，2026-11-26 15:42 实测） |
+| selection 重算 | P1 已用修复后 af 重算 selection_backtest_10y / selection_timing 表，rerun sha256 位对位一致（a65cf6c146f379ed，11-25 实测）；当日增量 rc=0 后 daily 脚本自动以 11-26 收盘重算 |
+| dividend_events 新鲜度 | max(ex_date) = **2026-11-26**（11-26 15:27 t4-sync 抓取 96 条 11-11~11-26 事件落库；10-23 后累计 170+ 条） |
+
+### 三、口径说明（与本文原始验收标准的差异）
+
+1. 原验收第 1 条"tushare adj_factor 抽验"：因 2026-11-25 **tushare 全面弃用**（v8.2.11 P2，Joel 定案）不再适用，改为事件驱动自洽校验：af 边界比值 = c0×(1+B)/(c0−C)（raw close 计算，4 位小数一致）+ EM 数据中心 2026 全年除权清单（5241 条）交叉核对。tushare 弃用前已用它对全湖 5224 只做了最后一次官方锚定，此后 af 为 (kline, dividend_events) 纯函数，无新锚点依赖（lake 铁律 #3 不引入新锚点）。
+2. 原验收第 3 条"复跑 selection 抽验中国石油/中信银行"：被"selection 表全量重算 + rerun 确定性（sha256 位对位）"覆盖。
+3. 10-20 的 sz.002304 异常按设计保留 legacy af，不纳入本次修复面。
+
+### 四、遗留与备注
+
+1. **sz.300857 legacy 区 0.9% 差**：设计内保留（LEGACY_CUTOFF 之前不动），不影响 10-25 后任何信号。
+2. **2026-11-26 11:30 cron 撞锁**：当日 P3 手工灌数 job 与 cron 并发，DuckDB 单锁使 cron incremental rc=3 退出（按设计跳过 selection/timing 预计算防脏快照）；持锁进程结束后于 15:33 手动重跑补齐当日数据（见 `logs/lake_sync_20261126.log`）。
+3. **EM 出口限频（临时）**：11-26 15:30 前后 EU push2 与 SG push2delay 双出口对批量接口返回 502（前一日 P1/P3 大批量取数后的限频），daily 增量按设计回退逐只 legacy（sina/tencent）补数，预计限频解除后恢复批量通道。
+4. 本文档为审计记录，原始发现内容（11-23 时点数据）不改写；修复证据以上方记录为准。
