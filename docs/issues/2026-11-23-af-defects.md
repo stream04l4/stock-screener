@@ -112,6 +112,7 @@
 | af 单元/集成测试 | 27/27 通过（test_af_rebase / test_af_phantom_and_t4_sync / test_af_no_anchor / test_cli_af_guard，2026-11-26 15:42 实测） |
 | selection 重算 | P1 已用修复后 af 重算 selection_backtest_10y / selection_timing 表，rerun sha256 位对位一致（a65cf6c146f379ed，11-25 实测）；当日增量 rc=0 后 daily 脚本自动以 11-26 收盘重算 |
 | dividend_events 新鲜度 | max(ex_date) = **2026-11-26**（11-26 15:27 t4-sync 抓取 96 条 11-11~11-26 事件落库；10-23 后累计 170+ 条） |
+| 11-26 daily 全流程数据层验收（20:50 实测活湖） | **四表 max(date)=2026-11-26**（kline/valuation/index/factor）；kline 11-26 覆盖 **5222/5227**（5 只缺者均退市股：东兴证券/信达证券 delist 10-19、*ST康佳A delist 10-23 等，退市前 K 线断更属正常）；selection as_of=11-26（80/80，n_positive 64）、timing 18 只；af 无 NULL/<=0；10-25 后 af 跳变 17 处均正常除权；fundamentals_quarterly 2026Q3=5221/5222 active（缺 1：奥精医疗 sh.688613，F10 辅表个别缺，下轮自动补） |
 
 ### 三、口径说明（与本文原始验收标准的差异）
 
@@ -124,4 +125,5 @@
 1. **sz.300857 legacy 区 0.9% 差**：设计内保留（LEGACY_CUTOFF 之前不动），不影响 10-25 后任何信号。
 2. **2026-11-26 11:30 cron 撞锁**：当日 P3 手工灌数 job 与 cron 并发，DuckDB 单锁使 cron incremental rc=3 退出（按设计跳过 selection/timing 预计算防脏快照）；持锁进程结束后于 15:33 手动重跑补齐当日数据（见 `logs/lake_sync_20261126.log`）。
 3. **EM 出口限频（临时）**：11-26 15:30 前后 EU push2 与 SG push2delay 双出口对批量接口返回 502（前一日 P1/P3 大批量取数后的限频），daily 增量按设计回退逐只 legacy（sina/tencent）补数，预计限频解除后恢复批量通道。
-4. 本文档为审计记录，原始发现内容（11-23 时点数据）不改写；修复证据以上方记录为准。
+4. **Gate1 观察系统性失败（11-26 新发现并修复）**：11-11~11-25 cron 观察 8 连 `rc=124`（600s 超时）+ 11-26 手动跑 `rc=124`——东财 502 限频时 T2 逐股 3 次退避重试需 ~15min（11-26 补跑实测 elapsed_s=945），600s 预算不够；且脚本无日期参数，北京日界 24:00 后裸跑会观测到空数据日，失败日无法补跑。修复（本 commit）：① `run_lake_sync_daily.sh` Gate1 超时 600→1800s；② `lake_observation.py` 增 `--date` 参数。已用 `--daily --date 2026-11-26` 补跑成功落盘 `data/observation/2026-11-26.json`：t4 本地分红验证 **pass**；t1/t2/t3/t7 因 EM 502 限频降级（t2 em_fail 80/82）如实记录，fuyao PIT 空 items。EM 限频解除后 11-27 11:30 cron 起恢复正常观察。
+5. 本文档为审计记录，原始发现内容（11-23 时点数据）不改写；修复证据以上方记录为准。

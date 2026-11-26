@@ -80,9 +80,11 @@ fi
 # v1.1（Gate 1 观察期，设计 §6/§8，2026-11-10）：只读交叉验证（零写入——
 # 湖 read_only 连接；唯一落盘 data/observation/）。东财 T1 列表/T2 池逐股/
 # T3 报表/T7 指数/T4 端点探活 + Fuyao PIT，≈140 调用/日（东财无硬限）。
-# 失败不阻断增量（§8）：观察输出是 Gate 2 晋主判据输入，缺失由 TL 次日补跑
-# （.venv/bin/python scripts/lake_observation.py --daily）。
-run_step "Gate1观察" 600 .venv/bin/python scripts/lake_observation.py --daily
+# 失败不阻断增量（§8）：观察输出是 Gate 2 晋主判据输入，缺失由 TL 补跑
+# （.venv/bin/python scripts/lake_observation.py --daily [--date YYYY-MM-DD]）。
+# 超时 600→1800s（2026-11-26 复盘：11-11..11-25 连续 8 天 rc=124——东财 502
+# 限频时 T2 逐股 3 次退避重试 ≈18-25min，600s 预算不够；正常日 ≈2-5min）。
+run_step "Gate1观察" 1800 .venv/bin/python scripts/lake_observation.py --daily
 OBC=$?
 if [ "$OBC" -ne 0 ]; then
   echo "[$(date -u +%FT%TZ)] Gate1 观察失败 rc=$OBC（不阻断增量；TL 次日补跑）"

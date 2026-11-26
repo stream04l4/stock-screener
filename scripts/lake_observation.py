@@ -496,8 +496,17 @@ def main() -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--daily", action="store_true")
     g.add_argument("--latency", action="store_true")
+    # --date：指定观察目标日（缺省=北京当前日）。补跑历史日必须用它——
+    # 北京日界 24:00 后 _beijing_today() 已指向次日，裸跑会观测到空数据日
+    # （2026-11-26 复盘：11-11..11-25 连续 rc=124，失败日从未被补跑）。
+    ap.add_argument("--date", default=None,
+                    help="观察目标日 YYYY-MM-DD（默认北京当前日；补跑用）")
     args = ap.parse_args()
-    today = _beijing_today()
+    if args.date:
+        today = args.date
+        dt.date.fromisoformat(today)  # 格式校验，错误即快速失败
+    else:
+        today = _beijing_today()
     result: Dict[str, Any] = {
         "date": today,
         "ts_utc": dt.datetime.utcnow().isoformat(timespec="seconds"),
