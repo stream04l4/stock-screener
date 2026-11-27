@@ -19,10 +19,12 @@ B. PIT 检查：
 
 输出：JSON 汇总到 /tmp/fuyao_t5_verify.json + 摘要打印。
 """
-import json, time, random, datetime, urllib.request, sys
+import json, time, random, datetime, urllib.request, sys, os
 
+# .env 用仓库根绝对路径（同 lake_observation.py 约定），不依赖启动 cwd
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = {}
-for p in ('.env', 'data/.env'):
+for p in (os.path.join(REPO, '.env'), '.env'):
     try:
         ENV = dict(l.strip().split('=', 1) for l in open(p) if '=' in l and not l.startswith('#'))
         break
