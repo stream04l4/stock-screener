@@ -9,7 +9,7 @@
 
 **设计纪律（2026-11-10 v1.2，Joel 拍板：数据源状态标明本机可达+备用通道可达）**
 - **纯 stdlib**：SG（1C1G）无项目 venv，只依赖 python3 标准库。
-- **无凭据**：fuyao 只做**通道可达性**检查（不附 key、不调配额 API）——
+- **无凭据**：SG 侧各源只做**通道可达性**检查（不附 key、不调配额 API）——
   key 留在 EU 端 .env，"通道可达"≠"已鉴权"，语义在 detail 里写明。
 - **并行 + 硬超时**：每源一个线程（端点超时 8s），整体墙钟 25s；SG 弱机器上
   不串行拖长 ssh 会话。
@@ -35,8 +35,6 @@ import urllib.request
 #     tcp      —— TCP connect 成功即可（TDX 行情端口；多 host 依次试）
 #     quote    —— http 200 且 body>10B（行情快照真实返回，防空响应页）
 #     http200  —— http 200（报表类端点）
-#     http_any —— 任何 HTTP 响应=通道可达（401/403/404 都算网络路径通；
-#                fuyao 无 key 场景）
 #     em_rc0   —— 东财 JSON rc==0 且 klines 非空（真实数据，非错误页）
 TDX_HOSTS = ["180.153.18.170", "111.229.247.189", "120.76.152.87"]
 TDX_PORT = 7709
@@ -53,8 +51,6 @@ ENDPOINTS = {
     "eastmoney": ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
                   "?secid=1.600546&fields1=f1&fields2=f51,f53&klt=101"
                   "&fqt=1&lmt=1&end=20500101", {}, "em_rc0"),
-    "fuyao": ("https://fuyao.aicubes.cn/api/a-share/special-data/"
-              "dragon-tiger-list?date=2026-11-09", {}, "http_any"),
 }
 
 TIMEOUT_S = 8.0        # 单端点超时
@@ -79,11 +75,7 @@ def _probe_http(url, headers, check):
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
             code, body = r.getcode(), r.read(8192)
     except urllib.error.HTTPError as e:   # 4xx/5xx 也是"通道可达"
-        if check == "http_any":
-            return 1, f"http={e.code}（通道可达，未鉴权）"
         return 0, f"http={e.code}"
-    if check == "http_any":
-        return 1, f"http={code}（通道可达，未鉴权）"
     if check == "http200":
         return (1, "http=200 OK") if code == 200 else (0, f"http={code}")
     if check == "quote":

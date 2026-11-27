@@ -701,14 +701,14 @@ def test_v12_run_sg_batch_parses_tsv(tmp_path, monkeypatch):
            "garbage-line-no-tabs\n")   # 坏行须被跳过
     monkeypatch.setattr(_sp, "run",
                         lambda *a, **kw: _FakeProc(0, tsv))
-    out = REAL_RUN_SG_BATCH(["sina", "eastmoney", "fuyao"])
+    out = REAL_RUN_SG_BATCH(["sina", "eastmoney", "legacy_src"])
     assert out["sina"] == {"available": True, "probed_at": out["sina"]["probed_at"],
                            "latency_ms": 120, "detail": "quote OK"}
     assert out["eastmoney"]["available"] is False
     assert out["eastmoney"]["detail"] == "push2his 超时"
-    # 未返回的源（fuyao 不在 TSV）→ 显式"未返回该源结果"（不 KeyError）
-    assert out["fuyao"]["available"] is False
-    assert "未返回" in out["fuyao"]["detail"]
+    # 未返回的源（legacy_src 不在 TSV）→ 显式"未返回该源结果"（不 KeyError）
+    assert out["legacy_src"]["available"] is False
+    assert "未返回" in out["legacy_src"]["detail"]
 
 
 def test_v12_run_sg_batch_failure_modes(tmp_path, monkeypatch):
@@ -771,9 +771,9 @@ def test_o4_probe_default_all_and_bad_name_400(tmp_path, monkeypatch):
         wapi, "_probe_one_source",
         lambda name: (calls.append(name), {"available": False, "probed_at": None,
                                            "latency_ms": None, "detail": ""})[1])
-    d = wapi.sources_probe({})   # 缺省 = 全部 6 源（v1.1：4 灌数池 + 2 展示源）
+    d = wapi.sources_probe({})   # 缺省 = 全部 5 源（2026-11-27 源池定案：4 灌数池 + eastmoney 展示源；fuyao 移除）
     assert calls == ["sina", "tencent", "tdx", "adata_f10",
-                     "eastmoney", "fuyao"]
+                     "eastmoney"]
     with pytest.raises(wapi.HTTPException) as ei:
         wapi.sources_probe({"names": ["sina", "nope"]})
     assert ei.value.status_code == 400
@@ -820,30 +820,6 @@ def test_v11_probe_eastmoney_offline(monkeypatch):
                         lambda *a, **kw: _FakeResp(_json.dumps({"rc": 1})))
     ok, detail = wapi._probe_eastmoney()
     assert ok is False and "rc=" in detail
-
-
-def test_v11_probe_fuyao_offline(monkeypatch):
-    """fuyao：code=0 → 可用；缺 key → false（不触网）；code 非 0 → false。"""
-    import json as _json
-    import urllib.request as _ur
-
-    monkeypatch.setattr(wapi, "_env_token",
-                        lambda k: "k" if k == "HITHINK_FINANCE_API_KEY" else None)
-    good = _json.dumps({"code": 0, "data": {"stock_items": [1, 2]}})
-    monkeypatch.setattr(_ur, "urlopen", lambda *a, **kw: _FakeResp(good))
-    ok, detail = wapi._probe_fuyao()
-    assert ok is True and "2 股" in detail, (ok, detail)
-
-    monkeypatch.setattr(wapi, "_env_token", lambda k: None)
-    ok, detail = wapi._probe_fuyao()
-    assert ok is False and "HITHINK_FINANCE_API_KEY" in detail
-
-    monkeypatch.setattr(wapi, "_env_token",
-                        lambda k: "k" if k == "HITHINK_FINANCE_API_KEY" else None)
-    monkeypatch.setattr(_ur, "urlopen",
-                        lambda *a, **kw: _FakeResp(_json.dumps({"code": 1, "message": "no"})))
-    ok, detail = wapi._probe_fuyao()
-    assert ok is False and "code=1" in detail
 
 
 def test_o4_probe_timeout_15s_isolation(tmp_path, monkeypatch):

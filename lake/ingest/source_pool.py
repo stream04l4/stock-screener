@@ -220,8 +220,11 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
         # 不达标（2024Q4 重述漂移 6 股 + 600960 2025Q4 liab 孤立陈旧格）
         # → 不作备源，T5=adata_f10 主源单源。
         # T6 条目 2026-11-27 移除（Joel 源池原则：T6 非策略表仅主备，
-        # 备源=东财已实测收编）→ fuyao 现无任何表角色，仅保留展示源位
-        # （/status 面板 6 源固定序 + lake_observation 探活），能力表清空。
+        # 备源=东财已实测收编）。
+        # 2026-11-27 源池定案收口：fuyao 无任何表角色 + 生产库 0 行 →
+        # 展示源位一并移除（/status 卡片/探测/SG 端点全链路下线，
+        # lake/web_api._ADAPTER_NAMES 不再含 fuyao）；lake_observation 的
+        # fuyao PIT 观察条目保留（手动研究工具，非探测链路）。
         # fuyao 非灌数池 adapter：不写入（同 v1.1 设计）。
     ],
 }

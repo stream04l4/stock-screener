@@ -146,13 +146,13 @@ def test_ready_source_pool_conflict_rows_total_sum(tmp_path, monkeypatch):
 # B. adapters / stale（source_health.json 缺失 / 新鲜 / 过期 三分支）
 # ===========================================================================
 def test_ready_adapters_missing_file_all_null_stale(tmp_path, monkeypatch):
-    """文件缺失 → adapters 全 null + stale=true（'从未探测'语义；v1.1 起 6 源）。"""
+    """文件缺失 → adapters 全 null + stale=true（'从未探测'语义；v1.1 起 5 源）。"""
     d = _ready_status(tmp_path, monkeypatch)   # 未写 source_health.json
     sp = d["source_pool"]
-    # v1.1（2026-11-10 重设计）：adapters 6 源（4 灌数池 + eastmoney/fuyao 展示源；
-    # 2026-11-26 tushare 随弃用移除）
+    # v1.1（2026-11-10 重设计）：adapters 5 源（4 灌数池 + eastmoney 展示源；
+    # 2026-11-26 tushare 随弃用移除；2026-11-27 fuyao 随源池定案移除）
     assert set(sp["adapters"].keys()) == \
-        {"sina", "tencent", "tdx", "adata_f10", "eastmoney", "fuyao"}
+        {"sina", "tencent", "tdx", "adata_f10", "eastmoney"}
     for name, a in sp["adapters"].items():
         assert a == {"available": None, "probed_at": None, "latency_ms": None}, \
             f"{name} 缺失文件应全 null: {a}"
@@ -317,21 +317,20 @@ def test_probe_all_adapters_writes_health_file(tmp_path, monkeypatch):
         return fakes.get(name)   # tdx 未注册 → None → false
 
     monkeypatch.setattr(sp, "get_adapter", fake_get_adapter)
-    # v7.0.35：展示源探测也 mock（测试零网络纪律——web_api 两探测分支真触网；
-    # 2026-11-26 tushare 分支随弃用移除）
+    # v7.0.35：展示源探测也 mock（测试零网络纪律——web_api 探测分支真触网；
+    # 2026-11-26 tushare 分支随弃用移除；2026-11-27 fuyao 分支随源池定案移除）
     import lake.web_api as wapi
     monkeypatch.setattr(wapi, "_probe_eastmoney", lambda: (False, "fake 请求失败"))
-    monkeypatch.setattr(wapi, "_probe_fuyao", lambda: (True, "fake 龙虎榜 OK"))
     db = str(tmp_path / "custom.duckdb")
     res = drv._probe_all_adapters(db)
     assert res["enabled"] is True
     hp = tmp_path / "source_health.json"     # B-2：自定义 --db → 库目录
     assert res["path"] == str(hp) and hp.exists(), f"应落 {hp}: {res}"
     data = json.loads(hp.read_text(encoding="utf-8"))
-    # v7.0.35：4 池源 + eastmoney/fuyao 2 展示源（每日自动刷新本机态；
-    # 2026-11-26 tushare 随弃用移除）
+    # v7.0.35：4 池源 + eastmoney 展示源（每日自动刷新本机态；
+    # 2026-11-26 tushare 随弃用移除；2026-11-27 fuyao 随源池定案移除）
     assert set(data.keys()) == {"sina", "tencent", "tdx", "adata_f10",
-                                "eastmoney", "fuyao"}
+                                "eastmoney"}
     assert data["sina"]["available"] is True and isinstance(data["sina"]["latency_ms"], int)
     assert data["tdx"]["available"] is False   # 未注册 → false（不猜 null）
     assert data["eastmoney"]["available"] is False

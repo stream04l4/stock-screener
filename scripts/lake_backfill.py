@@ -221,23 +221,23 @@ def _probe_all_adapters(db_path: Optional[str] = None) -> Dict[str, Any]:
             adapters[name] = {"available": False, "probed_at": now_s,
                               "latency_ms": int((time.monotonic() - t0) * 1000)}
 
-    # v7.0.35（2026-11-20 Joel 指出）：展示源 eastmoney/fuyao 随灌数启动
-    # 同探——此前 source_health.json 只含 4 池源，两源本机态恒显「未探测」，
+    # v7.0.35（2026-11-20 Joel 指出）：展示源 eastmoney 随灌数启动同探——
+    # 此前 source_health.json 只含 4 池源，展示源本机态恒显「未探测」，
     # 只有手动点【探测】才刷新。实现单点=lake/web_api 的轻量探测分支：
-    # 各 1 次免费轻量调用（push2his 1 根 / 龙虎榜 1 次），异常→false 不阻断灌数。
+    # 1 次免费轻量调用（push2his 1 根），异常→false 不阻断灌数。
     # 2026-11-26：tushare 弃用（Joel 定案）→ 原第三探 _probe_tushare 移除。
+    # 2026-11-27 源池定案：fuyao 展示源随能力表清空移除（原龙虎榜探）。
     try:
-        from lake.web_api import _probe_eastmoney, _probe_fuyao
-        for name, fn in (("eastmoney", _probe_eastmoney),
-                         ("fuyao", _probe_fuyao)):
-            t0 = time.monotonic()
-            try:
-                ok, detail = fn()
-            except Exception as exc:  # noqa: BLE001 - 单源异常→false（不阻断）
-                ok, detail = False, f"probe error: {exc}"
-            adapters[name] = {"available": ok, "probed_at": now_s,
-                              "latency_ms": int((time.monotonic() - t0) * 1000),
-                              "detail": detail}
+        from lake.web_api import _probe_eastmoney
+        name, fn = "eastmoney", _probe_eastmoney
+        t0 = time.monotonic()
+        try:
+            ok, detail = fn()
+        except Exception as exc:  # noqa: BLE001 - 单源异常→false（不阻断）
+            ok, detail = False, f"probe error: {exc}"
+        adapters[name] = {"available": ok, "probed_at": now_s,
+                          "latency_ms": int((time.monotonic() - t0) * 1000),
+                          "detail": detail}
     except ImportError:
         pass   # 最小环境无 web_api → 展示源保持未探测（不阻断灌数）
 

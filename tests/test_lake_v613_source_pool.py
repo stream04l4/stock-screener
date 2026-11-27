@@ -2,9 +2,10 @@
 """test_lake_v613_source_pool —— v6.1.3 数据源池状态面板：/status.source_pool.sources。
 
 规格（v6.1.3 brief A/C；v7.0.18 更新；v1.1 2026-11-10 重设计更新）：
-- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 6 源：4 灌数池源
-  + eastmoney/fuyao 展示源，与前端 SOURCE_COLORS 对齐；
-  2026-11-26 tushare 展示源随弃用移除），每源一项：
+- **ready 态** ``source_pool`` 追加 ``sources`` 数组（固定顺序 5 源：4 灌数池源
+  + eastmoney 展示源，与前端 SOURCE_COLORS 对齐；
+  2026-11-26 tushare 展示源随弃用移除；2026-11-27 fuyao 随源池定案移除），
+  每源一项：
   ``{name, enabled, switchable, available, probed_at, latency_ms, authority,
   provides, quota, rate_limit}``。
 - ``switchable``：仅灌数池 4 源 true（strategy.yaml 有开关键；v1.1 新源无→false）；
@@ -15,7 +16,8 @@
   观察期标注；东财含 T4 分红在线主源）；
 - ``quota`` **恒 null**（v7.0.18：baostock 日配额随渠道移除，无计数方）；
 - ``rate_limit`` = min_interval_s 派生文案（sina/tdx/adata_f10 有，tencent→null；
-  v1.1：eastmoney/fuyao 静态实测配额文案；tushare 条目 2026-11-26 随弃用移除）；
+  v1.1：eastmoney 静态实测配额文案；tushare 条目 2026-11-26 随弃用移除；
+  fuyao 条目 2026-11-27 随源池定案移除）；
 - **三态契约红线**：sources 仅 ready 态出现——locked/uninitialized 响应体逐字节不动
   （无 source_pool 键 → 无 sources）；ready 态 ``sync.quota_used_today/quota_budget``
   **保留不删**（v605 断言依赖 + API 契约，本次只是前端不再展示）。
@@ -41,8 +43,9 @@ from lake import conn as lconn  # noqa: E402
 from lake.ingest.source_pool import AUTHORITY, SOURCE_CAPABILITIES  # noqa: E402
 
 # 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐；v7.0.18 baostock 移除；
-# v1.1 2026-11-10：+eastmoney/fuyao 展示源；2026-11-26 tushare 随弃用移除）
-ALL_SOURCES = ["sina", "tencent", "tdx", "adata_f10", "eastmoney", "fuyao"]
+# v1.1 2026-11-10：+eastmoney/fuyao 展示源；2026-11-26 tushare 随弃用移除；
+# 2026-11-27 源池定案：fuyao 展示源移除）
+ALL_SOURCES = ["sina", "tencent", "tdx", "adata_f10", "eastmoney"]
 SWITCHABLE_SOURCES = ["sina", "tencent", "tdx", "adata_f10"]   # 灌数池源（有开关键）
 # 每源条目键集恒定（形状稳定，前端按此渲染四行卡；v1.1 +switchable；
 # v1.2 +sg_* 四字段=SG 中转备用通道档）
@@ -125,7 +128,8 @@ def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     # conflict_codes 形状 = conflict_rows 同键集（T1-T7 + total）
     assert set(sp["conflict_codes"].keys()) == set(sp["conflict_rows"].keys())
     srcs = sp["sources"]
-    assert isinstance(srcs, list) and len(srcs) == 6, f"sources 应 6 源: {len(srcs)}"
+    # 2026-11-27 源池定案：fuyao 展示源移除 → 5 源（4 灌数池 + eastmoney）
+    assert isinstance(srcs, list) and len(srcs) == 5, f"sources 应 5 源: {len(srcs)}"
     # 固定顺序（与前端 SOURCE_COLORS / _ADAPTER_NAMES 对齐）
     assert [s["name"] for s in srcs] == ALL_SOURCES, \
         f"sources 顺序必须=ALL_SOURCES: {[s['name'] for s in srcs]}"
@@ -136,7 +140,7 @@ def test_ready_sources_five_fixed_order_and_keys(tmp_path, monkeypatch):
     by_sw = {s["name"]: s["switchable"] for s in srcs}
     for n in SWITCHABLE_SOURCES:
         assert by_sw[n] is True, f"{n} 应可开关"
-    for n in ("eastmoney", "fuyao"):
+    for n in ("eastmoney",):
         assert by_sw[n] is False, f"{n} 不应有开关（无 yaml 键）"
 
 
@@ -188,7 +192,7 @@ def test_ready_sources_authority_from_constant(tmp_path, monkeypatch):
         assert by_name[name]["authority"] == AUTHORITY[name], \
             f"{name} authority 应={AUTHORITY[name]}: {by_name[name]['authority']}"
     # v1.1：新展示源不参与裁决 → None（晋主前不写入，无裁决需求）
-    for name in ("eastmoney", "fuyao"):
+    for name in ("eastmoney",):
         assert by_name[name]["authority"] is None
     # Q1 序：sina(0) < tencent(1) < tdx(3) == adata_f10(3)（baostock:2 空位随渠道移除）
     assert by_name["sina"]["authority"] < by_name["tencent"]["authority"] \
@@ -254,9 +258,8 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     # T9 条目 2026-11-27 移除（声明级残留；T9=te_local 日更，不进多源池）
     assert all(p["table"] != "macro_rf" for p in by_name["eastmoney"]["provides"]), \
         "EM T9 条目应已移除（T9 不进多源池）"
-    # fuyao 能力表清空（T5 11-27 未收 + T6 条目移除 → 无表角色）
-    fy = {(p["table"], p["field_group"], p["role"]) for p in by_name["fuyao"]["provides"]}
-    assert fy == set(), f"fuyao 应无表角色: {fy}"
+    # 2026-11-27 源池定案：fuyao 展示源移除（无表角色+生产 0 行）→ 不出现在 sources
+    assert "fuyao" not in by_name, f"fuyao 应已随源池定案移除: {sorted(by_name)}"
     # T4 分红：v1.1 起仅东财在线源列 T4（旧 em_local_static CSV 是 source 值不是源能力）
     for name in ALL_SOURCES:
         if name == "eastmoney":
@@ -299,9 +302,8 @@ def test_ready_sources_rate_limit_text(tmp_path, monkeypatch):
     # tencent 无 min_interval 配置 → null（前端显示"无官方配额"）
     assert by_name["tencent"]["rate_limit"] is None
     # v1.1：新展示源静态实测文案（config 无关；2026-11-10 限额探测结论；
-    # tushare 条目 2026-11-26 随弃用移除）
+    # tushare 条目 2026-11-26 随弃用移除；fuyao 条目 2026-11-27 随源池定案移除）
     assert by_name["eastmoney"]["rate_limit"] == "无硬限（2026-11-10 实测 20并发≈12 req/s）"
-    assert by_name["fuyao"]["rate_limit"] == "15次/秒（X-RateLimit-Limit）·日配额未观测"
 
 
 def test_ready_sources_rate_limit_from_config_override(tmp_path, monkeypatch):
@@ -404,9 +406,9 @@ def test_build_sources_no_db_no_adapter_import(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# v7.0.35（2026-11-20 Joel 指出）：灌数 driver 启动探测覆盖 2 展示源
-# （eastmoney/fuyao 本机态每日自动刷新，不再恒「未探测」；
-#   2026-11-26 tushare 随弃用移除）
+# v7.0.35（2026-11-20 Joel 指出）：灌数 driver 启动探测覆盖展示源 eastmoney
+# （eastmoney 本机态每日自动刷新，不再恒「未探测」；
+#   2026-11-26 tushare 随弃用移除；2026-11-27 fuyao 随源池定案移除）
 # ===========================================================================
 class _FakeAdapter:
     def available(self) -> bool:
@@ -417,10 +419,11 @@ class _FakeAdapter:
 
 
 def test_driver_probe_includes_display_sources(tmp_path, monkeypatch):
-    """driver _probe_all_adapters 探测对象 = 4 池源 + eastmoney/fuyao。
+    """driver _probe_all_adapters 探测对象 = 4 池源 + eastmoney 展示源。
 
     - 实现单点=lake.web_api 轻量探测分支（monkeypatch 验调用+值透传）；
-    - source_health.json 落 6 源（B-2 派生→tmp 库目录，不触生产 data/lake/）。"""
+    - source_health.json 落 5 源（B-2 派生→tmp 库目录，不触生产 data/lake/）。
+    2026-11-27 源池定案：fuyao 展示源移除（原第 6 探）。"""
     import lake.ingest.source_pool as sp
     import os as _os
     _scripts = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "scripts")
@@ -434,20 +437,18 @@ def test_driver_probe_includes_display_sources(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(wapi, "_probe_eastmoney",
                         lambda: calls.append("eastmoney") or (False, "请求失败：rc=202（WAF）"))
-    monkeypatch.setattr(wapi, "_probe_fuyao",
-                        lambda: calls.append("fuyao") or (True, "龙虎榜 2 股"))
 
     db = str(tmp_path / "test.duckdb")  # 仅派生 health 落点（函数不连库）
     res = drv._probe_all_adapters(db)
     assert res["enabled"] is True
 
-    assert calls == ["eastmoney", "fuyao"], f"展示源探测调用序: {calls}"
+    assert calls == ["eastmoney"], f"展示源探测调用序: {calls}"
 
     data = json.load(open(tmp_path / "source_health.json", encoding="utf-8"))
-    assert set(data.keys()) == set(ALL_SOURCES), f"6 源齐全: {sorted(data.keys())}"
+    assert set(data.keys()) == set(ALL_SOURCES), f"5 源齐全: {sorted(data.keys())}"
     assert data["eastmoney"]["available"] is False
     assert "WAF" in data["eastmoney"]["detail"]
-    assert data["fuyao"]["available"] is True
+    assert "fuyao" not in data, "fuyao 应已随源池定案移除"
     for n in ALL_SOURCES:
         assert data[n]["probed_at"], f"{n} 应有 probed_at"
 
@@ -467,7 +468,6 @@ def test_driver_display_probe_failure_not_blocking(tmp_path, monkeypatch):
     def _boom():
         raise RuntimeError("probe down")
     monkeypatch.setattr(wapi, "_probe_eastmoney", _boom)
-    monkeypatch.setattr(wapi, "_probe_fuyao", lambda: (True, "ok"))
 
     db = str(tmp_path / "test.duckdb")  # 仅派生 health 落点（函数不连库）
     res = drv._probe_all_adapters(db)
@@ -475,4 +475,3 @@ def test_driver_display_probe_failure_not_blocking(tmp_path, monkeypatch):
     data = json.load(open(tmp_path / "source_health.json", encoding="utf-8"))
     assert data["eastmoney"]["available"] is False
     assert "probe error" in data["eastmoney"]["detail"]
-    assert data["fuyao"]["available"] is True

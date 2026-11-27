@@ -825,9 +825,11 @@ _CONFLICT_TABLES = _SOURCE_TABLES[:7]                 # T1-T7（T8/T9 无 confli
 # v6.3.5：conflict 股票数口径的 code 列（index_daily=index_code，其余=ts_code）——
 # 与 _TABLE_META code_col 同口径，防 COUNT(DISTINCT ts_code) 在 index_daily 报列不存在。
 _CONFLICT_CODE_COL = {t[0]: t[5] for t in _TABLE_META}
-_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10", "eastmoney",
-                  "fuyao"]   # v1.1（2026-11-10）：4 灌数池源 + 展示源
-                             # （2026-11-26：tushare 展示源随弃用移除，Joel 定案）
+_ADAPTER_NAMES = ["sina", "tencent", "tdx", "adata_f10", "eastmoney"]
+# v1.1（2026-11-10）：4 灌数池源 + 展示源
+# （2026-11-26：tushare 展示源随弃用移除，Joel 定案；
+#  2026-11-27 源池定案：fuyao 展示源移除——能力表清空后无任何表角色，
+#  生产库 0 行，卡片/探测/SG 全链路下线）
 _STALE_DAYS = 7                                       # probed_at 距今 >7 天 → stale
 
 
@@ -890,13 +892,13 @@ def _read_source_health():
 #
 # 设计纪律：
 # - **独立文件 source_health_sg.json**：灌数 driver 每次启动全量覆盖
-#   source_health.json（v7.0.35 起含 4 池源 + eastmoney/fuyao 2 展示源；
+#   source_health.json（v7.0.35 起含 4 池源 + eastmoney 展示源；
 #   2026-11-26 tushare 展示源随弃用移除），
 #   若把 sg 记进取会被每日冲掉 → 分文件、仅 Web 探测写入，天然不受灌数影响。
 # - **一次 ssh 批量**：ssh oci 'python3 -s -' 跑 scripts/lake_probe_sg.py（SG 侧
 #   并行探活、纯 stdlib、无凭据、整体墙钟 25s）→ TSV 回传。不逐源开 7 条 ssh。
-# - **通道语义**：fuyao 在 SG 侧只做可达性（不附 key、不调配额 API）——
-#   key 留在 EU .env；"SG 通道可达"≠"SG 已鉴权"，detail 如实写明。
+# - **通道语义**：SG 侧各源只做**通道可达性**检查（不鉴权、不调配额 API）——
+#   各源 key 留在 EU .env；"SG 通道可达"≠"SG 已鉴权"，detail 如实写明。
 # - **零影响红线**：sg 探测失败/超时/ssh 断 → 只记 sg 档不可达，本机档与
 #   /status 其余部分不受影响；探测是手动动作，无 cron 自动触发。
 # ---------------------------------------------------------------------------
@@ -1015,14 +1017,12 @@ def _rate_limit_text(name: str, cfg: Dict[str, Any]) -> Optional[str]:
 
     灌数池 4 源：config ``{name}_min_interval_s`` 派生（1.0 → "≥1s/股"；
     未配置 → None，前端显示"无官方配额"）。
-    展示源静态文案（2026-11-10 实测口径；2026-11-26 tushare 条目随弃用移除）：
-    - eastmoney：无硬限（连发 60+20 并发零 429/繁忙，20 并发 ≈12 req/s）；
-    - fuyao：X-RateLimit-Limit=15（秒级窗口），日配额未观测（63 次/日未触底）。
+    展示源静态文案（2026-11-10 实测口径；2026-11-26 tushare 条目随弃用移除；
+    2026-11-27 fuyao 条目随源池定案移除）：
+    - eastmoney：无硬限（连发 60+20 并发零 429/繁忙，20 并发 ≈12 req/s）。
     """
     if name == "eastmoney":
         return "无硬限（2026-11-10 实测 20并发≈12 req/s）"
-    if name == "fuyao":
-        return "15次/秒（X-RateLimit-Limit）·日配额未观测"
     v = cfg.get(f"{name}_min_interval_s")
     if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
         s = str(int(v)) if float(v).is_integer() else str(v)
@@ -1697,34 +1697,13 @@ def _probe_eastmoney() -> tuple:
     return False, f"rc={d.get('rc')}（疑 geo 墙/端点漂移）"
 
 
-def _probe_fuyao() -> tuple:
-    """Fuyao 探测：龙虎榜 1 次（code==0=可达；2026-11-10 起 EU 直连已通）。"""
-    import json as _json
-    import urllib.request
-
-    key = _env_token("HITHINK_FINANCE_API_KEY")
-    if not key:
-        return False, ".env 缺 HITHINK_FINANCE_API_KEY"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(
-                "https://fuyao.aicubes.cn/api/a-share/special-data/dragon-tiger-list?date=2026-11-09",
-                headers={"User-Agent": "Mozilla/5.0", "X-api-key": key}),
-                timeout=10) as r:
-            d = _json.loads(r.read())
-    except Exception as exc:  # noqa: BLE001
-        return False, f"请求失败: {exc}"
-    if d.get("code") == 0:
-        return True, f"龙虎榜 OK（{len((d.get('data') or {}).get('stock_items', []))} 股）"
-    return False, f"code={d.get('code')} {d.get('message')}"
-
-
 def _probe_one_source(name: str) -> Dict[str, Any]:
     """单源探测（**调用方须在独立线程跑**——本函数内部可能阻塞至网络层超时）。
 
     sina/tencent/tdx/adata_f10：清懒缓存（reset_available_for_test）→ available()
     （首次触发 EU 自检；失败→False，不抛）。
-    v1.1：eastmoney（push2his 1 根）/fuyao（龙虎榜 1 次）走轻量探测分支
-    （2026-11-26：tushare 探测随弃用移除）。
+    v1.1：eastmoney（push2his 1 根）走轻量探测分支
+    （2026-11-26：tushare 探测随弃用移除；2026-11-27：fuyao 随源池定案移除）。
     """
     from .ingest import source_pool as sp
 
@@ -1733,8 +1712,6 @@ def _probe_one_source(name: str) -> Dict[str, Any]:
     detail = ""
     if name == "eastmoney":
         ok, detail = _probe_eastmoney()
-    elif name == "fuyao":
-        ok, detail = _probe_fuyao()
     else:
         try:
             ad = sp.get_adapter(name)

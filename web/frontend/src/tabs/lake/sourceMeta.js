@@ -22,7 +22,7 @@
 export const SOURCE_COLORS = {
   sina: "#2563eb", tencent: "#f97316",
   tdx: "#06b6d4", adata_f10: "#ec4899", local: "#64748b",   // v6.1.5 F2：slate-500（白底可读）
-  eastmoney: "#ef4444", fuyao: "#8b5cf6",
+  eastmoney: "#ef4444",
 };
 export const UNKNOWN_COLOR = "#cbd5e1";
 
@@ -33,7 +33,7 @@ export const UNKNOWN_COLOR = "#cbd5e1";
 export const SOURCE_LABELS = {
   sina: "新浪", tencent: "腾讯",
   tdx: "通达信", adata_f10: "adata", local: "本地缓存",
-  eastmoney: "东财", fuyao: "Fuyao",
+  eastmoney: "东财",
 };
 
 // v6.3.3（2026-10-02）：已知 source **变体**着色（活跃源的子标记值，不占图例位）。
@@ -55,6 +55,13 @@ export const SOURCE_VARIANTS = {
   // v1.1：T4 分红 2026-10-21 Web 端点人工核验落库行（source=web_verified_20261021，
   // 本地核验语义 → 灰 + 中文 label，不再裸显"其他·…"）。
   web_verified_20261021: { color: UNKNOWN_COLOR, label: "Web核验(T4)" },
+  // 2026-11-27 源池定案配套：EM 批量通道写入的 source 值 em_batch（kline_daily/
+  // valuation_daily 生产实值）——东财族 → 东财红（同 SOURCE_COLORS.eastmoney，
+  // 与图例"东财"同族着色；此前漏配落"其他·em_batch"灰显，图例与堆叠条矛盾）。
+  em_batch: { color: SOURCE_COLORS.eastmoney, label: "东财批量" },
+  // 2026-11-27：valuation_daily 由 bd_static 月度序列窗口派生行（source=
+  // derived_from_bd，scripts/derive_valuation_window.py）——百度族 → 灰 + 中文 label。
+  derived_from_bd: { color: UNKNOWN_COLOR, label: "百度派生" },
 };
 
 // v6.1.5 F1：已知 legacy source 别名映射（生产库 DISTINCT source 核对结果 + brief 点名）。
@@ -82,9 +89,10 @@ export const LEGACY_SOURCE_ALIASES = {
 };
 
 // 图例行固定顺序（v7.0.18：baostock 随渠道移除，5 源 + local）。
-// v8.2.15（2026-11-27）：tushare 随源弃用移除 → 灌数池 4 源 + local 殿后（7 项）。
+// v8.2.15（2026-11-27）：tushare 随源弃用移除；2026-11-27 源池定案：fuyao
+// 展示源移除（无表角色+生产 0 行）→ 灌数池 4 源 + eastmoney 展示源 + local 殿后（6 项）。
 export const LEGEND_ORDER = ["sina", "tencent", "tdx", "adata_f10",
-  "eastmoney", "fuyao", "local"];
+  "eastmoney", "local"];
 
 // source → {color, label}（v6.1.5 F1 三级 + v6.3.3 变体级，不再裸显英文）
 //   1) 当前活跃源 SOURCE_COLORS/SOURCE_LABELS → 固定色 + 中文名；
