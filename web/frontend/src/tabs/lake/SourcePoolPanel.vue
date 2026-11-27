@@ -31,8 +31,8 @@ const probingAll = ref(false);
 function _stores() { return { toast: useToastStore(), lake: useLakeStore() }; }
 
 // O4 源开关：UI 勾选框已移除（11-10 Joel review：7 源监控页上只覆盖 4/7 卡、
-// 主引擎 tushare 不可切，误点会破坏观察期 fallback 链）。后端 /sources/toggle
-// 端点 + strategy.yaml 键保留（应急仍可改 yaml；lake.config 消费点不变）。
+// 主引擎不可切，误点会破坏 fallback 链；11-26 tushare 弃用后池内已无主引擎开关需求）。
+// 后端 /sources/toggle 端点 + strategy.yaml 键保留（应急仍可改 yaml；lake.config 消费点不变）。
 
 // O4：单源探测 → POST /api/lake/sources/probe {names:[name]}（后端懒缓存先清、
 // 每源 ≤15s 超时、写 source_health.json）→ 重拉 /status 刷新卡片连通性/探测时间。

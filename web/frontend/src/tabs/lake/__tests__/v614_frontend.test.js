@@ -129,19 +129,18 @@ function mountSPP() {
 }
 
 describe("O5：SourcePoolPanel 固定色板图例行 + 中文悬停提示", () => {
-  it("#lake-spp-legend 8 项（v1.1：+tushare/eastmoney/fuyao 展示源；local 殿后）+ 色点同源 SOURCE_COLORS", () => {
+  it("#lake-spp-legend 7 项（v8.2.15：tushare 弃用移 legacy 灰显；eastmoney/fuyao 展示源；local 殿后）+ 色点同源 SOURCE_COLORS", () => {
     const w = mountSPP();
     const items = w.findAll("#lake-spp-legend .lake-spp-legend-item");
-    expect(items.length).toBe(8);
+    expect(items.length).toBe(7);
     const texts = items.map((i) => i.text());
-    expect(texts).toEqual(["新浪", "腾讯", "通达信", "adata", "Tushare", "东财", "Fuyao", "本地缓存"]);
+    expect(texts).toEqual(["新浪", "腾讯", "通达信", "adata", "东财", "Fuyao", "本地缓存"]);
     // 色点颜色与 sourceMeta 同源（sina 蓝 #2563eb / tdx 青 #06b6d4）
     expect(items[0].find(".lake-spp-dot").attributes("style")).toContain("#2563eb");
     expect(items[2].find(".lake-spp-dot").attributes("style")).toContain("#06b6d4");
-    // v1.1 新源色点（tushare 靛 #6366f1 / eastmoney 红 #ef4444 / fuyao 紫 #8b5cf6）
-    expect(items[4].find(".lake-spp-dot").attributes("style")).toContain("#6366f1");
-    expect(items[5].find(".lake-spp-dot").attributes("style")).toContain("#ef4444");
-    expect(items[6].find(".lake-spp-dot").attributes("style")).toContain("#8b5cf6");
+    // v1.1 展示源色点（eastmoney 红 #ef4444 / fuyao 紫 #8b5cf6；tushare 靛随源弃用移除）
+    expect(items[4].find(".lake-spp-dot").attributes("style")).toContain("#ef4444");
+    expect(items[5].find(".lake-spp-dot").attributes("style")).toContain("#8b5cf6");
     w.unmount();
   });
 
