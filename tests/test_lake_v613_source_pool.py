@@ -220,7 +220,8 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
     assert ("stock_master", "master") in tables_tx
     assert ("valuation_daily", "valuation") in tables_tx
     assert ("index_daily", "ohlcv") in tables_tx
-    # v1.1：tdx T7 由「amount 主源」收敛为单源全字段（观察期主源，东财晋主后降备）
+    # v1.1：tdx T7 由「amount 主源」收敛为单源全字段（观察期主源；2026-11-27
+    # 东财退出 T7 后"晋主降备"条款废止，tdx 保持观察期主源）
     tdx = {(p["table"], p["field_group"], p["role"]) for p in by_name["tdx"]["provides"]}
     assert ("index_daily", "ohlcv_amount", "主源(观察期→降备)") in tdx
     # adata_f10 仅 T5 f10 主源

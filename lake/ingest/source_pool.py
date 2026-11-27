@@ -159,7 +159,8 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
         {"table": "kline_daily", "table_cn": "T2 日K线",
          "field_group": "ohlcv_amount", "role": "交叉校验"},
         # v1.1：T7 由「腾讯 ohlcv + tdx amount 字段组拼接」收敛为 tdx 单源全字段
-        # （观察期主源；东财晋主后 tdx 降备）。
+        # （观察期主源）。2026-11-27 Joel 定案：T7=腾讯+tdx，东财已退出 T7
+        # （其「主源(观察期→晋主)」条目移除），"东财晋主后降备"不再成立。
         {"table": "index_daily", "table_cn": "T7 指数日线",
          "field_group": "ohlcv_amount", "role": "主源(观察期→降备)"},
     ],
@@ -186,8 +187,9 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
         # 无交叉校验/备源——fuyao PIT 验证后质量不达标亦未收）。
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
          "field_group": "holders", "role": "备源(待验证)"},
-        {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "ohlcv_amount", "role": "主源(观察期→晋主)"},  # 指数K线含amount已验
+        # T7 条目 2026-11-27 移除（Joel 定案：T7=腾讯(ohlcv 写入) + tdx
+        # （amount 补缺 + close 0.3% 交叉校验），东财不参与 T7；原
+        # "主源(观察期→晋主)" 废止）。
         {"table": "macro_rf", "table_cn": "T9 无风险利率",
          "field_group": "rf", "role": "备源(待验证)"},
     ],
