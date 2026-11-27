@@ -704,7 +704,11 @@ def run_t7(con, db_path: str, days: int, runner, force: bool = False) -> Dict[st
             from lake.ingest.tencent_ingest import fetch_kline_ohlcv
 
             kl = fetch_kline_ohlcv(tclient, ic, n=days + 30)
-        # tdx amount 补充（腾讯指数行 amount 缺→NULL；tdx 提供则补上）
+        # tdx amount 补充（腾讯指数行 amount 缺→NULL；tdx 提供则补上）。
+        # 2026-11-27 定案（Joel ④）：T7=腾讯唯一主源，tdx T7 声明条目移除、
+        # 主源观察期终止（17 天 0 写入）——本路径为**质量门**（amount 补填 +
+        # close 0.3% 交叉校验写 conflict_src 审计列，不产新行归属），保留；
+        # tdx_enabled=False 或 tdx 不可用时自动跳过（留 NULL）。
         tdx_ad = sp.get_adapter("tdx") if lake_cfg().get("tdx_enabled", True) else None
         conflict = None
         tdx_rows: List[Dict[str, Any]] = []
@@ -774,7 +778,8 @@ def run_t2(con, db_path: str, days: int, codes: Optional[List[str]],
     （tencent=1 覆盖 sina=0）。现改为与 run_history 相同的多源逻辑（**窗口化**）：
 
     - ``ohlcv_srcs = resolve_source("kline_daily","ohlcv_amount")``（config 序
-      sina→tencent→tdx）、``adj_srcs = resolve_source(...,"adj_factor")``（sina→tdx）；
+      sina→tdx；2026-11-27 tencent 退出 T2 逐只链）、
+      ``adj_srcs = resolve_source(...,"adj_factor")``（sina→tdx）；
       按 Q1 优先级取第一个 available() 且成功的源（break）。
     - **窗口化**：p0 是"近 N 天增量"，非全史重写——``window_start = (今日北京时间 -
       (days+30) 自然日)``；对每个源 ``fetch_kline(code, start=window_start)``，取数后
@@ -1919,7 +1924,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
 
     - **kline_daily**：对全市场取**最近缺口**（每股 date_max+1→今日；无行→近 250 日），
       走 source_pool ``resolve_source("kline_daily","ohlcv_amount")`` + adj_factor 组
-      （Q1 优先级 sina→tencent→tdx / sina→tdx，与 history/p0 同一 worker 语义）；
+      （2026-11-27 sina→tdx；Q1 原序 sina→tencent→tdx，tencent 已退出逐只链；
+      与 history/p0 同一 worker 语义）；
       upsert 复用 load_t2（内部 common.upsert）。限速：sina/tdx adapter 内置
       RateLimiter（config sina_min_interval_s 等）+ worker 尾 0.3s。
     - **valuation_daily**：Tencent load_t3 逐只取最新快照（date=今日；腾讯快照是
@@ -2060,10 +2066,12 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     "adj_sources": [a.name for a in adj_srcs]}
 
     # ---- v7.0.33：全市场单日批量（2026-11-15 EM 拍板转正；2026-11-26 tushare
-    # 备源随弃用整段移除）----
-    # 通道链：① 东财 clist 主源（快照只含**最近交易日**数据 → 触发条件=缺口众数
-    # 日=指数最新交易日，或周末/节假日陈旧缺口（众数日前无其他交易日，refetch
-    # 语义同 v7.0.8）；多日缺口（停牌复牌/补跑）走逐只多源）② 逐只 legacy。
+    # 备源随弃用整段移除；2026-11-27 角色定案：sina 主源 + EM 批量备源）----
+    # 通道链：① 东财 clist 快速通道（**备源角色**：快照只含**最近交易日**数据 →
+    # 触发条件=缺口众数日=指数最新交易日，或周末/节假日陈旧缺口（众数日前无其他
+    # 交易日，refetch 语义同 v7.0.8）；多日缺口（停牌复牌/补跑）走逐只多源）
+    # ② 逐只 sina 主源链（主源保底：11-11..11-25 EM 连续 8 日 502 限频期间由本链
+    # 写满 5,200 行/日——通道序≠角色序，先试 EM 加速、失败回退 sina 主源）。
     # EM 字段映射/单位/af 推导口径见 lake/ingest/em_batch_ingest.py（2026-11-15
     # 实锤：f17=open f15=high f16=low f18=preclose f5 手→股 f20 元→亿元；af=官方
     # 除权参考价公式推导，配股 fail-closed；EU 直连 → SG 备用出口）。
@@ -2084,7 +2092,7 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                     _idx_max = max(_idx_dates, default=None)
                 except Exception as exc:  # noqa: BLE001 - 指数探测失败 → 批量无日期锚 → 逐只
                     log.warning("incremental 批量: 指数探测失败（批量跳过，走逐只）: %s", exc)
-            # —— ① EM 主通道（快照=指数最新交易日；陈旧缺口 refetch 语义同 v7.0.8）——
+            # —— ① EM 快速通道（备源角色；快照=指数最新交易日；陈旧缺口 refetch 语义同 v7.0.8）——
             if _idx_max is not None and not batch.get("date"):
                 _em_bdate: Optional[str] = None
                 _em_refetch = False
@@ -2137,9 +2145,9 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                             _em_bdate, _em_refetch, len(_t2_rows), len(_t3_rows),
                             len(_events),
                             sum(1 for c in codes if c not in batch["t2"]))
-                    except Exception as exc:  # noqa: BLE001 - EM 失败 → 逐只 legacy（2026-11-26 tushare 备源随弃用移除）
+                    except Exception as exc:  # noqa: BLE001 - EM 失败 → 逐只 sina 主源链（2026-11-26 tushare 备源随弃用移除）
                         _batch_errs.append(f"em: {str(exc)[:120]}")
-                        log.warning("incremental 批量 (EM) 失败 → 回退逐只 legacy: %s", exc)
+                        log.warning("incremental 批量 (EM) 失败 → 回退逐只 sina 主源链: %s", exc)
                         batch = {"failed": " | ".join(_batch_errs)[:200]}
                 elif _idx_max < _mode_date or (
                         _idx_max > _mode_date and any(
@@ -2247,7 +2255,8 @@ def run_incremental(con, db_path: str, codes: Optional[List[str]],
                             dates=[str(_brow["date"])[:10]]) or None
                     load_t2(con, code, [_brow],
                             adj_map=adj_map,
-                            # 来源标签随批量通道（v7.0.33 EM 主源；2026-11-26 备源随 tushare 弃用移除）
+                            # 来源标签随批量通道（v7.0.33 EM 批量通道；2026-11-27 角色=备源快速通道；
+                            # tushare 备源 2026-11-26 随弃用移除）
                             source="em_batch",
                             volume_is_shares=True)
                     return

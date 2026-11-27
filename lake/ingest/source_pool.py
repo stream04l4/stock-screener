@@ -130,9 +130,14 @@ AUTHORITY: Dict[str, int] = {
 SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     "sina": [
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "主源(观察期→降备)"},
+         "field_group": "ohlcv_amount",
+         "role": "主源(2026-11-27 晋主；连续 14 日 5,200 行/日 + 28.7 万全史验证)"},
+        # 2026-11-27 定案（Joel 源池原则）：T2=sina 主源 + EM 批量备源。
+        # 观察期条款（v1.1 2026-11-10）随 11-27 定案终止：sina 晋主、
+        # 东财批量通道降备（2-4 周稳定运行后可再晋主，见 eastmoney 条目）。
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "adj_factor", "role": "主源·推导(观察期)"},   # hfq÷raw 推导
+         "field_group": "adj_factor",
+         "role": "推导(p0/history 手工路径；日增量为无锚点填充)"},   # hfq÷raw 推导
         # v6.3.3（2026-10-02）：T6 前十大股东补登记。根因：本表建于 v6.1.3，
         # 当时 sina 只管 K线；T6 是 v6.1.7 加的（SinaClient.fetch_holders 抓新浪 F10
         # 股东研究页 vip.stock.finance.sina.com.cn vCI_CirculateStockHolder），加表
@@ -148,21 +153,23 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
          "field_group": "master", "role": "主源(2026-11-27 晋主)"},
     ],
     "tencent": [
-        {"table": "stock_master", "table_cn": "T1 股票主档",
-         "field_group": "master", "role": "name/is_st 补齐(v5 口径)"},
+        # T1 条目 2026-11-27 移除（Joel 源池原则清理）：「name/is_st 补齐(v5 口径)」
+        # 为声明级残留——tencent_ingest 对 stock_master 零写入（T1 实写=sina 快照）。
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
          "field_group": "valuation", "role": "主源"},
+        # 2026-11-27 定案（Joel ④）：T7=腾讯唯一主源（非策略表，仅主源）——
+        # tdx 观察期 17 天 0 写入（未晋主）→ tdx T7 条目移除，观察期终止。
         {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "ohlcv", "role": "交叉校验"},
+         "field_group": "ohlcv",
+         "role": "主源(2026-11-27 唯一主源；tdx 观察期 17 天 0 写入降级)"},
     ],
     "tdx": [
         {"table": "kline_daily", "table_cn": "T2 日K线",
          "field_group": "ohlcv_amount", "role": "交叉校验"},
-        # v1.1：T7 由「腾讯 ohlcv + tdx amount 字段组拼接」收敛为 tdx 单源全字段
-        # （观察期主源）。2026-11-27 Joel 定案：T7=腾讯+tdx，东财已退出 T7
-        # （其「主源(观察期→晋主)」条目移除），"东财晋主后降备"不再成立。
-        {"table": "index_daily", "table_cn": "T7 指数日线",
-         "field_group": "ohlcv_amount", "role": "主源(观察期→降备)"},
+        # T7 条目 2026-11-27 移除（Joel ④ 定案）：「主源(观察期→降备)」废止——
+        # 观察期（1 周/5 交易日）内 0 行写入、未晋主；T7=腾讯唯一主源。
+        # 注：run_t7 内 tdx amount 补填 + close 0.3% 交叉校验为质量门代码路径
+        # （get_adapter 直连，不受本表优先级门控；tdx_enabled=False 可禁用）。
     ],
     "adata_f10": [
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
@@ -175,32 +182,47 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
     "eastmoney": [
         {"table": "stock_master", "table_cn": "T1 股票主档",
          "field_group": "master", "role": "备用(2026-11-27 降备；sina 晋主)"},
+        # 2026-11-27 定案（Joel ①）：T2 主备=sina 主源 + EM 批量备源。
+        # EM 批量通道（clist 快照）为**快速通道**：成功时 2.5min 全市场 + T4 除权
+        # 事件 + af 推导；11-11..11-25 连续 8 日 502 限频由 sina 逐只兜底写满。
+        # 通道序≠角色序：incremental 先试 EM 批量加速、失败回退逐只 sina（主源
+        # 保底）；EM 连续稳定运行 2-4 周后可再晋主（届时同步改本条与 config 注释）。
         {"table": "kline_daily", "table_cn": "T2 日K线",
-         "field_group": "ohlcv_amount", "role": "主源"},
+         "field_group": "ohlcv_amount",
+         "role": "备源(批量快速通道；连续 2-4 周稳定后可晋主)"},
         {"table": "kline_daily", "table_cn": "T2 日K线",
          "field_group": "adj_factor", "role": "主源·推导"},   # 除权事件推导（配股 fail-closed）
+        # 2026-11-27 定案：T3 主备=tencent 主源 + EM 备源（全市场批量快速通道）。
         {"table": "valuation_daily", "table_cn": "T3 估值日线",
-         "field_group": "valuation", "role": "主源(全市场批量)"},
+         "field_group": "valuation", "role": "备源(全市场批量快速通道)"},
         {"table": "dividend_events", "table_cn": "T4 分红事件",
          "field_group": "dividend", "role": "主源"},    # RPT_SHAREBONUS_DET
         # T5 交叉校验条目 2026-11-27 移除（Joel 定案：T5=adata_f10 主源单源，
         # 无交叉校验/备源——fuyao PIT 验证后质量不达标亦未收）。
+        # 2026-11-27 实测验证（scripts/t6_em_verify.py，20 股×2026Q3）：端点
+        # emweb PC_HSF10/ShareholderResearch/PageAjax 全市场可达、sdgd 最新期
+        # 10 名齐全（rank/name/持股数/比例）；与湖内 sina_f10 同名单股比例
+        # 分母口径差（sina=流通股本、EM=报告期总股本，湖内系统性偏高 ≤~27%），
+        # 且 EM 暴露湖内陈旧行（sz.002978 09-30 行=06-30 原样复制，EM 为真实
+        # Q3 值）→ 收为备源。限制：仅返最新一期（无历史期 PIT）、比例入库前
+        # 须归一湖内口径。记录：docs/issues/2026-11-27-source-pool-cleanup.md。
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
-         "field_group": "holders", "role": "备源(待验证)"},
-        # T7 条目 2026-11-27 移除（Joel 定案：T7=腾讯(ohlcv 写入) + tdx
-        # （amount 补缺 + close 0.3% 交叉校验），东财不参与 T7；原
-        # "主源(观察期→晋主)" 废止）。
-        {"table": "macro_rf", "table_cn": "T9 无风险利率",
-         "field_group": "rf", "role": "备源(待验证)"},
+         "field_group": "holders",
+         "role": "备源(2026-11-27 实测通过；限最新一期+分母口径差)"},
+        # T9 条目 2026-11-27 移除（Joel 源池原则清理）：「备源(待验证)」为
+        # 声明级残留——T9 实写=te_local 日更（21 行→11-27）+ em_local_static
+        # 冻结历史 CSV（6,187 行→10-23，source 值非源能力）；T9 非策略表，
+        # 仅主源（te_local 日更），不进多源池（同 T8 本地派生不列池）。
     ],
     "fuyao": [
         # T5 2026-11-27：PIT 验证已做（41 股×3 期 123 行，记录
         # docs/issues/2026-11-27-t5-fuyao-verified.md）→ Joel 判定 vendor 质量
         # 不达标（2024Q4 重述漂移 6 股 + 600960 2025Q4 liab 孤立陈旧格）
         # → 不作备源，T5=adata_f10 主源单源。
-        # fuyao 非灌数池 adapter：晋主前不写入（同 v1.1 设计）。
-        {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
-         "field_group": "holders", "role": "交叉校验(待验证)"},
+        # T6 条目 2026-11-27 移除（Joel 源池原则：T6 非策略表仅主备，
+        # 备源=东财已实测收编）→ fuyao 现无任何表角色，仅保留展示源位
+        # （/status 面板 6 源固定序 + lake_observation 探活），能力表清空。
+        # fuyao 非灌数池 adapter：不写入（同 v1.1 设计）。
     ],
 }
 

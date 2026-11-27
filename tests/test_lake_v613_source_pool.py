@@ -206,30 +206,34 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
         # 原样透出（deep copy，值相等）
         assert by_name[name]["provides"] == SOURCE_CAPABILITIES.get(name, []), \
             f"{name} provides 应=SOURCE_CAPABILITIES: {by_name[name]['provides']}"
-    # 关键内容断言（防能力表被静默改动）——v1.1 角色语义（观察期标注）
+    # 关键内容断言（防能力表被静默改动）——2026-11-27 源池原则定案后角色语义
+    # （Joel 拍板：策略表主备、非策略表仅主源、其他源删除）
     sina = by_name["sina"]["provides"]
     assert {"table": "kline_daily", "field_group": "ohlcv_amount",
-            "role": "主源(观察期→降备)"} \
+            "role": "主源(2026-11-27 晋主；连续 14 日 5,200 行/日 + 28.7 万全史验证)"} \
         in [{k: p[k] for k in ("table", "field_group", "role")} for p in sina]
     # v6.3.3：sina 能力表含 T6 前十大股东（v6.1.7 加 T6 时漏回填，Joel 10-02 反馈补登）
     assert {"table": "holders_snapshot", "field_group": "holders", "role": "主源"} \
         in [{k: p[k] for k in ("table", "field_group", "role")} for p in sina]
-    # tencent 含 T1 主档（v1.1：ST 抽查降校验）+ T3 估值主源 + T7 指数（v1.1 降校验）
+    # tencent 含 T3 估值主源 + T7 指数（2026-11-27 ④：T7 唯一主源；
+    # T1「name/is_st 补齐」条目已移除——零写入声明级残留）
     tx = by_name["tencent"]["provides"]
     tables_tx = {(p["table"], p["field_group"]) for p in tx}
-    assert ("stock_master", "master") in tables_tx
     assert ("valuation_daily", "valuation") in tables_tx
     assert ("index_daily", "ohlcv") in tables_tx
-    # v1.1：tdx T7 由「amount 主源」收敛为单源全字段（观察期主源；2026-11-27
-    # 东财退出 T7 后"晋主降备"条款废止，tdx 保持观察期主源）
+    assert all(p["table"] != "stock_master" for p in tx), \
+        f"tencent 不应再列 T1（条目已移除）: {tables_tx}"
+    # tdx：T2 交叉校验保留；T7 条目 2026-11-27 移除（观察期 17 天 0 写入未晋主）
     tdx = {(p["table"], p["field_group"], p["role"]) for p in by_name["tdx"]["provides"]}
-    assert ("index_daily", "ohlcv_amount", "主源(观察期→降备)") in tdx
+    assert ("kline_daily", "ohlcv_amount", "交叉校验") in tdx
+    assert all(p[0] != "index_daily" for p in tdx), \
+        f"tdx T7 条目应已移除（观察期终止）: {tdx}"
     # adata_f10 仅 T5 f10 主源
     assert by_name["adata_f10"]["provides"] == [
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "主源"}]
-    # v1.1：eastmoney=观察期目标主源矩阵（2026-11-26 tushare 弃用后晋主）；
-    # fuyao=仅 T6 校验（T5 11-27 验证质量不达标，未收备源）
+    # eastmoney=T2/T3 备源（批量快速通道）+ T1 备 + T4 主 + T6 备（实测收编）；
+    # fuyao=能力表清空（T5 未收 + T6 条目移除 → 无表角色，仅保留展示源位）
     em = {(p["table"], p["field_group"], p["role"]) for p in by_name["eastmoney"]["provides"]}
     # T1 主档 2026-11-27 晋主=sina（全市场快照），EM clist 降备
     assert ("stock_master", "master", "备用(2026-11-27 降备；sina 晋主)") in em
@@ -237,15 +241,22 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
                    for p in by_name["sina"]["provides"]
                    if p["table"] == "stock_master"}
     assert sina_master.get("role") == "主源(2026-11-27 晋主)", f"sina T1 应晋主: {sina_master}"
-    assert ("kline_daily", "ohlcv_amount", "主源") in em
+    # T2 2026-11-27 ①：sina 主源晋主后，EM 批量通道降备（快速通道）
+    assert ("kline_daily", "ohlcv_amount",
+            "备源(批量快速通道；连续 2-4 周稳定后可晋主)") in em
     assert ("kline_daily", "adj_factor", "主源·推导") in em
-    assert ("valuation_daily", "valuation", "主源(全市场批量)") in em
+    # T3 2026-11-27：tencent 主源，EM 批量降备
+    assert ("valuation_daily", "valuation", "备源(全市场批量快速通道)") in em
     assert ("dividend_events", "dividend", "主源") in em
-    # v1.1 修订（11-10 review 断档修复）：T2 每日增量主引擎必须如实登记
-    # （生产 kline_daily 4.7 万行 source=tushare 为历史数据；2026-11-26 起新数据 source=em_batch）
-    # fuyao 能力表只剩 T6（T5 备源 2026-11-27 未收）
+    # T6 2026-11-27 ③：EM 备源实测验证通过（scripts/t6_em_verify.py）
+    assert ("holders_snapshot", "holders",
+            "备源(2026-11-27 实测通过；限最新一期+分母口径差)") in em
+    # T9 条目 2026-11-27 移除（声明级残留；T9=te_local 日更，不进多源池）
+    assert all(p["table"] != "macro_rf" for p in by_name["eastmoney"]["provides"]), \
+        "EM T9 条目应已移除（T9 不进多源池）"
+    # fuyao 能力表清空（T5 11-27 未收 + T6 条目移除 → 无表角色）
     fy = {(p["table"], p["field_group"], p["role"]) for p in by_name["fuyao"]["provides"]}
-    assert fy == {("holders_snapshot", "holders", "交叉校验(待验证)")}
+    assert fy == set(), f"fuyao 应无表角色: {fy}"
     # T4 分红：v1.1 起仅东财在线源列 T4（旧 em_local_static CSV 是 source 值不是源能力）
     for name in ALL_SOURCES:
         if name == "eastmoney":

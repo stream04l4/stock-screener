@@ -49,7 +49,9 @@ run_step() {  # run_step <label> <timeout-s> <cmd...>
 }
 
 echo "[$(date -u +%FT%TZ)] 湖增量开始 → $LOG"
-# 先同步 T4 分红送配增量（EM 主通道+tushare 抽样校验），保证 subsequent incremental 的 af_rebase 基于完整事件表
+# 先同步 T4 分红送配增量（EM 单一族主通道——2026-11-27 Joel 定案：T4=EM 单族
+# em_datacenter 日增 + em_local_static 冻结历史基线，无非 EM 备源；tushare 抽样
+# 校验随 11-26 tushare 弃用移除），保证 subsequent incremental 的 af_rebase 基于完整事件表
 run_step "T4分红增量" 300 .venv/bin/python scripts/lake_backfill.py t4-sync
 T4RC=$?
 if [ "$T4RC" -ne 0 ]; then

@@ -39,7 +39,8 @@ _DEFAULTS: Dict[str, Any] = {
 
     # v6.1 源开关（默认全开；False=该源不进池，worker 跳过）
     "sina_enabled": True,            # 新浪 akshare stock_zh_a_daily（T2 OHLCV/amount 主源）
-    "tdx_enabled": True,             # easy-tdx（T2/T7 fallback + T7 amount）
+    "tdx_enabled": True,             # easy-tdx（T2 fallback/交叉校验 + T7 amount 补填质量门；
+                                     # 2026-11-27：T7 主源观察期终止，tdx 不再晋主候选）
     "adata_f10_enabled": True,       # adata get_core_index（T5 主源，仅 F10）
     # v6.1.4 O4：tencent 原无开关键（腾讯是 legacy 直连兜底+T3/T7 主源）——补齐开关
     # （默认 True=现状不变；False=T2/T7 池跳过 tencent、T3 快照仍走腾讯直连——
@@ -48,12 +49,20 @@ _DEFAULTS: Dict[str, Any] = {
 
     # v6.1 字段组→源优先级（Q1 拍板序）。key=表名，value={field_group: [src,...]}。
     # resolve_source 按此返回 adapter 序列；worker 取第一个 available() 且成功的源。
+    # 2026-11-27 源池原则（Joel 拍板）：策略表主备、非策略表仅主源，其他源删除。
     "source_priority": {
-        # T2 kline_daily：OHLCV/amount 主源=新浪（全史一次拉全、含 amount、volume=股），
-        # fallback=腾讯(分页 n≤2000)→tdx；adj_factor 主源=新浪 hfq÷raw 推导，
-        # fallback=tdx hfq÷raw（v7.0.18：原尾部 BaoStock 兜底随渠道移除）。
+        # T2 kline_daily（策略表=主备）：OHLCV 逐只链=sina 主源(2026-11-27 晋主：
+        # 连续 14 日 5,200 行/日 + 28.7 万全史验证) + tdx fallback/交叉校验。
+        # tencent 退出逐只链（2026-11-27：其 9,363 行为 v6 时代历史兜底残留，
+        # 声明中从未列 T2；腾讯在 incremental 仅存 legacy 单源降级路径）。
+        # EM 批量通道（em_batch）不在本链——它是 incremental v7.0.33 的**快速
+        # 通道**（备源角色）：先试全市场批量、失败回退本链 sina（主源保底），
+        # 见 lake_backfill.run_incremental 与 source_pool eastmoney 条目。
+        # adj_factor：p0/history 手工重灌路径专用（sina→tdx hfq÷raw 推导，
+        # 源私有基准，全史重建语义）；**日增量不取任何源私有 af**——无锚点
+        # 填充（湖内 level 沿用+官方除权步长），湖内唯一新锚点=EM 除权事件推导。
         "kline_daily": {
-            "ohlcv_amount": ["sina", "tencent", "tdx"],
+            "ohlcv_amount": ["sina", "tdx"],
             "adj_factor": ["sina", "tdx"],
         },
         # T5 fundamentals_quarterly：adata F10 单源灌数（v7.0.18：原 BaoStock 交叉校验移除）。
@@ -63,10 +72,13 @@ _DEFAULTS: Dict[str, Any] = {
         "fundamentals_quarterly": {
             "f10": ["adata_f10"],
         },
-        # T7 index_daily：OHLCV 腾讯主源（现状稳定）+ tdx fallback；amount 补 tdx。
+        # T7 index_daily（非策略表=仅主源）：2026-11-27 定案（Joel ④）=腾讯唯一
+        # 主源（1,308 行唯一写入者→11-27）。原 tdx fallback 随观察期终止移除
+        # （观察期 17 天 0 写入、未晋主）；"amount" 组随 tdx 条目一并删除。
+        # 注：run_t7 内 tdx amount 补填 + close 0.3% 交叉校验为质量门代码路径
+        # （get_adapter 直连，不受本表优先级门控；tdx_enabled=False 可禁用）。
         "index_daily": {
-            "ohlcv": ["tencent", "tdx"],
-            "amount": ["tdx"],
+            "ohlcv": ["tencent"],
         },
     },
 

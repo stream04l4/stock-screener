@@ -378,36 +378,41 @@ def test_full_t8_t9_before_t5_segment_order(tmp_path, monkeypatch, capsys):
 
 
 # ===========================================================================
-# T1（2026-11-26 tushare 弃用切换）：东财 clist 快照单次调用 + delist_date 沿用
-#     + t1-delist 退市板（m:0 s:3）
+# T1（2026-11-27 v8.2.14 Joel 定案：sina 晋主，EM clist 降备用）
 # ===========================================================================
-def test_t1_clist_snapshot_preserves_delist_and_coarse_industry(tmp_path, monkeypatch):
-    """T1 主源=东财 clist（2026-11-26，Joel 定案）：单次快照调用；
-    delist_date 沿用 stock_master 旧值；行业=东财粗分类（csric2 置 NULL 不覆盖）；
-    北交所不在 clist fs 内（universe 天然排除）。"""
+def test_t1_sina_primary_preserves_prev_cols(tmp_path, monkeypatch):
+    """T1 主源=sina 全市场快照（2026-11-27，Joel 定案）：
+    sina 正常 → EM clist 零调用（em_calls_this_step=0）；
+    list_date/industry/industry_csric2/delist_date 存量保全（sina 无此字段）；
+    新股 list_date=湖内 K 线首日期（零网络推导）；
+    北交所不在快照 universe 内（天然排除）。"""
     import lake.ingest.em_batch_ingest as emb
     import lake.ingest.tencent_ingest as ti
     import screener.data.tencent as tmod
 
     db = str(tmp_path / "t1x.duckdb")
     con = lconn.open(db)
-    # 预置 1 行（tushare 时代旧数据）：带 delist_date + 旧 csric2
+    # 预置 1 行（tushare 时代旧数据）：带 delist_date + 旧 csric2 + 旧行业名
     con.execute(
-        "INSERT INTO stock_master (ts_code,name,industry_csric2,board,is_st,"
+        "INSERT INTO stock_master (ts_code,name,industry_csric2,industry_name,board,is_st,"
         "source,fetched_at,data_version,delist_date) VALUES "
-        "('sz.000002','旧值','J66','主板',0,'t','2026-01-01 09:00:00','v6.1','2026-09-01')")
+        "('sz.000002','旧值','J66','农林牧渔','主板',0,'t','2026-01-01 09:00:00','v6.1','2026-09-01')")
+    # 新股 sh.600999 的 K 线首日期 → list_date 零网络推导源
+    con.execute(
+        "INSERT INTO kline_daily (ts_code,date,open,high,low,close,volume,amount,source) "
+        "VALUES ('sh.600999','2026-10-01',10,11,9,10,100,1000,'sina')")
     snap_calls = []
 
     def fake_snap(allow_sg=True):
         snap_calls.append(1)
-        return [
-            {"ts_code": "sh.600001", "name": "股600001", "industry": "金融",
-             "list_date": "1999-01-01"},
-            {"ts_code": "sz.000002", "name": "股000002", "industry": "农林牧渔",
-             "list_date": "1999-01-01"},
-        ]
+        return []   # EM 备路若被误触发 → 空名单 → run_t1 拒绝落盘报错
 
     monkeypatch.setattr(emb, "fetch_clist_snapshot", fake_snap)
+    monkeypatch.setattr(drv, "_fetch_sina_universe", lambda: [
+        ("sh.600001", "股600001"),
+        ("sz.000002", "股000002"),
+        ("sh.600999", "新股600999"),
+    ])
     monkeypatch.setattr(ti, "fetch_snapshot", lambda c, b: {})   # 快照补 name/is_st no-op
 
     class _TC:
@@ -415,15 +420,23 @@ def test_t1_clist_snapshot_preserves_delist_and_coarse_industry(tmp_path, monkey
 
     monkeypatch.setattr(tmod, "TencentClient", _TC)
     res = drv.run_t1(con, db)
-    assert len(snap_calls) == 1, f"T1 应只发 1 次 clist 快照（退市档已拆 t1-delist）: {snap_calls}"
-    assert res["em_calls_this_step"] == 1
+    # 主源=sina：EM clist 零调用
+    assert res["source_used"] == "sina_spot", res
+    assert res["em_calls_this_step"] == 0, res
+    assert snap_calls == [], f"sina 正常时不得触发 EM 备路: {snap_calls}"
+    # 存量保全：csric2 / industry_name / delist_date 不被 sina（无此字段）清空
     row = con.execute(
         "SELECT industry_name, industry_csric2, CAST(delist_date AS VARCHAR), source "
         "FROM stock_master WHERE ts_code='sz.000002'").fetchone()
-    assert row == ("农林牧渔", "J66", "2026-09-01", "em_clist"), \
-        f"csric2 与 delist_date 均应沿用既有值（防 T1 同步清空证监会行业代码）: {row}"
+    assert row == ("农林牧渔", "J66", "2026-09-01", "sina_spot"), \
+        f"csric2/industry/delist_date 均应沿用既有值: {row}"
+    # 新股 list_date = 湖内 K 线首日期（零网络）
+    ld = con.execute(
+        "SELECT CAST(list_date AS VARCHAR) FROM stock_master WHERE ts_code='sh.600999'"
+    ).fetchone()[0]
+    assert ld == "2026-10-01", f"新股 list_date 应=K线首日期: {ld}"
     n_bj = con.execute("SELECT COUNT(*) FROM stock_master WHERE ts_code='bj.920001'").fetchone()[0]
-    assert n_bj == 0, "北交所不得入 universe（clist fs 天然不含）"
+    assert n_bj == 0, "北交所不得入 universe（sina 快照天然不含）"
     con.close()
 
 

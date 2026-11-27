@@ -275,8 +275,9 @@ def test_run_t2_suspended_stock_all_sources_empty_completes(monkeypatch, tmp_pat
     con.close()
 
 
-def test_run_t2_sina_empty_tencent_fail_raises(monkeypatch, tmp_path):
-    """sina 空 + tencent **真实失败** → 不视为完成（不标 done，下轮重试）。"""
+def test_run_t2_sina_empty_tdx_fail_raises(monkeypatch, tmp_path):
+    """sina 空 + tdx **真实失败** → 不视为完成（不标 done，下轮重试）。
+    2026-11-27 源池定案：T2 链=[sina, tdx]（tencent 退出 T2 逐只链，降 T3/T7 角色）。"""
     db = str(tmp_path / "susp2.duckdb")
     from lake import conn as lconn
 
@@ -286,7 +287,7 @@ def test_run_t2_sina_empty_tencent_fail_raises(monkeypatch, tmp_path):
 
     registry = {
         "sina": _MockKlineAdapter("sina", 0, "empty"),
-        "tencent": _MockKlineAdapter("tencent", 1, "fail"),
+        "tdx": _MockKlineAdapter("tdx", 3, "fail"),
     }
     stats, con = _run_t2_direct(monkeypatch, tmp_path, db, 40, ["sh.601398"], registry)
     # 有真实失败 → worker 抛"所有源均失败" → errors 非空（不标 done）
@@ -294,8 +295,9 @@ def test_run_t2_sina_empty_tencent_fail_raises(monkeypatch, tmp_path):
     con.close()
 
 
-def test_run_t2_sina_empty_falls_back_to_tencent_data(monkeypatch, tmp_path):
-    """sina 空（停牌误报/口径差）+ tencent 有数 → 用 tencent 写库（fallback 链）。"""
+def test_run_t2_sina_empty_falls_back_to_tdx_data(monkeypatch, tmp_path):
+    """sina 空（停牌误报/口径差）+ tdx 有数 → 用 tdx 写库（fallback 链 [sina, tdx]）。
+    2026-11-27 源池定案：tencent 退出 T2，tdx 为链内第二源。"""
     db = str(tmp_path / "susp3.duckdb")
     from lake import conn as lconn
 
@@ -305,10 +307,12 @@ def test_run_t2_sina_empty_falls_back_to_tencent_data(monkeypatch, tmp_path):
 
     registry = {
         "sina": _MockKlineAdapter("sina", 0, "empty"),
-        "tencent": _MockKlineAdapter("tencent", 1, "ok"),
+        "tdx": _MockKlineAdapter("tdx", 3, "ok"),
     }
     stats, con = _run_t2_direct(monkeypatch, tmp_path, db, 40, ["sh.601398"], registry)
-    assert stats["errors"] == [], f"tencent 有数应成功: {stats['errors']}"
+    assert stats["errors"] == [], f"tdx 有数应成功: {stats['errors']}"
     n = con.execute("SELECT COUNT(*) FROM kline_daily WHERE ts_code='sh.601398'").fetchone()[0]
-    assert n == 2, f"应写入 tencent 2 行: {n}"
+    assert n == 2, f"应写入 tdx 2 行: {n}"
+    src = con.execute("SELECT DISTINCT source FROM kline_daily WHERE ts_code='sh.601398'").fetchall()
+    assert [r[0] for r in src] == ["tdx"], f"fallback 写入 source 应为 tdx: {src}"
     con.close()

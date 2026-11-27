@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
-"""lake.ingest.em_batch_ingest —— 东财 push2/datacenter 全市场单日批量（唯一主通道）。
+"""lake.ingest.em_batch_ingest —— 东财 push2/datacenter 全市场单日批量。
 
-Joel 2026-11-15 拍板全面取代 tushare（每日增量 T2/T3 主通道 + T1 主档/退市 +
-af 本地推导）；2026-11-26 tushare 源完全弃用（数据清除 + 代码整删，Joel 定案），
-本模块为 lake 取数唯一主通道。全部接口 2026-11-15 实测验证（字段映射/单位/
-分页/限频见各函数 docstring 的实锤注记）。
+角色（2026-11-27 Joel 源池原则定案）：**T2/T3=备源·批量快速通道**（主源=sina
+逐只/tencent 快照；EM 批量成功时 2.5min 全市场加速 + T4 除权事件 + af 推导，
+失败回退主源逐只——通道序≠角色序；连续 2-4 周稳定运行后可晋主）、**T4 分红
+=EM 单一族主通道**（Joel ② 拍板：无非 EM 备源）、**T1 退市=EM 专用路径**
+（t1-delist，与 sina 快照主档并行）。
+历史：Joel 2026-11-15 拍板全面取代 tushare（每日增量 T2/T3 主通道 + T1 主档/
+退市 + af 本地推导）；2026-11-26 tushare 源完全弃用（数据清除 + 代码整删）。
+全部接口 2026-11-15 实测验证（字段映射/单位/分页/限频见各函数 docstring 的
+实锤注记）。
 
 通道与数据面：
 - **push2 clist 快照**（``fetch_clist_snapshot``）：全市场 5564 股 A 股
