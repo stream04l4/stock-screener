@@ -182,8 +182,8 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
          "field_group": "valuation", "role": "主源(全市场批量)"},
         {"table": "dividend_events", "table_cn": "T4 分红事件",
          "field_group": "dividend", "role": "主源"},    # RPT_SHAREBONUS_DET
-        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
-         "field_group": "f10", "role": "交叉校验(待验证)"},
+        # T5 交叉校验条目 2026-11-27 移除（Joel 定案：T5=adata_f10 主源单源，
+        # 无交叉校验/备源——fuyao PIT 验证后质量不达标亦未收）。
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
          "field_group": "holders", "role": "备源(待验证)"},
         {"table": "index_daily", "table_cn": "T7 指数日线",
@@ -192,8 +192,11 @@ SOURCE_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {
          "field_group": "rf", "role": "备源(待验证)"},
     ],
     "fuyao": [
-        {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
-         "field_group": "f10", "role": "备源(PIT待验证)"},
+        # T5 2026-11-27：PIT 验证已做（41 股×3 期 123 行，记录
+        # docs/issues/2026-11-27-t5-fuyao-verified.md）→ Joel 判定 vendor 质量
+        # 不达标（2024Q4 重述漂移 6 股 + 600960 2025Q4 liab 孤立陈旧格）
+        # → 不作备源，T5=adata_f10 主源单源。
+        # fuyao 非灌数池 adapter：晋主前不写入（同 v1.1 设计）。
         {"table": "holders_snapshot", "table_cn": "T6 前十大股东",
          "field_group": "holders", "role": "交叉校验(待验证)"},
     ],

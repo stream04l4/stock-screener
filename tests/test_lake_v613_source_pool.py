@@ -228,17 +228,23 @@ def test_ready_sources_provides_matches_capabilities(tmp_path, monkeypatch):
         {"table": "fundamentals_quarterly", "table_cn": "T5 季度基本面",
          "field_group": "f10", "role": "主源"}]
     # v1.1：eastmoney=观察期目标主源矩阵（2026-11-26 tushare 弃用后晋主）；
-    # fuyao=T5 备源+T6 校验
+    # fuyao=仅 T6 校验（T5 11-27 验证质量不达标，未收备源）
     em = {(p["table"], p["field_group"], p["role"]) for p in by_name["eastmoney"]["provides"]}
-    assert ("stock_master", "master", "主源") in em
+    # T1 主档 2026-11-27 晋主=sina（全市场快照），EM clist 降备
+    assert ("stock_master", "master", "备用(2026-11-27 降备；sina 晋主)") in em
+    sina_master = {k: p[k] for k in ("table", "field_group", "role")
+                   for p in by_name["sina"]["provides"]
+                   if p["table"] == "stock_master"}
+    assert sina_master.get("role") == "主源(2026-11-27 晋主)", f"sina T1 应晋主: {sina_master}"
     assert ("kline_daily", "ohlcv_amount", "主源") in em
     assert ("kline_daily", "adj_factor", "主源·推导") in em
     assert ("valuation_daily", "valuation", "主源(全市场批量)") in em
     assert ("dividend_events", "dividend", "主源") in em
     # v1.1 修订（11-10 review 断档修复）：T2 每日增量主引擎必须如实登记
     # （生产 kline_daily 4.7 万行 source=tushare 为历史数据；2026-11-26 起新数据 source=em_batch）
-    fy = {(p["table"], p["role"]) for p in by_name["fuyao"]["provides"]}
-    assert ("fundamentals_quarterly", "备源(PIT待验证)") in fy
+    # fuyao 能力表只剩 T6（T5 备源 2026-11-27 未收）
+    fy = {(p["table"], p["field_group"], p["role"]) for p in by_name["fuyao"]["provides"]}
+    assert fy == {("holders_snapshot", "holders", "交叉校验(待验证)")}
     # T4 分红：v1.1 起仅东财在线源列 T4（旧 em_local_static CSV 是 source 值不是源能力）
     for name in ALL_SOURCES:
         if name == "eastmoney":

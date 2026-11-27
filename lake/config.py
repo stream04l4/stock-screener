@@ -56,7 +56,10 @@ _DEFAULTS: Dict[str, Any] = {
             "ohlcv_amount": ["sina", "tencent", "tdx"],
             "adj_factor": ["sina", "tdx"],
         },
-        # T5 fundamentals_quarterly：adata F10 单源（v7.0.18：原 BaoStock 交叉校验移除）。
+        # T5 fundamentals_quarterly：adata F10 单源灌数（v7.0.18：原 BaoStock 交叉校验移除）。
+        # 2026-11-27 定案（Joel）：adata_f10 主源单源、无备源——EM T5 交叉校验移除；
+        # fuyao PIT 验证已做（vendor 质量不达标：2024Q4 重述漂移 + 1 孤立陈旧格）→ 不收。
+        # 记录：docs/issues/2026-11-27-t5-fuyao-verified.md。
         "fundamentals_quarterly": {
             "f10": ["adata_f10"],
         },
