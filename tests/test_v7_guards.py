@@ -68,7 +68,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # P2 tushare 完全弃用（29fef9b，v8.2.11，2026-11-26；Joel 2026-11-25 拍板）：
 # tushare_ingest.py 整删、增量批量/run_t1/run_t1_delist 切东财 clist 主源
 # （source=em_batch）、备源链路全删、eastmoney 晋主源，lake/ 有意变更，基线前移。
-BASELINE = "69bbf8f"   # 源池总体定案 lake/ 有意变更固化（Joel 2026-11-27 拍板；T1 sina 晋主/T2 tencent 退出 T7 tdx 降级/T6 EM 备源）
+BASELINE = "bbb03d8"   # 源池定案 lake/ 有意变更固化（fuyao 展示源全链路移除 + 卡片角色文案，Joel 2026-11-27）
 
 
 def _git(*args) -> str:
