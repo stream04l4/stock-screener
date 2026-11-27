@@ -118,6 +118,16 @@ async def _auth_gate(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _api_no_cache(request: Request, call_next):
+    """API JSON 一律 no-store：防止浏览器缓存旧 /api/lake/status 导致
+    页面残留已下线的源卡片（2026-11-27 tushare 探测卡残留根因之一）。"""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
 # ---------------------------------------------------------------------------
 # 登录/登出/当前用户
 # ---------------------------------------------------------------------------
